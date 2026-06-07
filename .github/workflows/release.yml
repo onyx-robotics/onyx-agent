@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun test
+      - run: bun run build:release
+      - name: Upload GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/onyx-darwin-arm64
+            dist/onyx-darwin-x64
+            dist/onyx-linux-arm64
+            dist/onyx-linux-x64-baseline
+            dist/checksums.txt
+            scripts/install.sh
+      - name: Publish npm package
+        if: env.NPM_CONFIG_TOKEN != ''
+        run: bun publish --access public
