@@ -1,4 +1,4 @@
-// Public surface barrel: keeps `bin/onyx.ts` and tests importing from "./onyx"
+// Public surface barrel: keeps the `onyx` bin and tests importing from "./onyx"
 // while the implementation lives in focused modules under lib/ and commands/.
 export { parseArgs, type Args } from "./lib/args"
 export { parseMetricLines, primaryMetric, summarizeOutput } from "./lib/metrics"

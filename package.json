@@ -1,6 +1,6 @@
 {
   "name": "@onyx-robotics/agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Onyx agent CLI and packaged agent skill for local research workflows.",
   "type": "module",
   "private": false,
@@ -14,7 +14,7 @@
     "url": "https://github.com/onyx-robotics/onyx-agent/issues"
   },
   "bin": {
-    "onyx": "./bin/onyx.ts"
+    "onyx": "bin/onyx.js"
   },
   "pi": {
     "skills": [

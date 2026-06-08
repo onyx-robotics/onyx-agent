@@ -30,7 +30,7 @@ await mkdir("dist", { recursive: true })
 for (const target of targets) {
   await run("bun", [
     "build",
-    "./bin/onyx.ts",
+    "./bin/onyx.js",
     "--compile",
     "--minify",
     `--target=${target}`,

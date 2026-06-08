@@ -14,5 +14,13 @@ export default tseslint.config(
         tsconfigRootDir: import.meta.dirname,
       },
     },
+  },
+  {
+    files: ["bin/onyx.js"],
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+      },
+    },
   }
 )
