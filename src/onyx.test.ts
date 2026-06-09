@@ -229,7 +229,7 @@ describe("onyx CLI helpers", () => {
   test("prints the package version for --version", async () => {
     const output = await captureLogs(() => main(["--version"]))
 
-    expect(output).toBe("0.1.1")
+    expect(output).toBe("0.1.2")
   })
 
   test("exp run writes last-run and exp log queues it when offline", async () => {

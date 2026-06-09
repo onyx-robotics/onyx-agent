@@ -328,7 +328,7 @@ describe("developer mode", () => {
       })
     )
 
-    expect(output).toBe("0.1.1")
+    expect(output).toBe("0.1.2")
   })
 
   test("launcher reports missing linked dev files", async () => {
