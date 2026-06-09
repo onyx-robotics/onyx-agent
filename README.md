@@ -61,6 +61,26 @@ bun run lint
 bun test
 ```
 
+To make the persistent `onyx` command use this checkout during development:
+
+```bash
+onyx developer link .
+onyx developer use dev
+```
+
+Developer mode runs source through Bun and links the managed Onyx skill to this
+checkout. Return to the installed release with:
+
+```bash
+onyx developer use release
+```
+
+Restart or reload active agent sessions if they cache skill files.
+
+When public CLI commands, flags, profile behavior, local state, sync behavior,
+or the bundled agent skill changes, update the public docs in
+`/Users/ted/onyx/docs` in the same change.
+
 Release binaries are built from Bun standalone executables:
 
 ```bash

@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises"
+
 import { describe, expect, test } from "bun:test"
 
 async function dryRun(os: string, arch: string) {
@@ -34,5 +36,15 @@ describe("install script", () => {
 
     expect(output).toContain("target=linux-x64-baseline")
     expect(output).toContain("asset=onyx-linux-x64-baseline")
+  })
+
+  test("post-install skill setup uses developer-aware sync first", async () => {
+    const script = await readFile(
+      import.meta.dir + "/../scripts/install.sh",
+      "utf8"
+    )
+
+    expect(script).toContain('"$install_path" developer sync-skill --quiet')
+    expect(script).toContain('"$install_path" agent install-skill --quiet')
   })
 })

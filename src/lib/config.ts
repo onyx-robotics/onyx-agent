@@ -17,15 +17,34 @@ export type CliProfile = {
   updatedAt: string
 }
 
+export type DeveloperMode = "release" | "dev"
+
+export type DeveloperCheckout = {
+  root: string
+  binPath: string
+  skillPath: string
+}
+
+export type DeveloperConfig = {
+  mode: DeveloperMode
+  checkout?: DeveloperCheckout
+}
+
 export type Config = {
   profiles: Record<string, CliProfile>
   currentProfile: string
+  developer: DeveloperConfig
+}
+
+export type ConfigInput = Omit<Config, "developer"> & {
+  developer?: DeveloperConfig
 }
 
 export function emptyConfig(): Config {
   return {
     profiles: {},
     currentProfile: "",
+    developer: { mode: "release" },
   }
 }
 
@@ -39,6 +58,33 @@ export function configPath() {
   return join(configDir(), CONFIG_FILE)
 }
 
+function normalizeDeveloperConfig(value: unknown): DeveloperConfig {
+  if (!value || typeof value !== "object") return { mode: "release" }
+  const candidate = value as Partial<DeveloperConfig>
+  const mode = candidate.mode === "dev" ? "dev" : "release"
+  const checkout = candidate.checkout
+  if (
+    checkout &&
+    typeof checkout.root === "string" &&
+    typeof checkout.binPath === "string" &&
+    typeof checkout.skillPath === "string"
+  ) {
+    return { mode, checkout }
+  }
+  return { mode }
+}
+
+async function readExistingDeveloperConfig() {
+  try {
+    const parsed = JSON.parse(
+      await readFile(configPath(), "utf8")
+    ) as Partial<Config>
+    return normalizeDeveloperConfig(parsed.developer)
+  } catch {
+    return { mode: "release" as const }
+  }
+}
+
 export async function readConfig(): Promise<Config> {
   try {
     const parsed = JSON.parse(
@@ -48,18 +94,34 @@ export async function readConfig(): Promise<Config> {
     return {
       profiles: parsed.profiles ?? {},
       currentProfile: parsed.currentProfile ?? "",
+      developer: normalizeDeveloperConfig(parsed.developer),
     }
   } catch {
     return emptyConfig()
   }
 }
 
-export async function writeConfig(config: Config) {
+export async function writeConfig(config: ConfigInput) {
   await mkdir(configDir(), { recursive: true })
-  await writeFile(configPath(), `${JSON.stringify(config, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  })
+  const developer =
+    config.developer === undefined
+      ? await readExistingDeveloperConfig()
+      : normalizeDeveloperConfig(config.developer)
+  await writeFile(
+    configPath(),
+    `${JSON.stringify(
+      {
+        ...config,
+        developer,
+      },
+      null,
+      2
+    )}\n`,
+    {
+      encoding: "utf8",
+      mode: 0o600,
+    }
+  )
 }
 
 export function normalizeProfileName(value: string) {

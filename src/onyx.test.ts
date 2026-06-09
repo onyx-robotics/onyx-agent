@@ -209,6 +209,8 @@ describe("onyx CLI helpers", () => {
 
   test("public usage stays focused on primitive commands", () => {
     expect(USAGE).toContain("onyx --version")
+    expect(USAGE).toContain("onyx developer status")
+    expect(USAGE).toContain("onyx developer use dev")
     expect(USAGE).toContain("onyx agent skill-path")
     expect(USAGE).toContain("onyx agent install-skill")
     expect(USAGE).not.toContain("onyx init")

@@ -100,7 +100,9 @@ cp "$tmp/$asset" "$install_path"
 chmod 0755 "$install_path"
 
 if [ "${ONYX_SKIP_SKILL:-}" != "1" ]; then
-  "$install_path" agent install-skill --quiet || true
+  "$install_path" developer sync-skill --quiet ||
+    "$install_path" agent install-skill --quiet ||
+    true
 fi
 
 echo "Installed onyx to $install_path"

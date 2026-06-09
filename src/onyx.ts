@@ -73,10 +73,20 @@ export {
 export {
   defaultSkillInstallRoot,
   displaySkillPath,
+  installDeveloperSkill,
   installOnyxSkill,
+  installReleaseSkill,
   packagedSkillPath,
+  readPackagedSkill,
+  skillInstallTarget,
 } from "./lib/skill"
 export * from "./protocol"
+export {
+  commandDeveloper,
+  detectDeveloperCheckout,
+  linkedDeveloperCheckout,
+  validateDeveloperCheckout,
+} from "./commands/developer"
 export { commandAgent } from "./commands/agent"
 export { commandLogin } from "./commands/login"
 export {
@@ -90,3 +100,10 @@ export { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 export { commandListen } from "./commands/listen"
 export { commandPush, commandStatus, commandSync } from "./commands/sync"
 export { USAGE, main } from "./main"
+export {
+  ONYX_LAUNCHER_BYPASS,
+  defaultDevCommandRunner,
+  runCli,
+  runLauncher,
+  type DevCommandRunner,
+} from "./launcher"

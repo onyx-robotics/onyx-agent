@@ -13,6 +13,12 @@ export const USAGE = `onyx - research workflow CLI
 
 Usage:
   onyx --version
+  onyx developer status
+  onyx developer link [path]
+  onyx developer use dev [--skill-dir <path>] [--quiet]
+  onyx developer use release [--skill-dir <path>] [--quiet]
+  onyx developer sync-skill [--skill-dir <path>] [--quiet]
+  onyx developer unlink [--skill-dir <path>] [--quiet]
   onyx login [--api-url <url>] [--print-url] [--refresh] [--port <port>] [--timeout <ms>]
   onyx agent skill-path
   onyx agent install-skill [--dir <path>] [--quiet]

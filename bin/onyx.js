@@ -1,4 +1,4 @@
 #!/usr/bin/env bun
-import { main } from "../src/onyx"
+import { runCli } from "../src/launcher"
 
-await main()
+await runCli()
