@@ -15,7 +15,7 @@ import { ONYX_SKILL_MARKDOWN } from "./skill-content"
 export const ONYX_SKILL_NAME = "onyx"
 
 export function defaultSkillInstallRoot() {
-  return join(homedir(), ".onyx", "skills")
+  return join(homedir(), ".claude", "skills")
 }
 
 export function skillInstallTarget(root = defaultSkillInstallRoot()) {

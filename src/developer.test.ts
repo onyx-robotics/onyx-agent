@@ -197,6 +197,11 @@ describe("developer mode", () => {
       expect(await readlink(target)).toBe(
         join(checkoutRealRoot, "skills", "onyx", "SKILL.md")
       )
+      await writeFile(
+        join(checkoutRealRoot, "skills", "onyx", "SKILL.md"),
+        "updated dev skill\n"
+      )
+      expect(await readFile(target, "utf8")).toBe("updated dev skill\n")
       expect((await readConfig()).developer.mode).toBe("dev")
 
       await commandDeveloper({
@@ -205,6 +210,13 @@ describe("developer mode", () => {
       })
       expect((await lstat(target)).isSymbolicLink()).toBe(false)
       expect(await readFile(target, "utf8")).toContain("name: onyx")
+      await writeFile(
+        join(checkoutRealRoot, "skills", "onyx", "SKILL.md"),
+        "dev skill after release\n"
+      )
+      expect(await readFile(target, "utf8")).not.toBe(
+        "dev skill after release\n"
+      )
       expect((await readConfig()).developer.mode).toBe("release")
     } finally {
       await rm(checkoutRoot, { recursive: true, force: true })

@@ -7,7 +7,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { describe, expect, test } from "bun:test"
@@ -24,6 +24,7 @@ import {
   commandExpLog,
   commandExpRun,
   commandStatus,
+  defaultSkillInstallRoot,
   formatAge,
   historyPath,
   installOnyxSkill,
@@ -482,6 +483,10 @@ describe("onyx CLI helpers", () => {
   test("agent skill commands expose and install the bundled skill", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-agent-skill-test-"))
     try {
+      expect(defaultSkillInstallRoot()).toBe(
+        join(homedir(), ".claude", "skills")
+      )
+
       const pathOutput = await captureLogs(() =>
         commandAgent({ positional: ["agent", "skill-path"], options: {} })
       )

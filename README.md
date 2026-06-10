@@ -28,7 +28,9 @@ onyx login --api-url http://localhost:3000
 
 ## Agent Skill
 
-The installer installs the bundled skill automatically. To install it manually:
+The installer installs the bundled skill automatically to Claude Code's
+personal skill directory at `~/.claude/skills/onyx/SKILL.md`. To install it
+manually:
 
 ```bash
 onyx agent install-skill
@@ -68,8 +70,10 @@ onyx developer link .
 onyx developer use dev
 ```
 
-Developer mode runs source through Bun and links the managed Onyx skill to this
-checkout. Return to the installed release with:
+Developer mode runs source through Bun and replaces
+`~/.claude/skills/onyx/SKILL.md` with a symlink to this checkout's
+`skills/onyx/SKILL.md`, so Claude Code sees skill edits from local source.
+Return to the installed release with:
 
 ```bash
 onyx developer use release
