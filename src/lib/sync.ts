@@ -14,7 +14,7 @@ import {
   type ApiProject,
 } from "./api"
 import { emitEvent } from "./events"
-import { pushBranch } from "./git"
+import { pushBranch, repositoryUrl } from "./git"
 import { applyHistorySyncUpdates, type HistorySyncUpdate } from "./history"
 import { branchMetadata } from "./markdown"
 import { branchStateKey, normalizeProjectPath } from "./project"
@@ -39,14 +39,12 @@ function secondaryMetrics(record: LocalResearchExperimentLoggedRecord) {
 }
 
 async function upsertBranchFromMetadata({
-  projectId,
   root,
   branchName,
   gitBranchName,
   state,
   args,
 }: {
-  projectId: string
   root: string
   branchName: string
   gitBranchName: string
@@ -69,9 +67,10 @@ async function upsertBranchFromMetadata({
       `Branch ${branchName} is missing a base commit. Run \`onyx branch create\` again.`
     )
   }
-  const branch = await upsertBranch(
-    projectId,
+  const result = await upsertBranch(
     {
+      repositoryUrl: await repositoryUrl(root, args.options["repository-url"]),
+      projectPath,
       name: branchName,
       description: meta.description ?? undefined,
       gitBranchName,
@@ -82,28 +81,33 @@ async function upsertBranchFromMetadata({
     },
     args
   )
-  state.branches[key] = { ...state.branches[key], branchId: branch.id }
-  return branch.id
+  state.projectId = result.project.id
+  state.branches[key] = {
+    ...state.branches[key],
+    branchId: result.branch.id,
+  }
+  return result.branch.id
 }
 
 async function flushBranchStarted({
-  projectId,
+  root,
   record,
   state,
   args,
 }: {
-  projectId: string
+  root: string
   record: LocalResearchBranchStartedRecord
   state: CliState
   args: Args
-}) {
+}): Promise<ApiProject> {
   if (record.projectPath !== undefined) {
     state.projectPath = record.projectPath
   }
   const projectPath = state.projectPath ?? ""
-  const branch = await upsertBranch(
-    projectId,
+  const result = await upsertBranch(
     {
+      repositoryUrl: await repositoryUrl(root, args.options["repository-url"]),
+      projectPath,
       name: record.name,
       description: record.description ?? undefined,
       gitBranchName: record.gitBranchName,
@@ -114,10 +118,11 @@ async function flushBranchStarted({
     },
     args
   )
+  state.projectId = result.project.id
   const key = branchStateKey(projectPath, record.name)
   state.branches[key] = {
     ...state.branches[key],
-    branchId: branch.id,
+    branchId: result.branch.id,
     projectPath,
     gitBranchName: record.gitBranchName,
     baseCommitSha: record.baseCommitSha,
@@ -126,16 +131,15 @@ async function flushBranchStarted({
     metricUnit: record.metricUnit ?? null,
     metricDirection: record.metricDirection,
   }
+  return result.project
 }
 
 async function flushExperiment({
-  projectId,
   root,
   record,
   state,
   args,
 }: {
-  projectId: string
   root: string
   record: LocalResearchExperimentLoggedRecord
   state: CliState
@@ -145,7 +149,6 @@ async function flushExperiment({
     state.projectPath = record.projectPath
   }
   const branchId = await upsertBranchFromMetadata({
-    projectId,
     root,
     branchName: record.branchName,
     gitBranchName: record.gitBranchName,
@@ -182,12 +185,11 @@ async function flushExperiment({
 }
 
 /**
- * Replays the local outbox to the Onyx API. Resolves the project, pushes every
- * referenced branch so reported commits are reachable, then upserts branches and
+ * Replays the local outbox to the Onyx API. Pushes every referenced branch so
+ * reported commits are reachable, then lazily upserts the project/branches and
  * reports experiments idempotently (server dedups by runRef). A 409 means the
  * commit is not reachable through GitHub yet (push/propagation lag) and is retried on the
- * next flush; any other error keeps the record queued and is surfaced. Offline
- * (project unresolvable) leaves the outbox untouched.
+ * next flush; any other error keeps the record queued and is surfaced.
  */
 export async function flushOutbox(
   root: string,
@@ -213,21 +215,19 @@ export async function flushOutbox(
     requestedProjectPath || queuedProjectPath || state.projectPath
   await writeState(root, state)
 
-  let project: ApiProject
+  let project: ApiProject | null = null
   try {
     project = await resolveProject(root, args)
+    state.projectId = project.id
   } catch (error) {
     if (!options.quiet) {
-      console.log(
-        `${records.length} record(s) queued locally; not synced (${
+      console.warn(
+        `Project lookup skipped; branch sync will lazily create it if GitHub access is available (${
           error instanceof Error ? error.message : String(error)
         })`
       )
     }
-    return { flushed: 0, pending: records.length, offline: true }
   }
-
-  state.projectId = project.id
 
   // Push every referenced branch up front so reported commits are reachable.
   for (const branch of new Set(records.map((record) => record.gitBranchName))) {
@@ -239,13 +239,15 @@ export async function flushOutbox(
   }
 
   // Pre-populate branch ids so concurrently-created branches resolve without upsert.
-  try {
-    for (const branch of await listProjectBranches(project.id, args)) {
-      const key = branchStateKey(state.projectPath ?? "", branch.name)
-      state.branches[key] = { ...state.branches[key], branchId: branch.id }
+  if (project) {
+    try {
+      for (const branch of await listProjectBranches(project.id, args)) {
+        const key = branchStateKey(state.projectPath ?? "", branch.name)
+        state.branches[key] = { ...state.branches[key], branchId: branch.id }
+      }
+    } catch {
+      // best-effort
     }
-  } catch {
-    // best-effort
   }
 
   const remaining: LocalResearchRecord[] = []
@@ -255,10 +257,9 @@ export async function flushOutbox(
   for (const record of records) {
     try {
       if (record.type === "branch_started") {
-        await flushBranchStarted({ projectId: project.id, record, state, args })
+        project = await flushBranchStarted({ root, record, state, args })
       } else {
         const update = await flushExperiment({
-          projectId: project.id,
           root,
           record,
           state,

@@ -20,6 +20,10 @@ export const researchExperimentStatusSchema = z.enum([
 ])
 
 export const createResearchBranchRequestSchema = z.object({
+  repositoryUrl: z.string().trim().min(1).max(500).optional(),
+  repositoryFullName: z.string().trim().min(1).max(240).optional(),
+  githubRepositoryId: z.string().trim().min(1).optional(),
+  projectPath: z.string().trim().max(240).optional(),
   parentBranchId: z.uuid().optional(),
   name: z
     .string()

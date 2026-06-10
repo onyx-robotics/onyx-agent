@@ -55,6 +55,11 @@ export type ApiTreeBranch = ApiBranch & {
   experiments: ApiTreeExperiment[]
 }
 
+export type ApiBranchUpsertResult = {
+  project: ApiProject
+  branch: ApiBranch
+}
+
 export type ApiProjectTree = {
   project: ApiProject
   branches: ApiTreeBranch[]
@@ -112,9 +117,9 @@ export function apiData<T>(payload: unknown): T {
 }
 
 /**
- * Resolves the linked Onyx project for this repository by matching the origin
+ * Resolves an existing Onyx project for this repository by matching the origin
  * URL + projectPath against the team's projects (or an explicit --project id).
- * Throws when nothing matches so callers can keep work queued in the outbox.
+ * Branch creation uses the repo-first endpoint and can provision the project.
  */
 export async function resolveProject(
   root: string,
@@ -151,7 +156,7 @@ export async function resolveProject(
 
   if (!project) {
     throw new Error(
-      "No linked Onyx project matched this repository. Link the repo in Onyx first."
+      "No Onyx project is tracking this repository yet. Start a branch with `onyx branch create`, or grant Onyx GitHub access to this repository and sync again."
     )
   }
 
@@ -188,14 +193,13 @@ export async function getProjectTree(
 }
 
 export async function upsertBranch(
-  projectId: string,
   body: CreateResearchBranchRequest,
   args?: Args
-): Promise<ApiBranch> {
-  return apiData<ApiBranch>(
+): Promise<ApiBranchUpsertResult> {
+  return apiData<ApiBranchUpsertResult>(
     await callApi(
       "POST",
-      `/api/v1/research/projects/${projectId}/branches`,
+      "/api/v1/research/branches",
       body,
       args
     )

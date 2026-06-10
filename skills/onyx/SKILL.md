@@ -17,7 +17,8 @@ Drive an autonomous research loop using the `onyx` CLI as the substrate. You own
    - **Constraints**
    - **Stop conditions** - eg. `stop after N iterations`, `for 30 minutes`, `until <condition>`, default is no stop condition, loop forever until manually stopped by user
 2. `onyx branch create --name <slug> --metric <name> --unit <unit> --direction <maximize/minimize> --description <goal>`
-   - Add `--project-path <projectPath>` when the Onyx project is scoped to a subdirectory.
+   - Add `--project-path <projectPath>` when the work is scoped to a subdirectory.
+   - The command infers the repository from `origin` and registers the branch with Onyx; if offline or GitHub access is missing, records stay queued until `onyx sync`.
 3. Read the source files. Understand the workload deeply before writing anything.
 4. Write `<projectPath>/onyx/onyx.md` and `<projectPath>/onyx/eval.sh` (see below). Optionally write `<projectPath>/onyx/checks.sh` when correctness constraints require it. Commit these files.
 5. Run a baseline with `onyx exp run`, then record it with `onyx exp log --description "baseline" --agent-notes '<json>'`, then start looping immediately.

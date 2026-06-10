@@ -83,6 +83,6 @@ export async function commandStatus(args: Args) {
     const project = await resolveProject(root, args)
     console.log(`project: ${project.name} (${project.id})`)
   } catch {
-    console.log("project: not linked / offline")
+    console.log("project: not provisioned / offline")
   }
 }
