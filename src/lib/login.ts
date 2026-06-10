@@ -33,6 +33,7 @@ const LOGIN_COMPLETE_MESSAGE =
   "Onyx CLI login complete. You can close this tab."
 
 const ONYX_MARK_SVG = `<svg width="381" height="509" viewBox="0 0 381 509" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M381 382.14L233 508.018V424.447L298.75 368.525L190.501 151.379L82.25 368.526L149 425.297V508.867L0 382.14L190.501 0L381 382.14Z" fill="currentColor"/></svg>`
+const CHECK_ICON_SVG = `<svg class="title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>`
 
 export function cliLoginCompleteHtml() {
   return `<!doctype html>
@@ -43,24 +44,14 @@ export function cliLoginCompleteHtml() {
   <title>Onyx CLI login complete</title>
   <style>
     :root {
-      color-scheme: light dark;
-      --background: oklch(0.96 0 0);
+      color-scheme: light;
+      --background: oklch(1 0 0);
       --foreground: oklch(0.145 0 0);
-      --card: oklch(0.96 0 0);
+      --card: oklch(1 0 0);
       --card-foreground: oklch(0.145 0 0);
       --muted-foreground: oklch(0.556 0 0);
       --border: oklch(0.922 0 0);
-    }
-
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --background: oklch(0.145 0 0);
-        --foreground: oklch(0.985 0 0);
-        --card: oklch(0.205 0 0);
-        --card-foreground: oklch(0.985 0 0);
-        --muted-foreground: oklch(0.708 0 0);
-        --border: oklch(1 0 0 / 10%);
-      }
+      --success: oklch(0.627 0.194 149.214);
     }
 
     * {
@@ -79,7 +70,8 @@ export function cliLoginCompleteHtml() {
     }
 
     main {
-      width: min(100%, 448px);
+      width: 100%;
+      max-width: 672px;
     }
 
     .brand {
@@ -89,7 +81,7 @@ export function cliLoginCompleteHtml() {
       gap: 32px;
       margin-bottom: 32px;
       font-size: 48px;
-      line-height: 1;
+      line-height: 1.1;
       font-weight: 600;
       letter-spacing: 0;
     }
@@ -105,9 +97,24 @@ export function cliLoginCompleteHtml() {
       border-radius: 8px;
       background: var(--card);
       color: var(--card-foreground);
-      padding: 24px;
-      text-align: center;
       box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    }
+
+    .card-header {
+      padding: 24px;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .title-icon {
+      width: 20px;
+      height: 20px;
+      flex: none;
+      color: var(--success);
     }
 
     h1 {
@@ -122,7 +129,7 @@ export function cliLoginCompleteHtml() {
       margin: 8px 0 0;
       color: var(--muted-foreground);
       font-size: 14px;
-      line-height: 22px;
+      line-height: 20px;
     }
   </style>
 </head>
@@ -130,8 +137,13 @@ export function cliLoginCompleteHtml() {
   <main>
     <div class="brand">${ONYX_MARK_SVG}<span>Onyx</span></div>
     <section class="card" aria-labelledby="title">
-      <h1 id="title">${LOGIN_COMPLETE_MESSAGE}</h1>
-      <p>Your CLI profile is ready to use.</p>
+      <div class="card-header">
+        <div class="title-row">
+          ${CHECK_ICON_SVG}
+          <h1 id="title">${LOGIN_COMPLETE_MESSAGE}</h1>
+        </div>
+        <p>Your CLI profile is ready to use.</p>
+      </div>
     </section>
   </main>
 </body>

@@ -15,7 +15,7 @@ const packageRoot = import.meta.dir + "/.."
 const originalPath = Bun.env.PATH ?? ""
 
 async function dryRun(os: string, arch: string) {
-  const process = Bun.spawn(["sh", "scripts/install.sh"], {
+  const process = Bun.spawn(["bash", "scripts/install.sh"], {
     cwd: packageRoot,
     env: {
       ...Bun.env,
@@ -124,7 +124,7 @@ async function runInstall(
   fixture: Awaited<ReturnType<typeof installFixture>>,
   env: Record<string, string> = {}
 ) {
-  const process = Bun.spawn(["sh", "scripts/install.sh"], {
+  const process = Bun.spawn(["bash", "scripts/install.sh"], {
     cwd: packageRoot,
     env: {
       ...Bun.env,
@@ -179,6 +179,9 @@ describe("install script", () => {
       })
 
       expect(result.code).toBe(0)
+      expect(result.stdout).toContain("Onyx CLI Installer")
+      expect(result.stdout).not.toContain("Step 1/6")
+      expect(result.stdout).not.toContain(">  Authenticate")
       expect(result.stdout).toContain(
         `Installed onyx to ${fixture.home}/.local/bin/onyx`
       )
@@ -199,6 +202,10 @@ describe("install script", () => {
       })
 
       expect(result.code).toBe(0)
+      expect(result.stdout).toContain(">  Make onyx available")
+      expect(result.stdout).toContain(
+        `|     Add ${fixture.home}/.local/bin to your shell PATH?`
+      )
       expect(result.stdout).toContain(`Added ${fixture.home}/.local/bin to PATH`)
       expect(await readFile(`${fixture.home}/.bashrc`, "utf8")).toContain(
         'export PATH="$HOME/.local/bin:$PATH"'
@@ -229,6 +236,8 @@ describe("install script", () => {
       expect(result.code).toBe(0)
       expect(result.stdout).toContain("Authenticate later with browser login:")
       expect(result.stdout).toContain('export ONYX_API_KEY="onyx_..."')
+      expect(result.stdout).not.toContain(">  Make onyx available")
+      expect(result.stdout).not.toContain(">  Authenticate")
       await expect(readFile(`${fixture.home}/.bashrc`, "utf8")).rejects.toThrow()
       const log = await readFile(fixture.logPath, "utf8")
       expect(log).not.toContain("login")
@@ -247,21 +256,21 @@ describe("install script", () => {
     })
   })
 
-  test("browser auth choice runs login with the installed binary", async () => {
+  test("runs browser login with the installed binary by default", async () => {
     await withFixture(async (fixture) => {
       const result = await runInstall(fixture, {
         PATH: `${fixture.fakeBin}:${fixture.home}/.local/bin:${originalPath}`,
-        ONYX_INSTALL_AUTH: "login",
       })
 
       expect(result.code).toBe(0)
-      expect(result.stdout).toContain("Starting browser login...")
+      expect(result.stdout).toContain("Waiting for browser login...")
       expect(result.stdout).toContain("Onyx login complete.")
+      expect(result.stdout).not.toContain(">  Authenticate")
       expect(await readFile(fixture.logPath, "utf8")).toContain("login")
     })
   })
 
-  test("API key auth choice prints the global environment variable", async () => {
+  test("API key auth override prints the global environment variable", async () => {
     await withFixture(async (fixture) => {
       const result = await runInstall(fixture, {
         ONYX_INSTALL_AUTH: "env",
