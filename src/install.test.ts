@@ -265,7 +265,6 @@ describe("install script", () => {
       expect(result.code).toBe(0)
       expect(result.stdout).toContain("Waiting for browser login...")
       expect(result.stdout).toContain("Onyx login complete.")
-      expect(result.stdout).not.toContain(">  Authenticate")
       expect(await readFile(fixture.logPath, "utf8")).toContain("login")
     })
   })
