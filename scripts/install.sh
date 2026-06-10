@@ -1,5 +1,5 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
 REPO="${ONYX_INSTALL_REPO:-onyx-robotics/onyx-agent}"
 VERSION="${ONYX_VERSION:-latest}"
@@ -9,8 +9,92 @@ INSTALL_DIR="${INSTALL_DIR%/}"
 BASE_URL="${ONYX_INSTALL_BASE_URL:-https://github.com/$REPO/releases}"
 INSTALL_MARKER=".onyx-install"
 
+style_reset=""
+style_bold=""
+style_dim=""
+style_rail=""
+style_dot=""
+style_ok=""
+style_warn=""
+style_error=""
+style_code=""
+rail_marker="|"
+prompt_marker=">"
+ok_marker="OK"
+
+if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
+  rail_marker="│"
+  prompt_marker="◆"
+  ok_marker="✓"
+fi
+
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  esc="$(printf '\033')"
+  style_reset="${esc}[0m"
+  style_bold="${esc}[1m"
+  style_dim="${esc}[2m"
+  style_rail="${esc}[38;5;39m"
+  style_dot="${esc}[38;5;39m"
+  style_ok="${esc}[32m"
+  style_warn="${esc}[33m"
+  style_error="${esc}[31m"
+  style_code="${esc}[36m"
+fi
+
+print_intro() {
+  printf "\n%bOnyx CLI Installer%b\n" "$style_bold" "$style_reset"
+  printf "%bA guided setup for the local Onyx agent.%b\n" "$style_dim" "$style_reset"
+  printf "%bRelease:%b %s\n" "$style_dim" "$style_reset" "$VERSION"
+  printf "%bDestination:%b %s\n" "$style_dim" "$style_reset" "$INSTALL_DIR"
+}
+
+status_line() {
+  printf "  %s\n" "$*"
+}
+
+status_code() {
+  printf "    %b%s%b\n" "$style_code" "$*" "$style_reset"
+}
+
+status_success() {
+  printf "  %b%s%b %s\n" "$style_ok" "$ok_marker" "$style_reset" "$*"
+}
+
+status_warn() {
+  printf "  %bNote:%b %s\n" "$style_warn" "$style_reset" "$*"
+}
+
+prompt_start() {
+  prompt_title="$1"
+  prompt_detail="${2:-}"
+
+  printf "\n%b%s%b  %b%s%b\n" \
+    "$style_dot" "$prompt_marker" "$style_reset" \
+    "$style_bold" "$prompt_title" "$style_reset"
+
+  if [ -n "$prompt_detail" ]; then
+    prompt_line "$prompt_detail"
+  fi
+}
+
+prompt_line() {
+  printf "%b%s%b     %s\n" "$style_rail" "$rail_marker" "$style_reset" "$*"
+}
+
+prompt_code() {
+  printf "%b%s%b       %b%s%b\n" "$style_rail" "$rail_marker" "$style_reset" "$style_code" "$*" "$style_reset"
+}
+
+prompt_success() {
+  printf "%b%s%b     %b%s%b %s\n" "$style_rail" "$rail_marker" "$style_reset" "$style_ok" "$ok_marker" "$style_reset" "$*"
+}
+
+prompt_warn() {
+  printf "%b%s%b     %bNote:%b %s\n" "$style_rail" "$rail_marker" "$style_reset" "$style_warn" "$style_reset" "$*"
+}
+
 die() {
-  echo "Error: $*" >&2
+  printf "%bError:%b %s\n" "$style_error" "$style_reset" "$*" >&2
   exit 1
 }
 
@@ -66,13 +150,23 @@ path_export_line() {
 }
 
 print_path_instruction() {
-  echo ""
-  echo "Add Onyx to your PATH:"
-  echo "  $(path_export_line)"
+  status_line "Add Onyx to your PATH:"
+  status_code "$(path_export_line)"
+}
+
+print_prompt_path_instruction() {
+  prompt_line "Add Onyx to your PATH:"
+  prompt_code "$(path_export_line)"
+}
+
+print_path_prompt() {
+  prompt_start "Make onyx available" "$INSTALL_DIR is not currently on PATH."
+  prompt_line "Add $HOME/.local/bin to your shell PATH?"
 }
 
 shell_rc_file() {
-  shell_name="${SHELL##*/}"
+  shell_name="${SHELL:-}"
+  shell_name="${shell_name##*/}"
   case "$shell_name" in
     zsh) echo "$HOME/.zshrc" ;;
     bash) echo "$HOME/.bashrc" ;;
@@ -107,9 +201,9 @@ append_path_to_shell_rc() {
   else
     export PATH="$INSTALL_DIR"
   fi
-  echo "Added $INSTALL_DIR to PATH in $rc_file"
-  echo "Open a new terminal or run:"
-  echo "  $(path_export_line)"
+  prompt_success "Added $INSTALL_DIR to PATH in $rc_file"
+  prompt_line "Open a new terminal or run:"
+  prompt_code "$(path_export_line)"
 }
 
 prompt_yes_no() {
@@ -122,16 +216,16 @@ prompt_yes_no() {
     has_tty || return 2
     while :; do
       if [ "$default_answer" = "yes" ]; then
-        printf "%s [Y/n] " "$question" > /dev/tty
+        printf "%b%s%b     %s [Y/n] " "$style_rail" "$rail_marker" "$style_reset" "$question" > /dev/tty
       else
-        printf "%s [y/N] " "$question" > /dev/tty
+        printf "%b%s%b     %s [y/N] " "$style_rail" "$rail_marker" "$style_reset" "$question" > /dev/tty
       fi
       IFS= read -r answer < /dev/tty || return 2
       [ -n "$answer" ] || answer="$default_answer"
       case "$answer" in
         y|Y|yes|YES|Yes) return 0 ;;
         n|N|no|NO|No) return 1 ;;
-        *) echo "Please answer yes or no." > /dev/tty ;;
+        *) prompt_line "Please answer yes or no." > /dev/tty ;;
       esac
     done
   fi
@@ -144,106 +238,131 @@ prompt_yes_no() {
 }
 
 setup_path() {
-  echo ""
-  echo "Step 1/2: Make onyx available"
-
   if path_contains "${PATH:-}" "$INSTALL_DIR"; then
-    echo "onyx is available on PATH from $INSTALL_DIR"
+    status_success "onyx is available on PATH from $INSTALL_DIR"
     return 0
   fi
 
-  echo "$INSTALL_DIR is not currently on PATH."
-
   if [ "${ONYX_INSTALL_NO_PROMPT:-}" = "1" ]; then
+    status_warn "$INSTALL_DIR is not currently on PATH."
     print_path_instruction
     return 0
   fi
 
-  if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then
+  if [ "$INSTALL_DIR" = "$HOME/.local/bin" ] &&
+    { [ -n "${ONYX_INSTALL_PATH_ANSWER:-}" ] || has_tty; }; then
+    if [ -n "${ONYX_INSTALL_PATH_ANSWER:-}" ]; then
+      print_path_prompt
+    else
+      print_path_prompt > /dev/tty
+    fi
+
     if prompt_yes_no "Add $HOME/.local/bin to your shell PATH?" yes; then
       append_path_to_shell_rc
     else
-      print_path_instruction
+      print_prompt_path_instruction
     fi
     return 0
   fi
 
+  status_warn "$INSTALL_DIR is not currently on PATH."
   print_path_instruction
 }
 
 print_auth_followup() {
   user_cmd="$(install_path_for_user)"
-  echo ""
-  echo "Authenticate later with browser login:"
-  echo "  $user_cmd login"
-  echo ""
-  echo "Or use a global API key:"
-  echo '  export ONYX_API_KEY="onyx_..."'
+  status_line "Authenticate later with browser login:"
+  status_code "$user_cmd login"
+  status_line "Or use a global API key:"
+  status_code 'export ONYX_API_KEY="onyx_..."'
 }
 
-auth_choice() {
-  if [ "${ONYX_INSTALL_NO_PROMPT:-}" = "1" ]; then
-    echo "skip"
+print_prompt_auth_followup() {
+  user_cmd="$(install_path_for_user)"
+  prompt_line "Login later with browser login:"
+  prompt_code "$user_cmd login"
+  prompt_line "Or use a global API key:"
+  prompt_code 'export ONYX_API_KEY="onyx_..."'
+}
+
+run_login_without_cancel() {
+  status_line "Waiting for browser login..."
+  if "$install_path" login; then
+    status_success "Onyx login complete."
+  else
+    status_warn "Browser login did not complete."
+    print_auth_followup
+  fi
+}
+
+run_login_with_cancel() {
+  login_log="$tmp/login.log"
+  cancel_file="$tmp/login-canceled"
+
+  prompt_start "Authenticate" "Waiting for browser login... Press ESC to cancel or use API key."
+  "$install_path" login > "$login_log" 2>&1 &
+  login_pid=$!
+
+  (
+    while kill -0 "$login_pid" 2>/dev/null; do
+      key=""
+      if IFS= read -rsn1 -t 1 key < /dev/tty 2>/dev/null; then
+        if [[ "$key" == $'\e' ]]; then
+          : > "$cancel_file"
+          kill "$login_pid" 2>/dev/null || true
+          exit 0
+        fi
+      fi
+    done
+  ) &
+  cancel_pid=$!
+
+  if wait "$login_pid"; then
+    login_status=0
+  else
+    login_status=$?
+  fi
+
+  kill "$cancel_pid" 2>/dev/null || true
+  wait "$cancel_pid" 2>/dev/null || true
+
+  if [ -f "$cancel_file" ]; then
+    prompt_warn "Browser login canceled."
+    print_prompt_auth_followup
     return 0
   fi
 
-  if [ -n "${ONYX_INSTALL_AUTH:-}" ]; then
-    echo "$ONYX_INSTALL_AUTH"
-    return 0
+  if [ "$login_status" -eq 0 ]; then
+    prompt_success "Onyx login complete."
+  else
+    prompt_warn "Browser login did not complete."
+    print_prompt_auth_followup
   fi
-
-  if ! has_tty; then
-    echo "skip"
-    return 0
-  fi
-
-  while :; do
-    {
-      echo ""
-      echo "Step 2/2: Authenticate"
-      echo "  1) Browser login (recommended)"
-      echo "  2) Environment API key"
-      echo "  3) Skip for now"
-      printf "Choose an authentication method [1]: "
-    } > /dev/tty
-    IFS= read -r choice < /dev/tty || {
-      echo "skip"
-      return 0
-    }
-    [ -n "$choice" ] || choice="1"
-    case "$choice" in
-      1|login|browser) echo "login"; return 0 ;;
-      2|env|key|api-key) echo "env"; return 0 ;;
-      3|skip|none) echo "skip"; return 0 ;;
-      *) echo "Please choose 1, 2, or 3." > /dev/tty ;;
-    esac
-  done
 }
 
 setup_auth() {
-  choice="$(auth_choice)"
-  case "$choice" in
-    login)
-      echo ""
-      echo "Starting browser login..."
-      if "$install_path" login; then
-        echo "Onyx login complete."
-      else
-        echo "Login did not complete. You can retry with:"
-        echo "  $(install_path_for_user) login"
-      fi
-      ;;
+  if [ "${ONYX_INSTALL_NO_PROMPT:-}" = "1" ]; then
+    print_auth_followup
+    return 0
+  fi
+
+  case "${ONYX_INSTALL_AUTH:-login}" in
     env)
-      echo ""
-      echo "Use a global Onyx API key by adding this to your shell:"
-      echo '  export ONYX_API_KEY="onyx_..."'
+      status_line "Use a global Onyx API key by adding this to your shell:"
+      status_code 'export ONYX_API_KEY="onyx_..."'
       ;;
     skip)
       print_auth_followup
       ;;
+    login|browser|"")
+      if has_tty; then
+        run_login_with_cancel
+      else
+        run_login_without_cancel
+      fi
+      ;;
     *)
-      echo ""
-      echo "Unknown auth choice: $choice"
+      status_warn "Unknown ONYX_INSTALL_AUTH value: ${ONYX_INSTALL_AUTH:-}"
       print_auth_followup
       ;;
   esac
@@ -318,7 +437,12 @@ else
   exit 1
 fi
 
+print_intro
+
+status_line "Target: $target"
+status_success "Required tools found."
 prepare_install_dir
+status_success "Install directory ready: $INSTALL_DIR"
 
 tmp="${TMPDIR:-/tmp}/onyx-install.$$"
 cleanup() {
@@ -327,10 +451,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 mkdir -p "$tmp"
 
-echo "Downloading Onyx agent $VERSION for $target..."
+status_line "Downloading Onyx agent $VERSION for $target..."
 curl -fsSL "$asset_url" -o "$tmp/$asset"
 curl -fsSL "$checksums_url" -o "$tmp/checksums.txt"
+status_success "Downloaded release assets."
 
+status_line "Verifying checksum..."
 expected="$(grep "  $asset\$" "$tmp/checksums.txt" | awk '{print $1}')"
 if [ -z "$expected" ]; then
   echo "No checksum found for $asset" >&2
@@ -342,17 +468,27 @@ if [ "$actual" != "$expected" ]; then
   echo "Checksum mismatch for $asset" >&2
   exit 1
 fi
+status_success "Checksum verified."
 
+status_line "Installing onyx..."
 cp "$tmp/$asset" "$install_path"
 chmod 0755 "$install_path"
 write_install_marker
+status_success "Installed onyx to $install_path"
 
 if [ "${ONYX_SKIP_SKILL:-}" != "1" ]; then
-  "$install_path" developer sync-skill --quiet ||
-    "$install_path" agent install-skill --quiet ||
-    true
+  if "$install_path" developer sync-skill --quiet; then
+    status_success "Synced bundled Onyx skill."
+  elif "$install_path" agent install-skill --quiet; then
+    status_success "Installed bundled Onyx skill."
+  else
+    status_warn "Skipped bundled skill setup; the CLI is installed."
+  fi
+else
+  status_warn "Skipped bundled skill setup."
 fi
 
-echo "Installed onyx to $install_path"
 setup_path
 setup_auth
+
+printf "\n%bOnyx is ready.%b\n" "$style_bold" "$style_reset"
