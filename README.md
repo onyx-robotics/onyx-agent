@@ -10,15 +10,27 @@ metadata to the Onyx app.
 ## Install
 
 ```bash
-curl -fsSL https://onyxresearch.ai/install | sh
+curl -fsSL https://onyxresearch.ai/install.sh | sh
 ```
 
-Then make sure `~/.onyx/bin` is on your `PATH` and run:
+The installer puts `onyx` in `~/.local/bin` by default, walks you through PATH
+setup if your shell needs it, and then offers browser login or a global
+`ONYX_API_KEY` environment variable.
+
+Verify the command:
 
 ```bash
 onyx --version
-onyx login
 ```
+
+For non-interactive installs, set `ONYX_INSTALL_NO_PROMPT=1`. For explicit
+system-wide installs, choose a writable install directory:
+
+```bash
+ONYX_INSTALL_DIR=/usr/local/bin curl -fsSL https://onyxresearch.ai/install.sh | sh
+```
+
+If you skip authentication during install, run `onyx login` later.
 
 Profiles are team-scoped. Use `onyx profile list`, `onyx profile use <name>`,
 and `onyx profile delete <name>` to inspect, switch, or remove local profile
