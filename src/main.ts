@@ -24,6 +24,7 @@ Usage:
   onyx agent install-skill [--dir <path>] [--quiet]
   onyx profile list
   onyx profile use <name>
+  onyx profile delete <name>
   onyx profile set-api-key-env <name> <ENV_VAR>
   onyx branch create --name <name> --metric <name> [--unit <unit>] [--direction maximize|minimize] [--description <text>] [--project-path <path>]
   onyx exp run [--branch <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]

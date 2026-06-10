@@ -21,6 +21,7 @@ import {
 } from "./commands/login"
 import {
   commandProfileList,
+  commandProfileDelete,
   commandProfileSetApiKeyEnv,
   commandProfileUse,
 } from "./commands/profile"
@@ -400,6 +401,43 @@ describe("CLI profiles", () => {
     expect((await readConfig()).currentProfile).toBe("beta")
   })
 
+  test("deletes profiles without switching teams implicitly", async () => {
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: {
+        alpha: profile({ apiKey: "alpha-key" }),
+        beta: profile({
+          apiKey: "beta-key",
+          teamId: "33333333-3333-4333-8333-333333333333",
+          teamName: "Beta Team",
+        }),
+      },
+    })
+
+    await captureLogs(() =>
+      commandProfileDelete({
+        positional: ["profile", "delete", "beta"],
+        options: {},
+      })
+    )
+
+    let config = await readConfig()
+    expect(config.currentProfile).toBe("alpha")
+    expect(config.profiles.alpha).toBeDefined()
+    expect(config.profiles.beta).toBeUndefined()
+
+    await captureLogs(() =>
+      commandProfileDelete({
+        positional: ["profile", "delete", "alpha"],
+        options: {},
+      })
+    )
+
+    config = await readConfig()
+    expect(config.currentProfile).toBe("")
+    expect(config.profiles.alpha).toBeUndefined()
+  })
+
   test("lists env-backed credential sources", async () => {
     process.env[ALPHA_API_KEY_ENV] = "alpha-env-key"
     await writeConfig({
@@ -465,6 +503,12 @@ describe("CLI profiles", () => {
     await expect(
       commandProfileUse({
         positional: ["profile", "use", "missing"],
+        options: {},
+      })
+    ).rejects.toThrow('Unknown Onyx CLI profile "missing"')
+    await expect(
+      commandProfileDelete({
+        positional: ["profile", "delete", "missing"],
         options: {},
       })
     ).rejects.toThrow('Unknown Onyx CLI profile "missing"')

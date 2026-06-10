@@ -14,12 +14,16 @@ export async function commandProfile(args: Args) {
     return commandProfileUse(args)
   }
 
+  if (sub === "delete") {
+    return commandProfileDelete(args)
+  }
+
   if (sub === "set-api-key-env") {
     return commandProfileSetApiKeyEnv(args)
   }
 
   throw new Error(
-    "Usage: onyx profile list | onyx profile use <name> | onyx profile set-api-key-env <name> <ENV_VAR>"
+    "Usage: onyx profile list | onyx profile use <name> | onyx profile delete <name> | onyx profile set-api-key-env <name> <ENV_VAR>"
   )
 }
 
@@ -70,6 +74,40 @@ export async function commandProfileUse(args: Args) {
     currentProfile: name,
   })
   console.log(`Using profile ${name}`)
+}
+
+export async function commandProfileDelete(args: Args) {
+  const requested = args.positional[2]
+  if (!requested) {
+    throw new Error("Usage: onyx profile delete <name>")
+  }
+
+  const name = normalizeProfileName(requested)
+  if (!name) {
+    throw new Error("Profile name must contain at least one letter or number")
+  }
+
+  const config = await readConfig()
+  if (!config.profiles[name]) {
+    throw new Error(`Unknown Onyx CLI profile "${name}".`)
+  }
+
+  const profiles = { ...config.profiles }
+  delete profiles[name]
+  const currentProfile =
+    config.currentProfile === name ? "" : config.currentProfile
+
+  await writeConfig({
+    ...config,
+    profiles,
+    currentProfile,
+  })
+
+  if (currentProfile) {
+    console.log(`Deleted profile ${name}`)
+  } else {
+    console.log(`Deleted profile ${name}. No profile selected.`)
+  }
 }
 
 export async function commandProfileSetApiKeyEnv(args: Args) {

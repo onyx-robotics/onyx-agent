@@ -20,6 +20,10 @@ onyx --version
 onyx login
 ```
 
+Profiles are team-scoped. Use `onyx profile list`, `onyx profile use <name>`,
+and `onyx profile delete <name>` to inspect, switch, or remove local profile
+entries.
+
 Only for local app development, point the agent at a non-production API:
 
 ```bash

@@ -91,6 +91,7 @@ export { commandAgent } from "./commands/agent"
 export { commandLogin } from "./commands/login"
 export {
   commandProfile,
+  commandProfileDelete,
   commandProfileList,
   commandProfileSetApiKeyEnv,
   commandProfileUse,
