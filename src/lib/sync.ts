@@ -64,13 +64,18 @@ async function upsertBranchFromMetadata({
     branchName,
     gitBranchName,
   })
+  if (!meta.baseCommitSha) {
+    throw new Error(
+      `Branch ${branchName} is missing a base commit. Run \`onyx branch create\` again.`
+    )
+  }
   const branch = await upsertBranch(
     projectId,
     {
       name: branchName,
       description: meta.description ?? undefined,
       gitBranchName,
-      baseCommitSha: meta.baseCommitSha ?? undefined,
+      baseCommitSha: meta.baseCommitSha,
       metricName: meta.metricName,
       metricUnit: meta.metricUnit ?? undefined,
       metricDirection: meta.metricDirection,
@@ -102,7 +107,7 @@ async function flushBranchStarted({
       name: record.name,
       description: record.description ?? undefined,
       gitBranchName: record.gitBranchName,
-      baseCommitSha: record.baseCommitSha ?? undefined,
+      baseCommitSha: record.baseCommitSha,
       metricName: record.metricName,
       metricUnit: record.metricUnit ?? undefined,
       metricDirection: record.metricDirection,
@@ -115,7 +120,7 @@ async function flushBranchStarted({
     branchId: branch.id,
     projectPath,
     gitBranchName: record.gitBranchName,
-    baseCommitSha: record.baseCommitSha ?? null,
+    baseCommitSha: record.baseCommitSha,
     description: record.description ?? null,
     metricName: record.metricName,
     metricUnit: record.metricUnit ?? null,
@@ -180,7 +185,7 @@ async function flushExperiment({
  * Replays the local outbox to the Onyx API. Resolves the project, pushes every
  * referenced branch so reported commits are reachable, then upserts branches and
  * reports experiments idempotently (server dedups by runRef). A 409 means the
- * commit is not on the mirror yet (push/propagation lag) and is retried on the
+ * commit is not reachable through GitHub yet (push/propagation lag) and is retried on the
  * next flush; any other error keeps the record queued and is surfaced. Offline
  * (project unresolvable) leaves the outbox untouched.
  */

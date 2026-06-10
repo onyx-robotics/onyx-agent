@@ -36,7 +36,7 @@ export const localResearchBranchStartedRecordSchema = z.object({
   description: z.string().trim().max(2000).nullable().optional(),
   gitBranchName: z.string().trim().min(1).max(240),
   projectPath: z.string().trim().max(240).optional(),
-  baseCommitSha: gitShaSchema.nullable().optional(),
+  baseCommitSha: gitShaSchema,
   metricName: z.string().trim().min(1).max(120),
   metricUnit: z.string().trim().max(80).nullable().optional(),
   metricDirection: researchMetricDirectionSchema,

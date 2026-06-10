@@ -39,14 +39,14 @@ export async function commandSync(args: Args) {
     )
   }
 
-  // Warm the server mirror so file/diff views stay fast.
+  // Refresh repository metadata so file/diff views see the latest GitHub head.
   try {
     const project = await resolveProject(root, args)
     await requestProjectSync(project.id, args)
-    console.log(`Requested mirror refresh for project ${project.id}`)
+    console.log(`Requested repository sync for project ${project.id}`)
   } catch (error) {
     console.warn(
-      `Mirror refresh skipped: ${
+      `Repository sync skipped: ${
         error instanceof Error ? error.message : String(error)
       }`
     )

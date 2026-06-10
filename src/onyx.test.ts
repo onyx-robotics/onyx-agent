@@ -433,6 +433,7 @@ describe("onyx CLI helpers", () => {
         createdAt: "2026-05-02T12:00:00.000Z",
         name: "fast-eval",
         gitBranchName: "onyx/fast-eval",
+        baseCommitSha: "abcdef1",
         metricName: "score",
         metricDirection: "maximize",
       })
