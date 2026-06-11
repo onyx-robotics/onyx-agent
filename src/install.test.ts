@@ -135,6 +135,9 @@ async function runInstall(
       ONYX_FAKE_LOG: fixture.logPath,
       ONYX_INSTALL_OS: "Linux",
       ONYX_INSTALL_ARCH: "x86_64",
+      // Force the non-interactive code paths so assertions do not depend on
+      // whether the test runner has a controlling terminal.
+      ONYX_INSTALL_NO_TTY: "1",
       ...env,
     },
     stdout: "pipe",

@@ -130,6 +130,10 @@ path_contains() {
 }
 
 has_tty() {
+  if [ "${ONYX_INSTALL_NO_TTY:-}" = "1" ]; then
+    return 1
+  fi
+
   [ -r /dev/tty ] && [ -w /dev/tty ]
 }
 
