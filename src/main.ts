@@ -19,7 +19,7 @@ Usage:
   onyx developer use release [--skill-dir <path>] [--quiet]
   onyx developer sync-skill [--skill-dir <path>] [--quiet]
   onyx developer unlink [--skill-dir <path>] [--quiet]
-  onyx login [--api-url <url>] [--print-url] [--refresh] [--port <port>] [--timeout <ms>]
+  onyx login [--api-url <url>] [--local] [--print-url] [--refresh] [--port <port>] [--timeout <ms>]
   onyx agent skill-path
   onyx agent install-skill [--dir <path>] [--quiet]
   onyx profile list

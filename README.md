@@ -36,11 +36,17 @@ Profiles are team-scoped. Use `onyx profile list`, `onyx profile use <name>`,
 and `onyx profile delete <name>` to inspect, switch, or remove local profile
 entries.
 
-Only for local app development, point the agent at a non-production API:
+Only for local app development, point the agent at a non-production API.
+`--local` is shorthand for `--api-url http://localhost:3000`:
 
 ```bash
-onyx login --api-url http://localhost:3000
+onyx login --local
 ```
+
+This stores a separate profile for the local app; switch between it and the
+hosted app with `onyx profile use <name>`. Developer mode
+(`onyx developer use dev`) changes which CLI source runs, not which app the
+CLI targets.
 
 ## Agent Skill
 

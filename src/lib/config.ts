@@ -132,7 +132,7 @@ export function normalizeProfileName(value: string) {
     .replace(/^-+|-+$/g, "")
 }
 
-function profileNameFromArgs(args: Args | undefined, config: Config) {
+export function profileNameFromArgs(args: Args | undefined, config: Config) {
   return args?.options.profile ?? config.currentProfile
 }
 
@@ -163,21 +163,54 @@ export async function selectedProfile(args?: Args): Promise<CliProfile> {
   return (await selectedProfileEntry(args)).profile
 }
 
-export async function apiBaseUrl(
+export type ApiTarget = {
+  url: string
+  source: "flag" | "env" | "profile" | "default"
+  profileName?: string
+}
+
+export async function apiTarget(
   args?: Args,
   options?: { allowDefault?: boolean }
-) {
-  if (args?.options["api-url"]) return args.options["api-url"]
-  if (process.env.ONYX_API_URL) return process.env.ONYX_API_URL
+): Promise<ApiTarget | null> {
+  if (args?.options["api-url"]) {
+    return { url: args.options["api-url"], source: "flag" }
+  }
+  if (process.env.ONYX_API_URL) {
+    return { url: process.env.ONYX_API_URL, source: "env" }
+  }
 
   const config = await readConfig()
   const profileName = profileNameFromArgs(args, config)
   const profile = profileName ? config.profiles[profileName] : undefined
 
-  if (profile) return profile.apiUrl
-  if (process.env.ONYX_API_KEY) return DEFAULT_API_URL
-  if (options?.allowDefault) return DEFAULT_API_URL
+  if (profile && profileName) {
+    return { url: profile.apiUrl, source: "profile", profileName }
+  }
+  if (process.env.ONYX_API_KEY || options?.allowDefault) {
+    return { url: DEFAULT_API_URL, source: "default" }
+  }
 
+  return null
+}
+
+export function describeApiTarget(target: ApiTarget) {
+  if (target.source === "flag") return `${target.url} (--api-url)`
+  if (target.source === "env") return `${target.url} (ONYX_API_URL)`
+  if (target.source === "profile")
+    return `${target.url} (profile ${target.profileName})`
+  return `${target.url} (default)`
+}
+
+export async function apiBaseUrl(
+  args?: Args,
+  options?: { allowDefault?: boolean }
+) {
+  const target = await apiTarget(args, options)
+  if (target) return target.url
+
+  const config = await readConfig()
+  const profileName = profileNameFromArgs(args, config)
   if (profileName) {
     throw new Error(
       `Unknown Onyx CLI profile "${profileName}". Run \`onyx profile list\`.`

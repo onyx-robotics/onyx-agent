@@ -1,5 +1,11 @@
 import type { Args } from "../lib/args"
 import { requestProjectSync, resolveProject } from "../lib/api"
+import {
+  apiTarget,
+  describeApiTarget,
+  profileNameFromArgs,
+  readConfig,
+} from "../lib/config"
 import { emitEvent } from "../lib/events"
 import { currentBranch, pushBranch, repoRoot } from "../lib/git"
 import { hydrateHistoryFromApi } from "../lib/history"
@@ -66,6 +72,20 @@ export async function commandStatus(args: Args) {
     (record) => record.type === "branch_started"
   ).length
 
+  const config = await readConfig()
+  const profileName = profileNameFromArgs(args, config)
+  const profile = profileName ? config.profiles[profileName] : undefined
+  console.log(
+    profile
+      ? `profile: ${profileName} (${profile.teamName})`
+      : "profile: (none)"
+  )
+  const target = await apiTarget(args)
+  console.log(
+    target
+      ? `api: ${describeApiTarget(target)}`
+      : "api: not configured (run `onyx login`)"
+  )
   console.log(`branch: ${branchName || "(detached)"}`)
   console.log(`projectPath: ${projectPath || "(repo root)"}`)
   console.log(

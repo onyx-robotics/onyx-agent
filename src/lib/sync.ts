@@ -13,6 +13,7 @@ import {
   upsertBranch,
   type ApiProject,
 } from "./api"
+import { apiTarget } from "./config"
 import { emitEvent } from "./events"
 import { pushBranch, repositoryUrl } from "./git"
 import { applyHistorySyncUpdates, type HistorySyncUpdate } from "./history"
@@ -293,7 +294,10 @@ export async function flushOutbox(
   })
 
   if (!options.quiet) {
-    console.log(`Synced ${flushed} record(s); ${remaining.length} pending.`)
+    const target = await apiTarget(args)
+    console.log(
+      `Synced ${flushed} record(s)${target ? ` to ${target.url}` : ""}; ${remaining.length} pending.`
+    )
   }
 
   return { flushed, pending: remaining.length, offline: false }
