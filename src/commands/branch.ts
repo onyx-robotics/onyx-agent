@@ -9,6 +9,7 @@ import {
 import { emitEvent } from "../lib/events"
 import {
   gitBranchForName,
+  currentBranch,
   currentCommit,
   git,
   gitResult,
@@ -34,7 +35,15 @@ export async function commandBranchCreate(args: Args) {
 
   const gitBranchName = gitBranchForName(name)
   const baseCommitSha = await currentCommit(root)
+  const headBranch = await currentBranch(root)
   const exists = await gitResult(["rev-parse", "--verify", gitBranchName], root)
+  // The parent is the branch HEAD was on when the git branch is actually
+  // created. Checking out a pre-existing branch records no parent (the
+  // server keeps any previously stored one), and detached HEAD yields "".
+  const parentGitBranchName =
+    exists.code !== 0 && headBranch && headBranch !== gitBranchName
+      ? headBranch
+      : null
   if (exists.code === 0) {
     await git(["checkout", gitBranchName], root)
   } else {
@@ -48,6 +57,7 @@ export async function commandBranchCreate(args: Args) {
     name,
     description,
     baseCommitSha,
+    parentGitBranchName,
     metricName,
     metricUnit,
     metricDirection,
@@ -60,6 +70,7 @@ export async function commandBranchCreate(args: Args) {
     name,
     description,
     gitBranchName,
+    ...(parentGitBranchName ? { parentGitBranchName } : {}),
     projectPath,
     baseCommitSha,
     metricName,
@@ -74,6 +85,7 @@ export async function commandBranchCreate(args: Args) {
     ...state.branches[branchStateKey(projectPath, name)],
     projectPath,
     gitBranchName,
+    ...(parentGitBranchName ? { parentGitBranchName } : {}),
     baseCommitSha,
     description,
     metricName,

@@ -27,6 +27,8 @@ Usage:
   onyx profile delete <name>
   onyx profile set-api-key-env <name> <ENV_VAR>
   onyx branch create --name <name> --metric <name> [--unit <unit>] [--direction maximize|minimize] [--description <text>] [--project-path <path>]
+      (forks from the current git HEAD; when HEAD is on another onyx/* branch,
+      that branch is recorded as the parent and the app nests it accordingly)
   onyx exp run [--branch <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
   onyx exp log [--branch <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]
   onyx exp list [--branch <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]

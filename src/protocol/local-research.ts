@@ -35,6 +35,10 @@ export const localResearchBranchStartedRecordSchema = z.object({
   name: nameSchema,
   description: z.string().trim().max(2000).nullable().optional(),
   gitBranchName: z.string().trim().min(1).max(240),
+  // The git branch HEAD was on when the branch was created (e.g. another
+  // onyx/* branch, or "main"). The server resolves it to a tracked parent
+  // branch, or null when it doesn't match one.
+  parentGitBranchName: z.string().trim().min(1).max(240).nullable().optional(),
   projectPath: z.string().trim().max(240).optional(),
   baseCommitSha: gitShaSchema,
   metricName: z.string().trim().min(1).max(120),

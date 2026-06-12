@@ -10,6 +10,7 @@ export type BranchMetadata = {
   name: string
   description: string | null
   gitBranchName: string
+  parentGitBranchName: string | null
   baseCommitSha: string | null
   metricName: string
   metricUnit: string | null
@@ -57,11 +58,13 @@ async function branchFromMarkdown({
   const unit = markdownField(section, "Unit")
   const direction = markdownField(section, "Direction")
   const baseCommitSha = markdownField(section, "Base commit")
+  const parentGitBranchName = markdownField(section, "Parent branch")
 
   return {
     name,
     description: markdownField(section, "Description") || null,
     gitBranchName,
+    parentGitBranchName: parentGitBranchName || null,
     baseCommitSha: baseCommitSha || null,
     metricName,
     metricUnit: unit || null,
@@ -87,6 +90,7 @@ export async function branchMetadata({
       name: branchName,
       description: stored.description ?? null,
       gitBranchName: stored.gitBranchName ?? gitBranchName,
+      parentGitBranchName: stored.parentGitBranchName ?? null,
       baseCommitSha: stored.baseCommitSha ?? null,
       metricName: stored.metricName,
       metricUnit: stored.metricUnit ?? null,
@@ -105,6 +109,7 @@ export async function branchMetadata({
       name: branchName,
       description: null,
       gitBranchName,
+      parentGitBranchName: null,
       baseCommitSha: null,
       metricName: "score",
       metricUnit: null,
@@ -119,6 +124,7 @@ export async function appendBranchToMarkdown({
   name,
   description,
   baseCommitSha,
+  parentGitBranchName,
   metricName,
   metricUnit,
   metricDirection,
@@ -128,6 +134,7 @@ export async function appendBranchToMarkdown({
   name: string
   description?: string | null
   baseCommitSha?: string | null
+  parentGitBranchName?: string | null
   metricName: string
   metricUnit?: string | null
   metricDirection: MetricDirection
@@ -143,6 +150,6 @@ export async function appendBranchToMarkdown({
 
   if (text.includes(marker)) return
 
-  const addition = `\n### ${name}\n\nDescription: ${description ?? ""}\n\nMetric: ${metricName}\nUnit: ${metricUnit ?? ""}\nDirection: ${metricDirection}\nBase commit: ${baseCommitSha ?? ""}\n\nPlan:\n\nSuccess criteria:\n\nNext to try:\n\n- Add hypotheses here as a queue. Each iteration pops one and appends a row to Attempts.\n\nAttempts:\n\n| commit | hypothesis | metric | status | learning |\n| ------ | ---------- | ------ | ------ | -------- |\n`
+  const addition = `\n### ${name}\n\nDescription: ${description ?? ""}\n\nMetric: ${metricName}\nUnit: ${metricUnit ?? ""}\nDirection: ${metricDirection}\nBase commit: ${baseCommitSha ?? ""}\nParent branch: ${parentGitBranchName ?? ""}\n\nPlan:\n\nSuccess criteria:\n\nNext to try:\n\n- Add hypotheses here as a queue. Each iteration pops one and appends a row to Attempts.\n\nAttempts:\n\n| commit | hypothesis | metric | status | learning |\n| ------ | ---------- | ------ | ------ | -------- |\n`
   await writeFile(file, `${text.trimEnd()}\n${addition}`, "utf8")
 }

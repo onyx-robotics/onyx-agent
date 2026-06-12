@@ -75,6 +75,7 @@ async function upsertBranchFromMetadata({
       name: branchName,
       description: meta.description ?? undefined,
       gitBranchName,
+      parentGitBranchName: meta.parentGitBranchName ?? undefined,
       baseCommitSha: meta.baseCommitSha,
       metricName: meta.metricName,
       metricUnit: meta.metricUnit ?? undefined,
@@ -112,6 +113,7 @@ async function flushBranchStarted({
       name: record.name,
       description: record.description ?? undefined,
       gitBranchName: record.gitBranchName,
+      parentGitBranchName: record.parentGitBranchName ?? undefined,
       baseCommitSha: record.baseCommitSha,
       metricName: record.metricName,
       metricUnit: record.metricUnit ?? undefined,
@@ -126,6 +128,9 @@ async function flushBranchStarted({
     branchId: result.branch.id,
     projectPath,
     gitBranchName: record.gitBranchName,
+    ...(record.parentGitBranchName
+      ? { parentGitBranchName: record.parentGitBranchName }
+      : {}),
     baseCommitSha: record.baseCommitSha,
     description: record.description ?? null,
     metricName: record.metricName,
@@ -253,11 +258,22 @@ export async function flushOutbox(
 
   const remaining: LocalResearchRecord[] = []
   const historyUpdates = new Map<string, HistorySyncUpdate>()
+  // Outbox order guarantees a parent's branch_started precedes its child's,
+  // but a parent that fails to flush must hold its children back: a child
+  // upserted first would be permanently recorded without a parent.
+  const failedBranchNames = new Set<string>()
   let flushed = 0
 
   for (const record of records) {
     try {
       if (record.type === "branch_started") {
+        if (
+          record.parentGitBranchName &&
+          failedBranchNames.has(record.parentGitBranchName)
+        ) {
+          remaining.push(record)
+          continue
+        }
         project = await flushBranchStarted({ root, record, state, args })
       } else {
         const update = await flushExperiment({
@@ -270,6 +286,9 @@ export async function flushOutbox(
       }
       flushed += 1
     } catch (error) {
+      if (record.type === "branch_started") {
+        failedBranchNames.add(record.gitBranchName)
+      }
       if (!(error instanceof ApiError) || error.status !== 409) {
         if (!options.quiet) {
           console.warn(
