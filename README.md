@@ -76,6 +76,20 @@ onyx push
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
 
+To delete a research direction entirely — the Onyx branch record with all its
+experiments, the remote and local `onyx/<name>` git branches, and matching
+local cache rows:
+
+```bash
+onyx branch delete fast-eval
+```
+
+Deletion requires connectivity (it is never queued). The server tombstones
+every deleted experiment's `runRef`, so an offline agent that still has them
+queued skips them on its next sync instead of resurrecting them. Recreating a
+branch with the same name later is fine — tombstones only match records
+created before the deletion.
+
 ## Development
 
 ```bash

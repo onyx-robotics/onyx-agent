@@ -60,6 +60,7 @@ function describeEvent(event: LocalResearchEvent, nowMs: number) {
   const sha = event.commitSha ? event.commitSha.slice(0, 7) : null
   const labels: Record<LocalResearchEvent["type"], string> = {
     branch_created: "branch created",
+    branch_deleted: "branch deleted",
     exp_run_started: "running eval",
     eval_finished: "eval finished",
     checks_finished: "checks",

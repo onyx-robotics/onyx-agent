@@ -139,7 +139,9 @@ pnpm typecheck 2>&1 | grep -i error || true
 
 ## Git Rules
 
-Onyx is append-only: commit every attempt forward on `onyx/{name}`. Do not use `git reset --hard`, auto-revert, or force-push. Experiment metadata is canonical in the Onyx app/API; `.git/onyx/outbox.jsonl` is only an offline retry queue.
+Onyx is append-only on live branches: commit every attempt forward on `onyx/{name}`. Do not use `git reset --hard`, auto-revert, or force-push. Experiment metadata is canonical in the Onyx app/API; `.git/onyx/outbox.jsonl` is only an offline retry queue.
+
+Fixing a mistake goes through deletion, never history rewriting: the user can delete a branch (record + git branch + local cache) with `onyx branch delete <name>` or from the web app, and individual experiments from the web app. Deleted records are tombstoned server-side — `onyx sync` drops them from the local queue and history, and re-reporting a deleted experiment is rejected. Only delete when the user asks for it; the autonomous loop itself never deletes.
 
 ## Ideas Backlog
 

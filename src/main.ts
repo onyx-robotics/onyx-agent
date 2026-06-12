@@ -3,7 +3,7 @@ import packageJson from "../package.json"
 import { commandAgent } from "./commands/agent"
 import { parseArgs } from "./lib/args"
 import { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
-import { commandBranchCreate } from "./commands/branch"
+import { commandBranchCreate, commandBranchDelete } from "./commands/branch"
 import { commandListen } from "./commands/listen"
 import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
@@ -29,6 +29,10 @@ Usage:
   onyx branch create --name <name> --metric <name> [--unit <unit>] [--direction maximize|minimize] [--description <text>] [--project-path <path>]
       (forks from the current git HEAD; when HEAD is on another onyx/* branch,
       that branch is recorded as the parent and the app nests it accordingly)
+  onyx branch delete <name> [--project-path <path>]
+      (removes the Onyx branch record with all its experiments, the remote and
+      local onyx/<name> git branches, and matching local outbox/history rows;
+      requires connectivity — deletions are never queued)
   onyx exp run [--branch <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
   onyx exp log [--branch <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]
   onyx exp list [--branch <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
@@ -60,6 +64,8 @@ export async function main(argv = process.argv.slice(2)) {
     if (command === "profile") return commandProfile(args)
     if (command === "branch" && sub === "create")
       return commandBranchCreate(args)
+    if (command === "branch" && sub === "delete")
+      return commandBranchDelete(args)
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "exp" && sub === "log") return commandExpLog(args)
     if (command === "exp" && sub === "list") return commandExpList(args)

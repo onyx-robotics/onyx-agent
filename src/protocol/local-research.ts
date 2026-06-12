@@ -114,6 +114,7 @@ export const localResearchHistoryRecordSchema = z.object({
 
 export const localResearchEventTypeSchema = z.enum([
   "branch_created",
+  "branch_deleted",
   "exp_run_started",
   "eval_finished",
   "checks_finished",

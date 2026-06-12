@@ -65,6 +65,22 @@ export type ApiProjectTree = {
   branches: ApiTreeBranch[]
 }
 
+export type ApiProjectDeletions = {
+  branches: Array<{
+    branchId: string
+    name: string
+    gitBranchName: string | null
+    deletedAt: string
+  }>
+  experiments: Array<{
+    experimentId: string
+    runRef: string
+    branchId: string
+    branchName: string
+    deletedAt: string
+  }>
+}
+
 export async function callApi(
   method: string,
   path: string,
@@ -228,4 +244,31 @@ export async function requestProjectSync(projectId: string, args?: Args) {
     undefined,
     args
   )
+}
+
+/**
+ * The project's branch/experiment tombstones. Callers treat this as
+ * best-effort (older servers without the endpoint return 404).
+ */
+export async function getProjectDeletions(
+  projectId: string,
+  args?: Args
+): Promise<ApiProjectDeletions> {
+  return apiData<ApiProjectDeletions>(
+    await callApi(
+      "GET",
+      `/api/v1/research/projects/${projectId}/deletions`,
+      undefined,
+      args
+    )
+  )
+}
+
+/**
+ * Deletes the branch record (and all of its experiments, tombstoned) on the
+ * server. Git deletion stays CLI-side — the user's own credentials remove
+ * the local and remote git branch.
+ */
+export async function deleteBranch(branchId: string, args?: Args) {
+  await callApi("DELETE", `/api/v1/research/branches/${branchId}`, undefined, args)
 }

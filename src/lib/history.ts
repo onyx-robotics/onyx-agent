@@ -8,12 +8,15 @@ import {
 } from "../protocol"
 
 import {
+  getProjectDeletions,
   getProjectTree,
   resolveProject,
+  type ApiProjectDeletions,
   type ApiTreeBranch,
   type ApiTreeExperiment,
 } from "./api"
 import type { Args } from "./args"
+import { isHistoryRecordDeleted } from "./deletions"
 import { onyxStateDir, readOutbox, readState } from "./outbox"
 
 export async function historyPath(root: string) {
@@ -225,7 +228,9 @@ export type HydrateResult = {
 
 /**
  * Rewrites `.git/onyx/history.jsonl` to the canonical API state, keeping
- * local records the server doesn't know yet (offline-logged, unflushed).
+ * local records the server doesn't know yet (offline-logged, unflushed) —
+ * unless the project deletions feed tombstones their runRef or branch, in
+ * which case they are dropped so deletions propagate to the local cache.
  * Throws on network/auth failure; callers treat hydration as best-effort.
  */
 export async function hydrateHistoryFromApi(
@@ -235,6 +240,12 @@ export async function hydrateHistoryFromApi(
   const state = await readState(root)
   const projectId = state.projectId ?? (await resolveProject(root, args)).id
   const tree = await getProjectTree(projectId, args)
+  let deletions: ApiProjectDeletions | null = null
+  try {
+    deletions = await getProjectDeletions(projectId, args)
+  } catch {
+    deletions = null
+  }
 
   const canonical: LocalResearchHistoryRecord[] = []
   for (const branch of tree.branches) {
@@ -247,16 +258,20 @@ export async function hydrateHistoryFromApi(
 
   // Local records the server doesn't have yet: provisional history rows plus
   // anything still queued in the outbox (covers a failed earlier append).
+  // Rows the server deleted are excluded rather than kept.
   const { records: existing } = await readHistory(root)
   const localCandidates = existing.filter(
     (record) =>
-      record.source === "local" && !canonicalRunRefs.has(record.runRef)
+      record.source === "local" &&
+      !canonicalRunRefs.has(record.runRef) &&
+      !isHistoryRecordDeleted(record, deletions)
   )
   const seen = new Set(localCandidates.map((record) => record.runRef))
   const { records: outbox } = await readOutbox(root)
   for (const record of outbox) {
     if (record.type !== "experiment_logged") continue
     if (canonicalRunRefs.has(record.runRef) || seen.has(record.runRef)) continue
+    if (isHistoryRecordDeleted(record, deletions)) continue
     localCandidates.push(experimentRecordToHistory(record))
     seen.add(record.runRef)
   }
