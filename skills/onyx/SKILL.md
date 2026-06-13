@@ -9,10 +9,10 @@ Drive an autonomous research loop using the `onyx` CLI as the substrate. You own
 
 ## Setup
 
-1. Ask (or infer):
+1. Ask (or infer from the user's prompt) the following key pieces of information. Verify with the user before starting:
    - **Goal**
    - **Evaluation**
-   - **Metric**, **unit**, **direction** (`maximize` / `minimize`)
+   - **Metric**, **unit** (make sure this is a real unit like time `s`, `ms`, `us` that can be formatted with the metric), **direction** (`maximize` / `minimize`)
    - **Files in scope**
    - **Constraints**
    - **Stop conditions** - eg. `stop after N iterations`, `for 30 minutes`, `until <condition>`, default is no stop condition, loop forever until manually stopped by user
@@ -123,19 +123,32 @@ pnpm test --run --reporter=dot 2>&1 | tail -50
 pnpm typecheck 2>&1 | grep -i error || true
 ```
 
-## Loop Rules
+## The Research Loop
 
-**LOOP FOREVER.** Never ask "should I continue?" - the user expects autonomous work.
+### **LOOP FOREVER:**
+
+1. Look at the `onyx/onyx.md`, git and onyx state
+2. Make edits for a new experiment idea
+3. Commit the experiment to the current onyx branch
+4. Run the experiment with `onyx exp run [--branch <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]`
+5. Inspect the result, including benchmark output and optional checks.sh result.
+6. Record `onyx exp log [--branch <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]`
+7. Run `onyx push` or `onyx sync` to push the branch and flush queued records.
+8. If improved, build from that result. If worse/equal, leave it recorded and make the next attempt from the prior best conceptually, without rewriting branch history.
+
+### Loop Rules
 
 - **Primary metric is king.** Improved -> build the next experiment from that result. Worse/equal -> leave it recorded and build from the prior best instead. Secondary metrics rarely affect this.
 - **Annotate every run with `--agent-notes`.** Record what you learned - not what you did. What would help the next iteration or a fresh agent resuming this session? Notes are searchable later via `onyx exp list --grep`.
+- **Keep descriptions clean.** Make sure descriptions are informative on what changed and simple, don't include redundant information like "exp1: " or "iter 1/10: " as that info is already tracked by onyx.
 - **Simpler is better.** Removing code for equal perf = good. Ugly complexity for tiny gain = probably not worth building on.
+- **Stick to the user's interfaces.** Don't create your own custom tuning, parameter search, or argument entry scripts unless explicitly asked to or required. Prefer using the user's existing method for changing parameters or code as it is.
 - **Don't thrash.** Repeatedly returning to the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on. Don't over-invest.
 - **Think longer when stuck.** Re-read source files, study the profiling data, reason about what the CPU is actually doing. The best ideas come from deep understanding, not from trying random variations.
 - **Resuming:** if `onyx.md` exists, read it + git log + `onyx status` + `onyx exp list --limit 20`, continue looping.
 
-**NEVER STOP.** The user may be away for hours. Keep going until interrupted.
+**NEVER STOP.** Never ask "should I continue?" - the user expects autonomous work. The user may be away for hours. Keep going until interrupted.
 
 ## Git Rules
 
