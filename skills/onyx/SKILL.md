@@ -9,16 +9,17 @@ Drive an autonomous research loop using the `onyx` CLI as the substrate. You own
 
 ## Setup
 
-1. Ask (or infer):
+1. Ask (or infer from the user's prompt) the following key pieces of information. Verify with the user before starting:
    - **Goal**
    - **Evaluation**
-   - **Metric**, **unit**, **direction** (`maximize` / `minimize`)
+   - **Metric**, **unit** (make sure this is a real unit like time `s`, `ms`, `us` that can be formatted with the metric), **direction** (`maximize` / `minimize`)
    - **Files in scope**
    - **Constraints**
    - **Stop conditions** - eg. `stop after N iterations`, `for 30 minutes`, `until <condition>`, default is no stop condition, loop forever until manually stopped by user
 2. `onyx branch create --name <slug> --metric <name> --unit <unit> --direction <maximize/minimize> --description <goal>`
    - Add `--project-path <projectPath>` when the work is scoped to a subdirectory.
    - The command infers the repository from `origin` and registers the branch with Onyx; if offline or GitHub access is missing, records stay queued until `onyx sync`.
+   - The new branch forks from the current git HEAD, and the branch HEAD is on becomes its parent in the Onyx app. To fork a new research direction off an existing Onyx branch, check out that parent first (`git checkout onyx/<parent>`), then run `onyx branch create` — the app renders it nested under the parent.
 3. Read the source files. Understand the workload deeply before writing anything.
 4. Write `<projectPath>/onyx/onyx.md` and `<projectPath>/onyx/eval.sh` (see below). Optionally write `<projectPath>/onyx/checks.sh` when correctness constraints require it. Commit these files.
 5. Run a baseline with `onyx exp run`, then record it with `onyx exp log --description "baseline" --agent-notes '<json>'`, then start looping immediately.
@@ -81,6 +82,10 @@ Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), 
 
 - `METRIC name=value` - primary metric (must match `onyx branch create`'s `metric name`) and any secondary metrics. Parsed automatically by `onyx exp run`.
 
+#### Control measurement noise
+
+For noisy metrics (timings, throughput) where the evaluation can be run quickly (<1s per run), run several trials in `eval.sh` and report the median or min as the primary `METRIC`, plus a spread (stddev or range) as a secondary so you can tell a real gain from noise. Warm up first and pin the environment (threads, frequency scaling) where it matters.
+
 #### Design the script to inform optimization
 
 The script should output **whatever data helps you make better decisions in the next iteration.** Think about what you'll need to see after each experiment run to know where to focus:
@@ -90,7 +95,7 @@ The script should output **whatever data helps you make better decisions in the 
 - Memory usage, cache hit rates, or other runtime diagnostics when relevant
 - Anything domain-specific that would help localize regressions or identify bottlenecks
 
-The script runs the same code every iteration - but you can **update it during the loop** if you discover you need more signal. Add instrumentation as you learn what matters.
+You can **update the script during the loop** for more signal. Adding diagnostic output or new secondary `METRIC` lines is safe. Changing the *measured workload itself* (size, iterations, what's timed) makes every prior metric incomparable - re-baseline and note it if you must.
 
 #### Agent experiment side notes via `onyx exp log`
 
@@ -100,7 +105,7 @@ Annotate failures and crashes heavily. If you don't capture what you tried and w
 
 ### `checks.sh` (optional)
 
-Bash script (`set -euo pipefail`) for backpressure/correctness checks: tests, types, lint, etc. **Only create this file when the user's constraints require correctness validation** (e.g., "tests must pass", "types must check").
+Bash script (`set -euo pipefail`) for backpressure/correctness checks: tests, types, lint, etc. **Only create this file when the user's constraints require correctness validation** (e.g., "tests must pass", "types must check"). Hard guardrails on secondary metrics belong here too (e.g. fail when memory exceeds a ceiling): a `checks_failed` result can never become best, so it stops a primary win that wrecks a tradeoff.
 
 When this file exists:
 
@@ -122,23 +127,42 @@ pnpm test --run --reporter=dot 2>&1 | tail -50
 pnpm typecheck 2>&1 | grep -i error || true
 ```
 
-## Loop Rules
+## The Research Loop
 
-**LOOP FOREVER.** Never ask "should I continue?" - the user expects autonomous work.
+### **LOOP** (until the stop condition or an interrupt):
 
-- **Primary metric is king.** Improved -> build the next experiment from that result. Worse/equal -> leave it recorded and build from the prior best instead. Secondary metrics rarely affect this.
+1. Check the stop condition (iterations / elapsed time / target). If met, wrap up and stop (see below).
+2. Review `onyx/onyx.md`, git, and onyx state. Identify the current best commit (`onyx exp list`). If the last experiment regressed, restore your in-scope files to the best before editing: `git checkout <best-sha> -- <scoped files>` (a forward commit, not history rewriting).
+3. Make edits for a new experiment idea.
+4. Commit to the current onyx branch. The tree must be clean before measuring - the result is attributed to HEAD.
+5. Run the experiment with `onyx exp run [--branch <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]`
+6. Inspect the result, including benchmark output and optional checks.sh result.
+7. Record `onyx exp log [--branch <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]`
+8. Run `onyx push` to push the branch to the remote and flush queued records.
+
+**On stop:** Update `onyx.md`'s "What's Been Tried" and write a short summary of the best result and any open ideas. Leave git clean - no uncommitted changes and no unpushed local commits. Commit any final edits forward (or discard work you won't record), then run `onyx push` so the local and remote `onyx/{name}` branch match and the outbox flushes (`onyx sync` to reconcile history).
+
+### Loop Rules
+
+- **Primary metric is king.** Improved -> build the next experiment from that result. Worse/equal -> restore the best commit's files and build from there. Secondary metrics rarely change the decision, but a guardrail breach (e.g. memory blowup) should fail the run - encode hard limits in `checks.sh`.
+- **Confirm new bests.** A single trial of a noisy metric can lie. Re-run a surprising improvement before building on it.
+- **Statuses:** the loop uses `succeeded` / `failed` / `checks_failed` (what `onyx exp run` emits). `accepted` / `rejected` are for human curation - don't set them in the loop.
 - **Annotate every run with `--agent-notes`.** Record what you learned - not what you did. What would help the next iteration or a fresh agent resuming this session? Notes are searchable later via `onyx exp list --grep`.
+- **Keep descriptions clean.** Make sure descriptions are informative on what changed and simple, don't include redundant information like "exp1: " or "iter 1/10: " as that info is already tracked by onyx.
 - **Simpler is better.** Removing code for equal perf = good. Ugly complexity for tiny gain = probably not worth building on.
+- **Stick to the user's interfaces.** Don't create your own custom tuning, parameter search, or argument entry scripts unless explicitly asked to or required. Prefer using the user's existing method for changing parameters or code as it is.
 - **Don't thrash.** Repeatedly returning to the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on. Don't over-invest.
 - **Think longer when stuck.** Re-read source files, study the profiling data, reason about what the CPU is actually doing. The best ideas come from deep understanding, not from trying random variations.
-- **Resuming:** if `onyx.md` exists, read it + git log + `onyx status` + `onyx exp list --limit 20`, continue looping.
+- **Resuming:** if `onyx.md` exists, read it + git log + `onyx status` + `onyx exp list --limit 20` (run `onyx sync` first on a fresh clone). Identify the best commit, restore its files if HEAD is a regression, then continue looping.
 
-**NEVER STOP.** The user may be away for hours. Keep going until interrupted.
+**Never stop voluntarily.** Don't ask "should I continue?" - the user expects autonomous work and may be away for hours. Keep going until the stop condition is met or you're interrupted.
 
 ## Git Rules
 
-Onyx is append-only: commit every attempt forward on `onyx/{name}`. Do not use `git reset --hard`, auto-revert, or force-push. Experiment metadata is canonical in the Onyx app/API; `.git/onyx/outbox.jsonl` is only an offline retry queue.
+Onyx is append-only on live branches: commit every attempt forward on `onyx/{name}`. Do not use `git reset --hard`, auto-revert, or force-push. Restoring an earlier commit's file contents to build from the best (`git checkout <sha> -- <files>`, then commit forward) is fine - that's a new forward commit, not history rewriting. Experiment metadata is canonical in the Onyx app/API; `.git/onyx/outbox.jsonl` is only an offline retry queue.
+
+Fixing a mistake goes through deletion, never history rewriting: the user can delete a branch (record + git branch + local cache) with `onyx branch delete <name>` or from the web app, and individual experiments from the web app. Deleted records are tombstoned server-side — `onyx sync` drops them from the local queue and history, and re-reporting a deleted experiment is rejected. Only delete when the user asks for it; the autonomous loop itself never deletes.
 
 ## Ideas Backlog
 

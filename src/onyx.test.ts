@@ -18,6 +18,7 @@ import {
   appendHistory,
   appendOutbox,
   applyHistorySyncUpdates,
+  branchMetadata,
   commandBranchCreate,
   commandAgent,
   commandExpList,
@@ -37,7 +38,9 @@ import {
   readHistory,
   readLastRun,
   readOutbox,
+  readState,
   renderFrame,
+  writeState,
   spinnerChar,
   stripAnsi,
   USAGE,
@@ -278,6 +281,120 @@ describe("onyx CLI helpers", () => {
               record.type === "branch_started" && record.name === "fast-eval"
           )
         ).toBe(true)
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("branch create records the branch HEAD was on as parent", async () => {
+    const root = await createGitRepo()
+    try {
+      await withCwd(root, async () => {
+        const defaultBranch = await git(root, ["branch", "--show-current"])
+        await startBranch({
+          root,
+          options: { name: "pid-tune", metric: "score" },
+        })
+
+        // HEAD is now on onyx/pid-tune; fork a child research direction.
+        await commandBranchCreate({
+          positional: ["branch", "create"],
+          options: { name: "pid-tune-d-only", metric: "score" },
+        })
+
+        const { records } = await readOutbox(root)
+        const branches = records.flatMap((record) =>
+          record.type === "branch_started" ? [record] : []
+        )
+        expect(branches).toHaveLength(2)
+        expect(branches[0]?.name).toBe("pid-tune")
+        expect(branches[0]?.parentGitBranchName).toBe(defaultBranch)
+        expect(branches[1]?.name).toBe("pid-tune-d-only")
+        expect(branches[1]?.parentGitBranchName).toBe("onyx/pid-tune")
+
+        const state = await readState(root)
+        expect(state.branches["pid-tune-d-only"]?.parentGitBranchName).toBe(
+          "onyx/pid-tune"
+        )
+
+        const markdown = await readFile(join(root, "onyx", "onyx.md"), "utf8")
+        expect(markdown).toContain("Parent branch: onyx/pid-tune")
+
+        // The markdown fallback path (fresh clone, no local state) parses the
+        // parent back out of onyx.md.
+        await writeState(root, { branches: {} })
+        const meta = await branchMetadata({
+          root,
+          projectPath: "",
+          branchName: "pid-tune-d-only",
+          gitBranchName: "onyx/pid-tune-d-only",
+        })
+        expect(meta.parentGitBranchName).toBe("onyx/pid-tune")
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("branch create on a detached HEAD records no parent", async () => {
+    const root = await createGitRepo()
+    try {
+      await withCwd(root, async () => {
+        await git(root, ["checkout", "--detach"])
+        await commandBranchCreate({
+          positional: ["branch", "create"],
+          options: { name: "detached", metric: "score" },
+        })
+
+        const { records } = await readOutbox(root)
+        const record = records.find(
+          (item) => item.type === "branch_started" && item.name === "detached"
+        )
+        expect(record?.type).toBe("branch_started")
+        expect(
+          record?.type === "branch_started"
+            ? record.parentGitBranchName
+            : "unset"
+        ).toBeUndefined()
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("branch create for an existing branch keeps the parent unset", async () => {
+    const root = await createGitRepo()
+    try {
+      await withCwd(root, async () => {
+        const defaultBranch = await git(root, ["branch", "--show-current"])
+        await startBranch({
+          root,
+          options: { name: "pid-tune", metric: "score" },
+        })
+        await git(root, ["checkout", defaultBranch])
+        await commandBranchCreate({
+          positional: ["branch", "create"],
+          options: { name: "other", metric: "score" },
+        })
+        await git(root, ["add", join("onyx", "onyx.md")])
+        await git(root, ["commit", "-m", "start other"])
+
+        // Re-running create for pid-tune while on onyx/other only checks the
+        // existing branch out; HEAD's branch is not its fork parent.
+        await commandBranchCreate({
+          positional: ["branch", "create"],
+          options: { name: "pid-tune", metric: "score" },
+        })
+
+        const { records } = await readOutbox(root)
+        const recreates = records.flatMap((record) =>
+          record.type === "branch_started" && record.name === "pid-tune"
+            ? [record]
+            : []
+        )
+        expect(recreates).toHaveLength(2)
+        expect(recreates[1]?.parentGitBranchName).toBeUndefined()
       })
     } finally {
       await rm(root, { recursive: true, force: true })

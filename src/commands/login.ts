@@ -9,6 +9,8 @@ import {
   type Config,
   writeConfig,
 } from "../lib/config"
+
+export const LOCAL_API_URL = "http://localhost:3000"
 import { openBrowser, waitForCliLogin, type CliLoginResult } from "../lib/login"
 
 export type CliLoginProfileManifestEntry = {
@@ -143,7 +145,7 @@ export async function saveLoginProfile({
       ...config,
       currentProfile: profileName,
     })
-    return { profileName, alreadyConfigured: true }
+    return { profileName, apiUrl, alreadyConfigured: true }
   }
 
   await writeConfig({
@@ -154,11 +156,21 @@ export async function saveLoginProfile({
     currentProfile: profileName,
   })
 
-  return { profileName, alreadyConfigured: false }
+  return { profileName, apiUrl, alreadyConfigured: false }
+}
+
+export async function loginBaseUrl(args: Args) {
+  if (optionalFlag(args, "local")) {
+    if (args.options["api-url"]) {
+      throw new Error("Pass either --local or --api-url, not both.")
+    }
+    return LOCAL_API_URL
+  }
+  return apiBaseUrl(args, { allowDefault: true })
 }
 
 export async function commandLogin(args: Args) {
-  const baseUrl = await apiBaseUrl(args, { allowDefault: true })
+  const baseUrl = await loginBaseUrl(args)
   const port = Number(args.options.port ?? 8765)
   const state = randomUUID()
   const redirectUri = `http://127.0.0.1:${port}/callback`
@@ -180,6 +192,7 @@ export async function commandLogin(args: Args) {
   if (optionalFlag(args, "print-url")) {
     console.log(loginUrl.toString())
   } else {
+    console.log(`Opening browser login at ${baseUrl} ...`)
     await openBrowser(loginUrl.toString())
     console.log("Waiting for browser login...")
   }
@@ -188,11 +201,11 @@ export async function commandLogin(args: Args) {
   const saved = await saveLoginProfile({ baseUrl, result })
   if (saved.alreadyConfigured) {
     console.log(
-      `Using existing profile ${saved.profileName} for ${result.teamName} (${result.teamId})`
+      `Using existing profile ${saved.profileName} for ${result.teamName} (${result.teamId}) at ${saved.apiUrl}`
     )
   } else {
     console.log(
-      `Logged in profile ${saved.profileName} for ${result.teamName} (${result.teamId})`
+      `Logged in profile ${saved.profileName} for ${result.teamName} (${result.teamId}) at ${saved.apiUrl}`
     )
   }
 }

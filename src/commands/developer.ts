@@ -8,7 +8,12 @@ import type {
 } from "../lib/config"
 
 import { type Args } from "../lib/args"
-import { readConfig, writeConfig } from "../lib/config"
+import {
+  apiTarget,
+  describeApiTarget,
+  readConfig,
+  writeConfig,
+} from "../lib/config"
 import { pathExists } from "../lib/process"
 import {
   defaultSkillInstallRoot,
@@ -95,6 +100,13 @@ export async function validateDeveloperCheckout(checkout: DeveloperCheckout) {
 async function readDeveloperConfig() {
   const config = await readConfig()
   return developerConfig(config)
+}
+
+async function apiTargetLine(args?: Args) {
+  const target = await apiTarget(args)
+  return target
+    ? describeApiTarget(target)
+    : "not configured (run `onyx login`)"
 }
 
 async function writeDeveloperConfig(developer: DeveloperConfig) {
@@ -188,6 +200,13 @@ export async function commandDeveloper(args: Args) {
       console.log(
         "Restart or reload active agent sessions if they cache skill files."
       )
+      if (mode === "dev") {
+        console.log(
+          "Developer mode changes which CLI source runs, not which app it targets."
+        )
+        console.log(`API target: ${await apiTargetLine(args)}`)
+        console.log("To log to a locally running app: onyx login --local")
+      }
     }
     return
   }
@@ -225,6 +244,7 @@ export async function commandDeveloper(args: Args) {
   if (sub === "status") {
     const current = await readDeveloperConfig()
     console.log(`Mode: ${current.mode}`)
+    console.log(`API target: ${await apiTargetLine(args)}`)
     console.log(`Skill target: ${skillInstallTarget(defaultSkillInstallRoot())}`)
     if (current.checkout) {
       console.log(`Developer checkout: ${current.checkout.root}`)

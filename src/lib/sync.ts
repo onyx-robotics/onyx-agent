@@ -7,12 +7,16 @@ import type {
 import type { Args } from "./args"
 import {
   ApiError,
+  getProjectDeletions,
   listProjectBranches,
   reportExperiment,
   resolveProject,
   upsertBranch,
   type ApiProject,
+  type ApiProjectDeletions,
 } from "./api"
+import { apiTarget } from "./config"
+import { filterDeletedOutboxRecords } from "./deletions"
 import { emitEvent } from "./events"
 import { pushBranch, repositoryUrl } from "./git"
 import { applyHistorySyncUpdates, type HistorySyncUpdate } from "./history"
@@ -30,6 +34,7 @@ export type FlushResult = {
   flushed: number
   pending: number
   offline: boolean
+  skippedDeleted: number
 }
 
 function secondaryMetrics(record: LocalResearchExperimentLoggedRecord) {
@@ -74,6 +79,7 @@ async function upsertBranchFromMetadata({
       name: branchName,
       description: meta.description ?? undefined,
       gitBranchName,
+      parentGitBranchName: meta.parentGitBranchName ?? undefined,
       baseCommitSha: meta.baseCommitSha,
       metricName: meta.metricName,
       metricUnit: meta.metricUnit ?? undefined,
@@ -111,6 +117,7 @@ async function flushBranchStarted({
       name: record.name,
       description: record.description ?? undefined,
       gitBranchName: record.gitBranchName,
+      parentGitBranchName: record.parentGitBranchName ?? undefined,
       baseCommitSha: record.baseCommitSha,
       metricName: record.metricName,
       metricUnit: record.metricUnit ?? undefined,
@@ -125,6 +132,9 @@ async function flushBranchStarted({
     branchId: result.branch.id,
     projectPath,
     gitBranchName: record.gitBranchName,
+    ...(record.parentGitBranchName
+      ? { parentGitBranchName: record.parentGitBranchName }
+      : {}),
     baseCommitSha: record.baseCommitSha,
     description: record.description ?? null,
     metricName: record.metricName,
@@ -189,7 +199,10 @@ async function flushExperiment({
  * reported commits are reachable, then lazily upserts the project/branches and
  * reports experiments idempotently (server dedups by runRef). A 409 means the
  * commit is not reachable through GitHub yet (push/propagation lag) and is retried on the
- * next flush; any other error keeps the record queued and is surfaced.
+ * next flush; a 410 means the record was deleted server-side and is dropped
+ * without retry; any other error keeps the record queued and is surfaced.
+ * Records matching the project's deletions feed are dropped up front so a
+ * stale queue never resurrects deleted branches or experiments.
  */
 export async function flushOutbox(
   root: string,
@@ -201,7 +214,7 @@ export async function flushOutbox(
     console.warn(`Skipped ${corrupt} unreadable outbox record(s).`)
   }
   if (records.length === 0) {
-    return { flushed: 0, pending: 0, offline: false }
+    return { flushed: 0, pending: 0, offline: false, skippedDeleted: 0 }
   }
 
   const state = await readState(root)
@@ -229,8 +242,22 @@ export async function flushOutbox(
     }
   }
 
+  // Drop records the server has deleted before replaying anything. Best
+  // effort: with no deletions feed (offline, older server) everything is
+  // kept and the report path's 410 still catches deleted runRefs.
+  let deletions: ApiProjectDeletions | null = null
+  if (project) {
+    try {
+      deletions = await getProjectDeletions(project.id, args)
+    } catch {
+      deletions = null
+    }
+  }
+  const { kept, dropped } = filterDeletedOutboxRecords(records, deletions)
+  let skippedDeleted = dropped
+
   // Push every referenced branch up front so reported commits are reachable.
-  for (const branch of new Set(records.map((record) => record.gitBranchName))) {
+  for (const branch of new Set(kept.map((record) => record.gitBranchName))) {
     try {
       await pushBranch(root, branch)
     } catch {
@@ -252,11 +279,22 @@ export async function flushOutbox(
 
   const remaining: LocalResearchRecord[] = []
   const historyUpdates = new Map<string, HistorySyncUpdate>()
+  // Outbox order guarantees a parent's branch_started precedes its child's,
+  // but a parent that fails to flush must hold its children back: a child
+  // upserted first would be permanently recorded without a parent.
+  const failedBranchNames = new Set<string>()
   let flushed = 0
 
-  for (const record of records) {
+  for (const record of kept) {
     try {
       if (record.type === "branch_started") {
+        if (
+          record.parentGitBranchName &&
+          failedBranchNames.has(record.parentGitBranchName)
+        ) {
+          remaining.push(record)
+          continue
+        }
         project = await flushBranchStarted({ root, record, state, args })
       } else {
         const update = await flushExperiment({
@@ -269,6 +307,15 @@ export async function flushOutbox(
       }
       flushed += 1
     } catch (error) {
+      // 410 Gone: the runRef was deleted server-side — drop it for good
+      // instead of re-queueing (replaying it would always 410 again).
+      if (error instanceof ApiError && error.status === 410) {
+        skippedDeleted += 1
+        continue
+      }
+      if (record.type === "branch_started") {
+        failedBranchNames.add(record.gitBranchName)
+      }
       if (!(error instanceof ApiError) || error.status !== 409) {
         if (!options.quiet) {
           console.warn(
@@ -293,8 +340,19 @@ export async function flushOutbox(
   })
 
   if (!options.quiet) {
-    console.log(`Synced ${flushed} record(s); ${remaining.length} pending.`)
+    const target = await apiTarget(args)
+    console.log(
+      `Synced ${flushed} record(s)${target ? ` to ${target.url}` : ""}; ${remaining.length} pending.`
+    )
+    if (skippedDeleted > 0) {
+      console.log(`Skipped ${skippedDeleted} record(s) deleted on the server.`)
+    }
   }
 
-  return { flushed, pending: remaining.length, offline: false }
+  return {
+    flushed,
+    pending: remaining.length,
+    offline: false,
+    skippedDeleted,
+  }
 }

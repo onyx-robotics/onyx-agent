@@ -19,6 +19,7 @@ export type CliState = {
       branchId?: string
       projectPath?: string
       gitBranchName?: string
+      parentGitBranchName?: string | null
       baseCommitSha?: string | null
       description?: string | null
       metricName?: string

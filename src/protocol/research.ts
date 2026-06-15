@@ -24,7 +24,12 @@ export const createResearchBranchRequestSchema = z.object({
   repositoryFullName: z.string().trim().min(1).max(240).optional(),
   githubRepositoryId: z.string().trim().min(1).optional(),
   projectPath: z.string().trim().max(240).optional(),
+  // Explicit parentBranchId wins. parentGitBranchName is the CLI-friendly
+  // alternative: the git branch HEAD was on at creation, resolved
+  // server-side against the project's branches; no match (e.g. "main" or an
+  // untracked branch) stores a null parent.
   parentBranchId: z.uuid().optional(),
+  parentGitBranchName: z.string().trim().min(1).max(240).optional(),
   name: z
     .string()
     .trim()

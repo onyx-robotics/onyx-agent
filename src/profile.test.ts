@@ -8,13 +8,17 @@ import {
   DEFAULT_API_URL,
   apiBaseUrl,
   apiKey,
+  apiTarget,
+  describeApiTarget,
   readConfig,
   writeConfig,
   type CliProfile,
 } from "./lib/config"
 import { cliLoginCompleteHtml } from "./lib/login"
 import {
+  LOCAL_API_URL,
   buildCliLoginUrl,
+  loginBaseUrl,
   loginProfileManifest,
   profileNameForTeam,
   saveLoginProfile,
@@ -80,6 +84,7 @@ describe("CLI profiles", () => {
 
     expect(saved).toEqual({
       profileName: "alpha",
+      apiUrl: "https://app.onyx.test",
       alreadyConfigured: false,
     })
     const config = await readConfig()
@@ -239,6 +244,7 @@ describe("CLI profiles", () => {
     const config = await readConfig()
     expect(saved).toEqual({
       profileName: "alpha",
+      apiUrl: "https://app.onyx.test",
       alreadyConfigured: true,
     })
     expect(config.currentProfile).toBe("alpha")
@@ -315,6 +321,94 @@ describe("CLI profiles", () => {
     process.env.ONYX_API_KEY = "env-key"
 
     expect(await apiBaseUrl()).toBe(DEFAULT_API_URL)
+  })
+
+  test("reports the API target with its source", async () => {
+    expect(await apiTarget()).toBeNull()
+
+    process.env.ONYX_API_KEY = "env-key"
+    expect(await apiTarget()).toEqual({
+      url: DEFAULT_API_URL,
+      source: "default",
+    })
+    delete process.env.ONYX_API_KEY
+
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: { alpha: profile() },
+    })
+    expect(await apiTarget()).toEqual({
+      url: "https://app.onyx.test",
+      source: "profile",
+      profileName: "alpha",
+    })
+
+    process.env.ONYX_API_URL = "https://env.onyx.test"
+    expect(await apiTarget()).toEqual({
+      url: "https://env.onyx.test",
+      source: "env",
+    })
+
+    expect(
+      await apiTarget({
+        positional: ["status"],
+        options: { "api-url": "https://flag.onyx.test" },
+      })
+    ).toEqual({ url: "https://flag.onyx.test", source: "flag" })
+  })
+
+  test("describes API targets for status output", () => {
+    expect(
+      describeApiTarget({
+        url: "https://app.onyx.test",
+        source: "profile",
+        profileName: "alpha",
+      })
+    ).toBe("https://app.onyx.test (profile alpha)")
+    expect(
+      describeApiTarget({ url: "https://env.onyx.test", source: "env" })
+    ).toBe("https://env.onyx.test (ONYX_API_URL)")
+    expect(
+      describeApiTarget({ url: "https://flag.onyx.test", source: "flag" })
+    ).toBe("https://flag.onyx.test (--api-url)")
+    expect(describeApiTarget({ url: DEFAULT_API_URL, source: "default" })).toBe(
+      `${DEFAULT_API_URL} (default)`
+    )
+  })
+
+  test("login --local targets the locally running app", async () => {
+    expect(
+      await loginBaseUrl({ positional: ["login"], options: { local: "true" } })
+    ).toBe(LOCAL_API_URL)
+
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: { alpha: profile() },
+    })
+    expect(
+      await loginBaseUrl({ positional: ["login"], options: { local: "true" } })
+    ).toBe(LOCAL_API_URL)
+
+    await expect(
+      loginBaseUrl({
+        positional: ["login"],
+        options: { local: "true", "api-url": "https://flag.onyx.test" },
+      })
+    ).rejects.toThrow("Pass either --local or --api-url, not both.")
+  })
+
+  test("login without --local follows the configured target", async () => {
+    expect(await loginBaseUrl({ positional: ["login"], options: {} })).toBe(
+      DEFAULT_API_URL
+    )
+
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: { alpha: profile() },
+    })
+    expect(await loginBaseUrl({ positional: ["login"], options: {} })).toBe(
+      "https://app.onyx.test"
+    )
   })
 
   test("resolves profile API keys from apiKeyEnv before stored profile keys", async () => {

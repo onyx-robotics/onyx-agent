@@ -36,11 +36,17 @@ Profiles are team-scoped. Use `onyx profile list`, `onyx profile use <name>`,
 and `onyx profile delete <name>` to inspect, switch, or remove local profile
 entries.
 
-Only for local app development, point the agent at a non-production API:
+Only for local app development, point the agent at a non-production API.
+`--local` is shorthand for `--api-url http://localhost:3000`:
 
 ```bash
-onyx login --api-url http://localhost:3000
+onyx login --local
 ```
+
+This stores a separate profile for the local app; switch between it and the
+hosted app with `onyx profile use <name>`. Developer mode
+(`onyx developer use dev`) changes which CLI source runs, not which app the
+CLI targets.
 
 ## Agent Skill
 
@@ -69,6 +75,20 @@ onyx push
 
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
+
+To delete a research direction entirely — the Onyx branch record with all its
+experiments, the remote and local `onyx/<name>` git branches, and matching
+local cache rows:
+
+```bash
+onyx branch delete fast-eval
+```
+
+Deletion requires connectivity (it is never queued). The server tombstones
+every deleted experiment's `runRef`, so an offline agent that still has them
+queued skips them on its next sync instead of resurrecting them. Recreating a
+branch with the same name later is fine — tombstones only match records
+created before the deletion.
 
 ## Development
 

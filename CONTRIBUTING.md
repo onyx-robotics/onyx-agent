@@ -19,6 +19,12 @@ large hidden runner.
 
 Use `onyx developer link .` and `onyx developer use dev` when you want the
 installed `onyx` command and managed skill files to follow this checkout.
+Developer mode does not change which app the CLI targets — the API URL still
+comes from the active profile (or `--api-url`/`ONYX_API_URL`). To log to a
+locally running app instead of the hosted one, create a local profile with
+`onyx login --local` and switch between profiles with
+`onyx profile use <name>`; `onyx status` and `onyx developer status` print the
+current API target.
 
 ## Pull Requests
 
