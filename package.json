@@ -1,6 +1,6 @@
 {
   "name": "@onyx-robotics/agent",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Onyx agent CLI and packaged agent skill for local research workflows.",
   "type": "module",
   "private": false,
