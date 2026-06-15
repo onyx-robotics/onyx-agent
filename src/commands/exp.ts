@@ -271,6 +271,13 @@ export async function commandExpLog(args: Args) {
   const status = validateStatus(
     args.options.status ?? usableLastRun?.status ?? "succeeded"
   )
+  if ((status === "succeeded" || status === "accepted") && metricValue === null) {
+    throw new Error(
+      `Cannot record ${status} without a metric for "${metricName}". ` +
+        `Run \`onyx exp run\` so eval.sh emits a \`METRIC ${metricName}=<value>\` line, ` +
+        `or pass \`--metric <value>\`. If the eval produced no metric, record it with \`--status failed\`.`
+    )
+  }
   const checks = usableLastRun?.checks ?? null
   if (
     checks &&

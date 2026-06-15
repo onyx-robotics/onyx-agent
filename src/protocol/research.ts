@@ -69,6 +69,17 @@ export const createResearchExperimentRequestSchema = z.object({
   startedAt: z.iso.datetime().optional(),
   completedAt: z.iso.datetime().optional(),
 })
+  // A measured, trusted result must carry its primary metric value; statuses
+  // like `failed`/`running`/`queued`/`rejected` legitimately have none.
+  .refine(
+    (value) =>
+      (value.status !== "succeeded" && value.status !== "accepted") ||
+      value.primaryMetricValue !== undefined,
+    {
+      path: ["primaryMetricValue"],
+      error: 'primaryMetricValue is required when status is "succeeded" or "accepted"',
+    }
+  )
 
 export type ResearchMetricDirection = z.infer<
   typeof researchMetricDirectionSchema

@@ -80,7 +80,7 @@ Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), 
 
 #### Structured output
 
-- `METRIC name=value` - primary metric (must match `onyx branch create`'s `metric name`) and any secondary metrics. Parsed automatically by `onyx exp run`.
+- `METRIC name=value` - primary metric (must match `onyx branch create`'s `metric name`) and any secondary metrics. Parsed automatically by `onyx exp run`. The primary `METRIC` line is **mandatory** for a successful run: if `eval.sh` exits 0 but emits no matching `METRIC` line, `onyx exp run` records the run as `failed`, and `onyx exp log` refuses to record it as `succeeded`/`accepted`. Always make the eval print the primary metric.
 
 #### Control measurement noise
 
@@ -147,6 +147,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 - **Primary metric is king.** Improved -> build the next experiment from that result. Worse/equal -> restore the best commit's files and build from there. Secondary metrics rarely change the decision, but a guardrail breach (e.g. memory blowup) should fail the run - encode hard limits in `checks.sh`.
 - **Confirm new bests.** A single trial of a noisy metric can lie. Re-run a surprising improvement before building on it.
 - **Statuses:** the loop uses `succeeded` / `failed` / `checks_failed` (what `onyx exp run` emits). `accepted` / `rejected` are for human curation - don't set them in the loop.
+- **Every `succeeded` result carries the primary metric.** A measured win is defined by its metric, so `onyx exp log` rejects `succeeded`/`accepted` without one. If a run produced no metric (eval crashed, no `METRIC` line), record it with `--status failed` and annotate why - never drop the experiment.
 - **Annotate every run with `--agent-notes`.** Record what you learned - not what you did. What would help the next iteration or a fresh agent resuming this session? Notes are searchable later via `onyx exp list --grep`.
 - **Keep descriptions clean.** Make sure descriptions are informative on what changed and simple, don't include redundant information like "exp1: " or "iter 1/10: " as that info is already tracked by onyx.
 - **Simpler is better.** Removing code for equal perf = good. Ugly complexity for tiny gain = probably not worth building on.

@@ -233,7 +233,7 @@ describe("onyx CLI helpers", () => {
   test("prints the package version for --version", async () => {
     const output = await captureLogs(() => main(["--version"]))
 
-    expect(output).toBe("0.1.6")
+    expect(output).toBe("0.1.7")
   })
 
   test("exp run writes last-run and exp log queues it when offline", async () => {
@@ -430,6 +430,41 @@ describe("onyx CLI helpers", () => {
       })
     } finally {
       process.exitCode = 0
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("exp log refuses to record a succeeded experiment without a metric", async () => {
+    const root = await createGitRepo()
+    try {
+      await withCwd(root, async () => {
+        await startBranch({
+          root,
+          options: { name: "fast-eval", metric: "score" },
+        })
+
+        // No `onyx exp run`, no --metric: status defaults to succeeded.
+        await expect(
+          commandExpLog({
+            positional: ["exp", "log"],
+            options: { description: "No metric" },
+          })
+        ).rejects.toThrow(/without a metric/)
+
+        // Recording the same outcome as a failure is allowed.
+        await commandExpLog({
+          positional: ["exp", "log"],
+          options: { description: "Eval produced no metric", status: "failed" },
+        })
+
+        const { records } = await readOutbox(root)
+        const experiments = records.filter(
+          (record) => record.type === "experiment_logged"
+        )
+        expect(experiments).toHaveLength(1)
+        expect(experiments[0]!.status).toBe("failed")
+      })
+    } finally {
       await rm(root, { recursive: true, force: true })
     }
   })
