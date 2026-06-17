@@ -186,7 +186,13 @@ async function flushCampaignExperiment({
       secondaryMetrics: campaignSecondaryMetrics(record),
       artifactRefs: {},
       agentNotes: record.agentNotes,
-      checks: record.checks ?? undefined,
+      checks: record.checks
+        ? {
+            status: record.checks.status,
+            durationMs: record.checks.durationMs ?? null,
+            outputSummary: record.checks.outputSummary ?? null,
+          }
+        : undefined,
       durationMs: record.durationMs ?? undefined,
       outputSummary: record.outputSummary ?? undefined,
       startedAt: record.startedAt ?? undefined,
