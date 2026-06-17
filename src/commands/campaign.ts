@@ -36,6 +36,10 @@ export async function commandCampaignCreate(args: Args) {
 
   const baseCommitSha = await currentCommit(root)
   const description = descriptionOption(args)
+  const tools = args.options.tools ?? null
+  const constraints = args.options.constraints ?? null
+  const reset = args.options.reset ?? null
+  const humanFeedback = args.options["human-feedback"] ?? null
   const promotionRefName =
     args.options["promotion-ref"] ?? `refs/heads/onyx/${name}/best`
 
@@ -50,6 +54,10 @@ export async function commandCampaignCreate(args: Args) {
     metricName,
     metricUnit,
     metricDirection,
+    tools,
+    constraints,
+    reset,
+    humanFeedback,
     promotionRefName,
   }
   await appendOutbox(root, record)
@@ -68,6 +76,10 @@ export async function commandCampaignCreate(args: Args) {
       metricName,
       metricUnit,
       metricDirection,
+      tools,
+      constraints,
+      reset,
+      humanFeedback,
       promotionRefName,
     },
   }
@@ -79,7 +91,7 @@ export async function commandCampaignCreate(args: Args) {
     commitSha: baseCommitSha,
     message: name,
   })
-  console.log(`Created campaign ${name}`)
+  console.log(`Created setup for campaign ${name}`)
   console.log(`Base commit: ${baseCommitSha}`)
 
   await flushOutbox(root, args, { quiet: true }).catch(() => {})

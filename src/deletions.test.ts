@@ -61,6 +61,7 @@ function experimentLogged(
     resultCommitSha: "1234567",
     resultRef: `refs/onyx/experiments/${campaignName}/${runRef}`,
     status: "succeeded",
+    setupId: "44444444-4444-4444-8444-444444444444",
     primaryMetricName: "score",
     primaryMetricValue: 0.5,
     metrics: {},

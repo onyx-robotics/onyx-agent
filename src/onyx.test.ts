@@ -12,8 +12,9 @@ import {
 
 describe("campaign CLI surface", () => {
   test("usage exposes campaigns and not legacy branch commands", () => {
-    expect(USAGE).toContain("onyx campaign create")
-    expect(USAGE).toContain("onyx swarm start --campaign")
+    expect(USAGE).toContain("onyx campaign setup")
+    expect(USAGE).toContain("onyx research start --campaign")
+    expect(USAGE).not.toContain("onyx campaign create")
     expect(USAGE).not.toContain("onyx branch create")
   })
 
@@ -36,6 +37,7 @@ describe("local research protocol", () => {
       resultRef:
         "refs/onyx/experiments/11111111-1111-4111-8111-111111111111/local/fast-eval/abc",
       status: "succeeded",
+      setupId: "22222222-2222-4222-8222-222222222222",
       primaryMetricName: "score",
       primaryMetricValue: 0.9,
       metrics: { score: 0.9 },

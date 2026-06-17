@@ -51,6 +51,10 @@ export const createResearchCampaignRequestSchema = z.object({
   metricName: z.string().trim().min(1).max(120),
   metricUnit: z.string().trim().max(80).optional(),
   metricDirection: researchMetricDirectionSchema.default("maximize"),
+  tools: z.string().trim().max(4000).optional(),
+  constraints: z.string().trim().max(4000).optional(),
+  reset: z.string().trim().max(4000).optional(),
+  humanFeedback: z.string().trim().max(4000).optional(),
   promotionRefName: gitRefSchema.optional(),
 })
 
@@ -65,9 +69,9 @@ const checksSchema = z
 
 export const createResearchCampaignExperimentRequestSchema = z
   .object({
+    setupId: z.uuid(),
     sessionId: z.uuid().optional(),
     laneId: z.uuid().optional(),
-    taskId: z.uuid().optional(),
     workerId: z.uuid().optional(),
     name: z.string().trim().min(1).max(160),
     description: z.string().trim().max(2000).optional(),

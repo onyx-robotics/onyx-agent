@@ -105,10 +105,11 @@ export function experimentRecordToHistory(
     completedAt: record.completedAt ?? null,
     createdAt: record.createdAt,
     campaignId: record.sync?.campaignId,
+    setupId: record.setupId ?? record.sync?.setupId,
     experimentId: record.sync?.experimentId,
     sessionId: record.sessionId ?? record.sync?.sessionId,
     workerId: record.workerId ?? record.sync?.workerId,
-    taskId: record.taskId ?? record.sync?.taskId,
+    laneId: record.laneId ?? record.sync?.laneId,
   }
 }
 
@@ -156,9 +157,10 @@ export function apiExperimentToHistory(
     createdAt: experiment.createdAt,
     experimentId: experiment.id,
     campaignId: campaign.id,
+    setupId: experiment.setupId,
     sessionId: experiment.sessionId ?? undefined,
     workerId: experiment.workerId ?? undefined,
-    taskId: experiment.taskId ?? undefined,
+    laneId: experiment.laneId ?? undefined,
   })
   return result.success ? result.data : null
 }
@@ -179,6 +181,7 @@ export function mergeHistory(
 export type HistorySyncUpdate = {
   experimentId: string
   campaignId: string
+  setupId?: string
 }
 
 export async function applyHistorySyncUpdates(
@@ -197,6 +200,7 @@ export async function applyHistorySyncUpdates(
       source: "api" as const,
       experimentId: update.experimentId,
       campaignId: update.campaignId,
+      setupId: update.setupId ?? record.setupId,
     }
   })
   if (changed) await rewriteHistory(root, next)

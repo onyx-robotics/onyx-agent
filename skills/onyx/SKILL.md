@@ -16,13 +16,14 @@ Drive an autonomous research loop using the `onyx` CLI as the substrate. You own
    - **Files in scope**
    - **Constraints**
    - **Stop conditions** - eg. `stop after N iterations`, `for 30 minutes`, `until <condition>`, default is no stop condition, loop forever until manually stopped by user
-2. `onyx campaign create --name <slug> --metric <name> --unit <unit> --direction <maximize/minimize> --description <goal>`
+2. `onyx campaign setup --name <slug> --metric <name> --unit <unit> --direction <maximize/minimize> --description <goal>`
    - Add `--project-path <projectPath>` when the work is scoped to a subdirectory.
    - The command infers the repository from `origin` and registers the campaign with Onyx; if offline or GitHub access is missing, records stay queued until `onyx sync`.
    - The campaign records the current git HEAD as its base commit. It does not create a shared research-history branch.
 3. Read the source files. Understand the workload deeply before writing anything.
 4. Write `<projectPath>/onyx/onyx.md` and `<projectPath>/onyx/eval.sh` (see below). Optionally write `<projectPath>/onyx/checks.sh` when correctness constraints require it. Commit these files.
-5. Run a baseline with `onyx exp run`, then record it with `onyx exp log --description "baseline" --agent-notes '<json>'`, then start looping immediately.
+5. Run `onyx setup validate`. This records the baseline experiment, validates the active setup, and moves the campaign into the Research phase.
+6. Start autonomous research with `onyx research start --campaign <slug> --agents <n> --worker-command "<agent command>"`, or continue manually with the loop below.
 
 ### `onyx.md`
 
@@ -80,7 +81,7 @@ Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), 
 
 #### Structured output
 
-- `METRIC name=value` - primary metric (must match `onyx campaign create`'s `metric name`) and any secondary metrics. Parsed automatically by `onyx exp run`. The primary `METRIC` line is **mandatory** for a successful run: if `eval.sh` exits 0 but emits no matching `METRIC` line, `onyx exp run` records the run as `failed`, and `onyx exp log` refuses to record it as `succeeded`/`accepted`. Always make the eval print the primary metric.
+- `METRIC name=value` - primary metric (must match `onyx campaign setup`'s `metric name`) and any secondary metrics. Parsed automatically by `onyx exp run`. The primary `METRIC` line is **mandatory** for a successful run: if `eval.sh` exits 0 but emits no matching `METRIC` line, `onyx exp run` records the run as `failed`, and `onyx exp log` refuses to record it as `succeeded`/`accepted`. Always make the eval print the primary metric.
 
 #### Control measurement noise
 
@@ -127,7 +128,9 @@ pnpm test --run --reporter=dot 2>&1 | tail -50
 pnpm typecheck 2>&1 | grep -i error || true
 ```
 
-## The Research Loop
+## The Research Phase
+
+Each autonomous agent owns one lane. The lane has a movable branch under `refs/heads/onyx/<campaign>/lanes/*`, while each measured attempt still gets an immutable `refs/onyx/experiments/<campaignId>/<runRef>` ref. A generated brief is available at `$ONYX_BRIEF_FILE` for lane workers.
 
 ### **LOOP** (until the stop condition or an interrupt):
 
@@ -139,6 +142,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 6. Inspect the result, including benchmark output and optional checks.sh result.
 7. Record `onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]`
 8. Run `onyx push` or `onyx sync` to push the immutable experiment ref and flush queued records.
+9. If running as a lane worker, update a concise lane summary through the Onyx CLI/API or in the final commit notes so later agents can resume from the brief.
 
 **On stop:** Update `onyx.md`'s "What's Been Tried" and write a short summary of the best result and any open ideas. Leave git clean - no uncommitted changes and no unreported local commits. Commit any final edits forward (or discard work you won't record), then run `onyx push` or `onyx sync` so immutable refs and the outbox are flushed.
 

@@ -26,9 +26,10 @@ export async function emitEvent(
     type: LocalResearchEventType
     campaignName?: string
     campaignId?: string
+    setupId?: string
     sessionId?: string
     workerId?: string
-    taskId?: string
+    laneId?: string
     runRef?: string
     commitSha?: string
     resultRef?: string

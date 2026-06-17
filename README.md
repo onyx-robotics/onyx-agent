@@ -5,7 +5,7 @@ Open-source agent package for Onyx research workflows.
 It installs the `onyx` command and the bundled `onyx` agent skill. The command
 is terminal-only: agents make code changes in your existing git repository,
 commit measured attempts, push immutable experiment refs, and report experiment
-metadata plus worker/task state to the Onyx app.
+metadata plus setup, lane, and worker state to the Onyx app.
 
 ## Install
 
@@ -67,27 +67,25 @@ onyx agent skill-path
 ## Core Workflow
 
 ```bash
-onyx campaign create --name fast-eval --metric score --direction maximize
-onyx exp run
-onyx exp log --description "baseline"
+onyx campaign setup --name fast-eval --metric score --direction maximize
+onyx setup validate
 onyx push
 ```
 
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
 
-To run multiple local workers, provide the agent command Onyx should invoke in
-each persistent worktree:
+To run multiple local research lanes, provide the agent command Onyx should
+invoke in each lane worktree:
 
 ```bash
-onyx swarm start --campaign fast-eval --workers 4 --worker-command "codex exec 'work on $ONYX_TASK_FILE and commit the result'"
+onyx research start --campaign fast-eval --agents 4 --worker-command "codex exec 'read $ONYX_BRIEF_FILE and improve the metric'"
 ```
 
-Each worker uses `.git/onyx/worktrees/<campaignId>/<sessionId>/<workerName>`
-and `.git/onyx/worker-state/<workerId>`, sends heartbeats every few seconds,
-leases tasks, runs `onyx/eval.sh` and optional `onyx/checks.sh`, pushes
-`refs/onyx/experiments/<campaignId>/<runRef>`, reports the experiment, and
-completes the task.
+Each lane has a branch under `refs/heads/onyx/<campaign>/lanes/*`, gets a
+generated brief under `.git/onyx/briefs/`, runs `onyx/eval.sh` and optional
+`onyx/checks.sh`, pushes `refs/onyx/experiments/<campaignId>/<runRef>`, and
+reports the experiment with setup/session/lane/worker context.
 
 To delete a research direction entirely — the campaign record with all its
 experiments and matching local cache rows:

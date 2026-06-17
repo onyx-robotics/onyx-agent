@@ -69,6 +69,10 @@ async function flushCampaignStarted({
       metricName: record.metricName,
       metricUnit: record.metricUnit ?? undefined,
       metricDirection: record.metricDirection,
+      tools: record.tools ?? undefined,
+      constraints: record.constraints ?? undefined,
+      reset: record.reset ?? undefined,
+      humanFeedback: record.humanFeedback ?? undefined,
       promotionRefName: record.promotionRefName ?? undefined,
     },
     args
@@ -80,6 +84,7 @@ async function flushCampaignStarted({
   state.campaigns[key] = {
     ...state.campaigns[key],
     campaignId: result.campaign.id,
+    setupId: result.setup.id,
     projectPath,
     baseCommitSha: record.baseCommitSha,
     description: record.description ?? null,
@@ -87,6 +92,13 @@ async function flushCampaignStarted({
     metricUnit: record.metricUnit ?? null,
     metricDirection: record.metricDirection,
     promotionRefName: record.promotionRefName ?? null,
+  }
+  record.sync = {
+    ...(record.sync ?? {}),
+    projectId: result.project.id,
+    campaignId: result.campaign.id,
+    setupId: result.setup.id,
+    syncedAt: new Date().toISOString(),
   }
   return result.project
 }
@@ -116,7 +128,7 @@ async function campaignIdFromMetadata({
   )
   if (!campaign) {
     throw new Error(
-      `Campaign ${campaignName} is not synced yet. Run \`onyx campaign create --name ${campaignName} --metric <metric>\`.`
+      `Campaign ${campaignName} is not synced yet. Run \`onyx campaign setup --name ${campaignName} --metric <metric>\`.`
     )
   }
   state.campaigns = state.campaigns ?? {}
@@ -130,6 +142,7 @@ async function campaignIdFromMetadata({
     metricUnit: campaign.metricUnit,
     metricDirection: campaign.metricDirection,
     promotionRefName: campaign.promotionRefName,
+    setupId: campaign.activeSetupId ?? state.campaigns?.[key]?.setupId,
   }
   return campaign.id
 }
@@ -163,6 +176,7 @@ async function flushCampaignExperiment({
       name: record.name,
       description: record.description ?? undefined,
       runRef: record.runRef,
+      setupId: record.setupId,
       baseCommitSha: record.baseCommitSha,
       resultCommitSha: record.resultCommitSha,
       resultRef: record.resultRef,
@@ -179,7 +193,7 @@ async function flushCampaignExperiment({
       completedAt: record.completedAt ?? undefined,
       sessionId: record.sessionId,
       workerId: record.workerId,
-      taskId: record.taskId,
+      laneId: record.laneId,
       provenance: [],
     },
     args
@@ -187,12 +201,14 @@ async function flushCampaignExperiment({
   record.sync = {
     ...(record.sync ?? {}),
     campaignId,
+    setupId: record.setupId,
     experimentId: reported.id,
     syncedAt: new Date().toISOString(),
   }
   return {
     experimentId: reported.id,
     campaignId,
+    setupId: reported.setupId,
   }
 }
 

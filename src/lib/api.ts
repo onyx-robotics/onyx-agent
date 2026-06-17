@@ -23,6 +23,8 @@ export type ApiCampaign = {
   name: string
   description: string | null
   baseCommitSha: string
+  phase: "setup" | "research"
+  activeSetupId: string | null
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
@@ -32,12 +34,31 @@ export type ApiCampaign = {
   promotionRefName: string | null
 }
 
+export type ApiSetup = {
+  id: string
+  campaignId: string
+  version: number
+  status: "draft" | "validated" | "superseded"
+  goal: string | null
+  metricName: string
+  metricUnit: string | null
+  metricDirection: "maximize" | "minimize"
+  tools: string | null
+  constraints: string | null
+  reset: string | null
+  humanFeedback: string | null
+  setupCommitSha: string
+  baselineExperimentId: string | null
+  validatedAt: string | null
+}
+
 export type ApiCampaignExperiment = {
   id: string
   campaignId: string
+  setupId: string
   sessionId: string | null
+  laneId: string | null
   workerId: string | null
-  taskId: string | null
   runRef: string
   name: string
   description: string | null
@@ -74,9 +95,9 @@ export type ApiWorker = {
   id: string
   campaignId: string
   sessionId: string | null
+  laneId: string | null
   workerName: string
   status: "idle" | "running" | "stale" | "lost" | "stopped"
-  currentTaskId: string | null
   currentExperimentId: string | null
   phase: string | null
   progressMessage: string | null
@@ -84,34 +105,66 @@ export type ApiWorker = {
   lastSeenAt: string
 }
 
-export type ApiTask = {
+export type ApiLane = {
+  id: string
+  campaignId: string
+  setupId: string
+  sessionId: string | null
+  name: string
+  description: string | null
+  status: "active" | "claimed" | "stale" | "lost" | "completed"
+  branchRef: string
+  baseCommitSha: string
+  currentCommitSha: string | null
+  bestExperimentId: string | null
+  bestMetricValue: number | null
+  currentWorkerId: string | null
+  metadata: Record<string, unknown>
+}
+
+export type ApiSummary = {
   id: string
   campaignId: string
   sessionId: string | null
+  laneId: string | null
+  setupId: string | null
+  authoredByWorkerId: string | null
+  summaryKind:
+    | "campaign_brief"
+    | "session_brief"
+    | "lane_summary"
+    | "transfer_brief"
+    | "setup_notes"
   title: string
-  description: string | null
-  status: "queued" | "leased" | "running" | "cancelled" | "expired" | "completed"
-  baseCommitSha: string | null
-  leasedByWorkerId: string | null
-  leaseExpiresAt: string | null
-  leaseVersion: number
-  attemptCount: number
-  maxAttempts: number
-  resultExperimentId: string | null
-  error: Record<string, unknown> | null
-  metadata: Record<string, unknown>
+  body: string
+  isCurrent: boolean
 }
 
 export type ApiCampaignTimeline = {
   campaign: ApiCampaign
+  activeSetup: ApiSetup | null
   experiments: ApiCampaignExperiment[]
   workers: ApiWorker[]
-  tasks: ApiTask[]
+  lanes: ApiLane[]
+  summaries: ApiSummary[]
 }
 
 export type ApiCampaignUpsertResult = {
   project: ApiProject
   campaign: ApiCampaign
+  setup: ApiSetup
+}
+
+export type ApiBrief = {
+  campaign: ApiCampaign
+  activeSetup: ApiSetup | null
+  bestExperiment: ApiCampaignExperiment | null
+  recentExperiments: ApiCampaignExperiment[]
+  lanes: ApiLane[]
+  workers: ApiWorker[]
+  summaries: ApiSummary[]
+  recommendedContext: string[]
+  markdown: string
 }
 
 export type ApiProjectDeletions = {
@@ -215,7 +268,7 @@ export async function resolveProject(
 
   if (!project) {
     throw new Error(
-      "No Onyx project is tracking this repository yet. Start a campaign with `onyx campaign create`, or grant Onyx GitHub access to this repository and sync again."
+      "No Onyx project is tracking this repository yet. Start a campaign with `onyx campaign setup`, or grant Onyx GitHub access to this repository and sync again."
     )
   }
 
@@ -282,11 +335,52 @@ export async function createCampaignSession(
     metadata?: Record<string, unknown>
   },
   args?: Args
-): Promise<ApiSession> {
-  return apiData<ApiSession>(
+): Promise<{ session: ApiSession; lanes: ApiLane[] }> {
+  return apiData<{ session: ApiSession; lanes: ApiLane[] }>(
     await callApi(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/sessions`,
+      body,
+      args
+    )
+  )
+}
+
+export async function createCampaignSetup(
+  campaignId: string,
+  body: {
+    goal?: string
+    metricName: string
+    metricUnit?: string | null
+    metricDirection?: "maximize" | "minimize"
+    tools?: string | null
+    constraints?: string | null
+    reset?: string | null
+    humanFeedback?: string | null
+    setupCommitSha?: string
+    metadata?: Record<string, unknown>
+  },
+  args?: Args
+): Promise<{ campaign: ApiCampaign; setup: ApiSetup }> {
+  return apiData<{ campaign: ApiCampaign; setup: ApiSetup }>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/setups`,
+      body,
+      args
+    )
+  )
+}
+
+export async function validateCampaignSetup(
+  setupId: string,
+  body: { baselineExperimentId: string },
+  args?: Args
+): Promise<{ campaign: ApiCampaign; setup: ApiSetup }> {
+  return apiData<{ campaign: ApiCampaign; setup: ApiSetup }>(
+    await callApi(
+      "POST",
+      `/api/v1/research/setups/${setupId}/validate`,
       body,
       args
     )
@@ -312,33 +406,11 @@ export async function stopCampaignSession(
   )
 }
 
-export async function createCampaignTask(
-  campaignId: string,
-  body: {
-    sessionId?: string
-    title: string
-    description?: string
-    priority?: number
-    baseCommitSha?: string
-    maxAttempts?: number
-    metadata?: Record<string, unknown>
-  },
-  args?: Args
-): Promise<ApiTask> {
-  return apiData<ApiTask>(
-    await callApi(
-      "POST",
-      `/api/v1/research/campaigns/${campaignId}/tasks`,
-      body,
-      args
-    )
-  )
-}
-
 export async function registerCampaignWorker(
   campaignId: string,
   body: {
     sessionId?: string
+    laneId?: string
     workerName: string
     agentKind?: string
     runtime?: "local" | "hosted"
@@ -361,7 +433,7 @@ export async function heartbeatWorker(
   body: {
     status?: "idle" | "running" | "stale" | "lost" | "stopped"
     sessionId?: string
-    taskId?: string | null
+    laneId?: string | null
     experimentId?: string | null
     phase?: string | null
     event?: string | null
@@ -382,74 +454,75 @@ export async function heartbeatWorker(
   )
 }
 
-export async function leaseCampaignTask(
-  body: { campaignId: string; workerId: string; leaseSeconds?: number },
+export async function claimCampaignLane(
+  laneId: string,
+  body: { workerId: string },
   args?: Args
-): Promise<{ task: ApiTask | null }> {
-  return apiData<{ task: ApiTask | null }>(
-    await callApi("POST", "/api/v1/research/tasks/lease", body, args)
+): Promise<{ lane: ApiLane }> {
+  return apiData<{ lane: ApiLane }>(
+    await callApi("POST", `/api/v1/research/lanes/${laneId}/claim`, body, args)
   )
 }
 
-export async function heartbeatCampaignTask(
-  taskId: string,
+export async function heartbeatCampaignLane(
+  laneId: string,
   body: {
-    campaignId: string
     workerId: string
-    leaseSeconds?: number
-    status?: "leased" | "running"
-    progressMessage?: string
+    status?: "active" | "claimed" | "completed" | "lost"
+    currentCommitSha?: string | null
     metadata?: Record<string, unknown>
   },
   args?: Args
-): Promise<ApiTask> {
-  return apiData<ApiTask>(
+): Promise<ApiLane> {
+  return apiData<ApiLane>(
     await callApi(
       "POST",
-      `/api/v1/research/tasks/${taskId}/heartbeat`,
+      `/api/v1/research/lanes/${laneId}/heartbeat`,
       body,
       args
     )
   )
 }
 
-export async function completeCampaignTask(
-  taskId: string,
+export async function upsertCampaignSummary(
+  campaignId: string,
   body: {
-    campaignId: string
-    workerId: string
-    experimentId?: string
-    status?: "completed" | "cancelled"
-    error?: Record<string, unknown> | null
+    sessionId?: string
+    laneId?: string
+    setupId?: string
+    authoredByWorkerId?: string
+    summaryKind:
+      | "campaign_brief"
+      | "session_brief"
+      | "lane_summary"
+      | "transfer_brief"
+      | "setup_notes"
+    title: string
+    body: string
+    isCurrent?: boolean
     metadata?: Record<string, unknown>
   },
   args?: Args
-): Promise<ApiTask> {
-  return apiData<ApiTask>(
+): Promise<ApiSummary> {
+  return apiData<ApiSummary>(
     await callApi(
       "POST",
-      `/api/v1/research/tasks/${taskId}/complete`,
+      `/api/v1/research/campaigns/${campaignId}/summaries`,
       body,
       args
     )
   )
 }
 
-export async function cancelCampaignTask(
-  taskId: string,
-  body: {
-    campaignId: string
-    workerId?: string
-    reason?: string
-    metadata?: Record<string, unknown>
-  },
+export async function getCampaignBrief(
+  campaignId: string,
   args?: Args
-): Promise<ApiTask> {
-  return apiData<ApiTask>(
+): Promise<ApiBrief> {
+  return apiData<ApiBrief>(
     await callApi(
-      "POST",
-      `/api/v1/research/tasks/${taskId}/cancel`,
-      body,
+      "GET",
+      `/api/v1/research/campaigns/${campaignId}/brief`,
+      undefined,
       args
     )
   )
@@ -485,7 +558,14 @@ export async function deleteCampaign(campaignId: string, args?: Args) {
     deleted: true
     alreadyDeleted: boolean
     deletedExperimentCount: number
-  }>(await callApi("DELETE", `/api/v1/research/campaigns/${campaignId}`, undefined, args))
+  }>(
+    await callApi(
+      "DELETE",
+      `/api/v1/research/campaigns/${campaignId}`,
+      undefined,
+      args
+    )
+  )
 }
 
 export async function deleteCampaignExperiment(

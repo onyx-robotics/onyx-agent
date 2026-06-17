@@ -177,6 +177,8 @@ async function ensureCampaignMetadata({
   if (cached?.campaignId && cached.metricName && cached.baseCommitSha) {
     return {
       campaignId: cached.campaignId,
+      setupId: cached.setupId,
+      laneId: cached.laneId,
       metricName: cached.metricName,
       baseCommitSha: cached.baseCommitSha,
     }
@@ -184,10 +186,12 @@ async function ensureCampaignMetadata({
 
   const project = await resolveProject(root, args)
   const campaigns = await listProjectCampaigns(project.id, args)
-  const campaign = campaigns.find((candidate) => candidate.name === campaignName)
+  const campaign = campaigns.find(
+    (candidate) => candidate.name === campaignName
+  )
   if (!campaign) {
     throw new Error(
-      `Campaign ${campaignName} is not synced. Run \`onyx campaign create --name ${campaignName} --metric <metric>\` and \`onyx sync\`.`
+      `Campaign ${campaignName} is not synced. Run \`onyx campaign setup --name ${campaignName} --metric <metric>\` and \`onyx sync\`.`
     )
   }
 
@@ -198,6 +202,7 @@ async function ensureCampaignMetadata({
   state.campaigns[key] = {
     ...state.campaigns[key],
     campaignId: campaign.id,
+    setupId: campaign.activeSetupId ?? undefined,
     projectPath,
     baseCommitSha: campaign.baseCommitSha,
     description: campaign.description,
@@ -210,13 +215,15 @@ async function ensureCampaignMetadata({
 
   return {
     campaignId: campaign.id,
+    setupId: campaign.activeSetupId ?? undefined,
+    laneId: state.campaigns[key]?.laneId,
     metricName: campaign.metricName,
     baseCommitSha: campaign.baseCommitSha,
   }
 }
 
 export async function commandExpRun(args: Args) {
-  const root = await repoRoot()
+  const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const campaignName = await resolveCampaignName(root, args)
   const campaign = await ensureCampaignMetadata({
@@ -279,6 +286,17 @@ export async function commandExpRun(args: Args) {
     : checks && checks.status !== "passed"
       ? "checks_failed"
       : "succeeded"
+  const setupId =
+    args.options.setup ?? process.env.ONYX_SETUP_ID ?? campaign.setupId
+  if (!setupId) {
+    throw new Error(
+      "No active setup id. Run `onyx setup validate` or pass --setup <id>."
+    )
+  }
+  const laneId =
+    args.options.lane ?? process.env.ONYX_LANE_ID ?? campaign.laneId
+  const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
+  const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
 
   const outputSummaryParts = [
     result.timedOut ? `Eval timed out after ${timeoutMs / 1000}s.` : "",
@@ -314,6 +332,10 @@ export async function commandExpRun(args: Args) {
     startedAt: started.toISOString(),
     completedAt: completed.toISOString(),
     outputSummary,
+    setupId,
+    sessionId,
+    workerId,
+    laneId,
   }
   await writeLastRun(root, record)
   await emitEvent(root, {
@@ -336,7 +358,7 @@ export async function commandExpRun(args: Args) {
 }
 
 export async function commandExpLog(args: Args) {
-  const root = await repoRoot()
+  const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const campaignName = await resolveCampaignName(root, args)
   const campaign = await ensureCampaignMetadata({
@@ -352,7 +374,9 @@ export async function commandExpLog(args: Args) {
       ? lastRun
       : null
   const resultCommitSha =
-    args.options.commit ?? usableLastRun?.resultCommitSha ?? (await currentCommit(root))
+    args.options.commit ??
+    usableLastRun?.resultCommitSha ??
+    (await currentCommit(root))
   const baseCommitSha =
     args.options.base ?? usableLastRun?.baseCommitSha ?? campaign.baseCommitSha
   const metricName =
@@ -399,6 +423,27 @@ export async function commandExpLog(args: Args) {
     args.options["result-ref"] ??
     usableLastRun?.resultRef ??
     `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
+  const setupId =
+    args.options.setup ??
+    usableLastRun?.setupId ??
+    process.env.ONYX_SETUP_ID ??
+    campaign.setupId
+  if (!setupId) {
+    throw new Error(
+      "No active setup id. Run `onyx setup validate` or pass --setup <id>."
+    )
+  }
+  const laneId =
+    args.options.lane ??
+    usableLastRun?.laneId ??
+    process.env.ONYX_LANE_ID ??
+    campaign.laneId
+  const sessionId =
+    args.options.session ??
+    usableLastRun?.sessionId ??
+    process.env.ONYX_SESSION_ID
+  const workerId =
+    args.options.worker ?? usableLastRun?.workerId ?? process.env.ONYX_WORKER_ID
 
   const record: LocalResearchCampaignExperimentLoggedRecord = {
     schemaVersion: 1,
@@ -422,9 +467,10 @@ export async function commandExpLog(args: Args) {
     startedAt: usableLastRun?.startedAt ?? null,
     completedAt: usableLastRun?.completedAt ?? completedAt,
     outputSummary: usableLastRun?.outputSummary ?? null,
-    sessionId: args.options.session ?? usableLastRun?.sessionId,
-    workerId: args.options.worker ?? usableLastRun?.workerId,
-    taskId: args.options.task ?? usableLastRun?.taskId,
+    setupId,
+    sessionId,
+    workerId,
+    laneId,
   }
   await appendOutbox(root, record)
   await appendHistory(root, experimentRecordToHistory(record)).catch(() => {})
@@ -437,7 +483,9 @@ export async function commandExpLog(args: Args) {
     resultRef,
     message: `${record.name} (${status})`,
   })
-  console.log(`Recorded ${record.name} (${status}) for campaign ${campaignName}`)
+  console.log(
+    `Recorded ${record.name} (${status}) for campaign ${campaignName}`
+  )
   if (usableLastRun) await clearLastRun(root)
 
   await syncAfterRecord(root, args, record.name)
@@ -474,9 +522,10 @@ export async function commandExpList(args: Args) {
       startedAt: lastRun.startedAt ?? null,
       completedAt: lastRun.completedAt ?? null,
       createdAt: lastRun.createdAt,
+      setupId: lastRun.setupId,
       sessionId: lastRun.sessionId,
       workerId: lastRun.workerId,
-      taskId: lastRun.taskId,
+      laneId: lastRun.laneId,
     })
   }
 

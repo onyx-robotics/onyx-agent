@@ -18,14 +18,22 @@ export type CliState = {
     string,
     {
       campaignId?: string
+      setupId?: string
       projectPath?: string
       baseCommitSha?: string | null
       description?: string | null
       metricName?: string
       metricUnit?: string | null
       metricDirection?: "maximize" | "minimize"
+      tools?: string | null
+      constraints?: string | null
+      reset?: string | null
+      humanFeedback?: string | null
       promotionRefName?: string | null
       sessionId?: string
+      laneId?: string
+      laneName?: string
+      laneBranch?: string
       workers?: Record<
         string,
         {

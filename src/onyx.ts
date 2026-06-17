@@ -98,10 +98,11 @@ export { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 export { commandListen } from "./commands/listen"
 export { commandPush, commandStatus, commandSync } from "./commands/sync"
 export {
-  commandSwarmStart,
-  commandSwarmStatus,
+  commandResearchStart,
+  commandResearchStatus,
+  commandSetupValidate,
   commandWorkerRun,
-} from "./commands/swarm"
+} from "./commands/research"
 export { USAGE, main } from "./main"
 export {
   ONYX_LAUNCHER_BYPASS,

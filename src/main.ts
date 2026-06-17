@@ -13,10 +13,11 @@ import { commandListen } from "./commands/listen"
 import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
 import {
-  commandSwarmStart,
-  commandSwarmStatus,
+  commandResearchStart,
+  commandResearchStatus,
+  commandSetupValidate,
   commandWorkerRun,
-} from "./commands/swarm"
+} from "./commands/research"
 import { commandPush, commandStatus, commandSync } from "./commands/sync"
 
 export const USAGE = `onyx - research workflow CLI
@@ -36,15 +37,16 @@ Usage:
   onyx profile use <name>
   onyx profile delete <name>
   onyx profile set-api-key-env <name> <ENV_VAR>
-  onyx campaign create --name <name> --metric <name> [--unit <unit>] [--direction maximize|minimize] [--description <text>] [--project-path <path>]
-      (creates a logical campaign without creating a mutable git branch; each
-      experiment is pushed as an immutable refs/onyx/experiments/* ref)
+  onyx campaign setup --name <name> --metric <name> [--unit <unit>] [--direction maximize|minimize] [--description <text>] [--project-path <path>]
+      (creates a campaign and draft setup; each measured experiment is pushed
+      as an immutable refs/onyx/experiments/* ref)
+  onyx setup validate [--campaign <name>]
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx swarm start --campaign <name> --worker-command "<cmd>" [--workers <n>] [--agent <kind>]
-      (starts persistent local worker worktrees and leases campaign tasks)
-  onyx swarm status [--campaign <name>]
+  onyx research start --campaign <name> --worker-command "<cmd>" [--agents <n>] [--agent <kind>]
+      (starts local autonomous lane workers for a validated setup)
+  onyx research status [--campaign <name>]
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
   onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
@@ -74,15 +76,19 @@ export async function main(argv = process.argv.slice(2)) {
     if (command === "login") return commandLogin(args)
     if (command === "agent") return commandAgent(args)
     if (command === "profile") return commandProfile(args)
-    if (command === "campaign" && sub === "create")
+    if (command === "campaign" && sub === "setup")
       return commandCampaignCreate(args)
+    if (command === "setup" && sub === "validate")
+      return commandSetupValidate(args)
     if (command === "campaign" && sub === "use") return commandCampaignUse(args)
     if (command === "campaign" && sub === "status")
       return commandCampaignStatus(args)
     if (command === "campaign" && sub === "delete")
       return commandCampaignDelete(args)
-    if (command === "swarm" && sub === "start") return commandSwarmStart(args)
-    if (command === "swarm" && sub === "status") return commandSwarmStatus(args)
+    if (command === "research" && sub === "start")
+      return commandResearchStart(args)
+    if (command === "research" && sub === "status")
+      return commandResearchStatus(args)
     if (command === "worker" && sub === "run") return commandWorkerRun(args)
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "exp" && sub === "log") return commandExpLog(args)
