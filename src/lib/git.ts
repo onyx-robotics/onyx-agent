@@ -25,19 +25,9 @@ export async function currentCommit(cwd: string) {
   return git(["rev-parse", "HEAD"], cwd)
 }
 
-export function gitBranchForName(name: string) {
-  return `onyx/${name}`
-}
-
-export function nameFromGitBranch(gitBranchName: string) {
-  return gitBranchName.startsWith("onyx/")
-    ? gitBranchName.slice("onyx/".length)
-    : null
-}
-
-/** Pushes a branch to origin, setting upstream. Throws on failure. */
-export async function pushBranch(root: string, branchName: string) {
-  await git(["push", "-u", "origin", branchName], root)
+/** Pushes an immutable local commit SHA to a remote ref. */
+export async function pushRef(root: string, commitSha: string, ref: string) {
+  await git(["push", "origin", `${commitSha}:${ref}`], root)
 }
 
 export function normalizeRepositoryUrl(value: string) {

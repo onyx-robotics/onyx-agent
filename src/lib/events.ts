@@ -24,8 +24,14 @@ export async function emitEvent(
   root: string,
   event: {
     type: LocalResearchEventType
-    branchName?: string
+    campaignName?: string
+    campaignId?: string
+    sessionId?: string
+    workerId?: string
+    taskId?: string
+    runRef?: string
     commitSha?: string
+    resultRef?: string
     message?: string
   }
 ): Promise<void> {

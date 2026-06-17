@@ -1,19 +1,19 @@
 import type {
-  LocalResearchExperimentLoggedRecord,
+  LocalResearchCampaignExperimentLoggedRecord,
   LocalResearchHistoryRecord,
 } from "../protocol"
 
 import { readFile } from "node:fs/promises"
 
+import { listProjectCampaigns, resolveProject } from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
 import { emitEvent } from "../lib/events"
-import { currentBranch, currentCommit, repoRoot } from "../lib/git"
+import { currentCommit, repoRoot } from "../lib/git"
 import {
   appendHistory,
   experimentRecordToHistory,
   readHistory,
 } from "../lib/history"
-import { branchMetadata, resolveBranchName } from "../lib/markdown"
 import {
   parseMetricLines,
   primaryMetric,
@@ -24,16 +24,25 @@ import {
   clearLastRun,
   clientRunRef,
   readLastRun,
+  readState,
   writeLastRun,
+  writeState,
   type LastRunRecord,
 } from "../lib/outbox"
-import { onyxPath, resolveProjectPath, scopedRoot } from "../lib/project"
+import {
+  campaignStateKey,
+  onyxPath,
+  resolveProjectPath,
+  scopedRoot,
+} from "../lib/project"
 import { pathExists, runProcess } from "../lib/process"
 import { flushOutbox } from "../lib/sync"
 import { renderExperimentTable } from "../lib/tui"
 
-type ExperimentStatus = LocalResearchExperimentLoggedRecord["status"]
-type ChecksRecord = NonNullable<LocalResearchExperimentLoggedRecord["checks"]>
+type ExperimentStatus = LocalResearchCampaignExperimentLoggedRecord["status"]
+type ChecksRecord = NonNullable<
+  LocalResearchCampaignExperimentLoggedRecord["checks"]
+>
 
 async function syncAfterRecord(root: string, args: Args, recordName: string) {
   await flushOutbox(root, args).catch((error) => {
@@ -88,6 +97,10 @@ function parseAgentNotes(value?: string): Record<string, unknown> {
   return { note: value }
 }
 
+function safeRefSegment(value: string) {
+  return value.replace(/[^A-Za-z0-9._/-]+/g, "-")
+}
+
 async function assertEvalReady(evalSh: string) {
   if (!(await pathExists(evalSh))) {
     throw new Error(
@@ -134,39 +147,117 @@ async function runChecks({
   }
 }
 
+async function resolveCampaignName(root: string, args: Args) {
+  const state = await readState(root)
+  const campaignName = args.options.campaign ?? state.activeCampaign
+  if (!campaignName) {
+    throw new Error(
+      "No active campaign. Run `onyx campaign use --name <name>` or pass `--campaign <name>`."
+    )
+  }
+  return campaignName
+}
+
+async function ensureCampaignMetadata({
+  root,
+  args,
+  projectPath,
+  campaignName,
+}: {
+  root: string
+  args: Args
+  projectPath: string
+  campaignName: string
+}) {
+  await flushOutbox(root, args, { quiet: true }).catch(() => {})
+
+  const state = await readState(root)
+  const key = campaignStateKey(projectPath, campaignName)
+  const cached = state.campaigns?.[key]
+  if (cached?.campaignId && cached.metricName && cached.baseCommitSha) {
+    return {
+      campaignId: cached.campaignId,
+      metricName: cached.metricName,
+      baseCommitSha: cached.baseCommitSha,
+    }
+  }
+
+  const project = await resolveProject(root, args)
+  const campaigns = await listProjectCampaigns(project.id, args)
+  const campaign = campaigns.find((candidate) => candidate.name === campaignName)
+  if (!campaign) {
+    throw new Error(
+      `Campaign ${campaignName} is not synced. Run \`onyx campaign create --name ${campaignName} --metric <metric>\` and \`onyx sync\`.`
+    )
+  }
+
+  state.projectId = project.id
+  state.projectPath = projectPath
+  state.activeCampaign = campaignName
+  state.campaigns = state.campaigns ?? {}
+  state.campaigns[key] = {
+    ...state.campaigns[key],
+    campaignId: campaign.id,
+    projectPath,
+    baseCommitSha: campaign.baseCommitSha,
+    description: campaign.description,
+    metricName: campaign.metricName,
+    metricUnit: campaign.metricUnit,
+    metricDirection: campaign.metricDirection,
+    promotionRefName: campaign.promotionRefName,
+  }
+  await writeState(root, state)
+
+  return {
+    campaignId: campaign.id,
+    metricName: campaign.metricName,
+    baseCommitSha: campaign.baseCommitSha,
+  }
+}
+
 export async function commandExpRun(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
-  const branchName = await resolveBranchName(root, args.options.branch)
-  const gitBranchName = await currentBranch(root)
-  const commitSha = await currentCommit(root)
-  const branch = await branchMetadata({
+  const campaignName = await resolveCampaignName(root, args)
+  const campaign = await ensureCampaignMetadata({
     root,
+    args,
     projectPath,
-    branchName,
-    gitBranchName,
+    campaignName,
   })
+  const resultCommitSha = await currentCommit(root)
   const evalSh = onyxPath(root, projectPath, "eval.sh")
   await assertEvalReady(evalSh)
 
   const timeoutMs = numberOption(args, "timeout", 600) * 1000
   const checksTimeoutMs = numberOption(args, "checks-timeout", 300) * 1000
   const started = new Date()
-  const runRef = clientRunRef(branchName)
-  await emitEvent(root, { type: "exp_run_started", branchName, commitSha })
+  const runRef = clientRunRef(campaignName)
+  const resultRef = `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
+  await emitEvent(root, {
+    type: "exp_run_started",
+    campaignName,
+    campaignId: campaign.campaignId,
+    runRef,
+    commitSha: resultCommitSha,
+    resultRef,
+  })
   const result = await runProcess("bash", [evalSh], {
     cwd: scopedRoot(root, projectPath),
     timeoutMs,
   })
   const completed = new Date()
-  const metrics = parseMetricLines(result.stdout, branch.metricName)
-  const primary = primaryMetric(metrics, branch.metricName)
+  const metrics = parseMetricLines(result.stdout, campaign.metricName)
+  const primary = primaryMetric(metrics, campaign.metricName)
   const benchmarkSucceeded =
     result.code === 0 && !result.timedOut && primary.value !== null
   await emitEvent(root, {
     type: "eval_finished",
-    branchName,
-    commitSha,
+    campaignName,
+    campaignId: campaign.campaignId,
+    runRef,
+    commitSha: resultCommitSha,
+    resultRef,
     message: `${primary.name}=${primary.value ?? "null"} (${benchmarkSucceeded ? "ok" : "failed"})`,
   })
   const checks = benchmarkSucceeded
@@ -175,8 +266,11 @@ export async function commandExpRun(args: Args) {
   if (checks) {
     await emitEvent(root, {
       type: "checks_finished",
-      branchName,
-      commitSha,
+      campaignName,
+      campaignId: campaign.campaignId,
+      runRef,
+      commitSha: resultCommitSha,
+      resultRef,
       message: checks.status,
     })
   }
@@ -189,7 +283,7 @@ export async function commandExpRun(args: Args) {
   const outputSummaryParts = [
     result.timedOut ? `Eval timed out after ${timeoutMs / 1000}s.` : "",
     result.code === 0 && primary.value === null
-      ? `No METRIC line found for ${branch.metricName}.`
+      ? `No METRIC line found for ${campaign.metricName}.`
       : "",
     summarizeOutput(result.stdout, result.stderr),
   ].filter(Boolean)
@@ -205,10 +299,11 @@ export async function commandExpRun(args: Args) {
     schemaVersion: 1,
     createdAt: completed.toISOString(),
     runRef,
-    branchName,
-    gitBranchName,
+    campaignName,
     projectPath,
-    commitSha,
+    baseCommitSha: campaign.baseCommitSha,
+    resultCommitSha,
+    resultRef,
     status,
     primaryMetricName: primary.name,
     primaryMetricValue: primary.value,
@@ -223,12 +318,15 @@ export async function commandExpRun(args: Args) {
   await writeLastRun(root, record)
   await emitEvent(root, {
     type: "run_finished",
-    branchName,
-    commitSha,
+    campaignName,
+    campaignId: campaign.campaignId,
+    runRef,
+    commitSha: resultCommitSha,
+    resultRef,
     message: status,
   })
   console.log(
-    `Measured ${commitSha.slice(0, 7)} (${primary.name}=${primary.value ?? "null"}, ${status}); runRef ${runRef}`
+    `Measured ${resultCommitSha.slice(0, 7)} (${primary.name}=${primary.value ?? "null"}, ${status}); runRef ${runRef}`
   )
   console.log("Run `onyx exp log --description <text>` to record this result.")
 
@@ -240,27 +338,27 @@ export async function commandExpRun(args: Args) {
 export async function commandExpLog(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
-  const branchName = await resolveBranchName(root, args.options.branch)
-  const gitBranchName = await currentBranch(root)
+  const campaignName = await resolveCampaignName(root, args)
+  const campaign = await ensureCampaignMetadata({
+    root,
+    args,
+    projectPath,
+    campaignName,
+  })
   const lastRun = await readLastRun(root)
   const usableLastRun =
-    lastRun?.branchName === branchName && lastRun.projectPath === projectPath
+    lastRun?.campaignName === campaignName &&
+    lastRun.projectPath === projectPath
       ? lastRun
       : null
-  const commitSha =
-    args.options.commit ??
-    usableLastRun?.commitSha ??
-    (await currentCommit(root))
-  const branch = await branchMetadata({
-    root,
-    projectPath,
-    branchName,
-    gitBranchName,
-  })
+  const resultCommitSha =
+    args.options.commit ?? usableLastRun?.resultCommitSha ?? (await currentCommit(root))
+  const baseCommitSha =
+    args.options.base ?? usableLastRun?.baseCommitSha ?? campaign.baseCommitSha
   const metricName =
     args.options["metric-name"] ??
     usableLastRun?.primaryMetricName ??
-    branch.metricName
+    campaign.metricName
   const metricValue =
     args.options.metric === undefined
       ? (usableLastRun?.primaryMetricValue ?? null)
@@ -271,11 +369,12 @@ export async function commandExpLog(args: Args) {
   const status = validateStatus(
     args.options.status ?? usableLastRun?.status ?? "succeeded"
   )
-  if ((status === "succeeded" || status === "accepted") && metricValue === null) {
+  if (
+    (status === "succeeded" || status === "accepted") &&
+    metricValue === null
+  ) {
     throw new Error(
-      `Cannot record ${status} without a metric for "${metricName}". ` +
-        `Run \`onyx exp run\` so eval.sh emits a \`METRIC ${metricName}=<value>\` line, ` +
-        `or pass \`--metric <value>\`. If the eval produced no metric, record it with \`--status failed\`.`
+      `Cannot record ${status} without a metric for "${metricName}".`
     )
   }
   const checks = usableLastRun?.checks ?? null
@@ -295,18 +394,24 @@ export async function commandExpLog(args: Args) {
       : metricValue === null
         ? {}
         : { ...(usableLastRun?.metrics ?? {}), [metricName]: metricValue }
+  const runRef = usableLastRun?.runRef ?? clientRunRef(campaignName)
+  const resultRef =
+    args.options["result-ref"] ??
+    usableLastRun?.resultRef ??
+    `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
 
-  const record: LocalResearchExperimentLoggedRecord = {
+  const record: LocalResearchCampaignExperimentLoggedRecord = {
     schemaVersion: 1,
-    type: "experiment_logged",
+    type: "campaign_experiment_logged",
     createdAt: completedAt,
-    runRef: usableLastRun?.runRef ?? clientRunRef(branchName),
-    branchName,
-    name: args.options.name ?? `experiment-${commitSha.slice(0, 7)}`,
+    runRef,
+    campaignName,
+    name: args.options.name ?? `experiment-${resultCommitSha.slice(0, 7)}`,
     description: descriptionOption(args),
-    gitBranchName,
     projectPath,
-    commitSha,
+    baseCommitSha,
+    resultCommitSha,
+    resultRef,
     status,
     primaryMetricName: metricName,
     primaryMetricValue: metricValue,
@@ -317,26 +422,27 @@ export async function commandExpLog(args: Args) {
     startedAt: usableLastRun?.startedAt ?? null,
     completedAt: usableLastRun?.completedAt ?? completedAt,
     outputSummary: usableLastRun?.outputSummary ?? null,
+    sessionId: args.options.session ?? usableLastRun?.sessionId,
+    workerId: args.options.worker ?? usableLastRun?.workerId,
+    taskId: args.options.task ?? usableLastRun?.taskId,
   }
   await appendOutbox(root, record)
-  // Permanent local history row; superseded by the canonical record on sync.
   await appendHistory(root, experimentRecordToHistory(record)).catch(() => {})
   await emitEvent(root, {
     type: "exp_logged",
-    branchName,
-    commitSha,
+    campaignName,
+    campaignId: campaign.campaignId,
+    runRef,
+    commitSha: resultCommitSha,
+    resultRef,
     message: `${record.name} (${status})`,
   })
-  console.log(`Recorded ${record.name} (${status})`)
+  console.log(`Recorded ${record.name} (${status}) for campaign ${campaignName}`)
   if (usableLastRun) await clearLastRun(root)
 
   await syncAfterRecord(root, args, record.name)
 }
 
-/**
- * Searches the local history cache (`.git/onyx/history.jsonl`). Works fully
- * offline; run `onyx sync` first to hydrate cross-branch canonical history.
- */
 export async function commandExpList(args: Args) {
   const root = await repoRoot()
   const { records, corrupt } = await readHistory(root)
@@ -346,18 +452,18 @@ export async function commandExpList(args: Args) {
 
   const rows: LocalResearchHistoryRecord[] = [...records]
 
-  // Surface a measured-but-unlogged run so the latest attempt is never hidden.
   const lastRun = await readLastRun(root)
   if (lastRun && !rows.some((row) => row.runRef === lastRun.runRef)) {
     rows.push({
       schemaVersion: 1,
       source: "local",
-      branchName: lastRun.branchName,
-      gitBranchName: lastRun.gitBranchName,
+      campaignName: lastRun.campaignName,
       runRef: lastRun.runRef,
-      commitSha: lastRun.commitSha,
+      baseCommitSha: lastRun.baseCommitSha,
+      resultCommitSha: lastRun.resultCommitSha,
+      resultRef: lastRun.resultRef,
       status: lastRun.status,
-      name: `(unlogged) ${lastRun.commitSha.slice(0, 7)}`,
+      name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
       description: null,
       primaryMetricName: lastRun.primaryMetricName,
       primaryMetricValue: lastRun.primaryMetricValue,
@@ -368,12 +474,17 @@ export async function commandExpList(args: Args) {
       startedAt: lastRun.startedAt ?? null,
       completedAt: lastRun.completedAt ?? null,
       createdAt: lastRun.createdAt,
+      sessionId: lastRun.sessionId,
+      workerId: lastRun.workerId,
+      taskId: lastRun.taskId,
     })
   }
 
   let filtered = rows
-  if (args.options.branch) {
-    filtered = filtered.filter((row) => row.branchName === args.options.branch)
+  if (args.options.campaign) {
+    filtered = filtered.filter(
+      (row) => row.campaignName === args.options.campaign
+    )
   }
   if (args.options.status) {
     const status = validateStatus(args.options.status)
@@ -402,7 +513,6 @@ export async function commandExpList(args: Args) {
     )
   }
 
-  // Newest first for reading; the file itself stays branch-grouped.
   filtered.sort((a, b) =>
     a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0
   )
@@ -427,8 +537,7 @@ export async function commandExpList(args: Args) {
     columns: process.stdout.columns ?? 120,
     color: process.stdout.isTTY ?? false,
     nowMs: Date.now(),
-    // The branch column is redundant when filtering to a single branch.
-    showBranch: !args.options.branch,
+    showCampaign: !args.options.campaign,
   })
   for (const line of lines) console.log(line)
   if (filtered.length > limited.length) {

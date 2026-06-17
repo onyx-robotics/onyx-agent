@@ -1,5 +1,6 @@
 import {
   gitShaSchema,
+  researchExperimentGitStatusSchema,
   researchExperimentStatusSchema,
   researchMetricDirectionSchema,
 } from "./research"
@@ -23,41 +24,41 @@ const checksSchema = z.object({
 
 export const localResearchSyncMetadataSchema = z.object({
   projectId: z.uuid().optional(),
-  branchId: z.uuid().optional(),
+  campaignId: z.uuid().optional(),
   experimentId: z.uuid().optional(),
+  workerId: z.uuid().optional(),
+  taskId: z.uuid().optional(),
+  sessionId: z.uuid().optional(),
   syncedAt: z.iso.datetime().optional(),
 })
 
-export const localResearchBranchStartedRecordSchema = z.object({
+export const localResearchCampaignStartedRecordSchema = z.object({
   schemaVersion: z.literal(1),
-  type: z.literal("branch_started"),
+  type: z.literal("campaign_started"),
   createdAt: z.iso.datetime(),
   name: nameSchema,
   description: z.string().trim().max(2000).nullable().optional(),
-  gitBranchName: z.string().trim().min(1).max(240),
-  // The git branch HEAD was on when the branch was created (e.g. another
-  // onyx/* branch, or "main"). The server resolves it to a tracked parent
-  // branch, or null when it doesn't match one.
-  parentGitBranchName: z.string().trim().min(1).max(240).nullable().optional(),
   projectPath: z.string().trim().max(240).optional(),
   baseCommitSha: gitShaSchema,
   metricName: z.string().trim().min(1).max(120),
   metricUnit: z.string().trim().max(80).nullable().optional(),
   metricDirection: researchMetricDirectionSchema,
+  promotionRefName: z.string().trim().min(1).max(300).nullable().optional(),
   sync: localResearchSyncMetadataSchema.optional(),
 })
 
-export const localResearchExperimentLoggedRecordSchema = z.object({
+export const localResearchCampaignExperimentLoggedRecordSchema = z.object({
   schemaVersion: z.literal(1),
-  type: z.literal("experiment_logged"),
+  type: z.literal("campaign_experiment_logged"),
   createdAt: z.iso.datetime(),
   runRef: z.string().trim().min(1).max(240),
-  branchName: nameSchema,
+  campaignName: nameSchema,
   name: z.string().trim().min(1).max(160),
   description: z.string().trim().max(2000).nullable().optional(),
-  gitBranchName: z.string().trim().min(1).max(240),
   projectPath: z.string().trim().max(240).optional(),
-  commitSha: gitShaSchema,
+  baseCommitSha: gitShaSchema,
+  resultCommitSha: gitShaSchema,
+  resultRef: z.string().trim().min(1).max(300),
   status: researchExperimentStatusSchema,
   primaryMetricName: z.string().trim().min(1).max(120),
   primaryMetricValue: z.number().finite().nullable(),
@@ -68,31 +69,28 @@ export const localResearchExperimentLoggedRecordSchema = z.object({
   startedAt: z.iso.datetime().nullable().optional(),
   completedAt: z.iso.datetime().nullable().optional(),
   outputSummary: z.string().trim().max(4000).nullable().optional(),
+  sessionId: z.uuid().optional(),
+  workerId: z.uuid().optional(),
+  taskId: z.uuid().optional(),
   sync: localResearchSyncMetadataSchema.optional(),
 })
 
 export const localResearchRecordSchema = z.union([
-  localResearchBranchStartedRecordSchema,
-  localResearchExperimentLoggedRecordSchema,
+  localResearchCampaignStartedRecordSchema,
+  localResearchCampaignExperimentLoggedRecordSchema,
 ])
 
 export const localResearchJsonlSchema = z.array(localResearchRecordSchema)
 
-/**
- * One experiment in `.git/onyx/history.jsonl` — the permanent, offline-
- * searchable cache of the project's research history. Unlike the outbox,
- * entries are never deleted on flush: `onyx exp log` appends provisional
- * records (`source: "local"`) and `onyx sync` rewrites the file to the
- * canonical API state (`source: "api"`), keeping still-pending local records.
- * The Onyx app remains the source of truth; this is a cache keyed by runRef.
- */
 export const localResearchHistoryRecordSchema = z.object({
   schemaVersion: z.literal(1),
   source: z.enum(["local", "api"]),
-  branchName: nameSchema,
-  gitBranchName: z.string().trim().min(1).max(240).optional(),
+  campaignName: nameSchema,
   runRef: z.string().trim().min(1).max(240),
-  commitSha: gitShaSchema,
+  baseCommitSha: gitShaSchema,
+  resultCommitSha: gitShaSchema,
+  resultRef: z.string().trim().min(1).max(300),
+  gitStatus: researchExperimentGitStatusSchema.optional(),
   status: researchExperimentStatusSchema,
   name: z.string().trim().min(1).max(160),
   description: z.string().trim().max(2000).nullable().optional(),
@@ -106,15 +104,27 @@ export const localResearchHistoryRecordSchema = z.object({
   startedAt: z.iso.datetime().nullable().optional(),
   completedAt: z.iso.datetime().nullable().optional(),
   createdAt: z.iso.datetime(),
-  // Server-assigned fields, present when source === "api".
   experimentId: z.uuid().optional(),
-  branchId: z.uuid().optional(),
-  sequenceNumber: z.number().int().positive().optional(),
+  campaignId: z.uuid().optional(),
+  sessionId: z.uuid().optional(),
+  workerId: z.uuid().optional(),
+  taskId: z.uuid().optional(),
 })
 
 export const localResearchEventTypeSchema = z.enum([
-  "branch_created",
-  "branch_deleted",
+  "campaign_created",
+  "campaign_deleted",
+  "session_started",
+  "session_stopped",
+  "task_created",
+  "task_leased",
+  "task_heartbeat",
+  "task_completed",
+  "task_cancelled",
+  "worker_started",
+  "worker_heartbeat",
+  "worker_stopped",
+  "swarm_started",
   "exp_run_started",
   "eval_finished",
   "checks_finished",
@@ -124,28 +134,29 @@ export const localResearchEventTypeSchema = z.enum([
   "pushed",
 ])
 
-/**
- * One line in `.git/onyx/events.jsonl` — a best-effort local activity feed
- * emitted by CLI commands so `onyx listen` can show what a running agent
- * session is doing. Never authoritative; periodically truncated.
- */
 export const localResearchEventSchema = z.object({
   schemaVersion: z.literal(1),
   ts: z.iso.datetime(),
   type: localResearchEventTypeSchema,
-  branchName: z.string().trim().max(240).optional(),
+  campaignName: z.string().trim().max(240).optional(),
+  campaignId: z.uuid().optional(),
+  sessionId: z.uuid().optional(),
+  workerId: z.uuid().optional(),
+  taskId: z.uuid().optional(),
+  runRef: z.string().trim().max(240).optional(),
   commitSha: gitShaSchema.optional(),
+  resultRef: z.string().trim().max(300).optional(),
   message: z.string().max(1000).optional(),
 })
 
 export type LocalResearchSyncMetadata = z.infer<
   typeof localResearchSyncMetadataSchema
 >
-export type LocalResearchBranchStartedRecord = z.infer<
-  typeof localResearchBranchStartedRecordSchema
+export type LocalResearchCampaignStartedRecord = z.infer<
+  typeof localResearchCampaignStartedRecordSchema
 >
-export type LocalResearchExperimentLoggedRecord = z.infer<
-  typeof localResearchExperimentLoggedRecordSchema
+export type LocalResearchCampaignExperimentLoggedRecord = z.infer<
+  typeof localResearchCampaignExperimentLoggedRecordSchema
 >
 export type LocalResearchRecord = z.infer<typeof localResearchRecordSchema>
 export type LocalResearchHistoryRecord = z.infer<

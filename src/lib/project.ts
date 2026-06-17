@@ -37,6 +37,6 @@ export function onyxPath(
   return join(scopedRoot(root, projectPath), ONYX_DIR, ...segments)
 }
 
-export function branchStateKey(projectPath: string, branchName: string) {
-  return projectPath ? `${projectPath}:${branchName}` : branchName
+export function campaignStateKey(projectPath: string, campaignName: string) {
+  return projectPath ? `${projectPath}:${campaignName}` : campaignName
 }

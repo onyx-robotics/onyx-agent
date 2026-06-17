@@ -1,6 +1,6 @@
 import type {
-  LocalResearchExperimentLoggedRecord,
-  LocalResearchBranchStartedRecord,
+  LocalResearchCampaignExperimentLoggedRecord,
+  LocalResearchCampaignStartedRecord,
   LocalResearchRecord,
 } from "../protocol"
 
@@ -8,20 +8,19 @@ import type { Args } from "./args"
 import {
   ApiError,
   getProjectDeletions,
-  listProjectBranches,
-  reportExperiment,
+  listProjectCampaigns,
+  reportCampaignExperiment,
   resolveProject,
-  upsertBranch,
+  upsertCampaign,
   type ApiProject,
   type ApiProjectDeletions,
 } from "./api"
 import { apiTarget } from "./config"
 import { filterDeletedOutboxRecords } from "./deletions"
 import { emitEvent } from "./events"
-import { pushBranch, repositoryUrl } from "./git"
+import { pushRef, repositoryUrl } from "./git"
 import { applyHistorySyncUpdates, type HistorySyncUpdate } from "./history"
-import { branchMetadata } from "./markdown"
-import { branchStateKey, normalizeProjectPath } from "./project"
+import { campaignStateKey, normalizeProjectPath } from "./project"
 import {
   readOutbox,
   readState,
@@ -37,72 +36,22 @@ export type FlushResult = {
   skippedDeleted: number
 }
 
-function secondaryMetrics(record: LocalResearchExperimentLoggedRecord) {
+function campaignSecondaryMetrics(
+  record: LocalResearchCampaignExperimentLoggedRecord
+) {
   const rest: Record<string, number> = { ...record.metrics }
   delete rest[record.primaryMetricName]
   return rest
 }
 
-async function upsertBranchFromMetadata({
-  root,
-  branchName,
-  gitBranchName,
-  state,
-  args,
-}: {
-  root: string
-  branchName: string
-  gitBranchName: string
-  state: CliState
-  args: Args
-}): Promise<string> {
-  const projectPath = state.projectPath ?? ""
-  const key = branchStateKey(projectPath, branchName)
-  const cached = state.branches[key]?.branchId
-  if (cached) return cached
-
-  const meta = await branchMetadata({
-    root,
-    projectPath,
-    branchName,
-    gitBranchName,
-  })
-  if (!meta.baseCommitSha) {
-    throw new Error(
-      `Branch ${branchName} is missing a base commit. Run \`onyx branch create\` again.`
-    )
-  }
-  const result = await upsertBranch(
-    {
-      repositoryUrl: await repositoryUrl(root, args.options["repository-url"]),
-      projectPath,
-      name: branchName,
-      description: meta.description ?? undefined,
-      gitBranchName,
-      parentGitBranchName: meta.parentGitBranchName ?? undefined,
-      baseCommitSha: meta.baseCommitSha,
-      metricName: meta.metricName,
-      metricUnit: meta.metricUnit ?? undefined,
-      metricDirection: meta.metricDirection,
-    },
-    args
-  )
-  state.projectId = result.project.id
-  state.branches[key] = {
-    ...state.branches[key],
-    branchId: result.branch.id,
-  }
-  return result.branch.id
-}
-
-async function flushBranchStarted({
+async function flushCampaignStarted({
   root,
   record,
   state,
   args,
 }: {
   root: string
-  record: LocalResearchBranchStartedRecord
+  record: LocalResearchCampaignStartedRecord
   state: CliState
   args: Args
 }): Promise<ApiProject> {
@@ -110,73 +59,117 @@ async function flushBranchStarted({
     state.projectPath = record.projectPath
   }
   const projectPath = state.projectPath ?? ""
-  const result = await upsertBranch(
+  const result = await upsertCampaign(
     {
       repositoryUrl: await repositoryUrl(root, args.options["repository-url"]),
       projectPath,
       name: record.name,
       description: record.description ?? undefined,
-      gitBranchName: record.gitBranchName,
-      parentGitBranchName: record.parentGitBranchName ?? undefined,
       baseCommitSha: record.baseCommitSha,
       metricName: record.metricName,
       metricUnit: record.metricUnit ?? undefined,
       metricDirection: record.metricDirection,
+      promotionRefName: record.promotionRefName ?? undefined,
     },
     args
   )
   state.projectId = result.project.id
-  const key = branchStateKey(projectPath, record.name)
-  state.branches[key] = {
-    ...state.branches[key],
-    branchId: result.branch.id,
+  state.activeCampaign = record.name
+  const key = campaignStateKey(projectPath, record.name)
+  state.campaigns = state.campaigns ?? {}
+  state.campaigns[key] = {
+    ...state.campaigns[key],
+    campaignId: result.campaign.id,
     projectPath,
-    gitBranchName: record.gitBranchName,
-    ...(record.parentGitBranchName
-      ? { parentGitBranchName: record.parentGitBranchName }
-      : {}),
     baseCommitSha: record.baseCommitSha,
     description: record.description ?? null,
     metricName: record.metricName,
     metricUnit: record.metricUnit ?? null,
     metricDirection: record.metricDirection,
+    promotionRefName: record.promotionRefName ?? null,
   }
   return result.project
 }
 
-async function flushExperiment({
+async function campaignIdFromMetadata({
+  root,
+  campaignName,
+  state,
+  args,
+}: {
+  root: string
+  campaignName: string
+  state: CliState
+  args: Args
+}) {
+  const projectPath = state.projectPath ?? ""
+  const key = campaignStateKey(projectPath, campaignName)
+  const cached = state.campaigns?.[key]?.campaignId
+  if (cached) return cached
+
+  const project = state.projectId
+    ? ({ id: state.projectId } as ApiProject)
+    : await resolveProject(root, args)
+  const campaigns = await listProjectCampaigns(project.id, args)
+  const campaign = campaigns.find(
+    (candidate) => candidate.name === campaignName
+  )
+  if (!campaign) {
+    throw new Error(
+      `Campaign ${campaignName} is not synced yet. Run \`onyx campaign create --name ${campaignName} --metric <metric>\`.`
+    )
+  }
+  state.campaigns = state.campaigns ?? {}
+  state.campaigns[key] = {
+    ...state.campaigns[key],
+    campaignId: campaign.id,
+    projectPath,
+    baseCommitSha: campaign.baseCommitSha,
+    description: campaign.description,
+    metricName: campaign.metricName,
+    metricUnit: campaign.metricUnit,
+    metricDirection: campaign.metricDirection,
+    promotionRefName: campaign.promotionRefName,
+  }
+  return campaign.id
+}
+
+async function flushCampaignExperiment({
   root,
   record,
   state,
   args,
 }: {
   root: string
-  record: LocalResearchExperimentLoggedRecord
+  record: LocalResearchCampaignExperimentLoggedRecord
   state: CliState
   args: Args
 }): Promise<HistorySyncUpdate> {
   if (record.projectPath !== undefined) {
     state.projectPath = record.projectPath
   }
-  const branchId = await upsertBranchFromMetadata({
+  const campaignId = await campaignIdFromMetadata({
     root,
-    branchName: record.branchName,
-    gitBranchName: record.gitBranchName,
+    campaignName: record.campaignName,
     state,
     args,
   })
 
-  const reported = await reportExperiment(
-    branchId,
+  await pushRef(root, record.resultCommitSha, record.resultRef)
+
+  const reported = await reportCampaignExperiment(
+    campaignId,
     {
       name: record.name,
       description: record.description ?? undefined,
       runRef: record.runRef,
-      commitSha: record.commitSha,
+      baseCommitSha: record.baseCommitSha,
+      resultCommitSha: record.resultCommitSha,
+      resultRef: record.resultRef,
       status: record.status,
       primaryMetricName: record.primaryMetricName,
       primaryMetricValue: record.primaryMetricValue ?? undefined,
-      secondaryMetrics: secondaryMetrics(record),
+      secondaryMetrics: campaignSecondaryMetrics(record),
       artifactRefs: {},
       agentNotes: record.agentNotes,
       checks: record.checks ?? undefined,
@@ -184,26 +177,25 @@ async function flushExperiment({
       outputSummary: record.outputSummary ?? undefined,
       startedAt: record.startedAt ?? undefined,
       completedAt: record.completedAt ?? undefined,
+      sessionId: record.sessionId,
+      workerId: record.workerId,
+      taskId: record.taskId,
+      provenance: [],
     },
     args
   )
-  return {
-    sequenceNumber: reported.sequenceNumber,
+  record.sync = {
+    ...(record.sync ?? {}),
+    campaignId,
     experimentId: reported.id,
-    branchId,
+    syncedAt: new Date().toISOString(),
+  }
+  return {
+    experimentId: reported.id,
+    campaignId,
   }
 }
 
-/**
- * Replays the local outbox to the Onyx API. Pushes every referenced branch so
- * reported commits are reachable, then lazily upserts the project/branches and
- * reports experiments idempotently (server dedups by runRef). A 409 means the
- * commit is not reachable through GitHub yet (push/propagation lag) and is retried on the
- * next flush; a 410 means the record was deleted server-side and is dropped
- * without retry; any other error keeps the record queued and is surfaced.
- * Records matching the project's deletions feed are dropped up front so a
- * stale queue never resurrects deleted branches or experiments.
- */
 export async function flushOutbox(
   root: string,
   args: Args,
@@ -235,16 +227,13 @@ export async function flushOutbox(
   } catch (error) {
     if (!options.quiet) {
       console.warn(
-        `Project lookup skipped; branch sync will lazily create it if GitHub access is available (${
+        `Project lookup skipped; campaign sync will lazily create it if GitHub access is available (${
           error instanceof Error ? error.message : String(error)
         })`
       )
     }
   }
 
-  // Drop records the server has deleted before replaying anything. Best
-  // effort: with no deletions feed (offline, older server) everything is
-  // kept and the report path's 410 still catches deleted runRefs.
   let deletions: ApiProjectDeletions | null = null
   if (project) {
     try {
@@ -256,48 +245,16 @@ export async function flushOutbox(
   const { kept, dropped } = filterDeletedOutboxRecords(records, deletions)
   let skippedDeleted = dropped
 
-  // Push every referenced branch up front so reported commits are reachable.
-  for (const branch of new Set(kept.map((record) => record.gitBranchName))) {
-    try {
-      await pushBranch(root, branch)
-    } catch {
-      // Keep going: the report 409s and is retried if the commit is unreachable.
-    }
-  }
-
-  // Pre-populate branch ids so concurrently-created branches resolve without upsert.
-  if (project) {
-    try {
-      for (const branch of await listProjectBranches(project.id, args)) {
-        const key = branchStateKey(state.projectPath ?? "", branch.name)
-        state.branches[key] = { ...state.branches[key], branchId: branch.id }
-      }
-    } catch {
-      // best-effort
-    }
-  }
-
   const remaining: LocalResearchRecord[] = []
   const historyUpdates = new Map<string, HistorySyncUpdate>()
-  // Outbox order guarantees a parent's branch_started precedes its child's,
-  // but a parent that fails to flush must hold its children back: a child
-  // upserted first would be permanently recorded without a parent.
-  const failedBranchNames = new Set<string>()
   let flushed = 0
 
   for (const record of kept) {
     try {
-      if (record.type === "branch_started") {
-        if (
-          record.parentGitBranchName &&
-          failedBranchNames.has(record.parentGitBranchName)
-        ) {
-          remaining.push(record)
-          continue
-        }
-        project = await flushBranchStarted({ root, record, state, args })
+      if (record.type === "campaign_started") {
+        project = await flushCampaignStarted({ root, record, state, args })
       } else {
-        const update = await flushExperiment({
+        const update = await flushCampaignExperiment({
           root,
           record,
           state,
@@ -307,14 +264,9 @@ export async function flushOutbox(
       }
       flushed += 1
     } catch (error) {
-      // 410 Gone: the runRef was deleted server-side — drop it for good
-      // instead of re-queueing (replaying it would always 410 again).
       if (error instanceof ApiError && error.status === 410) {
         skippedDeleted += 1
         continue
-      }
-      if (record.type === "branch_started") {
-        failedBranchNames.add(record.gitBranchName)
       }
       if (!(error instanceof ApiError) || error.status !== 409) {
         if (!options.quiet) {
@@ -331,8 +283,6 @@ export async function flushOutbox(
 
   await rewriteOutbox(root, remaining)
   await writeState(root, state)
-  // Stamp server-assigned sequence numbers onto the local history cache so
-  // the TUI shows them immediately. Best-effort: hydration also covers this.
   await applyHistorySyncUpdates(root, historyUpdates).catch(() => {})
   await emitEvent(root, {
     type: "flush_finished",

@@ -3,17 +3,18 @@ import { join } from "node:path"
 
 import {
   localResearchHistoryRecordSchema,
-  type LocalResearchExperimentLoggedRecord,
+  type LocalResearchCampaignExperimentLoggedRecord,
   type LocalResearchHistoryRecord,
 } from "../protocol"
 
 import {
+  getCampaignTimeline,
   getProjectDeletions,
-  getProjectTree,
+  listProjectCampaigns,
   resolveProject,
+  type ApiCampaign,
+  type ApiCampaignExperiment,
   type ApiProjectDeletions,
-  type ApiTreeBranch,
-  type ApiTreeExperiment,
 } from "./api"
 import type { Args } from "./args"
 import { isHistoryRecordDeleted } from "./deletions"
@@ -34,10 +35,6 @@ export async function appendHistory(
   })
 }
 
-/**
- * Reads the local history cache. Corrupt or partially-written lines are
- * skipped and counted rather than thrown, mirroring the outbox.
- */
 export async function readHistory(
   root: string
 ): Promise<{ records: LocalResearchHistoryRecord[]; corrupt: number }> {
@@ -72,7 +69,6 @@ export async function readHistory(
   return { records, corrupt }
 }
 
-/** Atomically replaces the history cache. */
 export async function rewriteHistory(
   root: string,
   records: LocalResearchHistoryRecord[]
@@ -84,17 +80,17 @@ export async function rewriteHistory(
   await rename(tmp, path)
 }
 
-/** Provisional history record for a just-logged experiment. */
 export function experimentRecordToHistory(
-  record: LocalResearchExperimentLoggedRecord
+  record: LocalResearchCampaignExperimentLoggedRecord
 ): LocalResearchHistoryRecord {
   return {
     schemaVersion: 1,
     source: "local",
-    branchName: record.branchName,
-    gitBranchName: record.gitBranchName,
+    campaignName: record.campaignName,
     runRef: record.runRef,
-    commitSha: record.commitSha,
+    baseCommitSha: record.baseCommitSha,
+    resultCommitSha: record.resultCommitSha,
+    resultRef: record.resultRef,
     status: record.status,
     name: record.name,
     description: record.description ?? null,
@@ -108,13 +104,17 @@ export function experimentRecordToHistory(
     startedAt: record.startedAt ?? null,
     completedAt: record.completedAt ?? null,
     createdAt: record.createdAt,
+    campaignId: record.sync?.campaignId,
+    experimentId: record.sync?.experimentId,
+    sessionId: record.sessionId ?? record.sync?.sessionId,
+    workerId: record.workerId ?? record.sync?.workerId,
+    taskId: record.taskId ?? record.sync?.taskId,
   }
 }
 
-/** Canonical history record from a tree-endpoint experiment DTO. */
 export function apiExperimentToHistory(
-  branch: ApiTreeBranch,
-  experiment: ApiTreeExperiment
+  campaign: ApiCampaign,
+  experiment: ApiCampaignExperiment
 ): LocalResearchHistoryRecord | null {
   const metrics: Record<string, number> = {}
   for (const [key, value] of Object.entries(experiment.secondaryMetrics)) {
@@ -129,10 +129,12 @@ export function apiExperimentToHistory(
   const result = localResearchHistoryRecordSchema.safeParse({
     schemaVersion: 1,
     source: "api",
-    branchName: branch.name,
-    gitBranchName: branch.gitBranchName ?? undefined,
+    campaignName: campaign.name,
     runRef: experiment.runRef,
-    commitSha: experiment.commitSha,
+    baseCommitSha: experiment.baseCommitSha,
+    resultCommitSha: experiment.resultCommitSha,
+    resultRef: experiment.resultRef,
+    gitStatus: experiment.gitStatus,
     status: experiment.status,
     name: experiment.name.slice(0, 160),
     description: experiment.description?.slice(0, 2000) ?? null,
@@ -153,17 +155,14 @@ export function apiExperimentToHistory(
     completedAt: experiment.completedAt,
     createdAt: experiment.createdAt,
     experimentId: experiment.id,
-    branchId: experiment.branchId,
-    sequenceNumber: experiment.sequenceNumber,
+    campaignId: campaign.id,
+    sessionId: experiment.sessionId ?? undefined,
+    workerId: experiment.workerId ?? undefined,
+    taskId: experiment.taskId ?? undefined,
   })
   return result.success ? result.data : null
 }
 
-/**
- * Merges canonical API records with still-pending local records. Keyed by
- * runRef (globally unique: `local/{branch}/{uuid}`); canonical wins so
- * server-updated statuses (accepted/rejected) replace provisional rows.
- */
 export function mergeHistory(
   canonical: LocalResearchHistoryRecord[],
   localCandidates: LocalResearchHistoryRecord[]
@@ -172,32 +171,16 @@ export function mergeHistory(
   for (const record of localCandidates) byRunRef.set(record.runRef, record)
   for (const record of canonical) byRunRef.set(record.runRef, record)
 
-  return [...byRunRef.values()].sort((a, b) => {
-    if (a.branchName !== b.branchName) {
-      return a.branchName < b.branchName ? -1 : 1
-    }
-    // Server-sequenced records first in order; pending local records after.
-    if (a.sequenceNumber !== undefined && b.sequenceNumber !== undefined) {
-      return a.sequenceNumber - b.sequenceNumber
-    }
-    if (a.sequenceNumber !== undefined) return -1
-    if (b.sequenceNumber !== undefined) return 1
-    return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0
-  })
+  return [...byRunRef.values()].sort((a, b) =>
+    a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0
+  )
 }
 
 export type HistorySyncUpdate = {
-  sequenceNumber: number
   experimentId: string
-  branchId: string
+  campaignId: string
 }
 
-/**
- * Stamps server-assigned fields onto matching history records right after a
- * flush, so `onyx listen` and `exp list` show sequence numbers immediately
- * instead of waiting for the next full hydrate. Matched records become
- * canonical (`source: "api"`).
- */
 export async function applyHistorySyncUpdates(
   root: string,
   updates: Map<string, HistorySyncUpdate>
@@ -212,9 +195,8 @@ export async function applyHistorySyncUpdates(
     return {
       ...record,
       source: "api" as const,
-      sequenceNumber: update.sequenceNumber,
       experimentId: update.experimentId,
-      branchId: update.branchId,
+      campaignId: update.campaignId,
     }
   })
   if (changed) await rewriteHistory(root, next)
@@ -222,24 +204,17 @@ export async function applyHistorySyncUpdates(
 
 export type HydrateResult = {
   experiments: number
-  branches: number
+  campaigns: number
   pendingLocal: number
 }
 
-/**
- * Rewrites `.git/onyx/history.jsonl` to the canonical API state, keeping
- * local records the server doesn't know yet (offline-logged, unflushed) —
- * unless the project deletions feed tombstones their runRef or branch, in
- * which case they are dropped so deletions propagate to the local cache.
- * Throws on network/auth failure; callers treat hydration as best-effort.
- */
 export async function hydrateHistoryFromApi(
   root: string,
   args: Args
 ): Promise<HydrateResult> {
   const state = await readState(root)
   const projectId = state.projectId ?? (await resolveProject(root, args)).id
-  const tree = await getProjectTree(projectId, args)
+  const campaigns = await listProjectCampaigns(projectId, args)
   let deletions: ApiProjectDeletions | null = null
   try {
     deletions = await getProjectDeletions(projectId, args)
@@ -248,17 +223,15 @@ export async function hydrateHistoryFromApi(
   }
 
   const canonical: LocalResearchHistoryRecord[] = []
-  for (const branch of tree.branches) {
-    for (const experiment of branch.experiments) {
-      const record = apiExperimentToHistory(branch, experiment)
+  for (const campaign of campaigns) {
+    const timeline = await getCampaignTimeline(campaign.id, args)
+    for (const experiment of timeline.experiments) {
+      const record = apiExperimentToHistory(campaign, experiment)
       if (record) canonical.push(record)
     }
   }
   const canonicalRunRefs = new Set(canonical.map((record) => record.runRef))
 
-  // Local records the server doesn't have yet: provisional history rows plus
-  // anything still queued in the outbox (covers a failed earlier append).
-  // Rows the server deleted are excluded rather than kept.
   const { records: existing } = await readHistory(root)
   const localCandidates = existing.filter(
     (record) =>
@@ -269,7 +242,7 @@ export async function hydrateHistoryFromApi(
   const seen = new Set(localCandidates.map((record) => record.runRef))
   const { records: outbox } = await readOutbox(root)
   for (const record of outbox) {
-    if (record.type !== "experiment_logged") continue
+    if (record.type !== "campaign_experiment_logged") continue
     if (canonicalRunRefs.has(record.runRef) || seen.has(record.runRef)) continue
     if (isHistoryRecordDeleted(record, deletions)) continue
     localCandidates.push(experimentRecordToHistory(record))
@@ -281,7 +254,7 @@ export async function hydrateHistoryFromApi(
 
   return {
     experiments: merged.length,
-    branches: new Set(merged.map((record) => record.branchName)).size,
+    campaigns: new Set(merged.map((record) => record.campaignName)).size,
     pendingLocal: localCandidates.length,
   }
 }

@@ -3,13 +3,7 @@
 export { parseArgs, type Args } from "./lib/args"
 export { parseMetricLines, primaryMetric, summarizeOutput } from "./lib/metrics"
 export {
-  branchMetadata,
-  resolveBranchName,
-  type BranchMetadata,
-  type MetricDirection,
-} from "./lib/markdown"
-export {
-  branchStateKey,
+  campaignStateKey,
   normalizeProjectPath,
   onyxPath,
   resolveProjectPath,
@@ -62,11 +56,9 @@ export {
 } from "./lib/tui"
 export { flushOutbox, type FlushResult } from "./lib/sync"
 export {
-  gitBranchForName,
   currentBranch,
   currentCommit,
   gitDir,
-  nameFromGitBranch,
   normalizeRepositoryUrl,
   repoRoot,
 } from "./lib/git"
@@ -96,10 +88,20 @@ export {
   commandProfileSetApiKeyEnv,
   commandProfileUse,
 } from "./commands/profile"
-export { commandBranchCreate } from "./commands/branch"
+export {
+  commandCampaignCreate,
+  commandCampaignDelete,
+  commandCampaignStatus,
+  commandCampaignUse,
+} from "./commands/campaign"
 export { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 export { commandListen } from "./commands/listen"
 export { commandPush, commandStatus, commandSync } from "./commands/sync"
+export {
+  commandSwarmStart,
+  commandSwarmStatus,
+  commandWorkerRun,
+} from "./commands/swarm"
 export { USAGE, main } from "./main"
 export {
   ONYX_LAUNCHER_BYPASS,

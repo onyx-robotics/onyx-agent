@@ -4,7 +4,7 @@ import { join } from "node:path"
 
 import {
   localResearchRecordSchema,
-  type LocalResearchExperimentLoggedRecord,
+  type LocalResearchCampaignExperimentLoggedRecord,
   type LocalResearchRecord,
 } from "../protocol"
 
@@ -13,24 +13,33 @@ import { gitDir } from "./git"
 export type CliState = {
   projectId?: string
   projectPath?: string
-  branches: Record<
+  activeCampaign?: string
+  campaigns?: Record<
     string,
     {
-      branchId?: string
+      campaignId?: string
       projectPath?: string
-      gitBranchName?: string
-      parentGitBranchName?: string | null
       baseCommitSha?: string | null
       description?: string | null
       metricName?: string
       metricUnit?: string | null
       metricDirection?: "maximize" | "minimize"
+      promotionRefName?: string | null
+      sessionId?: string
+      workers?: Record<
+        string,
+        {
+          workerId: string
+          status?: string
+          lastSeenAt?: string
+        }
+      >
     }
   >
 }
 
 export type LastRunRecord = Omit<
-  LocalResearchExperimentLoggedRecord,
+  LocalResearchCampaignExperimentLoggedRecord,
   "type" | "schemaVersion" | "createdAt" | "name" | "description"
 > & {
   schemaVersion: 1
@@ -55,9 +64,8 @@ export async function lastRunPath(root: string) {
   return join(await onyxStateDir(root), "last-run.json")
 }
 
-/** Stable idempotency key persisted with the record and re-sent on every retry. */
-export function clientRunRef(branchName: string) {
-  return `local/${branchName}/${randomUUID()}`
+export function clientRunRef(campaignName: string) {
+  return `local/${campaignName}/${randomUUID()}`
 }
 
 export async function appendOutbox(root: string, record: LocalResearchRecord) {
@@ -126,10 +134,11 @@ export async function readState(root: string): Promise<CliState> {
     return {
       projectId: parsed.projectId,
       projectPath: parsed.projectPath,
-      branches: parsed.branches ?? {},
+      activeCampaign: parsed.activeCampaign,
+      campaigns: parsed.campaigns ?? {},
     }
   } catch {
-    return { branches: {} }
+    return { campaigns: {} }
   }
 }
 

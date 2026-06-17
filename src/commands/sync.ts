@@ -7,20 +7,19 @@ import {
   readConfig,
 } from "../lib/config"
 import { emitEvent } from "../lib/events"
-import { currentBranch, pushBranch, repoRoot } from "../lib/git"
+import { repoRoot } from "../lib/git"
 import { hydrateHistoryFromApi } from "../lib/history"
-import { readLastRun, readOutbox } from "../lib/outbox"
+import { readLastRun, readOutbox, readState } from "../lib/outbox"
 import { resolveProjectPath } from "../lib/project"
 import { flushOutbox } from "../lib/sync"
 
 export async function commandPush(args: Args) {
   const root = await repoRoot()
-  const branchName = await currentBranch(root)
-  if (!branchName) throw new Error("Cannot push from a detached HEAD.")
-  await pushBranch(root, branchName)
-  await emitEvent(root, { type: "pushed", message: branchName })
-  console.log(`Pushed ${branchName}`)
-  await flushOutbox(root, args)
+  const result = await flushOutbox(root, args)
+  await emitEvent(root, {
+    type: "pushed",
+    message: `${result.flushed} flushed, ${result.pending} pending`,
+  })
 }
 
 export async function commandSync(args: Args) {
@@ -33,7 +32,7 @@ export async function commandSync(args: Args) {
   try {
     const hydrated = await hydrateHistoryFromApi(root, args)
     console.log(
-      `history: ${hydrated.experiments} experiment(s) across ${hydrated.branches} branch(es)${
+      `history: ${hydrated.experiments} experiment(s) across ${hydrated.campaigns} campaign(s)${
         hydrated.pendingLocal ? `, ${hydrated.pendingLocal} pending local` : ""
       }`
     )
@@ -62,14 +61,14 @@ export async function commandSync(args: Args) {
 export async function commandStatus(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
-  const branchName = await currentBranch(root)
+  const state = await readState(root)
   const { records, corrupt } = await readOutbox(root)
   const lastRun = await readLastRun(root)
   const experiments = records.filter(
-    (record) => record.type === "experiment_logged"
+    (record) => record.type === "campaign_experiment_logged"
   ).length
-  const branches = records.filter(
-    (record) => record.type === "branch_started"
+  const campaigns = records.filter(
+    (record) => record.type === "campaign_started"
   ).length
 
   const config = await readConfig()
@@ -86,16 +85,16 @@ export async function commandStatus(args: Args) {
       ? `api: ${describeApiTarget(target)}`
       : "api: not configured (run `onyx login`)"
   )
-  console.log(`branch: ${branchName || "(detached)"}`)
+  console.log(`campaign: ${state.activeCampaign ?? "(none)"}`)
   console.log(`projectPath: ${projectPath || "(repo root)"}`)
   console.log(
-    `outbox: ${experiments} experiment(s), ${branches} branch(es) pending${
+    `outbox: ${experiments} experiment(s), ${campaigns} campaign(s) pending${
       corrupt ? `, ${corrupt} unreadable` : ""
     }`
   )
   if (lastRun) {
     console.log(
-      `last run: ${lastRun.commitSha.slice(0, 7)} (${lastRun.status}, ${lastRun.primaryMetricName}=${lastRun.primaryMetricValue ?? "null"})`
+      `last run: ${lastRun.resultCommitSha.slice(0, 7)} (${lastRun.status}, ${lastRun.primaryMetricName}=${lastRun.primaryMetricValue ?? "null"})`
     )
   }
 

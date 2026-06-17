@@ -147,14 +147,14 @@ export function glyphFor(status: string): StatusGlyph {
 
 export type ExperimentRow = Pick<
   LocalResearchHistoryRecord,
-  | "branchName"
+  | "campaignName"
   | "name"
   | "status"
+  | "resultCommitSha"
   | "primaryMetricName"
   | "primaryMetricValue"
   | "createdAt"
 > & {
-  sequenceNumber?: number
   source?: "local" | "api"
   description?: string | null
   startedAt?: string | null
@@ -162,8 +162,8 @@ export type ExperimentRow = Pick<
 }
 
 const GLYPH_W = 1
-const SEQ_W = 4
-const BRANCH_W = 16
+const COMMIT_W = 8
+const CAMPAIGN_W = 18
 const METRIC_W = 10
 const CREATED_W = 14
 const DURATION_W = 14
@@ -173,7 +173,7 @@ const METRIC_GAP = "  "
 
 /**
  * Renders the tree-view experiment table as aligned plain lines:
- * glyph · #seq · name · description · metric · created · duration · status.
+ * glyph · commit · campaign · name · description · metric · created · duration · status.
  * Description and duration columns drop out on narrow widths. Cells are
  * padded before color is applied so ANSI codes never skew alignment.
  */
@@ -183,17 +183,17 @@ export function renderExperimentTable(
     columns: number
     color: boolean
     nowMs: number
-    showBranch?: boolean
+    showCampaign?: boolean
   }
 ): string[] {
   const { columns, color, nowMs } = options
-  const showBranch = options.showBranch ?? false
+  const showCampaign = options.showCampaign ?? false
   const showDescription = columns >= 90
   const showDuration = columns >= 110
 
   let fixed =
-    GLYPH_W + SEQ_W + METRIC_W + METRIC_GAP.length + CREATED_W + STATUS_W + 5 // gaps for base cols
-  if (showBranch) fixed += BRANCH_W + 1
+    GLYPH_W + COMMIT_W + METRIC_W + METRIC_GAP.length + CREATED_W + STATUS_W + 5 // gaps for base cols
+  if (showCampaign) fixed += CAMPAIGN_W + 1
   if (showDuration) fixed += DURATION_W + 1
   const flex = Math.max(showDescription ? 24 : 12, columns - fixed)
   const nameWidth = showDescription ? Math.ceil(flex / 2) : flex
@@ -204,8 +204,8 @@ export function renderExperimentTable(
 
   const header = cells([
     " ".repeat(GLYPH_W),
-    pad("#", SEQ_W, "right"),
-    showBranch ? pad("BRANCH", BRANCH_W) : null,
+    pad("COMMIT", COMMIT_W),
+    showCampaign ? pad("CAMPAIGN", CAMPAIGN_W) : null,
     pad("NAME", nameWidth),
     showDescription ? pad("DESCRIPTION", descWidth) : null,
     `${pad("METRIC", METRIC_W, "right")}${METRIC_GAP}`,
@@ -217,15 +217,16 @@ export function renderExperimentTable(
   const lines = [dim(truncate(header, columns), color)]
   for (const row of rows) {
     const glyph = glyphFor(row.status)
-    const seq =
-      row.sequenceNumber !== undefined ? `#${row.sequenceNumber}` : "·"
+    const commit = "resultCommitSha" in row
+      ? String(row.resultCommitSha).slice(0, 7)
+      : "·"
     const statusPadded = pad(glyph.label, STATUS_W, "right")
     lines.push(
       truncateAnsi(
         cells([
           glyph.colorize(glyph.char, color),
-          dim(pad(seq, SEQ_W, "right"), color),
-          showBranch ? pad(row.branchName, BRANCH_W) : null,
+          dim(pad(commit, COMMIT_W), color),
+          showCampaign ? pad(row.campaignName, CAMPAIGN_W) : null,
           pad(row.name, nameWidth),
           showDescription
             ? dim(pad(row.description?.trim() || "—", descWidth), color)
@@ -267,7 +268,7 @@ export function spinnerChar(nowMs: number) {
 
 export type ListenModel = {
   projectName: string | null
-  branchName: string | null
+  campaignName: string | null
   metricName: string | null
   metricUnit: string | null
   metricDirection: "maximize" | "minimize" | null
@@ -284,7 +285,7 @@ export type ListenModel = {
 /**
  * Composes the full `onyx listen` frame as plain lines (no cursor control —
  * commands/listen.ts adds per-line clears): a rounded box around the
- * experiment table, the `ONYX | repo | branch` title interrupting the top
+ * experiment table, the `ONYX | repo | campaign` title interrupting the top
  * border on the left (best metric on the right), with the activity line and
  * sync footer below the box. Clipped to the terminal size.
  */
@@ -304,7 +305,7 @@ export function renderFrame(
         } ${model.metricName}${model.metricUnit ? ` ${model.metricUnit}` : ""}`
       : ""
   const title = truncate(
-    `ONYX | ${model.projectName ?? "(unlinked)"} | ${model.branchName ?? "(no onyx branch)"}`,
+    `ONYX | ${model.projectName ?? "(unlinked)"} | ${model.campaignName ?? "(no campaign)"}`,
     Math.max(8, columns - best.length - 12)
   )
   const fill = Math.max(

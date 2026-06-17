@@ -4,8 +4,8 @@ Open-source agent package for Onyx research workflows.
 
 It installs the `onyx` command and the bundled `onyx` agent skill. The command
 is terminal-only: agents make code changes in your existing git repository,
-commit to `onyx/{name}` branches, run repo-local evals, and report experiment
-metadata to the Onyx app.
+commit measured attempts, push immutable experiment refs, and report experiment
+metadata plus worker/task state to the Onyx app.
 
 ## Install
 
@@ -67,7 +67,7 @@ onyx agent skill-path
 ## Core Workflow
 
 ```bash
-onyx branch create --name fast-eval --metric score --direction maximize
+onyx campaign create --name fast-eval --metric score --direction maximize
 onyx exp run
 onyx exp log --description "baseline"
 onyx push
@@ -76,18 +76,30 @@ onyx push
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
 
-To delete a research direction entirely — the Onyx branch record with all its
-experiments, the remote and local `onyx/<name>` git branches, and matching
-local cache rows:
+To run multiple local workers, provide the agent command Onyx should invoke in
+each persistent worktree:
 
 ```bash
-onyx branch delete fast-eval
+onyx swarm start --campaign fast-eval --workers 4 --worker-command "codex exec 'work on $ONYX_TASK_FILE and commit the result'"
+```
+
+Each worker uses `.git/onyx/worktrees/<campaignId>/<sessionId>/<workerName>`
+and `.git/onyx/worker-state/<workerId>`, sends heartbeats every few seconds,
+leases tasks, runs `onyx/eval.sh` and optional `onyx/checks.sh`, pushes
+`refs/onyx/experiments/<campaignId>/<runRef>`, reports the experiment, and
+completes the task.
+
+To delete a research direction entirely — the campaign record with all its
+experiments and matching local cache rows:
+
+```bash
+onyx campaign delete --name fast-eval
 ```
 
 Deletion requires connectivity (it is never queued). The server tombstones
 every deleted experiment's `runRef`, so an offline agent that still has them
 queued skips them on its next sync instead of resurrecting them. Recreating a
-branch with the same name later is fine — tombstones only match records
+campaign with the same name later is fine because tombstones only match records
 created before the deletion.
 
 ## Development

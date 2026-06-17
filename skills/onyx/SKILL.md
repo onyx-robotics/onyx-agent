@@ -1,6 +1,6 @@
 ---
 name: onyx
-description: Drive the Onyx auto research workflow end-to-end. Use when asked to start, resume, or continue Onyx experiments, run auto research, optimize a metric, work on an Onyx branch, /onyx anything, or keep the Onyx platform updated from local research. Handles setup, the autonomous experiment loop, and recording every attempt — successful or failed — to the Onyx platform (queued in a local outbox when offline).
+description: Drive the Onyx auto research workflow end-to-end. Use when asked to start, resume, or continue Onyx experiments, run auto research, optimize a metric, work on an Onyx campaign, /onyx anything, or keep the Onyx platform updated from local research. Handles setup, the autonomous experiment loop, worker heartbeat visibility, and recording every attempt - successful or failed - to the Onyx platform (queued in a local outbox when offline).
 ---
 
 # Onyx Research
@@ -16,10 +16,10 @@ Drive an autonomous research loop using the `onyx` CLI as the substrate. You own
    - **Files in scope**
    - **Constraints**
    - **Stop conditions** - eg. `stop after N iterations`, `for 30 minutes`, `until <condition>`, default is no stop condition, loop forever until manually stopped by user
-2. `onyx branch create --name <slug> --metric <name> --unit <unit> --direction <maximize/minimize> --description <goal>`
+2. `onyx campaign create --name <slug> --metric <name> --unit <unit> --direction <maximize/minimize> --description <goal>`
    - Add `--project-path <projectPath>` when the work is scoped to a subdirectory.
-   - The command infers the repository from `origin` and registers the branch with Onyx; if offline or GitHub access is missing, records stay queued until `onyx sync`.
-   - The new branch forks from the current git HEAD, and the branch HEAD is on becomes its parent in the Onyx app. To fork a new research direction off an existing Onyx branch, check out that parent first (`git checkout onyx/<parent>`), then run `onyx branch create` — the app renders it nested under the parent.
+   - The command infers the repository from `origin` and registers the campaign with Onyx; if offline or GitHub access is missing, records stay queued until `onyx sync`.
+   - The campaign records the current git HEAD as its base commit. It does not create a shared research-history branch.
 3. Read the source files. Understand the workload deeply before writing anything.
 4. Write `<projectPath>/onyx/onyx.md` and `<projectPath>/onyx/eval.sh` (see below). Optionally write `<projectPath>/onyx/checks.sh` when correctness constraints require it. Commit these files.
 5. Run a baseline with `onyx exp run`, then record it with `onyx exp log --description "baseline" --agent-notes '<json>'`, then start looping immediately.
@@ -72,7 +72,7 @@ Update `onyx.md` periodically - especially the "What's Been Tried" section - so 
 - `onyx exp list --grep <regex>` - search names, descriptions, agent notes, and output summaries; e.g. `onyx exp list --grep 'cache|memoiz'` before trying a caching idea.
 - `onyx exp list --status failed --json` - full records (agent notes included) for post-mortems.
 
-The history cache is hydrated from the Onyx app on `onyx sync`, so after a fresh clone run `onyx sync` once to pull the cross-branch history.
+The history cache is hydrated from the Onyx app on `onyx sync`, so after a fresh clone run `onyx sync` once to pull the campaign history.
 
 ### `eval.sh`
 
@@ -80,7 +80,7 @@ Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), 
 
 #### Structured output
 
-- `METRIC name=value` - primary metric (must match `onyx branch create`'s `metric name`) and any secondary metrics. Parsed automatically by `onyx exp run`. The primary `METRIC` line is **mandatory** for a successful run: if `eval.sh` exits 0 but emits no matching `METRIC` line, `onyx exp run` records the run as `failed`, and `onyx exp log` refuses to record it as `succeeded`/`accepted`. Always make the eval print the primary metric.
+- `METRIC name=value` - primary metric (must match `onyx campaign create`'s `metric name`) and any secondary metrics. Parsed automatically by `onyx exp run`. The primary `METRIC` line is **mandatory** for a successful run: if `eval.sh` exits 0 but emits no matching `METRIC` line, `onyx exp run` records the run as `failed`, and `onyx exp log` refuses to record it as `succeeded`/`accepted`. Always make the eval print the primary metric.
 
 #### Control measurement noise
 
@@ -95,7 +95,7 @@ The script should output **whatever data helps you make better decisions in the 
 - Memory usage, cache hit rates, or other runtime diagnostics when relevant
 - Anything domain-specific that would help localize regressions or identify bottlenecks
 
-You can **update the script during the loop** for more signal. Adding diagnostic output or new secondary `METRIC` lines is safe. Changing the *measured workload itself* (size, iterations, what's timed) makes every prior metric incomparable - re-baseline and note it if you must.
+You can **update the script during the loop** for more signal. Adding diagnostic output or new secondary `METRIC` lines is safe. Changing the _measured workload itself_ (size, iterations, what's timed) makes every prior metric incomparable - re-baseline and note it if you must.
 
 #### Agent experiment side notes via `onyx exp log`
 
@@ -132,15 +132,15 @@ pnpm typecheck 2>&1 | grep -i error || true
 ### **LOOP** (until the stop condition or an interrupt):
 
 1. Check the stop condition (iterations / elapsed time / target). If met, wrap up and stop (see below).
-2. Review `onyx/onyx.md`, git, and onyx state. Identify the current best commit (`onyx exp list`). If the last experiment regressed, restore your in-scope files to the best before editing: `git checkout <best-sha> -- <scoped files>` (a forward commit, not history rewriting).
+2. Review `onyx/onyx.md`, git, and onyx state. Identify the current best commit (`onyx exp list`). If the last experiment regressed, restore your in-scope files to the best before editing: `git checkout <best-sha> -- <scoped files>` (a new forward commit, not history rewriting).
 3. Make edits for a new experiment idea.
-4. Commit to the current onyx branch. The tree must be clean before measuring - the result is attributed to HEAD.
-5. Run the experiment with `onyx exp run [--branch <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]`
+4. Commit the result locally. The tree must be clean before measuring - the result is attributed to HEAD.
+5. Run the experiment with `onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]`
 6. Inspect the result, including benchmark output and optional checks.sh result.
-7. Record `onyx exp log [--branch <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]`
-8. Run `onyx push` to push the branch to the remote and flush queued records.
+7. Record `onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]`
+8. Run `onyx push` or `onyx sync` to push the immutable experiment ref and flush queued records.
 
-**On stop:** Update `onyx.md`'s "What's Been Tried" and write a short summary of the best result and any open ideas. Leave git clean - no uncommitted changes and no unpushed local commits. Commit any final edits forward (or discard work you won't record), then run `onyx push` so the local and remote `onyx/{name}` branch match and the outbox flushes (`onyx sync` to reconcile history).
+**On stop:** Update `onyx.md`'s "What's Been Tried" and write a short summary of the best result and any open ideas. Leave git clean - no uncommitted changes and no unreported local commits. Commit any final edits forward (or discard work you won't record), then run `onyx push` or `onyx sync` so immutable refs and the outbox are flushed.
 
 ### Loop Rules
 
@@ -161,9 +161,9 @@ pnpm typecheck 2>&1 | grep -i error || true
 
 ## Git Rules
 
-Onyx is append-only on live branches: commit every attempt forward on `onyx/{name}`. Do not use `git reset --hard`, auto-revert, or force-push. Restoring an earlier commit's file contents to build from the best (`git checkout <sha> -- <files>`, then commit forward) is fine - that's a new forward commit, not history rewriting. Experiment metadata is canonical in the Onyx app/API; `.git/onyx/outbox.jsonl` is only an offline retry queue.
+Onyx campaign history is immutable-ref based: every measured attempt gets its own result commit and result ref, defaulting to `refs/onyx/experiments/<campaignId>/<runRef>`. Do not use `git reset --hard`, auto-revert, or force-push to rewrite reported experiments. Restoring an earlier commit's file contents to build from the best (`git checkout <sha> -- <files>`, then commit forward) is fine - that's a new attempt, not history rewriting. Experiment metadata is canonical in the Onyx app/API; `.git/onyx/outbox.jsonl` is only an offline retry queue.
 
-Fixing a mistake goes through deletion, never history rewriting: the user can delete a branch (record + git branch + local cache) with `onyx branch delete <name>` or from the web app, and individual experiments from the web app. Deleted records are tombstoned server-side — `onyx sync` drops them from the local queue and history, and re-reporting a deleted experiment is rejected. Only delete when the user asks for it; the autonomous loop itself never deletes.
+Fixing a mistake goes through deletion, never history rewriting: deleted records are tombstoned server-side, `onyx sync` drops them from the local queue and history, and re-reporting a deleted experiment is rejected. Only delete when the user asks for it; the autonomous loop itself never deletes.
 
 ## Ideas Backlog
 

@@ -8,15 +8,10 @@ import type {
 } from "../protocol"
 
 import { readEvents } from "../lib/events"
-import {
-  currentBranch,
-  gitResult,
-  nameFromGitBranch,
-  repoRoot,
-} from "../lib/git"
+import { gitResult, repoRoot } from "../lib/git"
 import { historyPath, readHistory } from "../lib/history"
 import { onyxStateDir, readLastRun, readOutbox, readState } from "../lib/outbox"
-import { branchStateKey } from "../lib/project"
+import { campaignStateKey } from "../lib/project"
 import { formatAge, renderFrame, type ListenModel } from "../lib/tui"
 
 const CSI = "\x1b["
@@ -59,8 +54,19 @@ async function readHistoryCached(
 function describeEvent(event: LocalResearchEvent, nowMs: number) {
   const sha = event.commitSha ? event.commitSha.slice(0, 7) : null
   const labels: Record<LocalResearchEvent["type"], string> = {
-    branch_created: "branch created",
-    branch_deleted: "branch deleted",
+    campaign_created: "campaign created",
+    campaign_deleted: "campaign deleted",
+    session_started: "session started",
+    session_stopped: "session stopped",
+    task_created: "task created",
+    task_leased: "task leased",
+    task_heartbeat: "task heartbeat",
+    task_completed: "task completed",
+    task_cancelled: "task cancelled",
+    worker_started: "worker started",
+    worker_heartbeat: "worker heartbeat",
+    worker_stopped: "worker stopped",
+    swarm_started: "swarm started",
     exp_run_started: "running eval",
     eval_finished: "eval finished",
     checks_finished: "checks",
@@ -87,15 +93,14 @@ async function headCommitInfo(root: string) {
 
 async function buildModel(root: string): Promise<ListenModel> {
   const state = await readState(root)
-  const gitBranch = await currentBranch(root).catch(() => "")
-  const branchName = gitBranch ? nameFromGitBranch(gitBranch) : null
+  const campaignName = state.activeCampaign ?? null
 
   const records = await readHistoryCached(root)
   // Ascending — the most recent experiment renders at the bottom of the
   // table. Copy before sorting/pushing so the cached array stays untouched.
   const rows = (
-    branchName
-      ? records.filter((record) => record.branchName === branchName)
+    campaignName
+      ? records.filter((record) => record.campaignName === campaignName)
       : [...records]
   ).sort((a, b) =>
     a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0
@@ -107,11 +112,13 @@ async function buildModel(root: string): Promise<ListenModel> {
     rows.push({
       schemaVersion: 1,
       source: "local",
-      branchName: lastRun.branchName,
+      campaignName: lastRun.campaignName,
       runRef: lastRun.runRef,
-      commitSha: lastRun.commitSha,
+      baseCommitSha: lastRun.baseCommitSha,
+      resultCommitSha: lastRun.resultCommitSha,
+      resultRef: lastRun.resultRef,
       status: lastRun.status,
-      name: `(unlogged) ${lastRun.commitSha.slice(0, 7)}`,
+      name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
       primaryMetricName: lastRun.primaryMetricName,
       primaryMetricValue: lastRun.primaryMetricValue,
       metrics: lastRun.metrics,
@@ -122,8 +129,8 @@ async function buildModel(root: string): Promise<ListenModel> {
     })
   }
 
-  const meta = branchName
-    ? state.branches[branchStateKey(state.projectPath ?? "", branchName)]
+  const meta = campaignName
+    ? state.campaigns?.[campaignStateKey(state.projectPath ?? "", campaignName)]
     : undefined
   const metricName = meta?.metricName ?? rows[0]?.primaryMetricName ?? null
   const metricDirection = meta?.metricDirection ?? "maximize"
@@ -176,7 +183,7 @@ async function buildModel(root: string): Promise<ListenModel> {
 
   return {
     projectName: basename(root),
-    branchName: gitBranch || null,
+    campaignName,
     metricName,
     metricUnit: meta?.metricUnit ?? null,
     metricDirection,
