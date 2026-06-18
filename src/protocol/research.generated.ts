@@ -577,6 +577,39 @@ export const researchCampaignOverviewResponseSchema = z.object({
   }),
 })
 
+export const researchCampaignTimelinePointSchema = z.object({
+  experimentId: z.uuid(),
+  displayIndex: z.number().int().positive(),
+  name: z.string().min(1),
+  primaryMetricValue: z.number().finite().nullable(),
+  status: researchExperimentStatusSchema,
+  gitStatus: researchExperimentGitStatusSchema,
+  createdAt: z.iso.datetime(),
+})
+
+export const researchCampaignTimelineBestStepSchema = z.object({
+  experimentId: z.uuid(),
+  displayIndex: z.number().int().positive(),
+  metricValue: z.number().finite(),
+})
+
+export const researchCampaignTimelineResponseSchema = z.object({
+  data: z.object({
+    campaign: researchCampaignSchema,
+    experiments: z.array(researchCampaignExperimentSummarySchema),
+    points: z.array(researchCampaignTimelinePointSchema),
+    bestSteps: z.array(researchCampaignTimelineBestStepSchema),
+    defaultExperiment: researchCampaignExperimentSummarySchema.nullable(),
+    total: z.number().int().nonnegative(),
+    sampled: z.boolean(),
+    window: z.object({
+      maxPoints: z.number().int().positive(),
+      startIndex: z.number().int().positive().nullable(),
+      endIndex: z.number().int().positive().nullable(),
+    }),
+  }),
+})
+
 export const listResearchCampaignExperimentsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   cursor: z.string().trim().min(1).optional(),
@@ -838,6 +871,17 @@ export const researchCampaignDiffResponseSchema = z.object({
   }),
 })
 
+export const researchCampaignExperimentCodeResponseSchema = z.object({
+  data: z.object({
+    experiment: researchCampaignExperimentSchema,
+    baseExperiment: researchCampaignExperimentSchema.nullable(),
+    baseCommitSha: gitShaSchema,
+    commitSha: gitShaSchema,
+    files: z.array(researchFileTreeNodeSchema),
+    diffFiles: z.array(researchDiffFileSchema),
+  }),
+})
+
 export const researchCampaignGraphNodeSchema = z.object({
   id: z.string().min(1),
   type: z.enum(["campaign", "experiment", "lane", "worker"]),
@@ -1008,6 +1052,15 @@ export type BatchResearchCampaignExperimentResponse = z.infer<
 export type ResearchCampaignOverviewResponse = z.infer<
   typeof researchCampaignOverviewResponseSchema
 >
+export type ResearchCampaignTimelinePoint = z.infer<
+  typeof researchCampaignTimelinePointSchema
+>
+export type ResearchCampaignTimelineBestStep = z.infer<
+  typeof researchCampaignTimelineBestStepSchema
+>
+export type ResearchCampaignTimelineResponse = z.infer<
+  typeof researchCampaignTimelineResponseSchema
+>
 export type ListResearchCampaignExperimentsQuery = z.infer<
   typeof listResearchCampaignExperimentsQuerySchema
 >
@@ -1094,6 +1147,9 @@ export type ResearchCampaignFileBlobResponse = z.infer<
 >
 export type ResearchCampaignDiffResponse = z.infer<
   typeof researchCampaignDiffResponseSchema
+>
+export type ResearchCampaignExperimentCodeResponse = z.infer<
+  typeof researchCampaignExperimentCodeResponseSchema
 >
 export type ResearchCampaignGraphResponse = z.infer<
   typeof researchCampaignGraphResponseSchema
