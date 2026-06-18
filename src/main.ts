@@ -44,8 +44,8 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> --worker-command "<cmd>" [--agents <n>] [--agent <kind>]
-      (starts local autonomous lane workers for a validated setup)
+  onyx research start --campaign <name> --worker-command "<cmd>" [--agents <n>] [--agent <kind>] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
+      (starts durable local lane workers for a validated setup)
   onyx research status [--campaign <name>]
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
   onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]
@@ -53,11 +53,11 @@ Usage:
   onyx listen
   onyx status
   onyx push
-  onyx sync [--project <id>] [--repository-url <url>] [--project-path <path>]
+  onyx sync [--watch] [--interval <seconds>] [--project <id>] [--repository-url <url>] [--project-path <path>]
 
-Results are reported to the Onyx app and queued in a local outbox
-(.git/onyx/outbox.jsonl) when offline; \`onyx push\` and \`onyx sync\` flush the
-queue and push immutable experiment refs. \`onyx sync\` also refreshes the local history cache
+Results are logged locally first in .git/onyx/outbox.jsonl. \`onyx push\`,
+\`onyx sync\`, \`onyx sync --watch\`, and \`onyx research start\` flush the queue
+and push immutable experiment refs. \`onyx sync\` also refreshes the local history cache
 (.git/onyx/history.jsonl) that \`onyx exp list\` searches offline; \`onyx listen\`
 is a live read-only view of the current repo's research session.
 

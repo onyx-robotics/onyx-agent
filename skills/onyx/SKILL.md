@@ -130,7 +130,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 
 ## The Research Phase
 
-Each autonomous agent owns one lane. The lane has a movable branch under `refs/heads/onyx/<campaign>/lanes/*`, while each measured attempt still gets an immutable `refs/onyx/experiments/<campaignId>/<runRef>` ref. A generated brief is available at `$ONYX_BRIEF_FILE` for lane workers.
+Each autonomous agent owns one lane. The lane has a movable branch under `refs/heads/onyx/<campaign>/lanes/*`, while each measured attempt still gets an immutable `refs/onyx/experiments/<campaignId>/<runRef>` ref. A generated brief is available at `$ONYX_BRIEF_FILE` and peer-lane state is available at `$ONYX_SESSION_STATE_FILE` for lane workers.
 
 ### **LOOP** (until the stop condition or an interrupt):
 
@@ -141,7 +141,7 @@ Each autonomous agent owns one lane. The lane has a movable branch under `refs/h
 5. Run the experiment with `onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]`
 6. Inspect the result, including benchmark output and optional checks.sh result.
 7. Record `onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]`
-8. Run `onyx push` or `onyx sync` to push the immutable experiment ref and flush queued records.
+8. `onyx exp log` records locally first. Keep `onyx sync --watch` running for manual loops, or run `onyx push`/`onyx sync` periodically to push immutable refs and flush queued records.
 9. If running as a lane worker, update a concise lane summary through the Onyx CLI/API or in the final commit notes so later agents can resume from the brief.
 
 **On stop:** Update `onyx.md`'s "What's Been Tried" and write a short summary of the best result and any open ideas. Leave git clean - no uncommitted changes and no unreported local commits. Commit any final edits forward (or discard work you won't record), then run `onyx push` or `onyx sync` so immutable refs and the outbox are flushed.

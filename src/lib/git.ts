@@ -30,6 +30,21 @@ export async function pushRef(root: string, commitSha: string, ref: string) {
   await git(["push", "origin", `${commitSha}:${ref}`], root)
 }
 
+export async function pushRefs(
+  root: string,
+  refs: Array<{ commitSha: string; ref: string }>
+) {
+  if (refs.length === 0) return
+  await git(
+    [
+      "push",
+      "origin",
+      ...refs.map((entry) => `${entry.commitSha}:${entry.ref}`),
+    ],
+    root
+  )
+}
+
 export function normalizeRepositoryUrl(value: string) {
   const ssh = value.match(/^git@github\.com:(.+?)\/(.+?)(?:\.git)?$/)
   if (ssh)

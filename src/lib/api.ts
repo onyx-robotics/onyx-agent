@@ -67,6 +67,8 @@ export type ApiCampaignExperiment = {
   resultRef: string
   status: string
   gitStatus: string
+  gitVerifiedAt: string | null
+  gitStatusReason: string | null
   primaryMetricName: string
   primaryMetricValue: number | null
   secondaryMetrics: Record<string, unknown>
@@ -143,10 +145,31 @@ export type ApiSummary = {
 export type ApiCampaignTimeline = {
   campaign: ApiCampaign
   activeSetup: ApiSetup | null
-  experiments: ApiCampaignExperiment[]
   workers: ApiWorker[]
   lanes: ApiLane[]
   summaries: ApiSummary[]
+}
+
+export type ApiCampaignOverview = ApiCampaignTimeline & {
+  bestExperiment: ApiCampaignExperiment | null
+  latestExperiments: ApiCampaignExperiment[]
+  counts: {
+    experiments: number
+    activeLanes: number
+    activeWorkers: number
+  }
+}
+
+export type ApiSessionState = {
+  session: ApiSession
+  campaign: ApiCampaign
+  activeSetup: ApiSetup | null
+  latestExperiments: ApiCampaignExperiment[]
+  bestExperiment: ApiCampaignExperiment | null
+  lanes: ApiLane[]
+  workers: ApiWorker[]
+  summaries: ApiSummary[]
+  updatedAt: string
 }
 
 export type ApiCampaignUpsertResult = {
@@ -188,6 +211,11 @@ export async function callApi(
   body?: unknown,
   args?: Args
 ) {
+  const timeoutMs = Number(args?.options["api-timeout"] ?? 30_000)
+  const signal =
+    Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined
   const response = await fetch(`${await apiBaseUrl(args)}${path}`, {
     method,
     headers: {
@@ -195,6 +223,7 @@ export async function callApi(
       authorization: `Bearer ${await apiKey(args)}`,
     },
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   })
 
   const text = await response.text()
@@ -238,15 +267,7 @@ export async function resolveProject(
   args: Args
 ): Promise<ApiProject> {
   const projectPath = await resolveProjectPath(root, args)
-  const projects = apiData<ApiProject[]>(
-    await callApi("GET", "/api/v1/research/projects", undefined, args)
-  )
-
   if (args.options.project) {
-    const byId = projects.find(
-      (candidate) => candidate.id === args.options.project
-    )
-    if (byId) return byId
     return {
       id: args.options.project,
       name: args.options.project,
@@ -260,19 +281,21 @@ export async function resolveProject(
   const url = normalizeRepositoryUrl(
     await repositoryUrl(root, args.options["repository-url"])
   )
-  const project = projects.find(
-    (candidate) =>
-      normalizeRepositoryUrl(candidate.repositoryUrl) === url &&
-      candidate.projectPath === projectPath
-  )
-
-  if (!project) {
+  const params = new URLSearchParams({ repositoryUrl: url, projectPath })
+  try {
+    return apiData<ApiProject>(
+      await callApi(
+        "GET",
+        `/api/v1/research/projects/resolve?${params.toString()}`,
+        undefined,
+        args
+      )
+    )
+  } catch {
     throw new Error(
       "No Onyx project is tracking this repository yet. Start a campaign with `onyx campaign setup`, or grant Onyx GitHub access to this repository and sync again."
     )
   }
-
-  return project
 }
 
 export async function upsertCampaign(
@@ -298,14 +321,39 @@ export async function listProjectCampaigns(
   )
 }
 
-export async function getCampaignTimeline(
+export async function getCampaignOverview(
   campaignId: string,
   args?: Args
-): Promise<ApiCampaignTimeline> {
-  return apiData<ApiCampaignTimeline>(
+): Promise<ApiCampaignOverview> {
+  return apiData<ApiCampaignOverview>(
     await callApi(
       "GET",
-      `/api/v1/research/campaigns/${campaignId}/timeline`,
+      `/api/v1/research/campaigns/${campaignId}/overview`,
+      undefined,
+      args
+    )
+  )
+}
+
+export async function listCampaignExperiments(
+  campaignId: string,
+  args?: Args,
+  options: { limit?: number; cursor?: string } = {}
+): Promise<{
+  items: ApiCampaignExperiment[]
+  page: { nextCursor: string | null }
+}> {
+  const params = new URLSearchParams({
+    limit: String(options.limit ?? 100),
+  })
+  if (options.cursor) params.set("cursor", options.cursor)
+  return apiData<{
+    items: ApiCampaignExperiment[]
+    page: { nextCursor: string | null }
+  }>(
+    await callApi(
+      "GET",
+      `/api/v1/research/campaigns/${campaignId}/experiments?${params.toString()}`,
       undefined,
       args
     )
@@ -322,6 +370,35 @@ export async function reportCampaignExperiment(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/experiments`,
       body,
+      args
+    )
+  )
+}
+
+export async function reportCampaignExperimentsBatch(
+  campaignId: string,
+  experiments: CreateResearchCampaignExperimentRequest[],
+  args?: Args
+): Promise<{
+  results: Array<{
+    runRef: string
+    status: "created" | "duplicate" | "deleted" | "invalid"
+    experiment: ApiCampaignExperiment | null
+    error: { code: string; message: string } | null
+  }>
+}> {
+  return apiData<{
+    results: Array<{
+      runRef: string
+      status: "created" | "duplicate" | "deleted" | "invalid"
+      experiment: ApiCampaignExperiment | null
+      error: { code: string; message: string } | null
+    }>
+  }>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/experiments/batch`,
+      { experiments },
       args
     )
   )
@@ -401,6 +478,20 @@ export async function stopCampaignSession(
       "POST",
       `/api/v1/research/sessions/${sessionId}/stop`,
       body,
+      args
+    )
+  )
+}
+
+export async function getResearchSessionState(
+  sessionId: string,
+  args?: Args
+): Promise<ApiSessionState> {
+  return apiData<ApiSessionState>(
+    await callApi(
+      "GET",
+      `/api/v1/research/sessions/${sessionId}/state`,
+      undefined,
       args
     )
   )

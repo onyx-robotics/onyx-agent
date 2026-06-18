@@ -30,9 +30,9 @@ Start autonomous lane workers with:
 
   onyx research start --campaign <slug> --agents <n> --worker-command "<agent command>"
 
-Each lane worker receives ONYX_SETUP_ID, ONYX_LANE_ID, ONYX_LANE_NAME, ONYX_LANE_BRANCH, and ONYX_BRIEF_FILE. Read the generated brief, make one measured improvement attempt, commit it, run eval/checks, report the experiment with onyx exp run/log, push/sync, and keep lane summaries concise.
+Each lane worker receives ONYX_SETUP_ID, ONYX_LANE_ID, ONYX_LANE_NAME, ONYX_LANE_BRANCH, ONYX_BRIEF_FILE, and ONYX_SESSION_STATE_FILE. Read the generated brief and session state, make one measured improvement attempt, and leave committed changes for the runner. The runner evaluates, logs locally, pushes/syncs in the background, and keeps lane summaries concise.
 
-Manual experiment loops can still use onyx exp run, onyx exp log, onyx exp list, onyx push, and onyx sync. Experiments must carry setup context, and research-session experiments must carry lane context.
+Manual experiment loops can still use onyx exp run, onyx exp log, onyx exp list, onyx push, onyx sync, and onyx sync --watch. Experiments must carry setup context, and research-session experiments must carry lane context.
 
 ## Git Rules
 

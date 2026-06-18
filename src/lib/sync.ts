@@ -9,7 +9,7 @@ import {
   ApiError,
   getProjectDeletions,
   listProjectCampaigns,
-  reportCampaignExperiment,
+  reportCampaignExperimentsBatch,
   resolveProject,
   upsertCampaign,
   type ApiProject,
@@ -18,7 +18,7 @@ import {
 import { apiTarget } from "./config"
 import { filterDeletedOutboxRecords } from "./deletions"
 import { emitEvent } from "./events"
-import { pushRef, repositoryUrl } from "./git"
+import { pushRefs, repositoryUrl } from "./git"
 import { applyHistorySyncUpdates, type HistorySyncUpdate } from "./history"
 import { campaignStateKey, normalizeProjectPath } from "./project"
 import {
@@ -147,75 +147,122 @@ async function campaignIdFromMetadata({
   return campaign.id
 }
 
-async function flushCampaignExperiment({
+function experimentRequestFromRecord(
+  record: LocalResearchCampaignExperimentLoggedRecord
+) {
+  return {
+    name: record.name,
+    description: record.description ?? undefined,
+    runRef: record.runRef,
+    setupId: record.setupId,
+    baseCommitSha: record.baseCommitSha,
+    resultCommitSha: record.resultCommitSha,
+    resultRef: record.resultRef,
+    status: record.status,
+    primaryMetricName: record.primaryMetricName,
+    primaryMetricValue: record.primaryMetricValue ?? undefined,
+    secondaryMetrics: campaignSecondaryMetrics(record),
+    artifactRefs: {},
+    agentNotes: record.agentNotes,
+    checks: record.checks
+      ? {
+          status: record.checks.status,
+          durationMs: record.checks.durationMs ?? null,
+          outputSummary: record.checks.outputSummary ?? null,
+        }
+      : undefined,
+    durationMs: record.durationMs ?? undefined,
+    outputSummary: record.outputSummary ?? undefined,
+    startedAt: record.startedAt ?? undefined,
+    completedAt: record.completedAt ?? undefined,
+    sessionId: record.sessionId,
+    workerId: record.workerId,
+    laneId: record.laneId,
+    provenance: [],
+  }
+}
+
+async function flushCampaignExperimentBatch({
   root,
-  record,
+  campaignName,
+  records,
   state,
   args,
 }: {
   root: string
-  record: LocalResearchCampaignExperimentLoggedRecord
+  campaignName: string
+  records: LocalResearchCampaignExperimentLoggedRecord[]
   state: CliState
   args: Args
-}): Promise<HistorySyncUpdate> {
-  if (record.projectPath !== undefined) {
-    state.projectPath = record.projectPath
-  }
+}): Promise<{
+  flushed: LocalResearchCampaignExperimentLoggedRecord[]
+  remaining: LocalResearchCampaignExperimentLoggedRecord[]
+  historyUpdates: Map<string, HistorySyncUpdate>
+  skippedDeleted: number
+}> {
   const campaignId = await campaignIdFromMetadata({
     root,
-    campaignName: record.campaignName,
+    campaignName,
     state,
     args,
   })
 
-  await pushRef(root, record.resultCommitSha, record.resultRef)
+  for (let index = 0; index < records.length; index += 20) {
+    const chunk = records.slice(index, index + 20)
+    await pushRefs(
+      root,
+      chunk.map((record) => ({
+        commitSha: record.resultCommitSha,
+        ref: record.resultRef,
+      }))
+    )
+  }
 
-  const reported = await reportCampaignExperiment(
-    campaignId,
-    {
-      name: record.name,
-      description: record.description ?? undefined,
-      runRef: record.runRef,
-      setupId: record.setupId,
-      baseCommitSha: record.baseCommitSha,
-      resultCommitSha: record.resultCommitSha,
-      resultRef: record.resultRef,
-      status: record.status,
-      primaryMetricName: record.primaryMetricName,
-      primaryMetricValue: record.primaryMetricValue ?? undefined,
-      secondaryMetrics: campaignSecondaryMetrics(record),
-      artifactRefs: {},
-      agentNotes: record.agentNotes,
-      checks: record.checks
-        ? {
-            status: record.checks.status,
-            durationMs: record.checks.durationMs ?? null,
-            outputSummary: record.checks.outputSummary ?? null,
-          }
-        : undefined,
-      durationMs: record.durationMs ?? undefined,
-      outputSummary: record.outputSummary ?? undefined,
-      startedAt: record.startedAt ?? undefined,
-      completedAt: record.completedAt ?? undefined,
-      sessionId: record.sessionId,
-      workerId: record.workerId,
-      laneId: record.laneId,
-      provenance: [],
-    },
-    args
-  )
-  record.sync = {
-    ...(record.sync ?? {}),
-    campaignId,
-    setupId: record.setupId,
-    experimentId: reported.id,
-    syncedAt: new Date().toISOString(),
+  const flushed: LocalResearchCampaignExperimentLoggedRecord[] = []
+  const remaining: LocalResearchCampaignExperimentLoggedRecord[] = []
+  const historyUpdates = new Map<string, HistorySyncUpdate>()
+  let skippedDeleted = 0
+
+  for (let index = 0; index < records.length; index += 100) {
+    const chunk = records.slice(index, index + 100)
+    const response = await reportCampaignExperimentsBatch(
+      campaignId,
+      chunk.map(experimentRequestFromRecord),
+      args
+    )
+    const byRunRef = new Map(
+      response.results.map((result) => [result.runRef, result])
+    )
+
+    for (const record of chunk) {
+      const result = byRunRef.get(record.runRef)
+      if (!result || result.status === "invalid") {
+        remaining.push(record)
+        continue
+      }
+      if (result.status === "deleted") {
+        skippedDeleted += 1
+        continue
+      }
+      if (result.experiment) {
+        record.sync = {
+          ...(record.sync ?? {}),
+          campaignId,
+          setupId: record.setupId,
+          experimentId: result.experiment.id,
+          syncedAt: new Date().toISOString(),
+        }
+        historyUpdates.set(record.runRef, {
+          experimentId: result.experiment.id,
+          campaignId,
+          setupId: result.experiment.setupId,
+        })
+      }
+      flushed.push(record)
+    }
   }
-  return {
-    experimentId: reported.id,
-    campaignId,
-    setupId: reported.setupId,
-  }
+
+  return { flushed, remaining, historyUpdates, skippedDeleted }
 }
 
 export async function flushOutbox(
@@ -270,19 +317,22 @@ export async function flushOutbox(
   const remaining: LocalResearchRecord[] = []
   const historyUpdates = new Map<string, HistorySyncUpdate>()
   let flushed = 0
+  const experimentRecords = new Map<
+    string,
+    LocalResearchCampaignExperimentLoggedRecord[]
+  >()
 
   for (const record of kept) {
+    if (record.type === "campaign_experiment_logged") {
+      const records = experimentRecords.get(record.campaignName) ?? []
+      records.push(record)
+      experimentRecords.set(record.campaignName, records)
+      continue
+    }
+
     try {
       if (record.type === "campaign_started") {
         project = await flushCampaignStarted({ root, record, state, args })
-      } else {
-        const update = await flushCampaignExperiment({
-          root,
-          record,
-          state,
-          args,
-        })
-        historyUpdates.set(record.runRef, update)
       }
       flushed += 1
     } catch (error) {
@@ -300,6 +350,33 @@ export async function flushOutbox(
         }
       }
       remaining.push(record)
+    }
+  }
+
+  for (const [campaignName, records] of experimentRecords) {
+    try {
+      const result = await flushCampaignExperimentBatch({
+        root,
+        campaignName,
+        records,
+        state,
+        args,
+      })
+      flushed += result.flushed.length
+      skippedDeleted += result.skippedDeleted
+      for (const record of result.remaining) remaining.push(record)
+      for (const [runRef, update] of result.historyUpdates) {
+        historyUpdates.set(runRef, update)
+      }
+    } catch (error) {
+      if (!options.quiet) {
+        console.warn(
+          `Keeping ${records.length} queued experiment record(s) after error: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
+      remaining.push(...records)
     }
   }
 

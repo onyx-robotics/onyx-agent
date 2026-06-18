@@ -36,23 +36,12 @@ import {
   scopedRoot,
 } from "../lib/project"
 import { pathExists, runProcess } from "../lib/process"
-import { flushOutbox } from "../lib/sync"
 import { renderExperimentTable } from "../lib/tui"
 
 type ExperimentStatus = LocalResearchCampaignExperimentLoggedRecord["status"]
 type ChecksRecord = NonNullable<
   LocalResearchCampaignExperimentLoggedRecord["checks"]
 >
-
-async function syncAfterRecord(root: string, args: Args, recordName: string) {
-  await flushOutbox(root, args).catch((error) => {
-    console.warn(
-      `Recorded ${recordName} locally; sync failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-  })
-}
 
 function numberOption(args: Args, name: string, fallback: number) {
   const value = args.options[name]
@@ -169,8 +158,6 @@ async function ensureCampaignMetadata({
   projectPath: string
   campaignName: string
 }) {
-  await flushOutbox(root, args, { quiet: true }).catch(() => {})
-
   const state = await readState(root)
   const key = campaignStateKey(projectPath, campaignName)
   const cached = state.campaigns?.[key]
@@ -487,8 +474,6 @@ export async function commandExpLog(args: Args) {
     `Recorded ${record.name} (${status}) for campaign ${campaignName}`
   )
   if (usableLastRun) await clearLastRun(root)
-
-  await syncAfterRecord(root, args, record.name)
 }
 
 export async function commandExpList(args: Args) {

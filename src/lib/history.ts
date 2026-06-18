@@ -8,8 +8,8 @@ import {
 } from "../protocol"
 
 import {
-  getCampaignTimeline,
   getProjectDeletions,
+  listCampaignExperiments,
   listProjectCampaigns,
   resolveProject,
   type ApiCampaign,
@@ -228,11 +228,18 @@ export async function hydrateHistoryFromApi(
 
   const canonical: LocalResearchHistoryRecord[] = []
   for (const campaign of campaigns) {
-    const timeline = await getCampaignTimeline(campaign.id, args)
-    for (const experiment of timeline.experiments) {
-      const record = apiExperimentToHistory(campaign, experiment)
-      if (record) canonical.push(record)
-    }
+    let cursor: string | null = null
+    do {
+      const page = await listCampaignExperiments(campaign.id, args, {
+        limit: 100,
+        cursor: cursor ?? undefined,
+      })
+      for (const experiment of page.items) {
+        const record = apiExperimentToHistory(campaign, experiment)
+        if (record) canonical.push(record)
+      }
+      cursor = page.page.nextCursor
+    } while (cursor)
   }
   const canonicalRunRefs = new Set(canonical.map((record) => record.runRef))
 

@@ -13,6 +13,20 @@ import { readLastRun, readOutbox, readState } from "../lib/outbox"
 import { resolveProjectPath } from "../lib/project"
 import { flushOutbox } from "../lib/sync"
 
+function positiveNumberOption(args: Args, name: string, fallback: number) {
+  const raw = args.options[name]
+  if (raw === undefined) return fallback
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`--${name} must be a positive number`)
+  }
+  return parsed
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 export async function commandPush(args: Args) {
   const root = await repoRoot()
   const result = await flushOutbox(root, args)
@@ -24,6 +38,21 @@ export async function commandPush(args: Args) {
 
 export async function commandSync(args: Args) {
   const root = await repoRoot()
+  if (args.options.watch === "true") {
+    const intervalMs = positiveNumberOption(args, "interval", 5) * 1000
+    console.log(`Watching outbox; syncing every ${intervalMs / 1000}s.`)
+    while (true) {
+      await flushOutbox(root, args).catch((error) => {
+        console.warn(
+          `Sync attempt failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      })
+      await sleep(intervalMs)
+    }
+  }
+
   const result = await flushOutbox(root, args)
   if (result.offline) return
 

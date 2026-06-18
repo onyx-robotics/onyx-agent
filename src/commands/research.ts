@@ -7,7 +7,8 @@ import {
   claimCampaignLane,
   createCampaignSession,
   getCampaignBrief,
-  getCampaignTimeline,
+  getCampaignOverview,
+  getResearchSessionState,
   heartbeatCampaignLane,
   heartbeatWorker,
   listProjectCampaigns,
@@ -23,7 +24,13 @@ import {
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import { readHistory } from "../lib/history"
-import { onyxStateDir, readLastRun, readState, writeState } from "../lib/outbox"
+import {
+  onyxStateDir,
+  readLastRun,
+  readOutbox,
+  readState,
+  writeState,
+} from "../lib/outbox"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { pathExists, runProcess, type ProcessResult } from "../lib/process"
 import { flushOutbox } from "../lib/sync"
@@ -42,8 +49,79 @@ function positiveIntegerOption(args: Args, name: string, fallback: number) {
   return value
 }
 
+function positiveNumberOption(args: Args, name: string, fallback: number) {
+  const raw = args.options[name]
+  if (raw === undefined) return fallback
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`--${name} must be a positive number`)
+  }
+  return value
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function createSyncSupervisor({
+  root,
+  args,
+  intervalMs,
+}: {
+  root: string
+  args: Args
+  intervalMs: number
+}) {
+  let running: Promise<void> | null = null
+  let stopped = false
+  let timer: ReturnType<typeof setInterval> | null = null
+
+  const run = () => {
+    if (running) return running
+    running = flushOutbox(root, args, { quiet: true })
+      .then(() => undefined)
+      .catch((error) => {
+        console.warn(
+          `Background sync skipped: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      })
+      .finally(() => {
+        running = null
+      })
+    return running
+  }
+
+  timer = setInterval(() => {
+    if (!stopped) void run()
+  }, intervalMs)
+
+  return {
+    request() {
+      if (!stopped) void run()
+    },
+    async drain(timeoutMs: number) {
+      stopped = true
+      if (timer) clearInterval(timer)
+      const deadline = Date.now() + timeoutMs
+      do {
+        await run()
+        const { records } = await readOutbox(root)
+        if (records.length === 0) return 0
+        await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
+      } while (Date.now() < deadline)
+      const { records } = await readOutbox(root)
+      return records.length
+    },
+    stop() {
+      stopped = true
+      if (timer) clearInterval(timer)
+    },
+  }
+}
+
 async function campaignForName(root: string, args: Args) {
-  await flushOutbox(root, args, { quiet: true }).catch(() => {})
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
   const campaignName =
@@ -63,8 +141,8 @@ async function campaignForName(root: string, args: Args) {
     throw new Error(`Campaign ${campaignName} was not found.`)
   }
 
-  const timeline = await getCampaignTimeline(campaign.id, args)
-  const setup = timeline.activeSetup
+  const overview = await getCampaignOverview(campaign.id, args)
+  const setup = overview.activeSetup
   const key = campaignStateKey(projectPath, campaign.name)
   state.projectId = project.id
   state.projectPath = projectPath
@@ -84,7 +162,7 @@ async function campaignForName(root: string, args: Args) {
   }
   await writeState(root, state)
 
-  return { projectPath, campaign, setup, timeline }
+  return { projectPath, campaign: overview.campaign, setup, overview }
 }
 
 function assertResearchReady(campaign: ApiCampaign, setup: ApiSetup | null) {
@@ -118,6 +196,25 @@ async function writeBrief({
   await mkdir(dir, { recursive: true })
   const path = join(dir, `${lane.name}.md`)
   await writeFile(path, `${brief.markdown}\n`, "utf8")
+  return path
+}
+
+async function writeSessionState({
+  root,
+  sessionId,
+  lane,
+  args,
+}: {
+  root: string
+  sessionId: string
+  lane: ApiLane
+  args: Args
+}) {
+  const dir = join(await onyxStateDir(root), "session-state", sessionId)
+  await mkdir(dir, { recursive: true })
+  const path = join(dir, `${lane.id}.json`)
+  const state = await getResearchSessionState(sessionId, args)
+  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, "utf8")
   return path
 }
 
@@ -156,10 +253,12 @@ async function ensureWorktree({
 
 async function commitIfNeeded(worktree: string, lane: ApiLane) {
   const status = await git(["status", "--porcelain"], worktree)
-  if (!status.trim()) return await currentCommit(worktree)
+  if (!status.trim()) {
+    return { commitSha: await currentCommit(worktree), changed: false }
+  }
   await git(["add", "-A"], worktree)
   await git(["commit", "-m", `onyx: ${lane.name} research attempt`], worktree)
-  return currentCommit(worktree)
+  return { commitSha: await currentCommit(worktree), changed: true }
 }
 
 function processFailure(result: ProcessResult, label: string) {
@@ -173,6 +272,45 @@ function processFailure(result: ProcessResult, label: string) {
 function assertProcessSucceeded(result: ProcessResult, label: string) {
   const failure = processFailure(result, label)
   if (failure) throw new Error(failure)
+}
+
+async function withWorkerHeartbeat<T>({
+  workerId,
+  sessionId,
+  laneId,
+  args,
+  phase,
+  progressMessage,
+  run,
+}: {
+  workerId: string
+  sessionId: string
+  laneId: string
+  args: Args
+  phase: string
+  progressMessage: string
+  run: () => Promise<T>
+}): Promise<T> {
+  const timer = setInterval(() => {
+    void heartbeatWorker(
+      workerId,
+      {
+        status: "running",
+        sessionId,
+        laneId,
+        phase,
+        event: "heartbeat",
+        progressMessage,
+      },
+      args
+    ).catch(() => {})
+  }, 10_000)
+
+  try {
+    return await run()
+  } finally {
+    clearInterval(timer)
+  }
 }
 
 function errorMessage(error: unknown) {
@@ -196,6 +334,10 @@ async function runLaneOnce({
   lane,
   workerCommand,
   agentKind,
+  maxIterations,
+  endTimeMs,
+  workerTimeoutMs,
+  syncSupervisor,
   args,
 }: {
   root: string
@@ -206,6 +348,10 @@ async function runLaneOnce({
   lane: ApiLane
   workerCommand: string
   agentKind: string
+  maxIterations: number
+  endTimeMs: number
+  workerTimeoutMs: number
+  syncSupervisor: ReturnType<typeof createSyncSupervisor>
   args: Args
 }): Promise<LaneRunResult> {
   let workerId: string | undefined
@@ -240,13 +386,6 @@ async function runLaneOnce({
       args
     )
 
-    const briefPath = await writeBrief({
-      root,
-      campaignId: campaign.id,
-      sessionId,
-      lane: claimed,
-      args,
-    })
     const worktree = await ensureWorktree({ root, lane: claimed, sessionId })
     await emitEvent(root, {
       type: "lane_claimed",
@@ -259,40 +398,6 @@ async function runLaneOnce({
       message: lane.name,
     })
 
-    const workerResult = await runProcess("sh", ["-lc", workerCommand], {
-      cwd: worktree,
-      env: {
-        ...process.env,
-        ONYX_CAMPAIGN_ID: campaign.id,
-        ONYX_CAMPAIGN_NAME: campaign.name,
-        ONYX_SETUP_ID: setup.id,
-        ONYX_SESSION_ID: sessionId,
-        ONYX_LANE_ID: lane.id,
-        ONYX_LANE_NAME: lane.name,
-        ONYX_LANE_BRANCH: lane.branchRef,
-        ONYX_WORKER_ID: worker.id,
-        ONYX_BRIEF_FILE: briefPath,
-      },
-    })
-    assertProcessSucceeded(workerResult, `Worker command for ${lane.name}`)
-
-    resultCommitSha = await commitIfNeeded(worktree, lane)
-    await heartbeatCampaignLane(
-      lane.id,
-      {
-        workerId: worker.id,
-        currentCommitSha: resultCommitSha,
-        status: "claimed",
-      },
-      args
-    )
-
-    const lanePush = await gitResult(
-      ["push", "origin", `HEAD:${lane.branchRef}`],
-      worktree
-    )
-    assertProcessSucceeded(lanePush, `Lane branch push for ${lane.name}`)
-
     const laneOptions = {
       ...args.options,
       campaign: campaign.name,
@@ -303,19 +408,124 @@ async function runLaneOnce({
       cwd: worktree,
       "project-path": projectPath,
     }
-    await commandExpRun({
-      positional: ["exp", "run"],
-      options: laneOptions,
-    })
-    await commandExpLog({
-      positional: ["exp", "log"],
-      options: {
-        ...laneOptions,
-        name: `${lane.name}-${resultCommitSha.slice(0, 7)}`,
-        description: `Result from ${lane.name}`,
-      },
-    })
-    process.exitCode = undefined
+    let noOpAttempts = 0
+    let completedAttempts = 0
+
+    for (
+      let attempt = 1;
+      attempt <= maxIterations && Date.now() < endTimeMs;
+      attempt += 1
+    ) {
+      const [briefPath, sessionStatePath] = await Promise.all([
+        writeBrief({
+          root,
+          campaignId: campaign.id,
+          sessionId,
+          lane: claimed,
+          args,
+        }),
+        writeSessionState({ root, sessionId, lane: claimed, args }).catch(
+          () => null
+        ),
+      ])
+
+      const workerResult = await withWorkerHeartbeat({
+        workerId: worker.id,
+        sessionId,
+        laneId: lane.id,
+        args,
+        phase: "research",
+        progressMessage: `${claimed.name} attempt ${attempt}`,
+        run: () =>
+          runProcess("sh", ["-lc", workerCommand], {
+            cwd: worktree,
+            timeoutMs: workerTimeoutMs,
+            env: {
+              ...process.env,
+              ONYX_CAMPAIGN_ID: campaign.id,
+              ONYX_CAMPAIGN_NAME: campaign.name,
+              ONYX_SETUP_ID: setup.id,
+              ONYX_SESSION_ID: sessionId,
+              ONYX_LANE_ID: lane.id,
+              ONYX_LANE_NAME: lane.name,
+              ONYX_LANE_BRANCH: lane.branchRef,
+              ONYX_WORKER_ID: worker.id,
+              ONYX_BRIEF_FILE: briefPath,
+              ...(sessionStatePath
+                ? { ONYX_SESSION_STATE_FILE: sessionStatePath }
+                : {}),
+            },
+          }),
+      })
+      assertProcessSucceeded(
+        workerResult,
+        `Worker command for ${lane.name} attempt ${attempt}`
+      )
+
+      const commit = await commitIfNeeded(worktree, lane)
+      resultCommitSha = commit.commitSha
+      if (!commit.changed) {
+        noOpAttempts += 1
+        await heartbeatWorker(
+          worker.id,
+          {
+            status: "running",
+            sessionId,
+            laneId: claimed.id,
+            phase: "research",
+            event: "no_op_attempt",
+            progressMessage: `${claimed.name} produced no changes (${noOpAttempts}/2)`,
+            gitLabel: resultCommitSha,
+          },
+          args
+        )
+        if (noOpAttempts >= 2) break
+        continue
+      }
+
+      noOpAttempts = 0
+      completedAttempts += 1
+      await heartbeatCampaignLane(
+        lane.id,
+        {
+          workerId: worker.id,
+          currentCommitSha: resultCommitSha,
+          status: "claimed",
+        },
+        args
+      )
+
+      const lanePush = await gitResult(
+        ["push", "origin", `HEAD:${lane.branchRef}`],
+        worktree
+      )
+      assertProcessSucceeded(lanePush, `Lane branch push for ${lane.name}`)
+
+      await withWorkerHeartbeat({
+        workerId: worker.id,
+        sessionId,
+        laneId: lane.id,
+        args,
+        phase: "eval",
+        progressMessage: `${claimed.name} evaluating attempt ${attempt}`,
+        run: async () => {
+          await commandExpRun({
+            positional: ["exp", "run"],
+            options: laneOptions,
+          })
+          await commandExpLog({
+            positional: ["exp", "log"],
+            options: {
+              ...laneOptions,
+              name: `${lane.name}-${resultCommitSha!.slice(0, 7)}`,
+              description: `Result from ${lane.name} attempt ${attempt}`,
+            },
+          })
+        },
+      })
+      process.exitCode = undefined
+      syncSupervisor.request()
+    }
 
     await heartbeatCampaignLane(
       lane.id,
@@ -348,7 +558,7 @@ async function runLaneOnce({
         authoredByWorkerId: worker.id,
         summaryKind: "lane_summary",
         title: `${lane.name} latest attempt`,
-        body: `Latest commit: ${resultCommitSha}`,
+        body: `Completed attempts: ${completedAttempts}\nLatest commit: ${resultCommitSha ?? "n/a"}`,
       },
       args
     )
@@ -427,6 +637,7 @@ export async function commandSetupValidate(args: Args) {
       description: `Baseline for setup v${setup.version}`,
     },
   })
+  await flushOutbox(root, args)
   const { records } = await readHistory(root)
   const history = records.find((record) => record.runRef === lastRun?.runRef)
   if (!history?.experimentId) {
@@ -463,6 +674,19 @@ export async function commandResearchStart(args: Args) {
     "agents",
     Number(args.options.workers ?? 1)
   )
+  const maxIterations = positiveIntegerOption(args, "max-iterations", 10)
+  const maxMinutes = positiveNumberOption(args, "max-minutes", 120)
+  const workerTimeoutMs =
+    positiveNumberOption(args, "worker-timeout", 1800) * 1000
+  const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
+  const finalSyncTimeoutMs =
+    positiveNumberOption(args, "final-sync-timeout", 120) * 1000
+  const endTimeMs = Date.now() + maxMinutes * 60_000
+  const syncSupervisor = createSyncSupervisor({
+    root,
+    args,
+    intervalMs: syncIntervalMs,
+  })
   const result = await createCampaignSession(
     campaign.id,
     {
@@ -503,10 +727,15 @@ export async function commandResearchStart(args: Args) {
         lane,
         workerCommand,
         agentKind,
+        maxIterations,
+        endTimeMs,
+        workerTimeoutMs,
+        syncSupervisor,
         args,
       })
     )
   )
+  const pendingAfterDrain = await syncSupervisor.drain(finalSyncTimeoutMs)
 
   const completed = laneResults.filter((lane) => lane.status === "completed")
   const failed = laneResults.filter((lane) => lane.status === "failed")
@@ -519,6 +748,7 @@ export async function commandResearchStart(args: Args) {
     `Session ${result.session.id}`,
     `Completed lanes: ${completed.length}`,
     `Failed lanes: ${failed.length}`,
+    `Pending sync records: ${pendingAfterDrain}`,
     "",
     ...resultLines,
   ].join("\n")
@@ -535,12 +765,12 @@ export async function commandResearchStart(args: Args) {
     args
   )
 
-  const latestTimeline = await getCampaignTimeline(campaign.id, args).catch(
+  const latestOverview = await getCampaignOverview(campaign.id, args).catch(
     () => null
   )
-  const bestLine = latestTimeline
-    ? `Best metric: ${latestTimeline.campaign.bestMetricValue ?? "n/a"} at ${
-        latestTimeline.campaign.bestCommitSha ?? "n/a"
+  const bestLine = latestOverview
+    ? `Best metric: ${latestOverview.campaign.bestMetricValue ?? "n/a"} at ${
+        latestOverview.campaign.bestCommitSha ?? "n/a"
       }`
     : "Best metric: n/a"
   await upsertCampaignSummary(
@@ -563,6 +793,7 @@ export async function commandResearchStart(args: Args) {
       metadata: {
         completed: completed.length,
         failed: failed.length,
+        pendingSyncRecords: pendingAfterDrain,
       },
     },
     args
@@ -580,19 +811,19 @@ export async function commandResearchStart(args: Args) {
 
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
-  const { campaign, setup, timeline } = await campaignForName(root, args)
+  const { campaign, setup, overview } = await campaignForName(root, args)
   console.log(`campaign: ${campaign.name}`)
   console.log(`phase: ${campaign.phase}`)
   console.log(
     `setup: ${setup ? `v${setup.version} ${setup.status}` : "(none)"}`
   )
-  console.log(`lanes: ${timeline.lanes.length}`)
-  for (const lane of timeline.lanes) {
+  console.log(`lanes: ${overview.lanes.length}`)
+  for (const lane of overview.lanes) {
     console.log(
       `  ${lane.name}: ${lane.status} branch=${lane.branchRef} best=${lane.bestMetricValue ?? "-"}`
     )
   }
-  console.log(`workers: ${timeline.workers.length}`)
+  console.log(`workers: ${overview.workers.length}`)
 }
 
 export async function commandWorkerRun(args: Args) {
