@@ -13,12 +13,19 @@ import { commandListen } from "./commands/listen"
 import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
 import {
+  commandResearchFinish,
+  commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
+  commandResearchStop,
+  commandSetupApprove,
+  commandSetupBaseline,
   commandSetupValidate,
+  commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
 import { commandPush, commandStatus, commandSync } from "./commands/sync"
+import { commandToolsRun } from "./commands/tools"
 
 export const USAGE = `onyx - research workflow CLI
 
@@ -40,13 +47,20 @@ Usage:
   onyx campaign setup --name <name> --metric <name> [--unit <unit>] [--direction maximize|minimize] [--description <text>] [--project-path <path>]
       (creates a campaign and draft setup; each measured experiment is pushed
       as an immutable refs/onyx/experiments/* ref)
+  onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
+  onyx setup baseline [--campaign <name>]
+  onyx setup approve [--campaign <name>] --baseline-experiment <id>
   onyx setup validate [--campaign <name>]
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> --worker-command "<cmd>" [--agents <n>] [--agent <kind>] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
+  onyx research start --campaign <name> [--agents <n>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
       (starts durable local lane workers for a validated setup)
+  onyx research should-stop [--session <id>] [--iteration <n>] [--json]
+  onyx research stop [--session <id>] [--reason <text>]
+  onyx research finish [--campaign <name>] [--session <id>]
   onyx research status [--campaign <name>]
+  onyx summary upsert [--campaign <name>] [--kind <kind>] [--title <text>] --body <text>
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
   onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
@@ -78,6 +92,11 @@ export async function main(argv = process.argv.slice(2)) {
     if (command === "profile") return commandProfile(args)
     if (command === "campaign" && sub === "setup")
       return commandCampaignCreate(args)
+    if (command === "tools" && sub === "run") return commandToolsRun(args)
+    if (command === "setup" && sub === "baseline")
+      return commandSetupBaseline(args)
+    if (command === "setup" && sub === "approve")
+      return commandSetupApprove(args)
     if (command === "setup" && sub === "validate")
       return commandSetupValidate(args)
     if (command === "campaign" && sub === "use") return commandCampaignUse(args)
@@ -87,8 +106,16 @@ export async function main(argv = process.argv.slice(2)) {
       return commandCampaignDelete(args)
     if (command === "research" && sub === "start")
       return commandResearchStart(args)
+    if (command === "research" && sub === "should-stop")
+      return commandResearchShouldStop(args)
+    if (command === "research" && sub === "stop")
+      return commandResearchStop(args)
+    if (command === "research" && sub === "finish")
+      return commandResearchFinish(args)
     if (command === "research" && sub === "status")
       return commandResearchStatus(args)
+    if (command === "summary" && sub === "upsert")
+      return commandSummaryUpsert(args)
     if (command === "worker" && sub === "run") return commandWorkerRun(args)
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "exp" && sub === "log") return commandExpLog(args)

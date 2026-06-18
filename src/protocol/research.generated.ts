@@ -70,6 +70,13 @@ export const researchLaneStatusSchema = z.enum([
   "lost",
   "completed",
 ])
+export const researchSessionStatusSchema = z.enum([
+  "running",
+  "stop_requested",
+  "completed",
+  "failed",
+  "stopped",
+])
 export const researchSummaryKindSchema = z.enum([
   "campaign_brief",
   "session_brief",
@@ -364,7 +371,7 @@ export const researchSessionSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
   name: z.string().min(1),
-  status: z.string().min(1),
+  status: researchSessionStatusSchema,
   workerTarget: z.number().int().positive().nullable(),
   metadata: metadataSchema,
   startedAt: z.iso.datetime(),
@@ -500,6 +507,9 @@ export const researchWorkerHeartbeatRequestSchema = z.object({
 
 export const stopResearchSessionRequestSchema = z.object({
   campaignId: z.uuid(),
+  status: z
+    .enum(["stop_requested", "completed", "failed", "stopped"])
+    .default("stop_requested"),
   reason: z.string().trim().max(1000).optional(),
   metadata: metadataSchema.default({}),
 })
@@ -1086,6 +1096,7 @@ export type ResearchProjectGraphResponse = z.infer<
   typeof researchProjectGraphResponseSchema
 >
 export type ResearchSession = z.infer<typeof researchSessionSchema>
+export type ResearchSessionStatus = z.infer<typeof researchSessionStatusSchema>
 export type CreateResearchSessionRequest = z.infer<
   typeof createResearchSessionRequestSchema
 >

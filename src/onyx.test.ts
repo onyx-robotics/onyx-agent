@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
 import { describe, expect, test } from "bun:test"
 
 import type { LocalResearchHistoryRecord } from "./protocol"
@@ -7,13 +11,20 @@ import {
   mergeHistory,
   parseMetricLines,
   renderExperimentTable,
+  runToolCommand,
   USAGE,
 } from "./onyx"
+import { runProcess } from "./lib/process"
 
 describe("campaign CLI surface", () => {
   test("usage exposes campaigns and not legacy branch commands", () => {
     expect(USAGE).toContain("onyx campaign setup")
+    expect(USAGE).toContain("onyx setup baseline")
+    expect(USAGE).toContain("onyx setup approve")
     expect(USAGE).toContain("onyx research start --campaign")
+    expect(USAGE).toContain("onyx research should-stop")
+    expect(USAGE).toContain("onyx research finish")
+    expect(USAGE).toContain("onyx tools run")
     expect(USAGE).not.toContain("onyx campaign create")
     expect(USAGE).not.toContain("onyx branch create")
   })
@@ -104,5 +115,35 @@ describe("metrics", () => {
     expect(parseMetricLines("METRIC score=1.25\n", "score")).toEqual({
       score: 1.25,
     })
+  })
+})
+
+describe("tool api", () => {
+  test("runs manifest commands from the project root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-tools-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await mkdir(join(root, "onyx"), { recursive: true })
+    await writeFile(
+      join(root, "onyx", "tool-api.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        commands: {
+          evaluate: {
+            command: "printf 'METRIC score=2\\n'",
+            timeoutSeconds: 5,
+          },
+        },
+      })}\n`,
+      "utf8"
+    )
+
+    const result = await runToolCommand({
+      root,
+      projectPath: "",
+      name: "evaluate",
+    })
+
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain("METRIC score=2")
   })
 })

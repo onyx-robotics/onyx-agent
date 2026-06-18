@@ -29,14 +29,14 @@ import {
   writeState,
   type LastRunRecord,
 } from "../lib/outbox"
-import {
-  campaignStateKey,
-  onyxPath,
-  resolveProjectPath,
-  scopedRoot,
-} from "../lib/project"
-import { pathExists, runProcess } from "../lib/process"
+import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
+import { pathExists } from "../lib/process"
 import { renderExperimentTable } from "../lib/tui"
+import {
+  hasToolCommand,
+  runToolCommand,
+  type ToolRunResult,
+} from "../lib/tools"
 
 type ExperimentStatus = LocalResearchCampaignExperimentLoggedRecord["status"]
 type ChecksRecord = NonNullable<
@@ -114,16 +114,26 @@ async function runChecks({
   projectPath: string
   timeoutMs: number
 }): Promise<ChecksRecord | null> {
+  const hasManifestCheck = await hasToolCommand({
+    root,
+    projectPath,
+    name: "check",
+  })
   const checksSh = onyxPath(root, projectPath, "checks.sh")
-  if (!(await pathExists(checksSh))) return null
+  if (!hasManifestCheck && !(await pathExists(checksSh))) return null
 
   const started = Date.now()
-  const result = await runProcess("bash", [checksSh], {
-    cwd: scopedRoot(root, projectPath),
-    timeoutMs,
+  const result = await runToolCommand({
+    root,
+    projectPath,
+    name: hasManifestCheck ? "check" : "checks",
+    timeoutSeconds: timeoutMs / 1000,
   })
   const durationMs = Date.now() - started
-  const outputSummary = summarizeOutput(result.stdout, result.stderr) || null
+  const outputSummary =
+    result.outputSummary ??
+    summarizeOutput(result.stdout, result.stderr) ??
+    null
 
   return {
     status: result.timedOut
@@ -228,6 +238,20 @@ export async function commandExpRun(args: Args) {
   const started = new Date()
   const runRef = clientRunRef(campaignName)
   const resultRef = `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
+  const setupId =
+    args.options.setup ?? process.env.ONYX_SETUP_ID ?? campaign.setupId
+  if (!setupId) {
+    throw new Error(
+      "No active setup id. Run `onyx setup baseline`, then `onyx setup approve`, or pass --setup <id>."
+    )
+  }
+  const laneId =
+    args.options.lane ?? process.env.ONYX_LANE_ID ?? campaign.laneId
+  const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
+  const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
+  const baseCommitSha =
+    args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+
   await emitEvent(root, {
     type: "exp_run_started",
     campaignName,
@@ -236,9 +260,49 @@ export async function commandExpRun(args: Args) {
     commitSha: resultCommitSha,
     resultRef,
   })
-  const result = await runProcess("bash", [evalSh], {
-    cwd: scopedRoot(root, projectPath),
-    timeoutMs,
+  if (await hasToolCommand({ root, projectPath, name: "reset" })) {
+    const reset = await runToolCommand({
+      root,
+      projectPath,
+      name: "reset",
+      timeoutSeconds: numberOption(args, "reset-timeout", 120),
+    })
+    if (reset.code !== 0 || reset.timedOut) {
+      await writeLastRun(root, {
+        schemaVersion: 1,
+        createdAt: new Date().toISOString(),
+        runRef,
+        campaignName,
+        projectPath,
+        baseCommitSha,
+        resultCommitSha,
+        resultRef,
+        status: "failed",
+        primaryMetricName: campaign.metricName,
+        primaryMetricValue: null,
+        metrics: {},
+        agentNotes: {},
+        checks: null,
+        durationMs: 0,
+        startedAt: started.toISOString(),
+        completedAt: new Date().toISOString(),
+        outputSummary:
+          reset.outputSummary ??
+          summarizeOutput(reset.stdout, reset.stderr) ??
+          "Environment reset failed.",
+        setupId,
+        sessionId,
+        workerId,
+        laneId,
+      })
+      throw new Error("Environment reset failed before evaluation.")
+    }
+  }
+  const result: ToolRunResult = await runToolCommand({
+    root,
+    projectPath,
+    name: "evaluate",
+    timeoutSeconds: timeoutMs / 1000,
   })
   const completed = new Date()
   const metrics = parseMetricLines(result.stdout, campaign.metricName)
@@ -273,24 +337,12 @@ export async function commandExpRun(args: Args) {
     : checks && checks.status !== "passed"
       ? "checks_failed"
       : "succeeded"
-  const setupId =
-    args.options.setup ?? process.env.ONYX_SETUP_ID ?? campaign.setupId
-  if (!setupId) {
-    throw new Error(
-      "No active setup id. Run `onyx setup validate` or pass --setup <id>."
-    )
-  }
-  const laneId =
-    args.options.lane ?? process.env.ONYX_LANE_ID ?? campaign.laneId
-  const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
-  const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
-
   const outputSummaryParts = [
     result.timedOut ? `Eval timed out after ${timeoutMs / 1000}s.` : "",
     result.code === 0 && primary.value === null
       ? `No METRIC line found for ${campaign.metricName}.`
       : "",
-    summarizeOutput(result.stdout, result.stderr),
+    result.outputSummary ?? summarizeOutput(result.stdout, result.stderr),
   ].filter(Boolean)
   const outputSummary = outputSummaryParts.join("\n").slice(0, 4000) || null
 
@@ -306,7 +358,7 @@ export async function commandExpRun(args: Args) {
     runRef,
     campaignName,
     projectPath,
-    baseCommitSha: campaign.baseCommitSha,
+    baseCommitSha,
     resultCommitSha,
     resultRef,
     status,
@@ -417,7 +469,7 @@ export async function commandExpLog(args: Args) {
     campaign.setupId
   if (!setupId) {
     throw new Error(
-      "No active setup id. Run `onyx setup validate` or pass --setup <id>."
+      "No active setup id. Run `onyx setup baseline`, then `onyx setup approve`, or pass --setup <id>."
     )
   }
   const laneId =

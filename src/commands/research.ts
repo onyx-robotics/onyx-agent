@@ -2,10 +2,11 @@ import { mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import { commandExpLog, commandExpRun } from "./exp"
-import { requireOption, type Args } from "../lib/args"
+import type { Args } from "../lib/args"
 import {
   claimCampaignLane,
   createCampaignSession,
+  createCampaignSetup,
   getCampaignBrief,
   getCampaignOverview,
   getResearchSessionState,
@@ -34,6 +35,8 @@ import {
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { pathExists, runProcess, type ProcessResult } from "../lib/process"
 import { flushOutbox } from "../lib/sync"
+import { protectedToolPaths, toolApiPath } from "../lib/tools"
+import { renderLaneWorkerPrompt } from "../lib/worker-prompt"
 
 function branchName(ref: string) {
   return ref.replace(/^refs\/heads\//, "")
@@ -173,7 +176,7 @@ function assertResearchReady(campaign: ApiCampaign, setup: ApiSetup | null) {
     !setup.baselineExperimentId
   ) {
     throw new Error(
-      "Research requires a validated setup with a baseline. Run `onyx setup validate` first."
+      "Research requires a validated setup with a baseline. Run `onyx setup baseline`, then `onyx setup approve` first."
     )
   }
 }
@@ -261,6 +264,111 @@ async function commitIfNeeded(worktree: string, lane: ApiLane) {
   return { commitSha: await currentCommit(worktree), changed: true }
 }
 
+async function writeWorkerPrompt({
+  root,
+  projectPath,
+  campaign,
+  setup,
+  sessionId,
+  lane,
+  briefPath,
+  sessionStatePath,
+  maxIterations,
+  endTimeMs,
+}: {
+  root: string
+  projectPath: string
+  campaign: ApiCampaign
+  setup: ApiSetup
+  sessionId: string
+  lane: ApiLane
+  briefPath: string
+  sessionStatePath: string | null
+  maxIterations: number
+  endTimeMs: number
+}) {
+  const dir = join(await onyxStateDir(root), "worker-prompts", sessionId)
+  await mkdir(dir, { recursive: true })
+  const path = join(dir, `${lane.name}.md`)
+  const protectedPaths = await protectedToolPaths(root, projectPath)
+  const minutesRemaining = Math.max(
+    0,
+    Math.ceil((endTimeMs - Date.now()) / 60_000)
+  )
+  const markdown = renderLaneWorkerPrompt({
+    briefPath,
+    campaignName: campaign.name,
+    goal: setup.goal ?? campaign.description ?? "not specified",
+    laneBranch: lane.branchRef,
+    laneId: lane.id,
+    laneName: lane.name,
+    maxIterations,
+    metricLabel: `${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
+    minutesRemaining,
+    protectedPaths,
+    researchSpecPath: projectPath
+      ? `${projectPath}/onyx/onyx.md`
+      : "onyx/onyx.md",
+    sessionId,
+    sessionStatePath,
+    setupId: setup.id,
+    setupVersion: setup.version,
+    toolApiPath: toolApiPath(root, projectPath),
+  })
+
+  await writeFile(path, `${markdown}\n`, "utf8")
+  return { path, markdown }
+}
+
+function buildWorkerInvocation({
+  agentKind,
+  workerCommand,
+  worktree,
+  prompt,
+}: {
+  agentKind: string
+  workerCommand?: string
+  worktree: string
+  prompt: string
+}): {
+  command: string
+  args: string[]
+  stdin?: string
+} {
+  if (workerCommand) {
+    return { command: "sh", args: ["-lc", workerCommand] }
+  }
+
+  if (agentKind === "claude") {
+    return {
+      command: "claude",
+      args: ["-p", "--permission-mode", "auto", "--add-dir", worktree, prompt],
+    }
+  }
+
+  if (agentKind !== "codex") {
+    throw new Error(
+      `Unknown --agent ${agentKind}. Use codex, claude, or pass --worker-command.`
+    )
+  }
+
+  return {
+    command: "codex",
+    args: [
+      "exec",
+      "--cd",
+      worktree,
+      "--search",
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "never",
+      "-",
+    ],
+    stdin: prompt,
+  }
+}
+
 function processFailure(result: ProcessResult, label: string) {
   if (result.timedOut) return `${label} timed out`
   if (result.code === 0) return null
@@ -346,7 +454,7 @@ async function runLaneOnce({
   setup: ApiSetup
   sessionId: string
   lane: ApiLane
-  workerCommand: string
+  workerCommand?: string
   agentKind: string
   maxIterations: number
   endTimeMs: number
@@ -398,134 +506,90 @@ async function runLaneOnce({
       message: lane.name,
     })
 
-    const laneOptions = {
-      ...args.options,
-      campaign: campaign.name,
-      setup: setup.id,
-      session: sessionId,
-      lane: lane.id,
-      worker: worker.id,
-      cwd: worktree,
-      "project-path": projectPath,
-    }
-    let noOpAttempts = 0
-    let completedAttempts = 0
-
-    for (
-      let attempt = 1;
-      attempt <= maxIterations && Date.now() < endTimeMs;
-      attempt += 1
-    ) {
-      const [briefPath, sessionStatePath] = await Promise.all([
-        writeBrief({
-          root,
-          campaignId: campaign.id,
-          sessionId,
-          lane: claimed,
-          args,
-        }),
-        writeSessionState({ root, sessionId, lane: claimed, args }).catch(
-          () => null
-        ),
-      ])
-
-      const workerResult = await withWorkerHeartbeat({
-        workerId: worker.id,
+    const [briefPath, sessionStatePath] = await Promise.all([
+      writeBrief({
+        root,
+        campaignId: campaign.id,
         sessionId,
-        laneId: lane.id,
+        lane: claimed,
         args,
-        phase: "research",
-        progressMessage: `${claimed.name} attempt ${attempt}`,
-        run: () =>
-          runProcess("sh", ["-lc", workerCommand], {
-            cwd: worktree,
-            timeoutMs: workerTimeoutMs,
-            env: {
-              ...process.env,
-              ONYX_CAMPAIGN_ID: campaign.id,
-              ONYX_CAMPAIGN_NAME: campaign.name,
-              ONYX_SETUP_ID: setup.id,
-              ONYX_SESSION_ID: sessionId,
-              ONYX_LANE_ID: lane.id,
-              ONYX_LANE_NAME: lane.name,
-              ONYX_LANE_BRANCH: lane.branchRef,
-              ONYX_WORKER_ID: worker.id,
-              ONYX_BRIEF_FILE: briefPath,
-              ...(sessionStatePath
-                ? { ONYX_SESSION_STATE_FILE: sessionStatePath }
-                : {}),
-            },
-          }),
-      })
-      assertProcessSucceeded(
-        workerResult,
-        `Worker command for ${lane.name} attempt ${attempt}`
-      )
-
-      const commit = await commitIfNeeded(worktree, lane)
-      resultCommitSha = commit.commitSha
-      if (!commit.changed) {
-        noOpAttempts += 1
-        await heartbeatWorker(
-          worker.id,
-          {
-            status: "running",
-            sessionId,
-            laneId: claimed.id,
-            phase: "research",
-            event: "no_op_attempt",
-            progressMessage: `${claimed.name} produced no changes (${noOpAttempts}/2)`,
-            gitLabel: resultCommitSha,
+      }),
+      writeSessionState({ root, sessionId, lane: claimed, args }).catch(
+        () => null
+      ),
+    ])
+    const prompt = await writeWorkerPrompt({
+      root,
+      projectPath,
+      campaign,
+      setup,
+      sessionId,
+      lane: claimed,
+      briefPath,
+      sessionStatePath,
+      maxIterations,
+      endTimeMs,
+    })
+    const invocation = buildWorkerInvocation({
+      agentKind,
+      workerCommand,
+      worktree,
+      prompt: prompt.markdown,
+    })
+    const workerResult = await withWorkerHeartbeat({
+      workerId: worker.id,
+      sessionId,
+      laneId: lane.id,
+      args,
+      phase: "research",
+      progressMessage: `${claimed.name} worker running`,
+      run: () =>
+        runProcess(invocation.command, invocation.args, {
+          cwd: worktree,
+          timeoutMs: Math.max(
+            1,
+            Math.min(workerTimeoutMs, endTimeMs - Date.now())
+          ),
+          stdin: invocation.stdin,
+          env: {
+            ...process.env,
+            ONYX_CAMPAIGN_ID: campaign.id,
+            ONYX_CAMPAIGN_NAME: campaign.name,
+            ONYX_SETUP_ID: setup.id,
+            ONYX_SESSION_ID: sessionId,
+            ONYX_LANE_ID: lane.id,
+            ONYX_LANE_NAME: lane.name,
+            ONYX_LANE_BRANCH: lane.branchRef,
+            ONYX_WORKER_ID: worker.id,
+            ONYX_BRIEF_FILE: briefPath,
+            ONYX_WORKER_PROMPT_FILE: prompt.path,
+            ONYX_TOOL_API_FILE: toolApiPath(root, projectPath),
+            ...(sessionStatePath
+              ? { ONYX_SESSION_STATE_FILE: sessionStatePath }
+              : {}),
           },
-          args
-        )
-        if (noOpAttempts >= 2) break
-        continue
-      }
+        }),
+    })
+    assertProcessSucceeded(workerResult, `Worker process for ${lane.name}`)
 
-      noOpAttempts = 0
-      completedAttempts += 1
-      await heartbeatCampaignLane(
-        lane.id,
-        {
-          workerId: worker.id,
-          currentCommitSha: resultCommitSha,
-          status: "claimed",
-        },
-        args
-      )
-
-      const lanePush = await gitResult(
-        ["push", "origin", `HEAD:${lane.branchRef}`],
-        worktree
-      )
-      assertProcessSucceeded(lanePush, `Lane branch push for ${lane.name}`)
-
-      await withWorkerHeartbeat({
+    const commit = await commitIfNeeded(worktree, lane)
+    resultCommitSha = commit.commitSha
+    await heartbeatCampaignLane(
+      lane.id,
+      {
         workerId: worker.id,
-        sessionId,
-        laneId: lane.id,
-        args,
-        phase: "eval",
-        progressMessage: `${claimed.name} evaluating attempt ${attempt}`,
-        run: async () => {
-          await commandExpRun({
-            positional: ["exp", "run"],
-            options: laneOptions,
-          })
-          await commandExpLog({
-            positional: ["exp", "log"],
-            options: {
-              ...laneOptions,
-              name: `${lane.name}-${resultCommitSha!.slice(0, 7)}`,
-              description: `Result from ${lane.name} attempt ${attempt}`,
-            },
-          })
-        },
-      })
-      process.exitCode = undefined
-      syncSupervisor.request()
-    }
+        currentCommitSha: resultCommitSha,
+        status: "completed",
+      },
+      args
+    )
+
+    const lanePush = await gitResult(
+      ["push", "origin", `HEAD:${lane.branchRef}`],
+      worktree
+    )
+    assertProcessSucceeded(lanePush, `Lane branch push for ${lane.name}`)
+    syncSupervisor.request()
 
     await heartbeatCampaignLane(
       lane.id,
@@ -557,8 +621,16 @@ async function runLaneOnce({
         setupId: setup.id,
         authoredByWorkerId: worker.id,
         summaryKind: "lane_summary",
-        title: `${lane.name} latest attempt`,
-        body: `Completed attempts: ${completedAttempts}\nLatest commit: ${resultCommitSha ?? "n/a"}`,
+        title: `${lane.name} completed`,
+        body: [
+          `Worker process exited successfully.`,
+          `Latest commit: ${resultCommitSha ?? "n/a"}`,
+          workerResult.stdout.trim()
+            ? `\nWorker output:\n${workerResult.stdout.trim().slice(-4000)}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
       },
       args
     )
@@ -609,21 +681,87 @@ async function runLaneOnce({
   }
 }
 
-export async function commandSetupValidate(args: Args) {
+async function ensureSetupCommit({
+  root,
+  projectPath,
+  campaign,
+  setup,
+  args,
+}: {
+  root: string
+  projectPath: string
+  campaign: ApiCampaign
+  setup: ApiSetup
+  args: Args
+}) {
+  const setupCommitSha = await currentCommit(root)
+  if (setup.status !== "draft" || setup.setupCommitSha === setupCommitSha) {
+    return setup
+  }
+
+  const result = await createCampaignSetup(
+    campaign.id,
+    {
+      goal: setup.goal ?? campaign.description ?? undefined,
+      metricName: setup.metricName,
+      metricUnit: setup.metricUnit,
+      metricDirection: setup.metricDirection,
+      tools: setup.tools,
+      constraints: setup.constraints,
+      reset: setup.reset,
+      humanFeedback: setup.humanFeedback,
+      setupCommitSha,
+      metadata: {
+        ...(setup.metadata ?? {}),
+        refreshedBy: "onyx setup baseline",
+      },
+    },
+    args
+  )
+  const state = await readState(root)
+  const key = campaignStateKey(projectPath, campaign.name)
+  state.campaigns = state.campaigns ?? {}
+  state.campaigns[key] = {
+    ...state.campaigns[key],
+    setupId: result.setup.id,
+  }
+  await writeState(root, state)
+  await emitEvent(root, {
+    type: "setup_created",
+    campaignName: campaign.name,
+    campaignId: campaign.id,
+    setupId: result.setup.id,
+    commitSha: setupCommitSha,
+    message: `setup v${result.setup.version}`,
+  })
+  return result.setup
+}
+
+export async function commandSetupBaseline(args: Args): Promise<string> {
   const root = await repoRoot()
-  const { campaign, setup } = await campaignForName(root, args)
+  const { campaign, setup, projectPath } = await campaignForName(root, args)
   if (!setup) throw new Error("Campaign has no active setup.")
   if (setup.status === "validated" && setup.baselineExperimentId) {
-    console.log(`Setup ${setup.id} is already validated.`)
-    return
+    console.log(
+      `Setup ${setup.id} already has baseline ${setup.baselineExperimentId}.`
+    )
+    return setup.baselineExperimentId
   }
+  const activeSetup = await ensureSetupCommit({
+    root,
+    projectPath,
+    campaign,
+    setup,
+    args,
+  })
 
   await commandExpRun({
     positional: ["exp", "run"],
     options: {
       ...args.options,
       campaign: campaign.name,
-      setup: setup.id,
+      setup: activeSetup.id,
+      base: campaign.baseCommitSha,
     },
   })
   const lastRun = await readLastRun(root)
@@ -632,9 +770,10 @@ export async function commandSetupValidate(args: Args) {
     options: {
       ...args.options,
       campaign: campaign.name,
-      setup: setup.id,
-      name: `baseline-${setup.version}`,
-      description: `Baseline for setup v${setup.version}`,
+      setup: activeSetup.id,
+      base: campaign.baseCommitSha,
+      name: `baseline-${activeSetup.version}`,
+      description: `Baseline for setup v${activeSetup.version}`,
     },
   })
   await flushOutbox(root, args)
@@ -645,21 +784,59 @@ export async function commandSetupValidate(args: Args) {
       "Baseline logged locally but was not synced; setup validation requires API sync."
     )
   }
+  console.log(`Baseline experiment: ${history.experimentId}`)
+  return history.experimentId
+}
+
+export async function commandSetupApprove(args: Args) {
+  const root = await repoRoot()
+  const { campaign, setup, projectPath } = await campaignForName(root, args)
+  if (!setup) throw new Error("Campaign has no active setup.")
+  if (setup.status === "validated" && setup.baselineExperimentId) {
+    console.log(`Setup ${setup.id} is already validated.`)
+    return
+  }
+  const baselineExperimentId =
+    args.options["baseline-experiment"] ?? args.options.experiment
+  if (!baselineExperimentId) {
+    throw new Error(
+      "Pass --baseline-experiment <id> from `onyx setup baseline`."
+    )
+  }
   const result = await validateCampaignSetup(
     setup.id,
     {
-      baselineExperimentId: history.experimentId,
+      baselineExperimentId,
     },
     args
   )
+  const state = await readState(root)
+  const key = campaignStateKey(projectPath, campaign.name)
+  state.campaigns = state.campaigns ?? {}
+  state.campaigns[key] = {
+    ...state.campaigns[key],
+    setupId: result.setup.id,
+  }
+  await writeState(root, state)
   await emitEvent(root, {
     type: "setup_validated",
     campaignName: campaign.name,
     campaignId: campaign.id,
     setupId: setup.id,
-    message: `baseline ${history.experimentId}`,
+    message: `baseline ${baselineExperimentId}`,
   })
   console.log(`Validated setup v${result.setup.version} for ${campaign.name}`)
+}
+
+export async function commandSetupValidate(args: Args) {
+  const baselineExperimentId = await commandSetupBaseline(args)
+  await commandSetupApprove({
+    positional: ["setup", "approve"],
+    options: {
+      ...args.options,
+      "baseline-experiment": baselineExperimentId,
+    },
+  })
 }
 
 export async function commandResearchStart(args: Args) {
@@ -667,7 +844,7 @@ export async function commandResearchStart(args: Args) {
   const { campaign, setup } = await campaignForName(root, args)
   assertResearchReady(campaign, setup)
 
-  const workerCommand = requireOption(args, "worker-command")
+  const workerCommand = args.options["worker-command"]
   const agentKind = args.options.agent ?? "codex"
   const workerTarget = positiveIntegerOption(
     args,
@@ -705,6 +882,14 @@ export async function commandResearchStart(args: Args) {
     campaignId: campaign.id,
     setupId: setup!.id,
     sessionId: result.session.id,
+  }
+  state.sessions = state.sessions ?? {}
+  state.sessions[result.session.id] = {
+    campaignName: campaign.name,
+    campaignId: campaign.id,
+    endTimeMs,
+    maxIterations,
+    status: "running",
   }
   await writeState(root, state)
   await emitEvent(root, {
@@ -788,6 +973,7 @@ export async function commandResearchStart(args: Args) {
     result.session.id,
     {
       campaignId: campaign.id,
+      status: failed.length > 0 ? "failed" : "completed",
       reason:
         failed.length > 0 ? `${failed.length} lane(s) failed` : "completed",
       metadata: {
@@ -798,6 +984,13 @@ export async function commandResearchStart(args: Args) {
     },
     args
   )
+  const finishedState = await readState(root)
+  finishedState.sessions = finishedState.sessions ?? {}
+  finishedState.sessions[result.session.id] = {
+    ...(finishedState.sessions[result.session.id] ?? {}),
+    status: failed.length > 0 ? "failed" : "completed",
+  }
+  await writeState(root, finishedState)
 
   if (failed.length > 0) {
     throw new Error(
@@ -812,11 +1005,21 @@ export async function commandResearchStart(args: Args) {
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
   const { campaign, setup, overview } = await campaignForName(root, args)
+  const state = await readState(root)
   console.log(`campaign: ${campaign.name}`)
   console.log(`phase: ${campaign.phase}`)
   console.log(
     `setup: ${setup ? `v${setup.version} ${setup.status}` : "(none)"}`
   )
+  const activeSessionId =
+    state.campaigns?.[
+      campaignStateKey(await resolveProjectPath(root, args), campaign.name)
+    ]?.sessionId
+  if (activeSessionId) {
+    console.log(
+      `session: ${activeSessionId} ${state.sessions?.[activeSessionId]?.status ?? ""}`.trim()
+    )
+  }
   console.log(`lanes: ${overview.lanes.length}`)
   for (const lane of overview.lanes) {
     console.log(
@@ -824,6 +1027,252 @@ export async function commandResearchStatus(args: Args) {
     )
   }
   console.log(`workers: ${overview.workers.length}`)
+}
+
+function activeSessionIdFromState({
+  state,
+  projectPath,
+  campaignName,
+}: {
+  state: Awaited<ReturnType<typeof readState>>
+  projectPath: string
+  campaignName?: string
+}) {
+  if (campaignName) {
+    return state.campaigns?.[campaignStateKey(projectPath, campaignName)]
+      ?.sessionId
+  }
+  if (state.activeCampaign) {
+    return state.campaigns?.[
+      campaignStateKey(projectPath, state.activeCampaign)
+    ]?.sessionId
+  }
+  return undefined
+}
+
+export async function commandResearchShouldStop(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const sessionId =
+    args.options.session ??
+    process.env.ONYX_SESSION_ID ??
+    activeSessionIdFromState({
+      state,
+      projectPath,
+      campaignName: args.options.campaign,
+    })
+  if (!sessionId) {
+    console.log("continue: no active session")
+    process.exitCode = 1
+    return
+  }
+
+  const localSession = state.sessions?.[sessionId]
+  const iteration =
+    args.options.iteration === undefined ? null : Number(args.options.iteration)
+  const reasons: string[] = []
+  if (localSession?.stopRequested) reasons.push("stop requested")
+  if (localSession?.endTimeMs && Date.now() >= localSession.endTimeMs) {
+    reasons.push("time budget reached")
+  }
+  if (
+    iteration !== null &&
+    Number.isFinite(iteration) &&
+    localSession?.maxIterations &&
+    iteration > localSession.maxIterations
+  ) {
+    reasons.push("iteration budget reached")
+  }
+
+  try {
+    const remote = await getResearchSessionState(sessionId, args)
+    if (
+      remote.session.status === "stop_requested" ||
+      remote.session.status === "stopped" ||
+      remote.session.status === "completed" ||
+      remote.session.status === "failed"
+    ) {
+      reasons.push(`remote session ${remote.session.status}`)
+    }
+  } catch {
+    // Local state is enough for offline stop checks.
+  }
+
+  const shouldStop = reasons.length > 0
+  if (args.options.json === "true") {
+    console.log(JSON.stringify({ shouldStop, sessionId, reasons }, null, 2))
+  } else {
+    console.log(
+      shouldStop
+        ? `stop: ${reasons.join(", ")}`
+        : `continue: session ${sessionId}`
+    )
+  }
+  process.exitCode = shouldStop ? 0 : 1
+}
+
+export async function commandResearchStop(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const sessionId =
+    args.options.session ??
+    activeSessionIdFromState({
+      state,
+      projectPath,
+      campaignName: args.options.campaign,
+    })
+  if (!sessionId) {
+    throw new Error("Pass --session <id> or start a research session first.")
+  }
+
+  const campaignId =
+    state.sessions?.[sessionId]?.campaignId ??
+    (args.options.campaign
+      ? (await campaignForName(root, args)).campaign.id
+      : undefined)
+  state.sessions = state.sessions ?? {}
+  state.sessions[sessionId] = {
+    ...(state.sessions[sessionId] ?? {}),
+    campaignId,
+    stopRequested: true,
+    status: "stop_requested",
+  }
+  await writeState(root, state)
+
+  if (campaignId) {
+    await stopCampaignSession(
+      sessionId,
+      {
+        campaignId,
+        status: "stop_requested",
+        reason: args.options.reason ?? "stop requested",
+      },
+      args
+    ).catch((error) => {
+      console.warn(
+        `Remote stop request skipped: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    })
+  }
+  await emitEvent(root, {
+    type: "session_stopped",
+    campaignId,
+    sessionId,
+    message: "stop requested",
+  })
+  console.log(`Stop requested for research session ${sessionId}`)
+}
+
+function safeBranchSegment(value: string) {
+  return value.replace(/[^A-Za-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
+}
+
+export async function commandResearchFinish(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign, setup, overview } = await campaignForName(root, args)
+  await flushOutbox(root, args, { quiet: true }).catch(() => {})
+
+  const branches: string[] = []
+  const campaignSegment = safeBranchSegment(campaign.name)
+  if (overview.campaign.bestCommitSha) {
+    const bestBranch = `onyx/${campaignSegment}/best`
+    await git(
+      ["branch", "-f", bestBranch, overview.campaign.bestCommitSha],
+      root
+    )
+    branches.push(`${bestBranch} -> ${overview.campaign.bestCommitSha}`)
+  }
+  for (const lane of overview.lanes) {
+    const commitSha = lane.currentCommitSha
+    if (!commitSha) continue
+    const laneBranch = `onyx/${campaignSegment}/lanes/${safeBranchSegment(
+      lane.name
+    )}`
+    await git(["branch", "-f", laneBranch, commitSha], root)
+    branches.push(`${laneBranch} -> ${commitSha}`)
+  }
+
+  const state = await readState(root)
+  const projectPath = await resolveProjectPath(root, args)
+  const sessionId =
+    args.options.session ??
+    activeSessionIdFromState({
+      state,
+      projectPath,
+      campaignName: campaign.name,
+    })
+  const body = [
+    `Finalized campaign ${campaign.name}.`,
+    `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
+    `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
+    "",
+    "Local branches:",
+    ...(branches.length > 0
+      ? branches.map((branch) => `- ${branch}`)
+      : ["- none"]),
+  ].join("\n")
+  await upsertCampaignSummary(
+    campaign.id,
+    {
+      sessionId,
+      setupId: setup?.id,
+      summaryKind: "campaign_brief",
+      title: `${campaign.name} final results`,
+      body,
+    },
+    args
+  ).catch(() => {})
+  if (sessionId) {
+    await stopCampaignSession(
+      sessionId,
+      {
+        campaignId: campaign.id,
+        status: "completed",
+        reason: "finalized",
+      },
+      args
+    ).catch(() => {})
+  }
+  console.log(body)
+}
+
+export async function commandSummaryUpsert(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign, setup } = await campaignForName(root, args)
+  const kind = args.options.kind ?? "lane_summary"
+  if (
+    kind !== "campaign_brief" &&
+    kind !== "session_brief" &&
+    kind !== "lane_summary" &&
+    kind !== "transfer_brief" &&
+    kind !== "setup_notes"
+  ) {
+    throw new Error(
+      "--kind must be campaign_brief, session_brief, lane_summary, transfer_brief, or setup_notes"
+    )
+  }
+  const title = args.options.title ?? `${kind} ${new Date().toISOString()}`
+  const body = args.options.body
+  if (!body) throw new Error("Pass --body <text>.")
+  await upsertCampaignSummary(
+    campaign.id,
+    {
+      sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
+      laneId: args.options.lane ?? process.env.ONYX_LANE_ID,
+      setupId: args.options.setup ?? process.env.ONYX_SETUP_ID ?? setup?.id,
+      authoredByWorkerId:
+        args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+      summaryKind: kind,
+      title,
+      body,
+    },
+    args
+  )
+  console.log(`Updated ${kind} for ${campaign.name}`)
 }
 
 export async function commandWorkerRun(args: Args) {

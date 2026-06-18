@@ -44,6 +44,17 @@ export type CliState = {
       >
     }
   >
+  sessions?: Record<
+    string,
+    {
+      campaignName?: string
+      campaignId?: string
+      endTimeMs?: number
+      maxIterations?: number
+      stopRequested?: boolean
+      status?: string
+    }
+  >
 }
 
 export type LastRunRecord = Omit<
@@ -144,9 +155,10 @@ export async function readState(root: string): Promise<CliState> {
       projectPath: parsed.projectPath,
       activeCampaign: parsed.activeCampaign,
       campaigns: parsed.campaigns ?? {},
+      sessions: parsed.sessions ?? {},
     }
   } catch {
-    return { campaigns: {} }
+    return { campaigns: {}, sessions: {} }
   }
 }
 

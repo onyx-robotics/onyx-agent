@@ -11,13 +11,18 @@ export type ProcessResult = {
 export function runProcess(
   command: string,
   args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}
+  options: {
+    cwd?: string
+    env?: NodeJS.ProcessEnv
+    stdin?: string
+    timeoutMs?: number
+  } = {}
 ): Promise<ProcessResult> {
   return new Promise((resolveProcess, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
@@ -30,8 +35,11 @@ export function runProcess(
             child.kill("SIGTERM")
           }, options.timeoutMs)
 
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
+    if (options.stdin !== undefined) {
+      child.stdin?.end(options.stdin)
+    }
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk))
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk))
     child.on("error", reject)
     child.on("close", (code) => {
       if (timeout) clearTimeout(timeout)

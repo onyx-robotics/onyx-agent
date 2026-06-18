@@ -68,24 +68,48 @@ onyx agent skill-path
 
 ```bash
 onyx campaign setup --name fast-eval --metric score --direction maximize
-onyx setup validate
+onyx tools run evaluate
+onyx setup baseline --campaign fast-eval
+onyx setup approve --campaign fast-eval --baseline-experiment <id>
 onyx push
 ```
 
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
 
-To run multiple local research lanes, provide the agent command Onyx should
-invoke in each lane worktree:
+The bundled `/onyx` skill is the preferred user-facing controller. It creates
+`onyx/onyx.md`, `onyx/tool-api.json`, `onyx/tools/*`, `onyx/eval.sh`, and
+optional `onyx/checks.sh`; runs the baseline; asks the human to approve setup;
+then starts persistent lane workers.
+
+Lane workers are driven by the TypeScript-rendered Markdown prompt in
+`src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the
+editor and standalone release binaries stay self-contained.
+
+To run multiple local research lanes directly from the CLI, choose a built-in
+agent launcher:
 
 ```bash
-onyx research start --campaign fast-eval --agents 4 --worker-command "codex exec 'read $ONYX_BRIEF_FILE and improve the metric'"
+onyx research start --campaign fast-eval --agents 4 --agent codex --max-minutes 10
+onyx research start --campaign fast-eval --agents 4 --agent claude --max-minutes 10
 ```
 
 Each lane has a branch under `refs/heads/onyx/<campaign>/lanes/*`, gets a
-generated brief under `.git/onyx/briefs/`, runs `onyx/eval.sh` and optional
-`onyx/checks.sh`, pushes `refs/onyx/experiments/<campaignId>/<runRef>`, and
-reports the experiment with setup/session/lane/worker context.
+generated brief and worker prompt under `.git/onyx/`, polls
+`onyx research should-stop`, runs the setup tool API through `onyx exp run`,
+pushes `refs/onyx/experiments/<campaignId>/<runRef>`, and reports the
+experiment with setup/session/lane/worker context. Use `--worker-command` only
+for custom harnesses.
+
+Stop and finalize campaigns explicitly:
+
+```bash
+onyx research stop --session <id>
+onyx research finish --campaign fast-eval
+```
+
+`finish` reconciles state and prints local extraction branches such as
+`onyx/fast-eval/best`.
 
 To delete a research direction entirely — the campaign record with all its
 experiments and matching local cache rows:

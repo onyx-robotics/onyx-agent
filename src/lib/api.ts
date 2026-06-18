@@ -50,6 +50,7 @@ export type ApiSetup = {
   setupCommitSha: string
   baselineExperimentId: string | null
   validatedAt: string | null
+  metadata: Record<string, unknown>
 }
 
 export type ApiCampaignExperiment = {
@@ -89,8 +90,14 @@ export type ApiSession = {
   id: string
   campaignId: string
   name: string
-  status: string
+  status:
+    | "running"
+    | "stop_requested"
+    | "completed"
+    | "failed"
+    | "stopped"
   workerTarget: number | null
+  metadata: Record<string, unknown>
 }
 
 export type ApiWorker = {
@@ -468,6 +475,7 @@ export async function stopCampaignSession(
   sessionId: string,
   body: {
     campaignId: string
+    status?: "stop_requested" | "completed" | "failed" | "stopped"
     reason?: string
     metadata?: Record<string, unknown>
   },

@@ -97,12 +97,30 @@ export {
 export { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 export { commandListen } from "./commands/listen"
 export { commandPush, commandStatus, commandSync } from "./commands/sync"
+export { commandToolsRun } from "./commands/tools"
 export {
+  commandResearchFinish,
+  commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
+  commandResearchStop,
+  commandSetupApprove,
+  commandSetupBaseline,
   commandSetupValidate,
+  commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
+export {
+  protectedToolPaths,
+  readToolApi,
+  resolveToolApiPath,
+  runToolCommand,
+  toolApiPath,
+  TOOL_API_FILE,
+  type ToolApi,
+  type ToolCommand,
+  type ToolRunResult,
+} from "./lib/tools"
 export { USAGE, main } from "./main"
 export {
   ONYX_LAUNCHER_BYPASS,
