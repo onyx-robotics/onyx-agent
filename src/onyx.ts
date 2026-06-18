@@ -16,6 +16,7 @@ export {
   lastRunPath,
   onyxStateDir,
   outboxPath,
+  outboxSpoolDir,
   readLastRun,
   readOutbox,
   readState,
@@ -58,6 +59,7 @@ export { flushOutbox, type FlushResult } from "./lib/sync"
 export {
   currentBranch,
   currentCommit,
+  gitCommonDir,
   gitDir,
   normalizeRepositoryUrl,
   repoRoot,
@@ -80,6 +82,7 @@ export {
   validateDeveloperCheckout,
 } from "./commands/developer"
 export { commandAgent } from "./commands/agent"
+export { commandContractHash } from "./commands/contract"
 export { commandLogin } from "./commands/login"
 export {
   commandProfile,
@@ -107,9 +110,18 @@ export {
   commandSetupApprove,
   commandSetupBaseline,
   commandSetupValidate,
+  commandKnowledgeAdd,
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
+export {
+  contractPath,
+  normalizeSetupContract,
+  readSetupContract,
+  setupContractHash,
+  writeSetupContract,
+  type ResearchSetupContract,
+} from "./lib/contract"
 export {
   protectedToolPaths,
   readToolApi,

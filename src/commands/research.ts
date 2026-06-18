@@ -1,6 +1,7 @@
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
+import { researchLanePlanSchema } from "../protocol"
 import { commandExpLog, commandExpRun } from "./exp"
 import type { Args } from "../lib/args"
 import {
@@ -12,6 +13,7 @@ import {
   getResearchSessionState,
   heartbeatCampaignLane,
   heartbeatWorker,
+  createCampaignKnowledge,
   listProjectCampaigns,
   registerCampaignWorker,
   stopCampaignSession,
@@ -22,6 +24,7 @@ import {
   type ApiLane,
   type ApiSetup,
 } from "../lib/api"
+import { contractPath, readSetupContract } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import { readHistory } from "../lib/history"
@@ -35,7 +38,7 @@ import {
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { pathExists, runProcess, type ProcessResult } from "../lib/process"
 import { flushOutbox } from "../lib/sync"
-import { protectedToolPaths, toolApiPath } from "../lib/tools"
+import { protectedToolPaths } from "../lib/tools"
 import { renderLaneWorkerPrompt } from "../lib/worker-prompt"
 
 function branchName(ref: string) {
@@ -60,6 +63,16 @@ function positiveNumberOption(args: Args, name: string, fallback: number) {
     throw new Error(`--${name} must be a positive number`)
   }
   return value
+}
+
+async function lanePlansOption(args: Args) {
+  const path = args.options["lane-plans"]
+  if (!path) return undefined
+  const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
+  if (!Array.isArray(parsed)) {
+    throw new Error("--lane-plans must point to a JSON array")
+  }
+  return parsed.map((plan) => researchLanePlanSchema.parse(plan))
 }
 
 function sleep(ms: number) {
@@ -161,6 +174,8 @@ async function campaignForName(root: string, args: Args) {
     metricName: campaign.metricName,
     metricUnit: campaign.metricUnit,
     metricDirection: campaign.metricDirection,
+    setupContract: setup?.contract,
+    contractHash: setup?.contractHash,
     promotionRefName: campaign.promotionRefName,
   }
   await writeState(root, state)
@@ -302,10 +317,13 @@ async function writeWorkerPrompt({
     laneBranch: lane.branchRef,
     laneId: lane.id,
     laneName: lane.name,
+    lanePlan: lane.plan,
     maxIterations,
     metricLabel: `${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
     minutesRemaining,
     protectedPaths,
+    contractHash: setup.contractHash,
+    contractPath: contractPath(root, projectPath),
     researchSpecPath: projectPath
       ? `${projectPath}/onyx/onyx.md`
       : "onyx/onyx.md",
@@ -313,7 +331,6 @@ async function writeWorkerPrompt({
     sessionStatePath,
     setupId: setup.id,
     setupVersion: setup.version,
-    toolApiPath: toolApiPath(root, projectPath),
   })
 
   await writeFile(path, `${markdown}\n`, "utf8")
@@ -563,7 +580,8 @@ async function runLaneOnce({
             ONYX_WORKER_ID: worker.id,
             ONYX_BRIEF_FILE: briefPath,
             ONYX_WORKER_PROMPT_FILE: prompt.path,
-            ONYX_TOOL_API_FILE: toolApiPath(root, projectPath),
+            ONYX_CONTRACT_FILE: contractPath(root, projectPath),
+            ONYX_CONTRACT_HASH: setup.contractHash,
             ...(sessionStatePath
               ? { ONYX_SESSION_STATE_FILE: sessionStatePath }
               : {}),
@@ -695,20 +713,19 @@ async function ensureSetupCommit({
   args: Args
 }) {
   const setupCommitSha = await currentCommit(root)
-  if (setup.status !== "draft" || setup.setupCommitSha === setupCommitSha) {
+  const setupContract = await readSetupContract(root, projectPath)
+  if (
+    setup.status !== "draft" ||
+    (setup.setupCommitSha === setupCommitSha &&
+      setup.contractHash === setupContract.contractHash)
+  ) {
     return setup
   }
 
   const result = await createCampaignSetup(
     campaign.id,
     {
-      goal: setup.goal ?? campaign.description ?? undefined,
-      metricName: setup.metricName,
-      metricUnit: setup.metricUnit,
-      metricDirection: setup.metricDirection,
-      tools: setup.tools,
-      constraints: setup.constraints,
-      reset: setup.reset,
+      setupContract,
       humanFeedback: setup.humanFeedback,
       setupCommitSha,
       metadata: {
@@ -724,6 +741,8 @@ async function ensureSetupCommit({
   state.campaigns[key] = {
     ...state.campaigns[key],
     setupId: result.setup.id,
+    setupContract: result.setup.contract,
+    contractHash: result.setup.contractHash,
   }
   await writeState(root, state)
   await emitEvent(root, {
@@ -844,8 +863,6 @@ export async function commandResearchStart(args: Args) {
   const { campaign, setup } = await campaignForName(root, args)
   assertResearchReady(campaign, setup)
 
-  const workerCommand = args.options["worker-command"]
-  const agentKind = args.options.agent ?? "codex"
   const workerTarget = positiveIntegerOption(
     args,
     "agents",
@@ -853,23 +870,19 @@ export async function commandResearchStart(args: Args) {
   )
   const maxIterations = positiveIntegerOption(args, "max-iterations", 10)
   const maxMinutes = positiveNumberOption(args, "max-minutes", 120)
-  const workerTimeoutMs =
-    positiveNumberOption(args, "worker-timeout", 1800) * 1000
-  const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
-  const finalSyncTimeoutMs =
-    positiveNumberOption(args, "final-sync-timeout", 120) * 1000
   const endTimeMs = Date.now() + maxMinutes * 60_000
-  const syncSupervisor = createSyncSupervisor({
-    root,
-    args,
-    intervalMs: syncIntervalMs,
-  })
+  const lanePlans = await lanePlansOption(args)
   const result = await createCampaignSession(
     campaign.id,
     {
       name: args.options.name ?? `research-${new Date().toISOString()}`,
-      workerTarget,
-      metadata: { startedBy: "onyx-research" },
+      workerTarget: lanePlans?.length ?? workerTarget,
+      lanePlans,
+      metadata: {
+        startedBy: "onyx-research",
+        maxIterations,
+        maxMinutes,
+      },
     },
     args
   )
@@ -901,105 +914,47 @@ export async function commandResearchStart(args: Args) {
     message: `${result.lanes.length} lane(s)`,
   })
 
-  const laneResults = await Promise.all(
-    result.lanes.map((lane) =>
-      runLaneOnce({
+  await Promise.all(
+    result.lanes.map(async (lane) => {
+      const [briefPath, sessionStatePath] = await Promise.all([
+        writeBrief({
+          root,
+          campaignId: campaign.id,
+          sessionId: result.session.id,
+          lane,
+          args,
+        }),
+        writeSessionState({
+          root,
+          sessionId: result.session.id,
+          lane,
+          args,
+        }).catch(() => null),
+      ])
+      await writeWorkerPrompt({
         root,
         projectPath,
         campaign,
         setup: setup!,
         sessionId: result.session.id,
         lane,
-        workerCommand,
-        agentKind,
+        briefPath,
+        sessionStatePath,
         maxIterations,
         endTimeMs,
-        workerTimeoutMs,
-        syncSupervisor,
-        args,
       })
-    )
-  )
-  const pendingAfterDrain = await syncSupervisor.drain(finalSyncTimeoutMs)
-
-  const completed = laneResults.filter((lane) => lane.status === "completed")
-  const failed = laneResults.filter((lane) => lane.status === "failed")
-  const resultLines = laneResults.map((lane) =>
-    lane.status === "completed"
-      ? `- ${lane.lane.name}: completed at ${lane.resultCommitSha ?? "unknown"}`
-      : `- ${lane.lane.name}: failed - ${lane.error ?? "unknown error"}`
-  )
-  const summaryBody = [
-    `Session ${result.session.id}`,
-    `Completed lanes: ${completed.length}`,
-    `Failed lanes: ${failed.length}`,
-    `Pending sync records: ${pendingAfterDrain}`,
-    "",
-    ...resultLines,
-  ].join("\n")
-
-  await upsertCampaignSummary(
-    campaign.id,
-    {
-      sessionId: result.session.id,
-      setupId: setup!.id,
-      summaryKind: "session_brief",
-      title: `${result.session.name} results`,
-      body: summaryBody,
-    },
-    args
+    })
   )
 
-  const latestOverview = await getCampaignOverview(campaign.id, args).catch(
-    () => null
-  )
-  const bestLine = latestOverview
-    ? `Best metric: ${latestOverview.campaign.bestMetricValue ?? "n/a"} at ${
-        latestOverview.campaign.bestCommitSha ?? "n/a"
-      }`
-    : "Best metric: n/a"
-  await upsertCampaignSummary(
-    campaign.id,
-    {
-      setupId: setup!.id,
-      summaryKind: "campaign_brief",
-      title: `${campaign.name} latest research`,
-      body: `${bestLine}\n\n${summaryBody}`,
-    },
-    args
-  )
-
-  await stopCampaignSession(
-    result.session.id,
-    {
-      campaignId: campaign.id,
-      status: failed.length > 0 ? "failed" : "completed",
-      reason:
-        failed.length > 0 ? `${failed.length} lane(s) failed` : "completed",
-      metadata: {
-        completed: completed.length,
-        failed: failed.length,
-        pendingSyncRecords: pendingAfterDrain,
-      },
-    },
-    args
-  )
-  const finishedState = await readState(root)
-  finishedState.sessions = finishedState.sessions ?? {}
-  finishedState.sessions[result.session.id] = {
-    ...(finishedState.sessions[result.session.id] ?? {}),
-    status: failed.length > 0 ? "failed" : "completed",
-  }
-  await writeState(root, finishedState)
-
-  if (failed.length > 0) {
-    throw new Error(
-      `Research session ${result.session.id} completed with ${failed.length} failed lane(s).`
+  console.log(`Research session: ${result.session.id}`)
+  console.log(`Campaign: ${campaign.name}`)
+  console.log(`Lanes: ${result.lanes.length}`)
+  for (const lane of result.lanes) {
+    console.log(
+      `- ${lane.name}: ${lane.plan.focus}\n  onyx worker run --session ${result.session.id} --lane ${lane.id}`
     )
   }
-  console.log(
-    `Research session ${result.session.id} completed ${result.lanes.length} lane(s)`
-  )
+  console.log("Use `onyx listen` or `onyx research status` to supervise.")
 }
 
 export async function commandResearchStatus(args: Args) {
@@ -1186,15 +1141,6 @@ export async function commandResearchFinish(args: Args) {
     )
     branches.push(`${bestBranch} -> ${overview.campaign.bestCommitSha}`)
   }
-  for (const lane of overview.lanes) {
-    const commitSha = lane.currentCommitSha
-    if (!commitSha) continue
-    const laneBranch = `onyx/${campaignSegment}/lanes/${safeBranchSegment(
-      lane.name
-    )}`
-    await git(["branch", "-f", laneBranch, commitSha], root)
-    branches.push(`${laneBranch} -> ${commitSha}`)
-  }
 
   const state = await readState(root)
   const projectPath = await resolveProjectPath(root, args)
@@ -1209,6 +1155,7 @@ export async function commandResearchFinish(args: Args) {
     `Finalized campaign ${campaign.name}.`,
     `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
     `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
+    "Lane refs are not promoted from mutable lane heads; use verified experiment best projections for curated outputs.",
     "",
     "Local branches:",
     ...(branches.length > 0
@@ -1275,6 +1222,131 @@ export async function commandSummaryUpsert(args: Args) {
   console.log(`Updated ${kind} for ${campaign.name}`)
 }
 
+export async function commandKnowledgeAdd(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign, setup } = await campaignForName(root, args)
+  const kind = args.options.kind ?? "insight"
+  if (
+    kind !== "insight" &&
+    kind !== "dead_end" &&
+    kind !== "promising_direction" &&
+    kind !== "risk" &&
+    kind !== "transfer_note"
+  ) {
+    throw new Error(
+      "--kind must be insight, dead_end, promising_direction, risk, or transfer_note"
+    )
+  }
+  const title = args.options.title
+  const body = args.options.body
+  if (!title) throw new Error("Pass --title <text>.")
+  if (!body) throw new Error("Pass --body <text>.")
+
+  await createCampaignKnowledge(
+    campaign.id,
+    {
+      sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
+      laneId: args.options.lane ?? process.env.ONYX_LANE_ID,
+      setupId: args.options.setup ?? process.env.ONYX_SETUP_ID ?? setup?.id,
+      authoredByWorkerId:
+        args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+      kind,
+      title,
+      body,
+      confidence:
+        args.options.confidence === undefined
+          ? undefined
+          : Number(args.options.confidence),
+    },
+    args
+  )
+  console.log(`Added ${kind} knowledge for ${campaign.name}`)
+}
+
 export async function commandWorkerRun(args: Args) {
-  return commandResearchStart(args)
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const sessionId =
+    args.options.session ??
+    process.env.ONYX_SESSION_ID ??
+    activeSessionIdFromState({
+      state,
+      projectPath,
+      campaignName: args.options.campaign,
+    })
+  if (!sessionId) {
+    throw new Error("Pass --session <id> or start a research session first.")
+  }
+
+  const sessionState = await getResearchSessionState(sessionId, args)
+  const campaign = sessionState.campaign
+  const setup = sessionState.activeSetup
+  assertResearchReady(campaign, setup)
+
+  const requestedLaneId = args.options.lane ?? process.env.ONYX_LANE_ID
+  const lane =
+    (requestedLaneId
+      ? sessionState.lanes.find((item) => item.id === requestedLaneId)
+      : sessionState.lanes.find((item) =>
+          ["active", "stale", "lost"].includes(item.status)
+        )) ?? null
+  if (!lane) {
+    throw new Error(
+      requestedLaneId
+        ? `Lane ${requestedLaneId} was not found in session ${sessionId}.`
+        : `No available lane found in session ${sessionId}.`
+    )
+  }
+
+  const sessionMetadata = sessionState.session.metadata
+  const maxIterations = positiveIntegerOption(
+    args,
+    "max-iterations",
+    typeof sessionMetadata.maxIterations === "number"
+      ? sessionMetadata.maxIterations
+      : 10
+  )
+  const maxMinutes = positiveNumberOption(
+    args,
+    "max-minutes",
+    typeof sessionMetadata.maxMinutes === "number"
+      ? sessionMetadata.maxMinutes
+      : 120
+  )
+  const workerTimeoutMs =
+    positiveNumberOption(args, "worker-timeout", 1800) * 1000
+  const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
+  const finalSyncTimeoutMs =
+    positiveNumberOption(args, "final-sync-timeout", 120) * 1000
+  const syncSupervisor = createSyncSupervisor({
+    root,
+    args,
+    intervalMs: syncIntervalMs,
+  })
+
+  const result = await runLaneOnce({
+    root,
+    projectPath,
+    campaign,
+    setup: setup!,
+    sessionId,
+    lane,
+    workerCommand: args.options["worker-command"],
+    agentKind: args.options.agent ?? "codex",
+    maxIterations,
+    endTimeMs: Date.now() + maxMinutes * 60_000,
+    workerTimeoutMs,
+    syncSupervisor,
+    args,
+  })
+  const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
+  if (result.status === "failed") {
+    throw new Error(
+      `Worker failed for ${lane.name}: ${result.error ?? "unknown error"}`
+    )
+  }
+  console.log(
+    `Worker completed ${lane.name} at ${result.resultCommitSha ?? "unknown"}; ${pending} sync record(s) pending.`
+  )
 }

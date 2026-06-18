@@ -5,16 +5,16 @@ description: Coordinate the Onyx parallel research workflow. Use when asked to s
 
 # Onyx Parallel Research
 
-You are the main-thread Onyx controller. The user talks to you. You run the
-Setup phase, get human approval, then launch and supervise autonomous lane
-workers through the `onyx` CLI.
+You are the main-thread Onyx orchestrator. The user talks to you. You run the
+Setup phase, get human approval, then create an async research session with
+deliberate lane plans through the `onyx` CLI.
 
 Do not behave like a lane worker in the main thread unless the user explicitly
 asks for a manual single-agent loop. The lane workers receive generated prompts
-from `onyx research start`; they own their own research loops inside lane
-worktrees.
+from `onyx research start`; they own their own research loops, measurement,
+logging, summaries, and knowledge updates inside their lane worktrees.
 
-## Controller Responsibilities
+## Orchestrator Responsibilities
 
 1. Infer or ask for the missing research spec:
    - goal
@@ -24,58 +24,73 @@ worktrees.
    - repo/project path and files in scope
    - hard constraints
    - environment resources, reset requirements, and tool/API needs
-2. Start or select the campaign:
+2. Build the canonical setup contract at `<projectPath>/onyx/contract.json`,
+   then stamp its hash:
 
    ```bash
-   onyx campaign setup --name <slug> --metric <metric> --unit <unit> --direction <maximize|minimize> --description <goal>
+   onyx contract hash --write
+   ```
+
+3. Start or select the campaign:
+
+   ```bash
+   onyx campaign setup --name <slug> --description <goal>
    ```
 
    Add `--project-path <path>` for monorepos.
-3. Build the Setup phase artifacts under `<projectPath>/onyx/`.
-4. Commit the setup artifacts.
-5. Run a baseline:
+
+4. Build the generated narrative setup artifact `<projectPath>/onyx/onyx.md`.
+5. Commit the setup artifacts.
+6. Run a baseline:
 
    ```bash
    onyx setup baseline --campaign <slug>
    ```
 
-6. Present the setup and baseline to the human for approval. Include the goal,
-   metric, constraints, reset/tool API, protected paths, and baseline result.
-7. After approval:
+7. Present the setup and baseline to the human for approval. Include the goal,
+   metric, contract hash, commands, resources, constraints, protected paths,
+   lane plan themes, and baseline result.
+8. After approval:
 
    ```bash
    onyx setup approve --campaign <slug> --baseline-experiment <id>
-   onyx research start --campaign <slug> --agents <n> --agent codex --max-minutes <minutes>
+   onyx research start --campaign <slug> --agents <n> --lane-plans <plans.json> --max-minutes <minutes>
    ```
 
-   Use `--agent claude` for Claude lane workers, or `--worker-command "<cmd>"`
-   for a custom worker harness.
-8. Monitor with `onyx research status`, `onyx listen`, and the web campaign
+   The command returns a session id and one `onyx worker run --session ...`
+   command per lane. Launch workers locally or on other machines. Use
+   `--agent claude` on `onyx worker run` for Claude lane workers, or
+   `--worker-command "<cmd>"` for a custom worker harness.
+
+9. Monitor with `onyx research status`, `onyx listen`, and the web campaign
    page. If the user interrupts, run `onyx research stop`.
-9. Finish with:
+10. Finish with:
 
-   ```bash
-   onyx research finish --campaign <slug>
-   ```
+```bash
+onyx research finish --campaign <slug>
+```
 
-   This reconciles, writes summaries, and creates local extraction branches
-   such as `onyx/<campaign>/best`.
+This reconciles, writes summaries, and creates local extraction branches
+such as `onyx/<campaign>/best`.
 
 ## Setup Artifacts
 
-The controller creates and owns the setup surface:
+The orchestrator creates and owns the setup surface:
 
-- `onyx/onyx.md`: durable campaign spec and research context.
-- `onyx/tool-api.json`: structured tool/resource manifest.
+- `onyx/contract.json`: canonical structured setup contract, including goal,
+  metric, project path, editable scope, protected paths, commands, resources,
+  constraints, risk model, measurement policy, stop policy, and contract hash.
+- `onyx/onyx.md`: generated narrative view of the contract and research context.
 - `onyx/tools/*`: helper scripts for reset, observation, data collection, or
   hardware/simulator control.
 - `onyx/eval.sh`: measurable evaluation entry point.
 - `onyx/checks.sh`: optional hard correctness or safety checks.
 
-During Research, lane workers must not edit `onyx/onyx.md`, `onyx/eval.sh`,
-`onyx/checks.sh`, `onyx/tool-api.json`, or `onyx/tools/*`. If the setup is
-wrong, stop and create a new setup version rather than silently changing the
-measurement contract.
+During Research, lane workers must not edit `onyx/contract.json`,
+`onyx/onyx.md`, `onyx/eval.sh`, `onyx/checks.sh`, or `onyx/tools/*`. If the
+setup is wrong, stop and create a new setup version rather than silently
+changing the measurement contract. `tool-api.json` may exist for legacy
+workflows, but it is not canonical.
 
 ## `onyx.md`
 
@@ -85,40 +100,63 @@ Write this as a compact but complete handoff for fresh agents:
 # Onyx Research: <goal>
 
 ## Objective
+
 <What we are optimizing and why.>
 
 ## Metric
+
 - Primary: <name>, <unit>, <maximize|minimize>
 - Baseline: <value and commit after setup baseline>
 
 ## Files In Scope
+
 - <path>: <why it matters>
 
 ## Protected Setup
+
 - onyx/onyx.md
+- onyx/contract.json
 - onyx/eval.sh
 - onyx/checks.sh
-- onyx/tool-api.json
-- onyx/tools/*
+- onyx/tools/\*
 
 ## Constraints
+
 <Hard safety, quality, dependency, runtime, or hardware rules.>
 
 ## Environment And Reset
+
 <How tools reset the environment, acquire resources, and keep measurements comparable.>
 
 ## What Has Been Tried
+
 <Strategic themes only. Full experiment history lives in `onyx exp list`.>
 ```
 
-## Tool API
+## Setup Contract
 
-`onyx/tool-api.json` declares commands and shared resources. Keep it simple and
-repo-local.
+`onyx/contract.json` declares commands and shared resources. Keep it simple and
+repo-local. Write it first with no `contractHash` or with a placeholder, then
+run `onyx contract hash --write`.
 
 ```json
 {
   "schemaVersion": 1,
+  "goal": "Improve the target metric without changing the evaluation contract.",
+  "metric": {
+    "name": "score",
+    "unit": null,
+    "direction": "maximize"
+  },
+  "projectPath": "",
+  "editableScope": ["src"],
+  "protectedPaths": [
+    "onyx/contract.json",
+    "onyx/onyx.md",
+    "onyx/eval.sh",
+    "onyx/checks.sh",
+    "onyx/tools"
+  ],
   "resources": {
     "simulator": {
       "slots": 1,
@@ -141,20 +179,28 @@ repo-local.
       "timeoutSeconds": 300
     }
   },
-  "protectedPaths": [
-    "onyx/onyx.md",
-    "onyx/eval.sh",
-    "onyx/checks.sh",
-    "onyx/tool-api.json",
-    "onyx/tools"
-  ]
+  "constraints": [],
+  "riskModel": {
+    "risks": [],
+    "antiGamingChecks": []
+  },
+  "measurement": {
+    "metricLine": "METRIC",
+    "trials": 1,
+    "aggregation": "single",
+    "notes": null
+  },
+  "stopPolicy": {
+    "maxIterations": null,
+    "maxMinutes": null,
+    "patience": null
+  },
+  "contractHash": "sha256:<filled-by-onyx-contract-hash>"
 }
 ```
 
 Use `onyx tools run <name>` to smoke-test any command. `onyx exp run` uses the
-manifest automatically: acquire resources, reset, evaluate, check, release.
-Without a manifest it falls back to `onyx/eval.sh` and optional
-`onyx/checks.sh`.
+contract automatically: acquire resources, reset, evaluate, check, release.
 
 `eval.sh` must print the primary metric as:
 
@@ -173,13 +219,13 @@ secondary diagnostics.
 - do not launch other agents;
 - do not edit protected setup paths;
 - poll `onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n>`;
-- read `ONYX_BRIEF_FILE`, `ONYX_SESSION_STATE_FILE`, and
-  `ONYX_TOOL_API_FILE`;
+- read `ONYX_BRIEF_FILE`, `ONYX_SESSION_STATE_FILE`, `ONYX_CONTRACT_FILE`, and
+  `ONYX_CONTRACT_HASH`;
 - make one committed experiment attempt at a time;
 - run `onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha>`;
 - record every attempt with `onyx exp log --agent-notes ...`;
-- update lane summaries with `onyx summary upsert` when they learn something
-  useful;
+- publish shared learning with `onyx knowledge add` and update lane summaries
+  with `onyx summary upsert` when they learn something useful;
 - sync/push periodically and leave the worktree clean on stop.
 
 ## Interrupts And Finish

@@ -9,16 +9,25 @@ const baseInput = {
   laneBranch: "refs/heads/onyx/drone/lane-1",
   laneId: "lane_123",
   laneName: "lane-1",
+  lanePlan: {
+    focus: "Reduce controller overshoot",
+    hypothesis: "Smoother gains can reduce tracking error.",
+    startingPoints: ["src/controller.ts"],
+    avoidList: ["eval changes"],
+    successSignals: ["tracking_error decreases"],
+    giveUpSignals: ["three attempts regress"],
+  },
   maxIterations: 8,
   metricLabel: "tracking_error (m), minimize",
   minutesRemaining: 10,
-  protectedPaths: ["onyx/onyx.md", "onyx/eval.sh", "onyx/tool-api.json"],
+  protectedPaths: ["onyx/onyx.md", "onyx/contract.json"],
+  contractHash: "sha256:123",
+  contractPath: "/repo/onyx/contract.json",
   researchSpecPath: "onyx/onyx.md",
   sessionId: "session_123",
   sessionStatePath: null,
   setupId: "setup_123",
   setupVersion: 2,
-  toolApiPath: "/repo/onyx/tool-api.json",
 }
 
 describe("lane worker prompt", () => {
@@ -28,7 +37,9 @@ describe("lane worker prompt", () => {
     expect(prompt).toContain("# Onyx Lane Worker: lane-1")
     expect(prompt).toContain("- Name: drone-controller")
     expect(prompt).toContain("- Metric: tracking_error (m), minimize")
-    expect(prompt).toContain("- onyx/tool-api.json")
+    expect(prompt).toContain("- Setup contract: /repo/onyx/contract.json")
+    expect(prompt).toContain("- Focus: Reduce controller overshoot")
+    expect(prompt).toContain("onyx knowledge add")
     expect(prompt).toContain("Primary metric is king")
     expect(prompt).toContain("Do not ask whether to continue")
     expect(prompt).not.toContain("Peer lane state")

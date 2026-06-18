@@ -2,9 +2,11 @@
 
 import {
   gitShaSchema,
+  researchContractComplianceSchema,
   researchExperimentGitStatusSchema,
   researchExperimentStatusSchema,
   researchMetricDirectionSchema,
+  researchSetupContractSchema,
 } from "./research.generated"
 import { z } from "zod"
 
@@ -43,12 +45,10 @@ export const localResearchCampaignStartedRecordSchema = z.object({
   description: z.string().trim().max(2000).nullable().optional(),
   projectPath: z.string().trim().max(240).optional(),
   baseCommitSha: gitShaSchema,
+  setupContract: researchSetupContractSchema,
   metricName: z.string().trim().min(1).max(120),
   metricUnit: z.string().trim().max(80).nullable().optional(),
   metricDirection: researchMetricDirectionSchema,
-  tools: z.string().trim().max(4000).nullable().optional(),
-  constraints: z.string().trim().max(4000).nullable().optional(),
-  reset: z.string().trim().max(4000).nullable().optional(),
   humanFeedback: z.string().trim().max(4000).nullable().optional(),
   promotionRefName: z.string().trim().min(1).max(300).nullable().optional(),
   sync: localResearchSyncMetadataSchema.optional(),
@@ -67,6 +67,14 @@ export const localResearchCampaignExperimentLoggedRecordSchema = z.object({
   resultCommitSha: gitShaSchema,
   resultRef: z.string().trim().min(1).max(300),
   status: researchExperimentStatusSchema,
+  contractHash: z.string().trim().min(1).max(128),
+  contractCompliance: researchContractComplianceSchema.default({
+    status: "passed",
+    protectedPathsChanged: [],
+    outOfScopePathsChanged: [],
+    contractPathsChanged: [],
+    notes: null,
+  }),
   primaryMetricName: z.string().trim().min(1).max(120),
   primaryMetricValue: z.number().finite().nullable(),
   metrics: metricsSchema.default({}),
@@ -105,6 +113,7 @@ export const localResearchHistoryRecordSchema = z.object({
   resultRef: z.string().trim().min(1).max(300),
   gitStatus: researchExperimentGitStatusSchema.optional(),
   status: researchExperimentStatusSchema,
+  contractHash: z.string().trim().min(1).max(128).optional(),
   name: z.string().trim().min(1).max(160),
   description: z.string().trim().max(2000).nullable().optional(),
   primaryMetricName: z.string().trim().min(1).max(120),

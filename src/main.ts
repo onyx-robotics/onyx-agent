@@ -1,6 +1,7 @@
 import packageJson from "../package.json"
 
 import { commandAgent } from "./commands/agent"
+import { commandContractHash } from "./commands/contract"
 import { parseArgs } from "./lib/args"
 import {
   commandCampaignCreate,
@@ -21,6 +22,7 @@ import {
   commandSetupApprove,
   commandSetupBaseline,
   commandSetupValidate,
+  commandKnowledgeAdd,
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
@@ -40,13 +42,14 @@ Usage:
   onyx login [--api-url <url>] [--local] [--print-url] [--refresh] [--port <port>] [--timeout <ms>]
   onyx agent skill-path
   onyx agent install-skill [--dir <path>] [--quiet]
+  onyx contract hash [--project-path <path>] [--write]
   onyx profile list
   onyx profile use <name>
   onyx profile delete <name>
   onyx profile set-api-key-env <name> <ENV_VAR>
-  onyx campaign setup --name <name> --metric <name> [--unit <unit>] [--direction maximize|minimize] [--description <text>] [--project-path <path>]
+  onyx campaign setup --name <name> [--description <text>] [--project-path <path>]
       (creates a campaign and draft setup; each measured experiment is pushed
-      as an immutable refs/onyx/experiments/* ref)
+      as an immutable refs/onyx/experiments/* ref; setup comes from onyx/contract.json)
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
   onyx setup baseline [--campaign <name>]
   onyx setup approve [--campaign <name>] --baseline-experiment <id>
@@ -54,22 +57,24 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> [--agents <n>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
-      (starts durable local lane workers for a validated setup)
+  onyx research start --campaign <name> [--agents <n>] [--lane-plans <json>] [--max-iterations <n>] [--max-minutes <n>]
+      (creates an async research session and prints worker launch commands)
+  onyx worker run --session <id> [--lane <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>]
   onyx research status [--campaign <name>]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--title <text>] --body <text>
+  onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
-  onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|accepted|rejected|running|queued] [--project-path <path>]
+  onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|contract_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
   onyx status
   onyx push
   onyx sync [--watch] [--interval <seconds>] [--project <id>] [--repository-url <url>] [--project-path <path>]
 
-Results are logged locally first in .git/onyx/outbox.jsonl. \`onyx push\`,
+Results are logged locally first in .git/onyx/outbox.d/pending/*.json. \`onyx push\`,
 \`onyx sync\`, \`onyx sync --watch\`, and \`onyx research start\` flush the queue
 and push immutable experiment refs. \`onyx sync\` also refreshes the local history cache
 (.git/onyx/history.jsonl) that \`onyx exp list\` searches offline; \`onyx listen\`
@@ -89,6 +94,8 @@ export async function main(argv = process.argv.slice(2)) {
   try {
     if (command === "login") return commandLogin(args)
     if (command === "agent") return commandAgent(args)
+    if (command === "contract" && sub === "hash")
+      return commandContractHash(args)
     if (command === "profile") return commandProfile(args)
     if (command === "campaign" && sub === "setup")
       return commandCampaignCreate(args)
@@ -116,6 +123,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandResearchStatus(args)
     if (command === "summary" && sub === "upsert")
       return commandSummaryUpsert(args)
+    if (command === "knowledge" && sub === "add")
+      return commandKnowledgeAdd(args)
     if (command === "worker" && sub === "run") return commandWorkerRun(args)
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "exp" && sub === "log") return commandExpLog(args)

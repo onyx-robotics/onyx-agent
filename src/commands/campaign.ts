@@ -3,10 +3,10 @@ import type { LocalResearchCampaignStartedRecord } from "../protocol"
 import {
   descriptionOption,
   nameOption,
-  requireOption,
   type Args,
 } from "../lib/args"
 import { deleteCampaign, listProjectCampaigns, resolveProject } from "../lib/api"
+import { readSetupContract } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, repoRoot } from "../lib/git"
 import { readHistory, rewriteHistory } from "../lib/history"
@@ -24,21 +24,15 @@ export async function commandCampaignCreate(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const name = nameOption(args)
-  const metricName = requireOption(args, "metric")
-  const metricUnit = args.options.unit ?? null
-  const metricDirection = (args.options.direction ?? "maximize") as
-    | "maximize"
-    | "minimize"
-
-  if (metricDirection !== "maximize" && metricDirection !== "minimize") {
-    throw new Error("--direction must be maximize or minimize")
+  const setupContract = await readSetupContract(root, projectPath)
+  if (setupContract.projectPath !== projectPath) {
+    throw new Error(
+      `onyx/contract.json projectPath is "${setupContract.projectPath}", but the active project path is "${projectPath}".`
+    )
   }
 
   const baseCommitSha = await currentCommit(root)
   const description = descriptionOption(args)
-  const tools = args.options.tools ?? null
-  const constraints = args.options.constraints ?? null
-  const reset = args.options.reset ?? null
   const humanFeedback = args.options["human-feedback"] ?? null
   const promotionRefName =
     args.options["promotion-ref"] ?? `refs/heads/onyx/${name}/best`
@@ -51,12 +45,10 @@ export async function commandCampaignCreate(args: Args) {
     description,
     projectPath,
     baseCommitSha,
-    metricName,
-    metricUnit,
-    metricDirection,
-    tools,
-    constraints,
-    reset,
+    setupContract,
+    metricName: setupContract.metric.name,
+    metricUnit: setupContract.metric.unit,
+    metricDirection: setupContract.metric.direction,
     humanFeedback,
     promotionRefName,
   }
@@ -73,12 +65,11 @@ export async function commandCampaignCreate(args: Args) {
       projectPath,
       baseCommitSha,
       description,
-      metricName,
-      metricUnit,
-      metricDirection,
-      tools,
-      constraints,
-      reset,
+      metricName: setupContract.metric.name,
+      metricUnit: setupContract.metric.unit,
+      metricDirection: setupContract.metric.direction,
+      setupContract,
+      contractHash: setupContract.contractHash,
       humanFeedback,
       promotionRefName,
     },

@@ -67,7 +67,8 @@ onyx agent skill-path
 ## Core Workflow
 
 ```bash
-onyx campaign setup --name fast-eval --metric score --direction maximize
+onyx contract hash --write
+onyx campaign setup --name fast-eval --description "Improve score"
 onyx tools run evaluate
 onyx setup baseline --campaign fast-eval
 onyx setup approve --campaign fast-eval --baseline-experiment <id>
@@ -77,10 +78,11 @@ onyx push
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
 
-The bundled `/onyx` skill is the preferred user-facing controller. It creates
-`onyx/onyx.md`, `onyx/tool-api.json`, `onyx/tools/*`, `onyx/eval.sh`, and
-optional `onyx/checks.sh`; runs the baseline; asks the human to approve setup;
-then starts persistent lane workers.
+The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
+`onyx/contract.json`, generated `onyx/onyx.md`, `onyx/tools/*`,
+`onyx/eval.sh`, and optional `onyx/checks.sh`; runs the baseline; asks the
+human to approve setup; then creates an async research session with deliberate
+lane plans.
 
 Lane workers are driven by the TypeScript-rendered Markdown prompt in
 `src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the
@@ -90,16 +92,18 @@ To run multiple local research lanes directly from the CLI, choose a built-in
 agent launcher:
 
 ```bash
-onyx research start --campaign fast-eval --agents 4 --agent codex --max-minutes 10
-onyx research start --campaign fast-eval --agents 4 --agent claude --max-minutes 10
+onyx research start --campaign fast-eval --agents 4 --lane-plans plans.json --max-minutes 10
+onyx worker run --session <id> --lane <lane-id> --agent codex
+onyx worker run --session <id> --lane <lane-id> --agent claude
 ```
 
 Each lane has a branch under `refs/heads/onyx/<campaign>/lanes/*`, gets a
 generated brief and worker prompt under `.git/onyx/`, polls
-`onyx research should-stop`, runs the setup tool API through `onyx exp run`,
+`onyx research should-stop`, runs the setup contract through `onyx exp run`,
 pushes `refs/onyx/experiments/<campaignId>/<runRef>`, and reports the
-experiment with setup/session/lane/worker context. Use `--worker-command` only
-for custom harnesses.
+experiment with setup/session/lane/worker context. Workers publish shared
+learning with `onyx knowledge add`. Use `--worker-command` only for custom
+harnesses.
 
 Stop and finalize campaigns explicitly:
 

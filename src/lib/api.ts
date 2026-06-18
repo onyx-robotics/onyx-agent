@@ -1,6 +1,9 @@
 import type {
   CreateResearchCampaignExperimentRequest,
   CreateResearchCampaignRequest,
+  ResearchContractCompliance,
+  ResearchLanePlan,
+  ResearchSetupContract,
 } from "../protocol"
 
 import type { Args } from "./args"
@@ -43,9 +46,8 @@ export type ApiSetup = {
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
-  tools: string | null
-  constraints: string | null
-  reset: string | null
+  contract: ResearchSetupContract
+  contractHash: string
   humanFeedback: string | null
   setupCommitSha: string
   baselineExperimentId: string | null
@@ -67,6 +69,8 @@ export type ApiCampaignExperiment = {
   resultCommitSha: string
   resultRef: string
   status: string
+  contractHash: string | null
+  contractCompliance: ResearchContractCompliance | null
   gitStatus: string
   gitVerifiedAt: string | null
   gitStatusReason: string | null
@@ -128,6 +132,7 @@ export type ApiLane = {
   bestExperimentId: string | null
   bestMetricValue: number | null
   currentWorkerId: string | null
+  plan: ResearchLanePlan
   metadata: Record<string, unknown>
 }
 
@@ -149,12 +154,30 @@ export type ApiSummary = {
   isCurrent: boolean
 }
 
+export type ApiKnowledge = {
+  id: string
+  campaignId: string
+  sessionId: string | null
+  laneId: string | null
+  setupId: string | null
+  authoredByWorkerId: string | null
+  experimentId: string | null
+  kind: "insight" | "dead_end" | "promising_direction" | "risk" | "transfer_note"
+  title: string
+  body: string
+  confidence: number | null
+  metadata: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
+}
+
 export type ApiCampaignTimeline = {
   campaign: ApiCampaign
   activeSetup: ApiSetup | null
   workers: ApiWorker[]
   lanes: ApiLane[]
   summaries: ApiSummary[]
+  knowledge: ApiKnowledge[]
 }
 
 export type ApiCampaignOverview = ApiCampaignTimeline & {
@@ -176,6 +199,7 @@ export type ApiSessionState = {
   lanes: ApiLane[]
   workers: ApiWorker[]
   summaries: ApiSummary[]
+  knowledge: ApiKnowledge[]
   updatedAt: string
 }
 
@@ -193,6 +217,7 @@ export type ApiBrief = {
   lanes: ApiLane[]
   workers: ApiWorker[]
   summaries: ApiSummary[]
+  knowledge: ApiKnowledge[]
   recommendedContext: string[]
   markdown: string
 }
@@ -416,6 +441,7 @@ export async function createCampaignSession(
   body: {
     name: string
     workerTarget?: number
+    lanePlans?: ResearchLanePlan[]
     metadata?: Record<string, unknown>
   },
   args?: Args
@@ -433,13 +459,7 @@ export async function createCampaignSession(
 export async function createCampaignSetup(
   campaignId: string,
   body: {
-    goal?: string
-    metricName: string
-    metricUnit?: string | null
-    metricDirection?: "maximize" | "minimize"
-    tools?: string | null
-    constraints?: string | null
-    reset?: string | null
+    setupContract: ResearchSetupContract
     humanFeedback?: string | null
     setupCommitSha?: string
     metadata?: Record<string, unknown>
@@ -607,6 +627,32 @@ export async function upsertCampaignSummary(
     await callApi(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/summaries`,
+      body,
+      args
+    )
+  )
+}
+
+export async function createCampaignKnowledge(
+  campaignId: string,
+  body: {
+    sessionId?: string
+    laneId?: string
+    setupId?: string
+    authoredByWorkerId?: string
+    experimentId?: string
+    kind: ApiKnowledge["kind"]
+    title: string
+    body: string
+    confidence?: number | null
+    metadata?: Record<string, unknown>
+  },
+  args?: Args
+): Promise<ApiKnowledge> {
+  return apiData<ApiKnowledge>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/knowledge`,
       body,
       args
     )

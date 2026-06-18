@@ -66,12 +66,7 @@ async function flushCampaignStarted({
       name: record.name,
       description: record.description ?? undefined,
       baseCommitSha: record.baseCommitSha,
-      metricName: record.metricName,
-      metricUnit: record.metricUnit ?? undefined,
-      metricDirection: record.metricDirection,
-      tools: record.tools ?? undefined,
-      constraints: record.constraints ?? undefined,
-      reset: record.reset ?? undefined,
+      setupContract: record.setupContract,
       humanFeedback: record.humanFeedback ?? undefined,
       promotionRefName: record.promotionRefName ?? undefined,
     },
@@ -91,6 +86,8 @@ async function flushCampaignStarted({
     metricName: record.metricName,
     metricUnit: record.metricUnit ?? null,
     metricDirection: record.metricDirection,
+    setupContract: record.setupContract,
+    contractHash: record.setupContract.contractHash,
     promotionRefName: record.promotionRefName ?? null,
   }
   record.sync = {
@@ -128,7 +125,7 @@ async function campaignIdFromMetadata({
   )
   if (!campaign) {
     throw new Error(
-      `Campaign ${campaignName} is not synced yet. Run \`onyx campaign setup --name ${campaignName} --metric <metric>\`.`
+      `Campaign ${campaignName} is not synced yet. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/contract.json.`
     )
   }
   state.campaigns = state.campaigns ?? {}
@@ -155,6 +152,8 @@ function experimentRequestFromRecord(
     description: record.description ?? undefined,
     runRef: record.runRef,
     setupId: record.setupId,
+    contractHash: record.contractHash,
+    contractCompliance: record.contractCompliance,
     baseCommitSha: record.baseCommitSha,
     resultCommitSha: record.resultCommitSha,
     resultRef: record.resultRef,

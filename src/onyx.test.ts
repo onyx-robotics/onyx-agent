@@ -6,10 +6,13 @@ import { describe, expect, test } from "bun:test"
 
 import type { LocalResearchHistoryRecord } from "./protocol"
 import {
+  appendOutbox,
   clientRunRef,
   localResearchRecordSchema,
   mergeHistory,
+  onyxStateDir,
   parseMetricLines,
+  readOutbox,
   renderExperimentTable,
   runToolCommand,
   USAGE,
@@ -49,12 +52,87 @@ describe("local research protocol", () => {
         "refs/onyx/experiments/11111111-1111-4111-8111-111111111111/local/fast-eval/abc",
       status: "succeeded",
       setupId: "22222222-2222-4222-8222-222222222222",
+      contractHash: "sha256:test",
+      contractCompliance: {
+        status: "passed",
+        protectedPathsChanged: [],
+        outOfScopePathsChanged: [],
+        contractPathsChanged: [],
+        notes: null,
+      },
       primaryMetricName: "score",
       primaryMetricValue: 0.9,
       metrics: { score: 0.9 },
       agentNotes: {},
     })
     expect(parsed.type).toBe("campaign_experiment_logged")
+  })
+
+  test("uses shared git common-dir state and concurrent spool appends", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-outbox-"))
+    const sibling = await mkdtemp(join(tmpdir(), "onyx-outbox-wt-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeFile(join(root, "README.md"), "test\n", "utf8")
+    await runProcess("git", ["add", "README.md"], { cwd: root })
+    await runProcess(
+      "git",
+      [
+        "-c",
+        "user.name=Onyx Test",
+        "-c",
+        "user.email=onyx@example.com",
+        "commit",
+        "-m",
+        "init",
+      ],
+      { cwd: root }
+    )
+    await runProcess("git", ["worktree", "add", "-b", "lane", sibling], {
+      cwd: root,
+    })
+
+    expect(await onyxStateDir(sibling)).toBe(await onyxStateDir(root))
+
+    await Promise.all(
+      Array.from({ length: 100 }, (_, index) =>
+        appendOutbox(root, {
+          schemaVersion: 1,
+          type: "campaign_experiment_logged",
+          createdAt: "2026-06-17T12:00:00.000Z",
+          runRef: `local/fast-eval/${index}`,
+          campaignName: "fast-eval",
+          name: `experiment-${index}`,
+          baseCommitSha: "abcdef1",
+          resultCommitSha: "1234567",
+          resultRef: `refs/onyx/experiments/campaign/local/fast-eval/${index}`,
+          status: "succeeded",
+          setupId: "22222222-2222-4222-8222-222222222222",
+          contractHash: "sha256:test",
+          contractCompliance: {
+            status: "passed",
+            protectedPathsChanged: [],
+            outOfScopePathsChanged: [],
+            contractPathsChanged: [],
+            notes: null,
+          },
+          primaryMetricName: "score",
+          primaryMetricValue: index,
+          metrics: { score: index },
+          agentNotes: {},
+        })
+      )
+    )
+
+    const { records, corrupt } = await readOutbox(sibling)
+    expect(corrupt).toBe(0)
+    expect(records).toHaveLength(100)
+    const runRefs = records.map((record) => {
+      if (record.type !== "campaign_experiment_logged") {
+        throw new Error(`Unexpected outbox record type: ${record.type}`)
+      }
+      return record.runRef
+    })
+    expect(new Set(runRefs).size).toBe(100)
   })
 })
 

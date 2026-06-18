@@ -3,12 +3,11 @@ import type {
   LocalResearchHistoryRecord,
 } from "../protocol"
 
-import { readFile } from "node:fs/promises"
-
 import { listProjectCampaigns, resolveProject } from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
+import { readSetupContract, type ResearchSetupContract } from "../lib/contract"
 import { emitEvent } from "../lib/events"
-import { currentCommit, repoRoot } from "../lib/git"
+import { currentCommit, git, repoRoot } from "../lib/git"
 import {
   appendHistory,
   experimentRecordToHistory,
@@ -37,6 +36,7 @@ import {
   runToolCommand,
   type ToolRunResult,
 } from "../lib/tools"
+import { flushOutbox } from "../lib/sync"
 
 type ExperimentStatus = LocalResearchCampaignExperimentLoggedRecord["status"]
 type ChecksRecord = NonNullable<
@@ -60,6 +60,7 @@ function validateStatus(value: string): ExperimentStatus {
     value === "succeeded" ||
     value === "failed" ||
     value === "checks_failed" ||
+    value === "contract_violation" ||
     value === "accepted" ||
     value === "rejected"
   ) {
@@ -67,7 +68,7 @@ function validateStatus(value: string): ExperimentStatus {
   }
 
   throw new Error(
-    "--status must be queued, running, succeeded, failed, checks_failed, accepted, or rejected"
+    "--status must be queued, running, succeeded, failed, checks_failed, contract_violation, accepted, or rejected"
   )
 }
 
@@ -90,18 +91,89 @@ function safeRefSegment(value: string) {
   return value.replace(/[^A-Za-z0-9._/-]+/g, "-")
 }
 
-async function assertEvalReady(evalSh: string) {
-  if (!(await pathExists(evalSh))) {
-    throw new Error(
-      `Missing ${evalSh}. Create onyx/eval.sh before running experiments.`
-    )
-  }
+function pathMatchesScope(path: string, scope: string) {
+  const normalized = scope.replace(/^\/+|\/+$/g, "")
+  if (!normalized) return true
+  return path === normalized || path.startsWith(`${normalized}/`)
+}
 
-  const text = await readFile(evalSh, "utf8")
-  if (text.includes("ONYX_STUB_EVAL")) {
-    throw new Error(
-      `${evalSh} still contains ONYX_STUB_EVAL. Replace the stub with a real eval before running experiments.`
+function stripProjectScope(path: string, projectPath: string) {
+  if (!projectPath) return path
+  if (path === projectPath) return ""
+  if (path.startsWith(`${projectPath}/`)) {
+    return path.slice(projectPath.length + 1)
+  }
+  return path
+}
+
+async function changedProjectPaths({
+  root,
+  projectPath,
+  baseCommitSha,
+  resultCommitSha,
+}: {
+  root: string
+  projectPath: string
+  baseCommitSha: string
+  resultCommitSha: string
+}) {
+  const output = await git(
+    ["diff", "--name-only", `${baseCommitSha}..${resultCommitSha}`],
+    root
+  )
+  return Array.from(
+    new Set(
+      output
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((path) => stripProjectScope(path, projectPath))
     )
+  ).sort()
+}
+
+function contractCompliance({
+  contract,
+  changedPaths,
+}: {
+  contract: ResearchSetupContract
+  changedPaths: string[]
+}): LocalResearchCampaignExperimentLoggedRecord["contractCompliance"] {
+  const defaultProtected = [
+    "onyx/onyx.md",
+    "onyx/contract.json",
+    "onyx/eval.sh",
+    "onyx/checks.sh",
+    "onyx/tool-api.json",
+    "onyx/tools",
+  ]
+  const protectedPaths = [...defaultProtected, ...contract.protectedPaths]
+  const protectedPathsChanged = changedPaths.filter((path) =>
+    protectedPaths.some((scope) => pathMatchesScope(path, scope))
+  )
+  const outOfScopePathsChanged =
+    contract.editableScope.length === 0
+      ? []
+      : changedPaths.filter(
+          (path) =>
+            !contract.editableScope.some((scope) =>
+              pathMatchesScope(path, scope)
+            )
+        )
+  const contractPathsChanged = changedPaths.filter((path) =>
+    defaultProtected.some((scope) => pathMatchesScope(path, scope))
+  )
+  const violated =
+    protectedPathsChanged.length > 0 || outOfScopePathsChanged.length > 0
+
+  return {
+    status: violated ? "contract_violation" : "passed",
+    protectedPathsChanged,
+    outOfScopePathsChanged,
+    contractPathsChanged,
+    notes: violated
+      ? "Local diff changed protected or out-of-scope paths under the setup contract."
+      : null,
   }
 }
 
@@ -188,7 +260,7 @@ async function ensureCampaignMetadata({
   )
   if (!campaign) {
     throw new Error(
-      `Campaign ${campaignName} is not synced. Run \`onyx campaign setup --name ${campaignName} --metric <metric>\` and \`onyx sync\`.`
+      `Campaign ${campaignName} is not synced. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/contract.json, then \`onyx sync\`.`
     )
   }
 
@@ -229,15 +301,17 @@ export async function commandExpRun(args: Args) {
     projectPath,
     campaignName,
   })
+  const contract = await readSetupContract(root, projectPath)
+  if (contract.projectPath !== projectPath) {
+    throw new Error(
+      `onyx/contract.json projectPath is "${contract.projectPath}", but the active project path is "${projectPath}".`
+    )
+  }
   const resultCommitSha = await currentCommit(root)
-  const evalSh = onyxPath(root, projectPath, "eval.sh")
-  await assertEvalReady(evalSh)
 
   const timeoutMs = numberOption(args, "timeout", 600) * 1000
   const checksTimeoutMs = numberOption(args, "checks-timeout", 300) * 1000
   const started = new Date()
-  const runRef = clientRunRef(campaignName)
-  const resultRef = `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
   const setupId =
     args.options.setup ?? process.env.ONYX_SETUP_ID ?? campaign.setupId
   if (!setupId) {
@@ -251,6 +325,52 @@ export async function commandExpRun(args: Args) {
   const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
   const baseCommitSha =
     args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+  const existingAttempt = await readLastRun(root)
+  const reusableAttempt =
+    existingAttempt?.campaignName === campaignName &&
+    existingAttempt.projectPath === projectPath &&
+    existingAttempt.setupId === setupId &&
+    existingAttempt.baseCommitSha === baseCommitSha &&
+    existingAttempt.resultCommitSha === resultCommitSha
+      ? existingAttempt
+      : null
+  const runRef = reusableAttempt?.runRef ?? clientRunRef(campaignName)
+  const resultRef =
+    reusableAttempt?.resultRef ??
+    `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
+  const initialRun: LastRunRecord = {
+    schemaVersion: 1,
+    createdAt: started.toISOString(),
+    runRef,
+    campaignName,
+    projectPath,
+    baseCommitSha,
+    resultCommitSha,
+    resultRef,
+    status: "running",
+    contractHash: contract.contractHash,
+    contractCompliance: {
+      status: "passed",
+      protectedPathsChanged: [],
+      outOfScopePathsChanged: [],
+      contractPathsChanged: [],
+      notes: null,
+    },
+    primaryMetricName: campaign.metricName,
+    primaryMetricValue: null,
+    metrics: {},
+    agentNotes: {},
+    checks: null,
+    durationMs: 0,
+    startedAt: started.toISOString(),
+    completedAt: null,
+    outputSummary: null,
+    setupId,
+    sessionId,
+    workerId,
+    laneId,
+  }
+  await writeLastRun(root, initialRun)
 
   await emitEvent(root, {
     type: "exp_run_started",
@@ -278,6 +398,8 @@ export async function commandExpRun(args: Args) {
         resultCommitSha,
         resultRef,
         status: "failed",
+        contractHash: contract.contractHash,
+        contractCompliance: initialRun.contractCompliance,
         primaryMetricName: campaign.metricName,
         primaryMetricValue: null,
         metrics: {},
@@ -332,11 +454,24 @@ export async function commandExpRun(args: Args) {
       message: checks.status,
     })
   }
-  const status: ExperimentStatus = !benchmarkSucceeded
+  const measuredStatus: ExperimentStatus = !benchmarkSucceeded
     ? "failed"
     : checks && checks.status !== "passed"
       ? "checks_failed"
       : "succeeded"
+  const compliance = contractCompliance({
+    contract,
+    changedPaths: await changedProjectPaths({
+      root,
+      projectPath,
+      baseCommitSha,
+      resultCommitSha,
+    }),
+  })
+  const status: ExperimentStatus =
+    compliance.status === "contract_violation"
+      ? "contract_violation"
+      : measuredStatus
   const outputSummaryParts = [
     result.timedOut ? `Eval timed out after ${timeoutMs / 1000}s.` : "",
     result.code === 0 && primary.value === null
@@ -347,7 +482,9 @@ export async function commandExpRun(args: Args) {
   const outputSummary = outputSummaryParts.join("\n").slice(0, 4000) || null
 
   if (optionalFlag(args, "no-log")) {
-    console.log(JSON.stringify({ metrics, status, checks }, null, 2))
+    console.log(
+      JSON.stringify({ metrics, status, checks, compliance }, null, 2)
+    )
     if (result.code !== 0) process.exitCode = result.code ?? 1
     return
   }
@@ -362,6 +499,8 @@ export async function commandExpRun(args: Args) {
     resultCommitSha,
     resultRef,
     status,
+    contractHash: contract.contractHash,
+    contractCompliance: compliance,
     primaryMetricName: primary.name,
     primaryMetricValue: primary.value,
     metrics,
@@ -391,7 +530,11 @@ export async function commandExpRun(args: Args) {
   )
   console.log("Run `onyx exp log --description <text>` to record this result.")
 
-  if (!benchmarkSucceeded || status === "checks_failed") {
+  if (
+    !benchmarkSucceeded ||
+    status === "checks_failed" ||
+    status === "contract_violation"
+  ) {
     process.exitCode = result.code && result.code !== 0 ? result.code : 1
   }
 }
@@ -406,6 +549,12 @@ export async function commandExpLog(args: Args) {
     projectPath,
     campaignName,
   })
+  const contract = await readSetupContract(root, projectPath)
+  if (contract.projectPath !== projectPath) {
+    throw new Error(
+      `onyx/contract.json projectPath is "${contract.projectPath}", but the active project path is "${projectPath}".`
+    )
+  }
   const lastRun = await readLastRun(root)
   const usableLastRun =
     lastRun?.campaignName === campaignName &&
@@ -432,6 +581,15 @@ export async function commandExpLog(args: Args) {
   const status = validateStatus(
     args.options.status ?? usableLastRun?.status ?? "succeeded"
   )
+  if (
+    !usableLastRun &&
+    status !== "failed" &&
+    !optionalFlag(args, "allow-unmeasured")
+  ) {
+    throw new Error(
+      "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for failed unmeasured attempts."
+    )
+  }
   if (
     (status === "succeeded" || status === "accepted") &&
     metricValue === null
@@ -483,6 +641,21 @@ export async function commandExpLog(args: Args) {
     process.env.ONYX_SESSION_ID
   const workerId =
     args.options.worker ?? usableLastRun?.workerId ?? process.env.ONYX_WORKER_ID
+  const loggedCompliance =
+    usableLastRun?.contractCompliance ??
+    contractCompliance({
+      contract,
+      changedPaths: await changedProjectPaths({
+        root,
+        projectPath,
+        baseCommitSha,
+        resultCommitSha,
+      }),
+    })
+  const loggedStatus: ExperimentStatus =
+    loggedCompliance.status === "contract_violation"
+      ? "contract_violation"
+      : status
 
   const record: LocalResearchCampaignExperimentLoggedRecord = {
     schemaVersion: 1,
@@ -496,7 +669,9 @@ export async function commandExpLog(args: Args) {
     baseCommitSha,
     resultCommitSha,
     resultRef,
-    status,
+    status: loggedStatus,
+    contractHash: usableLastRun?.contractHash ?? contract.contractHash,
+    contractCompliance: loggedCompliance,
     primaryMetricName: metricName,
     primaryMetricValue: metricValue,
     metrics,
@@ -512,6 +687,7 @@ export async function commandExpLog(args: Args) {
     laneId,
   }
   await appendOutbox(root, record)
+  await flushOutbox(root, args, { quiet: true }).catch(() => {})
   await appendHistory(root, experimentRecordToHistory(record)).catch(() => {})
   await emitEvent(root, {
     type: "exp_logged",
@@ -520,10 +696,10 @@ export async function commandExpLog(args: Args) {
     runRef,
     commitSha: resultCommitSha,
     resultRef,
-    message: `${record.name} (${status})`,
+    message: `${record.name} (${loggedStatus})`,
   })
   console.log(
-    `Recorded ${record.name} (${status}) for campaign ${campaignName}`
+    `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}`
   )
   if (usableLastRun) await clearLastRun(root)
 }
@@ -548,6 +724,7 @@ export async function commandExpList(args: Args) {
       resultCommitSha: lastRun.resultCommitSha,
       resultRef: lastRun.resultRef,
       status: lastRun.status,
+      contractHash: lastRun.contractHash,
       name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
       description: null,
       primaryMetricName: lastRun.primaryMetricName,

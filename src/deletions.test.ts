@@ -10,6 +10,46 @@ import type { LocalResearchRecord } from "./protocol"
 const CAMPAIGN_DELETED_AT = "2026-06-10T12:00:00.000Z"
 const BEFORE_DELETE = "2026-06-09T00:00:00.000Z"
 const AFTER_DELETE = "2026-06-11T00:00:00.000Z"
+const setupContract = {
+  schemaVersion: 1 as const,
+  goal: "Improve score",
+  metric: {
+    name: "score",
+    unit: null,
+    direction: "maximize" as const,
+  },
+  projectPath: "",
+  editableScope: [],
+  protectedPaths: [],
+  commands: {
+    evaluate: {
+      command: "bash",
+      args: ["onyx/eval.sh"],
+      shell: false,
+      cwd: "project",
+      env: {},
+      resources: [],
+      timeoutSeconds: 600,
+      leaseTimeoutSeconds: 120,
+      outputLimitBytes: 4000,
+    },
+  },
+  resources: {},
+  constraints: [],
+  riskModel: { risks: [], antiGamingChecks: [] },
+  measurement: {
+    metricLine: "METRIC",
+    trials: 1,
+    aggregation: "single" as const,
+    notes: null,
+  },
+  stopPolicy: {
+    maxIterations: null,
+    maxMinutes: null,
+    patience: null,
+  },
+  contractHash: "sha256:test",
+}
 
 const deletions: ApiProjectDeletions = {
   campaigns: [
@@ -40,6 +80,7 @@ function campaignStarted(
     createdAt,
     name,
     baseCommitSha: "abcdef1",
+    setupContract,
     metricName: "score",
     metricDirection: "maximize",
   }
@@ -62,6 +103,14 @@ function experimentLogged(
     resultRef: `refs/onyx/experiments/${campaignName}/${runRef}`,
     status: "succeeded",
     setupId: "44444444-4444-4444-8444-444444444444",
+    contractHash: setupContract.contractHash,
+    contractCompliance: {
+      status: "passed",
+      protectedPathsChanged: [],
+      outOfScopePathsChanged: [],
+      contractPathsChanged: [],
+      notes: null,
+    },
     primaryMetricName: "score",
     primaryMetricValue: 0.5,
     metrics: {},
