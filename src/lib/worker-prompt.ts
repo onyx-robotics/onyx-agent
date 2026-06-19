@@ -17,13 +17,11 @@ export type LaneWorkerPromptInput = {
   metricLabel: string
   minutesRemaining: number
   protectedPaths: string[]
-  contractHash: string
-  contractPath: string
+  setupFilePath: string
+  validationFilePath: string
   researchSpecPath: string
   sessionId: string
   sessionStatePath: string | null
-  setupId: string
-  setupVersion: number
 }
 
 function markdownList(items: string[]) {
@@ -44,7 +42,7 @@ You are an autonomous Onyx research lane worker. Do not ask the user questions. 
 - Name: ${input.campaignName}
 - Goal: ${input.goal}
 - Metric: ${input.metricLabel}
-- Setup: ${input.setupId} v${input.setupVersion} (${input.contractHash})
+- Setup: local repo files
 - Session: ${input.sessionId}
 - Lane: ${input.laneId} (${input.laneName})
 - Lane branch: ${input.laneBranch}
@@ -54,7 +52,8 @@ You are an autonomous Onyx research lane worker. Do not ask the user questions. 
 ## Context Files
 
 - Campaign brief: ${input.briefPath}
-${optionalContextLine("Peer lane state", input.sessionStatePath)}- Setup contract: ${input.contractPath}
+${optionalContextLine("Peer lane state", input.sessionStatePath)}- Setup file: ${input.setupFilePath}
+- Validation report: ${input.validationFilePath}
 - Research spec: ${input.researchSpecPath}
 
 ## Lane Plan
@@ -74,7 +73,7 @@ Do not edit protected setup paths during Research. If setup/eval/tools need to c
 
 ## Loop
 
-1. Read the setup contract, research spec, campaign brief, peer state, recent experiments, shared knowledge, git status, and relevant source files. Understand the workload before editing.
+1. Read the setup file, validation report, research spec, campaign brief, peer state, recent experiments, shared knowledge, git status, and relevant source files. Understand the workload before editing.
 2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, restore only in-scope files from the best commit and commit that forward; do not rewrite history.
 3. Pick a concrete research idea for this lane. Use peer progress as inspiration, but do not duplicate an already-failed idea.
 4. Before each iteration, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n>\`. Stop cleanly if it exits 0.
@@ -89,7 +88,7 @@ Do not edit protected setup paths during Research. If setup/eval/tools need to c
 - Primary metric is king: improved results are candidates to build from; worse or equal results should send you back to the current best before trying the next idea.
 - Secondary metrics inform tradeoffs, but hard guardrails belong in checks so a primary win that violates constraints becomes \`checks_failed\`.
 - Confirm surprising wins on noisy metrics before building on them. A single lucky trial can mislead the campaign.
-- Use loop statuses from \`onyx exp run\`: \`succeeded\`, \`failed\`, \`checks_failed\`, and \`contract_violation\`. Do not mark autonomous attempts \`accepted\` or \`rejected\`; those are for human curation.
+- Use loop statuses from \`onyx exp run\`: \`succeeded\`, \`failed\`, \`checks_failed\`, and \`setup_violation\`. Do not mark autonomous attempts \`accepted\` or \`rejected\`; those are for human curation.
 - Never drop failed attempts. If eval crashes or emits no primary metric, log it as failed with notes about what happened.
 - Annotate every run with useful \`--agent-notes\`: what you learned, why it mattered, and what a fresh worker should avoid or try next.
 - Keep experiment names/descriptions clean and specific. Do not prefix them with iteration counters; Onyx already tracks ordering.

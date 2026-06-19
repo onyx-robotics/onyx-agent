@@ -20,14 +20,12 @@ const baseInput = {
   maxIterations: 8,
   metricLabel: "tracking_error (m), minimize",
   minutesRemaining: 10,
-  protectedPaths: ["onyx/onyx.md", "onyx/contract.json"],
-  contractHash: "sha256:123",
-  contractPath: "/repo/onyx/contract.json",
+  protectedPaths: ["onyx/onyx.md", "onyx/setup.json"],
+  setupFilePath: "/repo/onyx/setup.json",
+  validationFilePath: "/repo/onyx/validation.json",
   researchSpecPath: "onyx/onyx.md",
   sessionId: "session_123",
   sessionStatePath: null,
-  setupId: "setup_123",
-  setupVersion: 2,
 }
 
 describe("lane worker prompt", () => {
@@ -37,7 +35,8 @@ describe("lane worker prompt", () => {
     expect(prompt).toContain("# Onyx Lane Worker: lane-1")
     expect(prompt).toContain("- Name: drone-controller")
     expect(prompt).toContain("- Metric: tracking_error (m), minimize")
-    expect(prompt).toContain("- Setup contract: /repo/onyx/contract.json")
+    expect(prompt).toContain("- Setup file: /repo/onyx/setup.json")
+    expect(prompt).toContain("- Validation report: /repo/onyx/validation.json")
     expect(prompt).toContain("- Focus: Reduce controller overshoot")
     expect(prompt).toContain("onyx knowledge add")
     expect(prompt).toContain("Primary metric is king")

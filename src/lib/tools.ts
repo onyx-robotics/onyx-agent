@@ -4,7 +4,7 @@ import { join, resolve } from "node:path"
 import { z } from "zod"
 
 import type { Args } from "./args"
-import { contractPath, readSetupContract } from "./contract"
+import { readSetupFile, setupPath, validationPath } from "./contract"
 import { onyxStateDir } from "./outbox"
 import { onyxPath, resolveProjectPath, scopedRoot } from "./project"
 import { pathExists, runProcess, type ProcessResult } from "./process"
@@ -77,18 +77,18 @@ export function defaultProtectedToolPaths(projectPath: string) {
   const prefix = projectPath ? `${projectPath}/` : ""
   return [
     `${prefix}onyx/onyx.md`,
-    `${prefix}onyx/contract.json`,
+    `${prefix}onyx/setup.json`,
+    `${prefix}onyx/validation.json`,
     `${prefix}onyx/eval.sh`,
     `${prefix}onyx/checks.sh`,
-    `${prefix}onyx/tool-api.json`,
     `${prefix}onyx/tools`,
   ]
 }
 
 export async function protectedToolPaths(root: string, projectPath: string) {
-  const contract = await readSetupContract(root, projectPath).catch(() => null)
-  const api = contract ? null : await readToolApi(root, projectPath)
-  const explicit = contract?.protectedPaths ?? api?.protectedPaths ?? []
+  const setup = await readSetupFile(root, projectPath).catch(() => null)
+  const api = setup ? null : await readToolApi(root, projectPath)
+  const explicit = setup?.protectedPaths ?? api?.protectedPaths ?? []
   return [...new Set([...defaultProtectedToolPaths(projectPath), ...explicit])]
 }
 
@@ -96,20 +96,20 @@ async function readCanonicalToolApi(
   root: string,
   projectPath: string
 ): Promise<ToolApi | null> {
-  const contract = await readSetupContract(root, projectPath).catch(() => null)
-  if (contract) {
+  const setup = await readSetupFile(root, projectPath).catch(() => null)
+  if (setup) {
     return {
       schemaVersion: 1,
       commands: {
-        ...(contract.commands.reset ? { reset: contract.commands.reset } : {}),
-        evaluate: contract.commands.evaluate,
-        eval: contract.commands.evaluate,
-        ...(contract.commands.check
-          ? { check: contract.commands.check, checks: contract.commands.check }
+        ...(setup.commands.reset ? { reset: setup.commands.reset } : {}),
+        evaluate: setup.commands.evaluate,
+        eval: setup.commands.evaluate,
+        ...(setup.commands.check
+          ? { check: setup.commands.check, checks: setup.commands.check }
           : {}),
       },
-      resources: contract.resources,
-      protectedPaths: contract.protectedPaths,
+      resources: setup.resources,
+      protectedPaths: setup.protectedPaths,
     }
   }
   return readToolApi(root, projectPath)
@@ -308,15 +308,12 @@ export async function runToolCommand({
   const command = await getToolCommand({ root, projectPath, name })
   if (!command) {
     throw new Error(
-      `Tool command "${name}" is not declared in onyx/contract.json`
+      `Tool command "${name}" is not declared in onyx/setup.json`
     )
   }
 
   const release = await acquireResources({ root, api, command })
   try {
-    const contract = await readSetupContract(root, projectPath).catch(
-      () => null
-    )
     const cwd = resolveCwd(root, projectPath, command.cwd)
     const toolEnv = {
       ...process.env,
@@ -326,8 +323,8 @@ export async function runToolCommand({
       ONYX_REPO_ROOT: root,
       ONYX_PROJECT_ROOT: scopedRoot(root, projectPath),
       ONYX_PROJECT_PATH: projectPath,
-      ONYX_CONTRACT_FILE: contractPath(root, projectPath),
-      ...(contract ? { ONYX_CONTRACT_HASH: contract.contractHash } : {}),
+      ONYX_SETUP_FILE: setupPath(root, projectPath),
+      ONYX_VALIDATION_FILE: validationPath(root, projectPath),
       ONYX_TOOL_API_FILE: toolApiPath(root, projectPath),
     }
     const timeoutMs = (timeoutSeconds ?? command.timeoutSeconds) * 1000

@@ -82,7 +82,6 @@ export {
   validateDeveloperCheckout,
 } from "./commands/developer"
 export { commandAgent } from "./commands/agent"
-export { commandContractHash } from "./commands/contract"
 export { commandLogin } from "./commands/login"
 export {
   commandProfile,
@@ -107,20 +106,31 @@ export {
   commandResearchStart,
   commandResearchStatus,
   commandResearchStop,
-  commandSetupApprove,
-  commandSetupBaseline,
-  commandSetupValidate,
   commandKnowledgeAdd,
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
 export {
-  contractPath,
-  normalizeSetupContract,
-  readSetupContract,
-  setupContractHash,
-  writeSetupContract,
-  type ResearchSetupContract,
+  commandSetupInit,
+  commandSetupModules,
+  commandSetupOptional,
+  commandSetupRequire,
+  commandSetupValidate,
+} from "./commands/setup"
+export {
+  normalizeSetupFile,
+  normalizeValidationFile,
+  readSetupFile,
+  readValidationFile,
+  requiredSetupModules,
+  setupModuleRequirement,
+  setupPath,
+  validationPath,
+  writeSetupFile,
+  writeValidationFile,
+  type ResearchSetupFile,
+  type ResearchSetupModuleId,
+  type ResearchSetupValidationFile,
 } from "./lib/contract"
 export {
   protectedToolPaths,

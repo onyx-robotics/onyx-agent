@@ -2,12 +2,10 @@ import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import { researchLanePlanSchema } from "../protocol"
-import { commandExpLog, commandExpRun } from "./exp"
 import type { Args } from "../lib/args"
 import {
   claimCampaignLane,
   createCampaignSession,
-  createCampaignSetup,
   getCampaignBrief,
   getCampaignOverview,
   getResearchSessionState,
@@ -19,23 +17,26 @@ import {
   stopCampaignSession,
   resolveProject,
   upsertCampaignSummary,
-  validateCampaignSetup,
   type ApiCampaign,
   type ApiLane,
-  type ApiSetup,
 } from "../lib/api"
-import { contractPath, readSetupContract } from "../lib/contract"
+import {
+  readSetupFile,
+  readValidationFile,
+  requiredSetupModules,
+  setupPath,
+  validationPath,
+  type ResearchSetupFile,
+} from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
-import { readHistory } from "../lib/history"
 import {
   onyxStateDir,
-  readLastRun,
   readOutbox,
   readState,
   writeState,
 } from "../lib/outbox"
-import { campaignStateKey, resolveProjectPath } from "../lib/project"
+import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import { pathExists, runProcess, type ProcessResult } from "../lib/process"
 import { flushOutbox } from "../lib/sync"
 import { protectedToolPaths } from "../lib/tools"
@@ -158,7 +159,6 @@ async function campaignForName(root: string, args: Args) {
   }
 
   const overview = await getCampaignOverview(campaign.id, args)
-  const setup = overview.activeSetup
   const key = campaignStateKey(projectPath, campaign.name)
   state.projectId = project.id
   state.projectPath = projectPath
@@ -167,33 +167,94 @@ async function campaignForName(root: string, args: Args) {
   state.campaigns[key] = {
     ...state.campaigns[key],
     campaignId: campaign.id,
-    setupId: setup?.id,
     projectPath,
     baseCommitSha: campaign.baseCommitSha,
     description: campaign.description,
     metricName: campaign.metricName,
     metricUnit: campaign.metricUnit,
     metricDirection: campaign.metricDirection,
-    setupContract: setup?.contract,
-    contractHash: setup?.contractHash,
     promotionRefName: campaign.promotionRefName,
   }
   await writeState(root, state)
 
-  return { projectPath, campaign: overview.campaign, setup, overview }
+  return { projectPath, campaign: overview.campaign, overview }
 }
 
-function assertResearchReady(campaign: ApiCampaign, setup: ApiSetup | null) {
-  if (
-    campaign.phase !== "research" ||
-    !setup ||
-    setup.status !== "validated" ||
-    !setup.baselineExperimentId
-  ) {
+async function assertLocalSetupReady(root: string, projectPath: string) {
+  const setup = await readSetupFile(root, projectPath)
+  const cheapFailures = await recheckCheapRequiredSetupModules({
+    root,
+    projectPath,
+    setup,
+  })
+  if (cheapFailures.length > 0) {
     throw new Error(
-      "Research requires a validated setup with a baseline. Run `onyx setup baseline`, then `onyx setup approve` first."
+      `Required setup module(s) failed local preflight: ${cheapFailures.join("; ")}. Run \`onyx setup validate --required\`.`
     )
   }
+
+  const validation = await readValidationFile(root, projectPath)
+  if (!validation) {
+    throw new Error(
+      "Missing onyx/validation.json. Run `onyx setup validate` before starting research."
+    )
+  }
+  const byModule = new Map(
+    validation.modules.map((module) => [module.moduleId, module])
+  )
+  const failing = requiredSetupModules(setup).filter(
+    (moduleId) => byModule.get(moduleId)?.status !== "passed"
+  )
+  if (failing.length > 0) {
+    throw new Error(
+      `Required setup module(s) are not passing: ${failing.join(", ")}. Run \`onyx setup validate --required\`.`
+    )
+  }
+  return { setup, validation }
+}
+
+async function recheckCheapRequiredSetupModules({
+  root,
+  projectPath,
+  setup,
+}: {
+  root: string
+  projectPath: string
+  setup: ResearchSetupFile
+}) {
+  const required = new Set(requiredSetupModules(setup))
+  const failures: string[] = []
+
+  if (required.has("project_scope") && setup.projectPath !== projectPath) {
+    failures.push(
+      `project_scope expected projectPath "${projectPath}" but setup has "${setup.projectPath}"`
+    )
+  }
+
+  if (required.has("metric") && setup.metric.name.trim().length === 0) {
+    failures.push("metric is missing")
+  }
+
+  if (
+    required.has("evaluation_definition") &&
+    setup.commands.evaluate.command.trim().length === 0
+  ) {
+    failures.push("evaluation_definition is missing")
+  }
+
+  if (required.has("agent_handoff")) {
+    const instructionsPath = onyxPath(root, projectPath, "onyx.md")
+    if (!(await pathExists(instructionsPath))) {
+      failures.push("agent_handoff is missing onyx/onyx.md")
+    } else {
+      const instructions = await readFile(instructionsPath, "utf8")
+      if (instructions.trim().length < 20) {
+        failures.push("agent_handoff has too little guidance in onyx/onyx.md")
+      }
+    }
+  }
+
+  return failures
 }
 
 async function writeBrief({
@@ -294,7 +355,7 @@ async function writeWorkerPrompt({
   root: string
   projectPath: string
   campaign: ApiCampaign
-  setup: ApiSetup
+  setup: ResearchSetupFile
   sessionId: string
   lane: ApiLane
   briefPath: string
@@ -322,15 +383,13 @@ async function writeWorkerPrompt({
     metricLabel: `${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
     minutesRemaining,
     protectedPaths,
-    contractHash: setup.contractHash,
-    contractPath: contractPath(root, projectPath),
+    setupFilePath: setupPath(root, projectPath),
+    validationFilePath: validationPath(root, projectPath),
     researchSpecPath: projectPath
       ? `${projectPath}/onyx/onyx.md`
       : "onyx/onyx.md",
     sessionId,
     sessionStatePath,
-    setupId: setup.id,
-    setupVersion: setup.version,
   })
 
   await writeFile(path, `${markdown}\n`, "utf8")
@@ -468,7 +527,7 @@ async function runLaneOnce({
   root: string
   projectPath: string
   campaign: ApiCampaign
-  setup: ApiSetup
+  setup: ResearchSetupFile
   sessionId: string
   lane: ApiLane
   workerCommand?: string
@@ -516,7 +575,6 @@ async function runLaneOnce({
       type: "lane_claimed",
       campaignName: campaign.name,
       campaignId: campaign.id,
-      setupId: setup.id,
       sessionId,
       workerId: worker.id,
       laneId: lane.id,
@@ -572,7 +630,6 @@ async function runLaneOnce({
             ...process.env,
             ONYX_CAMPAIGN_ID: campaign.id,
             ONYX_CAMPAIGN_NAME: campaign.name,
-            ONYX_SETUP_ID: setup.id,
             ONYX_SESSION_ID: sessionId,
             ONYX_LANE_ID: lane.id,
             ONYX_LANE_NAME: lane.name,
@@ -580,8 +637,8 @@ async function runLaneOnce({
             ONYX_WORKER_ID: worker.id,
             ONYX_BRIEF_FILE: briefPath,
             ONYX_WORKER_PROMPT_FILE: prompt.path,
-            ONYX_CONTRACT_FILE: contractPath(root, projectPath),
-            ONYX_CONTRACT_HASH: setup.contractHash,
+            ONYX_SETUP_FILE: setupPath(root, projectPath),
+            ONYX_VALIDATION_FILE: validationPath(root, projectPath),
             ...(sessionStatePath
               ? { ONYX_SESSION_STATE_FILE: sessionStatePath }
               : {}),
@@ -636,7 +693,6 @@ async function runLaneOnce({
       {
         sessionId,
         laneId: lane.id,
-        setupId: setup.id,
         authoredByWorkerId: worker.id,
         summaryKind: "lane_summary",
         title: `${lane.name} completed`,
@@ -687,7 +743,6 @@ async function runLaneOnce({
       {
         sessionId,
         laneId: lane.id,
-        setupId: setup.id,
         authoredByWorkerId: workerId,
         summaryKind: "lane_summary",
         title: `${lane.name} failed`,
@@ -699,169 +754,10 @@ async function runLaneOnce({
   }
 }
 
-async function ensureSetupCommit({
-  root,
-  projectPath,
-  campaign,
-  setup,
-  args,
-}: {
-  root: string
-  projectPath: string
-  campaign: ApiCampaign
-  setup: ApiSetup
-  args: Args
-}) {
-  const setupCommitSha = await currentCommit(root)
-  const setupContract = await readSetupContract(root, projectPath)
-  if (
-    setup.status !== "draft" ||
-    (setup.setupCommitSha === setupCommitSha &&
-      setup.contractHash === setupContract.contractHash)
-  ) {
-    return setup
-  }
-
-  const result = await createCampaignSetup(
-    campaign.id,
-    {
-      setupContract,
-      humanFeedback: setup.humanFeedback,
-      setupCommitSha,
-      metadata: {
-        ...(setup.metadata ?? {}),
-        refreshedBy: "onyx setup baseline",
-      },
-    },
-    args
-  )
-  const state = await readState(root)
-  const key = campaignStateKey(projectPath, campaign.name)
-  state.campaigns = state.campaigns ?? {}
-  state.campaigns[key] = {
-    ...state.campaigns[key],
-    setupId: result.setup.id,
-    setupContract: result.setup.contract,
-    contractHash: result.setup.contractHash,
-  }
-  await writeState(root, state)
-  await emitEvent(root, {
-    type: "setup_created",
-    campaignName: campaign.name,
-    campaignId: campaign.id,
-    setupId: result.setup.id,
-    commitSha: setupCommitSha,
-    message: `setup v${result.setup.version}`,
-  })
-  return result.setup
-}
-
-export async function commandSetupBaseline(args: Args): Promise<string> {
-  const root = await repoRoot()
-  const { campaign, setup, projectPath } = await campaignForName(root, args)
-  if (!setup) throw new Error("Campaign has no active setup.")
-  if (setup.status === "validated" && setup.baselineExperimentId) {
-    console.log(
-      `Setup ${setup.id} already has baseline ${setup.baselineExperimentId}.`
-    )
-    return setup.baselineExperimentId
-  }
-  const activeSetup = await ensureSetupCommit({
-    root,
-    projectPath,
-    campaign,
-    setup,
-    args,
-  })
-
-  await commandExpRun({
-    positional: ["exp", "run"],
-    options: {
-      ...args.options,
-      campaign: campaign.name,
-      setup: activeSetup.id,
-      base: campaign.baseCommitSha,
-    },
-  })
-  const lastRun = await readLastRun(root)
-  await commandExpLog({
-    positional: ["exp", "log"],
-    options: {
-      ...args.options,
-      campaign: campaign.name,
-      setup: activeSetup.id,
-      base: campaign.baseCommitSha,
-      name: `baseline-${activeSetup.version}`,
-      description: `Baseline for setup v${activeSetup.version}`,
-    },
-  })
-  await flushOutbox(root, args)
-  const { records } = await readHistory(root)
-  const history = records.find((record) => record.runRef === lastRun?.runRef)
-  if (!history?.experimentId) {
-    throw new Error(
-      "Baseline logged locally but was not synced; setup validation requires API sync."
-    )
-  }
-  console.log(`Baseline experiment: ${history.experimentId}`)
-  return history.experimentId
-}
-
-export async function commandSetupApprove(args: Args) {
-  const root = await repoRoot()
-  const { campaign, setup, projectPath } = await campaignForName(root, args)
-  if (!setup) throw new Error("Campaign has no active setup.")
-  if (setup.status === "validated" && setup.baselineExperimentId) {
-    console.log(`Setup ${setup.id} is already validated.`)
-    return
-  }
-  const baselineExperimentId =
-    args.options["baseline-experiment"] ?? args.options.experiment
-  if (!baselineExperimentId) {
-    throw new Error(
-      "Pass --baseline-experiment <id> from `onyx setup baseline`."
-    )
-  }
-  const result = await validateCampaignSetup(
-    setup.id,
-    {
-      baselineExperimentId,
-    },
-    args
-  )
-  const state = await readState(root)
-  const key = campaignStateKey(projectPath, campaign.name)
-  state.campaigns = state.campaigns ?? {}
-  state.campaigns[key] = {
-    ...state.campaigns[key],
-    setupId: result.setup.id,
-  }
-  await writeState(root, state)
-  await emitEvent(root, {
-    type: "setup_validated",
-    campaignName: campaign.name,
-    campaignId: campaign.id,
-    setupId: setup.id,
-    message: `baseline ${baselineExperimentId}`,
-  })
-  console.log(`Validated setup v${result.setup.version} for ${campaign.name}`)
-}
-
-export async function commandSetupValidate(args: Args) {
-  const baselineExperimentId = await commandSetupBaseline(args)
-  await commandSetupApprove({
-    positional: ["setup", "approve"],
-    options: {
-      ...args.options,
-      "baseline-experiment": baselineExperimentId,
-    },
-  })
-}
-
 export async function commandResearchStart(args: Args) {
   const root = await repoRoot()
-  const { campaign, setup } = await campaignForName(root, args)
-  assertResearchReady(campaign, setup)
+  const { campaign, projectPath } = await campaignForName(root, args)
+  const { setup } = await assertLocalSetupReady(root, projectPath)
 
   const workerTarget = positiveIntegerOption(
     args,
@@ -887,13 +783,11 @@ export async function commandResearchStart(args: Args) {
     args
   )
   const state = await readState(root)
-  const projectPath = await resolveProjectPath(root, args)
   const key = campaignStateKey(projectPath, campaign.name)
   state.campaigns = state.campaigns ?? {}
   state.campaigns[key] = {
     ...state.campaigns[key],
     campaignId: campaign.id,
-    setupId: setup!.id,
     sessionId: result.session.id,
   }
   state.sessions = state.sessions ?? {}
@@ -909,7 +803,6 @@ export async function commandResearchStart(args: Args) {
     type: "research_started",
     campaignName: campaign.name,
     campaignId: campaign.id,
-    setupId: setup!.id,
     sessionId: result.session.id,
     message: `${result.lanes.length} lane(s)`,
   })
@@ -935,7 +828,7 @@ export async function commandResearchStart(args: Args) {
         root,
         projectPath,
         campaign,
-        setup: setup!,
+        setup,
         sessionId: result.session.id,
         lane,
         briefPath,
@@ -959,13 +852,10 @@ export async function commandResearchStart(args: Args) {
 
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
-  const { campaign, setup, overview } = await campaignForName(root, args)
+  const { campaign, overview } = await campaignForName(root, args)
   const state = await readState(root)
   console.log(`campaign: ${campaign.name}`)
-  console.log(`phase: ${campaign.phase}`)
-  console.log(
-    `setup: ${setup ? `v${setup.version} ${setup.status}` : "(none)"}`
-  )
+  console.log(`setup: local onyx/setup.json`)
   const activeSessionId =
     state.campaigns?.[
       campaignStateKey(await resolveProjectPath(root, args), campaign.name)
@@ -1128,7 +1018,7 @@ function safeBranchSegment(value: string) {
 
 export async function commandResearchFinish(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign, setup, overview } = await campaignForName(root, args)
+  const { campaign, overview } = await campaignForName(root, args)
   await flushOutbox(root, args, { quiet: true }).catch(() => {})
 
   const branches: string[] = []
@@ -1166,7 +1056,6 @@ export async function commandResearchFinish(args: Args) {
     campaign.id,
     {
       sessionId,
-      setupId: setup?.id,
       summaryKind: "campaign_brief",
       title: `${campaign.name} final results`,
       body,
@@ -1189,7 +1078,7 @@ export async function commandResearchFinish(args: Args) {
 
 export async function commandSummaryUpsert(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign, setup } = await campaignForName(root, args)
+  const { campaign } = await campaignForName(root, args)
   const kind = args.options.kind ?? "lane_summary"
   if (
     kind !== "campaign_brief" &&
@@ -1210,7 +1099,6 @@ export async function commandSummaryUpsert(args: Args) {
     {
       sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
       laneId: args.options.lane ?? process.env.ONYX_LANE_ID,
-      setupId: args.options.setup ?? process.env.ONYX_SETUP_ID ?? setup?.id,
       authoredByWorkerId:
         args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
       summaryKind: kind,
@@ -1224,7 +1112,7 @@ export async function commandSummaryUpsert(args: Args) {
 
 export async function commandKnowledgeAdd(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign, setup } = await campaignForName(root, args)
+  const { campaign } = await campaignForName(root, args)
   const kind = args.options.kind ?? "insight"
   if (
     kind !== "insight" &&
@@ -1247,7 +1135,6 @@ export async function commandKnowledgeAdd(args: Args) {
     {
       sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
       laneId: args.options.lane ?? process.env.ONYX_LANE_ID,
-      setupId: args.options.setup ?? process.env.ONYX_SETUP_ID ?? setup?.id,
       authoredByWorkerId:
         args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
       kind,
@@ -1281,8 +1168,7 @@ export async function commandWorkerRun(args: Args) {
 
   const sessionState = await getResearchSessionState(sessionId, args)
   const campaign = sessionState.campaign
-  const setup = sessionState.activeSetup
-  assertResearchReady(campaign, setup)
+  const { setup } = await assertLocalSetupReady(root, projectPath)
 
   const requestedLaneId = args.options.lane ?? process.env.ONYX_LANE_ID
   const lane =
@@ -1329,7 +1215,7 @@ export async function commandWorkerRun(args: Args) {
     root,
     projectPath,
     campaign,
-    setup: setup!,
+    setup,
     sessionId,
     lane,
     workerCommand: args.options["worker-command"],

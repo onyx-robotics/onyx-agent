@@ -66,7 +66,7 @@ async function flushCampaignStarted({
       name: record.name,
       description: record.description ?? undefined,
       baseCommitSha: record.baseCommitSha,
-      setupContract: record.setupContract,
+      setup: record.setup,
       humanFeedback: record.humanFeedback ?? undefined,
       promotionRefName: record.promotionRefName ?? undefined,
     },
@@ -79,22 +79,19 @@ async function flushCampaignStarted({
   state.campaigns[key] = {
     ...state.campaigns[key],
     campaignId: result.campaign.id,
-    setupId: result.setup.id,
     projectPath,
     baseCommitSha: record.baseCommitSha,
     description: record.description ?? null,
     metricName: record.metricName,
     metricUnit: record.metricUnit ?? null,
     metricDirection: record.metricDirection,
-    setupContract: record.setupContract,
-    contractHash: record.setupContract.contractHash,
+    setup: record.setup,
     promotionRefName: record.promotionRefName ?? null,
   }
   record.sync = {
     ...(record.sync ?? {}),
     projectId: result.project.id,
     campaignId: result.campaign.id,
-    setupId: result.setup.id,
     syncedAt: new Date().toISOString(),
   }
   return result.project
@@ -125,7 +122,7 @@ async function campaignIdFromMetadata({
   )
   if (!campaign) {
     throw new Error(
-      `Campaign ${campaignName} is not synced yet. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/contract.json.`
+      `Campaign ${campaignName} is not synced yet. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/setup.json.`
     )
   }
   state.campaigns = state.campaigns ?? {}
@@ -139,7 +136,6 @@ async function campaignIdFromMetadata({
     metricUnit: campaign.metricUnit,
     metricDirection: campaign.metricDirection,
     promotionRefName: campaign.promotionRefName,
-    setupId: campaign.activeSetupId ?? state.campaigns?.[key]?.setupId,
   }
   return campaign.id
 }
@@ -151,9 +147,7 @@ function experimentRequestFromRecord(
     name: record.name,
     description: record.description ?? undefined,
     runRef: record.runRef,
-    setupId: record.setupId,
-    contractHash: record.contractHash,
-    contractCompliance: record.contractCompliance,
+    setupCompliance: record.setupCompliance,
     baseCommitSha: record.baseCommitSha,
     resultCommitSha: record.resultCommitSha,
     resultRef: record.resultRef,
@@ -247,14 +241,12 @@ async function flushCampaignExperimentBatch({
         record.sync = {
           ...(record.sync ?? {}),
           campaignId,
-          setupId: record.setupId,
           experimentId: result.experiment.id,
           syncedAt: new Date().toISOString(),
         }
         historyUpdates.set(record.runRef, {
           experimentId: result.experiment.id,
           campaignId,
-          setupId: result.experiment.setupId,
         })
       }
       flushed.push(record)

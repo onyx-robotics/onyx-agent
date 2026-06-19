@@ -2,11 +2,11 @@
 
 import {
   gitShaSchema,
-  researchContractComplianceSchema,
   researchExperimentGitStatusSchema,
   researchExperimentStatusSchema,
   researchMetricDirectionSchema,
-  researchSetupContractSchema,
+  researchSetupComplianceSchema,
+  researchSetupFileSchema,
 } from "./research.generated"
 import { z } from "zod"
 
@@ -29,7 +29,6 @@ const checksSchema = z.object({
 export const localResearchSyncMetadataSchema = z.object({
   projectId: z.uuid().optional(),
   campaignId: z.uuid().optional(),
-  setupId: z.uuid().optional(),
   experimentId: z.uuid().optional(),
   workerId: z.uuid().optional(),
   laneId: z.uuid().optional(),
@@ -45,7 +44,7 @@ export const localResearchCampaignStartedRecordSchema = z.object({
   description: z.string().trim().max(2000).nullable().optional(),
   projectPath: z.string().trim().max(240).optional(),
   baseCommitSha: gitShaSchema,
-  setupContract: researchSetupContractSchema,
+  setup: researchSetupFileSchema,
   metricName: z.string().trim().min(1).max(120),
   metricUnit: z.string().trim().max(80).nullable().optional(),
   metricDirection: researchMetricDirectionSchema,
@@ -67,12 +66,11 @@ export const localResearchCampaignExperimentLoggedRecordSchema = z.object({
   resultCommitSha: gitShaSchema,
   resultRef: z.string().trim().min(1).max(300),
   status: researchExperimentStatusSchema,
-  contractHash: z.string().trim().min(1).max(128),
-  contractCompliance: researchContractComplianceSchema.default({
+  setupCompliance: researchSetupComplianceSchema.default({
     status: "passed",
     protectedPathsChanged: [],
     outOfScopePathsChanged: [],
-    contractPathsChanged: [],
+    setupPathsChanged: [],
     notes: null,
   }),
   primaryMetricName: z.string().trim().min(1).max(120),
@@ -84,7 +82,6 @@ export const localResearchCampaignExperimentLoggedRecordSchema = z.object({
   startedAt: z.iso.datetime().nullable().optional(),
   completedAt: z.iso.datetime().nullable().optional(),
   outputSummary: z.string().trim().max(4000).nullable().optional(),
-  setupId: z.uuid(),
   sessionId: z.uuid().optional(),
   workerId: z.uuid().optional(),
   laneId: z.uuid().optional(),
@@ -113,7 +110,6 @@ export const localResearchHistoryRecordSchema = z.object({
   resultRef: z.string().trim().min(1).max(300),
   gitStatus: researchExperimentGitStatusSchema.optional(),
   status: researchExperimentStatusSchema,
-  contractHash: z.string().trim().min(1).max(128).optional(),
   name: z.string().trim().min(1).max(160),
   description: z.string().trim().max(2000).nullable().optional(),
   primaryMetricName: z.string().trim().min(1).max(120),
@@ -128,7 +124,6 @@ export const localResearchHistoryRecordSchema = z.object({
   createdAt: z.iso.datetime(),
   experimentId: z.uuid().optional(),
   campaignId: z.uuid().optional(),
-  setupId: z.uuid().optional(),
   sessionId: z.uuid().optional(),
   workerId: z.uuid().optional(),
   laneId: z.uuid().optional(),
@@ -139,6 +134,7 @@ export const localResearchEventTypeSchema = z.enum([
   "campaign_deleted",
   "setup_created",
   "setup_validated",
+  "setup_validation_failed",
   "session_started",
   "session_stopped",
   "lane_created",
@@ -168,7 +164,6 @@ export const localResearchEventSchema = z.object({
   type: localResearchEventTypeSchema,
   campaignName: z.string().trim().max(240).optional(),
   campaignId: z.uuid().optional(),
-  setupId: z.uuid().optional(),
   sessionId: z.uuid().optional(),
   workerId: z.uuid().optional(),
   laneId: z.uuid().optional(),

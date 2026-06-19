@@ -67,11 +67,11 @@ onyx agent skill-path
 ## Core Workflow
 
 ```bash
-onyx contract hash --write
+onyx setup init --goal "Improve score" --metric-name score
+onyx setup validate --required
 onyx campaign setup --name fast-eval --description "Improve score"
 onyx tools run evaluate
-onyx setup baseline --campaign fast-eval
-onyx setup approve --campaign fast-eval --baseline-experiment <id>
+onyx research start --campaign fast-eval --agents 4
 onyx push
 ```
 
@@ -79,10 +79,10 @@ The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
 
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
-`onyx/contract.json`, generated `onyx/onyx.md`, `onyx/tools/*`,
-`onyx/eval.sh`, and optional `onyx/checks.sh`; runs the baseline; asks the
-human to approve setup; then creates an async research session with deliberate
-lane plans.
+`onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
+`onyx/tools/*`, `onyx/eval.sh`, and optional `onyx/checks.sh`; validates
+required setup modules locally; then creates an async research session with
+deliberate lane plans.
 
 Lane workers are driven by the TypeScript-rendered Markdown prompt in
 `src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the

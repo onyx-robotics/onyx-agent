@@ -1,9 +1,8 @@
 import type {
   CreateResearchCampaignExperimentRequest,
   CreateResearchCampaignRequest,
-  ResearchContractCompliance,
   ResearchLanePlan,
-  ResearchSetupContract,
+  ResearchSetupCompliance,
 } from "../protocol"
 
 import type { Args } from "./args"
@@ -26,8 +25,6 @@ export type ApiCampaign = {
   name: string
   description: string | null
   baseCommitSha: string
-  phase: "setup" | "research"
-  activeSetupId: string | null
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
@@ -37,28 +34,9 @@ export type ApiCampaign = {
   promotionRefName: string | null
 }
 
-export type ApiSetup = {
-  id: string
-  campaignId: string
-  version: number
-  status: "draft" | "validated" | "superseded"
-  goal: string | null
-  metricName: string
-  metricUnit: string | null
-  metricDirection: "maximize" | "minimize"
-  contract: ResearchSetupContract
-  contractHash: string
-  humanFeedback: string | null
-  setupCommitSha: string
-  baselineExperimentId: string | null
-  validatedAt: string | null
-  metadata: Record<string, unknown>
-}
-
 export type ApiCampaignExperiment = {
   id: string
   campaignId: string
-  setupId: string
   sessionId: string | null
   laneId: string | null
   workerId: string | null
@@ -69,8 +47,7 @@ export type ApiCampaignExperiment = {
   resultCommitSha: string
   resultRef: string
   status: string
-  contractHash: string | null
-  contractCompliance: ResearchContractCompliance | null
+  setupCompliance: ResearchSetupCompliance | null
   gitStatus: string
   gitVerifiedAt: string | null
   gitStatusReason: string | null
@@ -121,7 +98,6 @@ export type ApiWorker = {
 export type ApiLane = {
   id: string
   campaignId: string
-  setupId: string
   sessionId: string | null
   name: string
   description: string | null
@@ -141,7 +117,6 @@ export type ApiSummary = {
   campaignId: string
   sessionId: string | null
   laneId: string | null
-  setupId: string | null
   authoredByWorkerId: string | null
   summaryKind:
     | "campaign_brief"
@@ -159,7 +134,6 @@ export type ApiKnowledge = {
   campaignId: string
   sessionId: string | null
   laneId: string | null
-  setupId: string | null
   authoredByWorkerId: string | null
   experimentId: string | null
   kind: "insight" | "dead_end" | "promising_direction" | "risk" | "transfer_note"
@@ -173,7 +147,6 @@ export type ApiKnowledge = {
 
 export type ApiCampaignTimeline = {
   campaign: ApiCampaign
-  activeSetup: ApiSetup | null
   workers: ApiWorker[]
   lanes: ApiLane[]
   summaries: ApiSummary[]
@@ -193,7 +166,6 @@ export type ApiCampaignOverview = ApiCampaignTimeline & {
 export type ApiSessionState = {
   session: ApiSession
   campaign: ApiCampaign
-  activeSetup: ApiSetup | null
   latestExperiments: ApiCampaignExperiment[]
   bestExperiment: ApiCampaignExperiment | null
   lanes: ApiLane[]
@@ -206,12 +178,10 @@ export type ApiSessionState = {
 export type ApiCampaignUpsertResult = {
   project: ApiProject
   campaign: ApiCampaign
-  setup: ApiSetup
 }
 
 export type ApiBrief = {
   campaign: ApiCampaign
-  activeSetup: ApiSetup | null
   bestExperiment: ApiCampaignExperiment | null
   recentExperiments: ApiCampaignExperiment[]
   lanes: ApiLane[]
@@ -456,41 +426,6 @@ export async function createCampaignSession(
   )
 }
 
-export async function createCampaignSetup(
-  campaignId: string,
-  body: {
-    setupContract: ResearchSetupContract
-    humanFeedback?: string | null
-    setupCommitSha?: string
-    metadata?: Record<string, unknown>
-  },
-  args?: Args
-): Promise<{ campaign: ApiCampaign; setup: ApiSetup }> {
-  return apiData<{ campaign: ApiCampaign; setup: ApiSetup }>(
-    await callApi(
-      "POST",
-      `/api/v1/research/campaigns/${campaignId}/setups`,
-      body,
-      args
-    )
-  )
-}
-
-export async function validateCampaignSetup(
-  setupId: string,
-  body: { baselineExperimentId: string },
-  args?: Args
-): Promise<{ campaign: ApiCampaign; setup: ApiSetup }> {
-  return apiData<{ campaign: ApiCampaign; setup: ApiSetup }>(
-    await callApi(
-      "POST",
-      `/api/v1/research/setups/${setupId}/validate`,
-      body,
-      args
-    )
-  )
-}
-
 export async function stopCampaignSession(
   sessionId: string,
   body: {
@@ -608,7 +543,6 @@ export async function upsertCampaignSummary(
   body: {
     sessionId?: string
     laneId?: string
-    setupId?: string
     authoredByWorkerId?: string
     summaryKind:
       | "campaign_brief"
@@ -638,7 +572,6 @@ export async function createCampaignKnowledge(
   body: {
     sessionId?: string
     laneId?: string
-    setupId?: string
     authoredByWorkerId?: string
     experimentId?: string
     kind: ApiKnowledge["kind"]

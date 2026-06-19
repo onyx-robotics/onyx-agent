@@ -1,87 +1,148 @@
-import { createHash } from "node:crypto"
 import { readFile, writeFile } from "node:fs/promises"
 
 import {
-  researchSetupContractSchema,
-  type ResearchSetupContract,
+  researchSetupFileSchema,
+  researchSetupModuleIdSchema,
+  researchSetupValidationFileSchema,
+  type ResearchSetupFile,
+  type ResearchSetupModuleId,
+  type ResearchSetupValidationFile,
+  type ResearchSetupValidationModuleResult,
 } from "../protocol"
-
-export type { ResearchSetupContract }
 
 import { onyxPath } from "./project"
 
-export function contractPath(root: string, projectPath: string) {
-  return onyxPath(root, projectPath, "contract.json")
+export type {
+  ResearchSetupFile,
+  ResearchSetupModuleId,
+  ResearchSetupValidationFile,
+  ResearchSetupValidationModuleResult,
 }
 
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value)
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(",")}]`
-  }
+export const FUNDAMENTAL_SETUP_MODULE_IDS = [
+  "setup_spec",
+  "project_scope",
+  "metric",
+  "evaluation_definition",
+  "agent_handoff",
+] as const satisfies readonly ResearchSetupModuleId[]
 
-  const object = value as Record<string, unknown>
-  return `{${Object.keys(object)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`)
-    .join(",")}}`
+export const CONDITIONAL_SETUP_MODULE_IDS = [
+  "resources",
+  "reset",
+  "evaluation_run",
+  "metric_parsing",
+  "checks",
+  "environment",
+  "hardware",
+  "repeatability",
+  "git_remote",
+] as const satisfies readonly ResearchSetupModuleId[]
+
+export const SETUP_MODULE_IDS = [
+  ...FUNDAMENTAL_SETUP_MODULE_IDS,
+  ...CONDITIONAL_SETUP_MODULE_IDS,
+] as const satisfies readonly ResearchSetupModuleId[]
+
+export function setupPath(root: string, projectPath: string) {
+  return onyxPath(root, projectPath, "setup.json")
 }
 
-export function setupContractHash(contract: ResearchSetupContract) {
-  const hashable = { ...contract } as Record<string, unknown>
-  delete hashable.contractHash
-  return `sha256:${createHash("sha256")
-    .update(stableStringify(hashable))
-    .digest("hex")}`
+export function validationPath(root: string, projectPath: string) {
+  return onyxPath(root, projectPath, "validation.json")
 }
 
-export function normalizeSetupContract(
-  value: unknown,
-  { repairHash = false }: { repairHash?: boolean } = {}
-): ResearchSetupContract {
-  const candidate =
-    repairHash &&
-    value &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    !("contractHash" in value)
-      ? {
-          ...(value as Record<string, unknown>),
-          contractHash: "sha256:pending",
-        }
-      : value
-  const parsed = researchSetupContractSchema.parse(candidate)
-  const hash = setupContractHash(parsed)
-  const next = repairHash ? { ...parsed, contractHash: hash } : parsed
-
-  if (next.contractHash !== hash) {
-    throw new Error(
-      `onyx/contract.json contractHash is ${next.contractHash}; expected ${hash}`
-    )
-  }
-
-  return next
+export function normalizeSetupFile(value: unknown): ResearchSetupFile {
+  return researchSetupFileSchema.parse(value)
 }
 
-export async function readSetupContract(
+export function normalizeValidationFile(
+  value: unknown
+): ResearchSetupValidationFile {
+  return researchSetupValidationFileSchema.parse(value)
+}
+
+export function parseSetupModuleId(value: string): ResearchSetupModuleId {
+  return researchSetupModuleIdSchema.parse(value)
+}
+
+export async function readSetupFile(
   root: string,
   projectPath: string
-): Promise<ResearchSetupContract> {
-  const path = contractPath(root, projectPath)
-  const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
-  return normalizeSetupContract(parsed)
+): Promise<ResearchSetupFile> {
+  const parsed: unknown = JSON.parse(await readFile(setupPath(root, projectPath), "utf8"))
+  return normalizeSetupFile(parsed)
 }
 
-export async function writeSetupContract(
+export async function writeSetupFile(
   root: string,
   projectPath: string,
-  contract: ResearchSetupContract
+  setup: ResearchSetupFile
 ) {
+  const normalized = normalizeSetupFile(setup)
   await writeFile(
-    contractPath(root, projectPath),
-    `${JSON.stringify(contract, null, 2)}\n`,
+    setupPath(root, projectPath),
+    `${JSON.stringify(normalized, null, 2)}\n`,
     "utf8"
+  )
+}
+
+export async function readValidationFile(
+  root: string,
+  projectPath: string
+): Promise<ResearchSetupValidationFile | null> {
+  try {
+    const parsed: unknown = JSON.parse(
+      await readFile(validationPath(root, projectPath), "utf8")
+    )
+    return normalizeValidationFile(parsed)
+  } catch (error) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return null
+    }
+    throw error
+  }
+}
+
+export async function writeValidationFile(
+  root: string,
+  projectPath: string,
+  validation: ResearchSetupValidationFile
+) {
+  const normalized = normalizeValidationFile(validation)
+  await writeFile(
+    validationPath(root, projectPath),
+    `${JSON.stringify(normalized, null, 2)}\n`,
+    "utf8"
+  )
+}
+
+export function isFundamentalSetupModule(id: ResearchSetupModuleId) {
+  return FUNDAMENTAL_SETUP_MODULE_IDS.includes(
+    id as (typeof FUNDAMENTAL_SETUP_MODULE_IDS)[number]
+  )
+}
+
+export function setupModuleRequirement(
+  setup: ResearchSetupFile,
+  id: ResearchSetupModuleId
+) {
+  if (isFundamentalSetupModule(id)) {
+    return {
+      required: true,
+      reason: "Required for Onyx auto research.",
+    }
+  }
+  return setup.modules[id] ?? { required: false, reason: null }
+}
+
+export function requiredSetupModules(setup: ResearchSetupFile) {
+  return SETUP_MODULE_IDS.filter(
+    (id) => setupModuleRequirement(setup, id).required
   )
 }

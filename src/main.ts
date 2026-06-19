@@ -1,7 +1,6 @@
 import packageJson from "../package.json"
 
 import { commandAgent } from "./commands/agent"
-import { commandContractHash } from "./commands/contract"
 import { parseArgs } from "./lib/args"
 import {
   commandCampaignCreate,
@@ -19,13 +18,17 @@ import {
   commandResearchStart,
   commandResearchStatus,
   commandResearchStop,
-  commandSetupApprove,
-  commandSetupBaseline,
-  commandSetupValidate,
   commandKnowledgeAdd,
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
+import {
+  commandSetupInit,
+  commandSetupModules,
+  commandSetupOptional,
+  commandSetupRequire,
+  commandSetupValidate,
+} from "./commands/setup"
 import { commandPush, commandStatus, commandSync } from "./commands/sync"
 import { commandToolsRun } from "./commands/tools"
 
@@ -42,18 +45,19 @@ Usage:
   onyx login [--api-url <url>] [--local] [--print-url] [--refresh] [--port <port>] [--timeout <ms>]
   onyx agent skill-path
   onyx agent install-skill [--dir <path>] [--quiet]
-  onyx contract hash [--project-path <path>] [--write]
   onyx profile list
   onyx profile use <name>
   onyx profile delete <name>
   onyx profile set-api-key-env <name> <ENV_VAR>
   onyx campaign setup --name <name> [--description <text>] [--project-path <path>]
       (creates a campaign and draft setup; each measured experiment is pushed
-      as an immutable refs/onyx/experiments/* ref; setup comes from onyx/contract.json)
+      as an immutable refs/onyx/experiments/* ref; setup comes from onyx/setup.json)
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
-  onyx setup baseline [--campaign <name>]
-  onyx setup approve [--campaign <name>] --baseline-experiment <id>
-  onyx setup validate [--campaign <name>]
+  onyx setup init [--project-path <path>] [--goal <text>] [--metric-name <name>] [--metric-unit <unit>] [--metric-direction maximize|minimize]
+  onyx setup validate [--project-path <path>] [--modules <ids>] [--required]
+  onyx setup modules [--project-path <path>]
+  onyx setup require <module> [--project-path <path>] [--reason <text>]
+  onyx setup optional <module> [--project-path <path>]
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
@@ -67,7 +71,7 @@ Usage:
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--title <text>] --body <text>
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
-  onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|contract_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
+  onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
   onyx status
@@ -94,18 +98,19 @@ export async function main(argv = process.argv.slice(2)) {
   try {
     if (command === "login") return commandLogin(args)
     if (command === "agent") return commandAgent(args)
-    if (command === "contract" && sub === "hash")
-      return commandContractHash(args)
     if (command === "profile") return commandProfile(args)
     if (command === "campaign" && sub === "setup")
       return commandCampaignCreate(args)
     if (command === "tools" && sub === "run") return commandToolsRun(args)
-    if (command === "setup" && sub === "baseline")
-      return commandSetupBaseline(args)
-    if (command === "setup" && sub === "approve")
-      return commandSetupApprove(args)
+    if (command === "setup" && sub === "init") return commandSetupInit(args)
     if (command === "setup" && sub === "validate")
       return commandSetupValidate(args)
+    if (command === "setup" && sub === "modules")
+      return commandSetupModules(args)
+    if (command === "setup" && sub === "require")
+      return commandSetupRequire(args)
+    if (command === "setup" && sub === "optional")
+      return commandSetupOptional(args)
     if (command === "campaign" && sub === "use") return commandCampaignUse(args)
     if (command === "campaign" && sub === "status")
       return commandCampaignStatus(args)

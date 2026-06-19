@@ -10,11 +10,14 @@ import {
   clientRunRef,
   localResearchRecordSchema,
   mergeHistory,
+  normalizeSetupFile,
   onyxStateDir,
   parseMetricLines,
   readOutbox,
   renderExperimentTable,
   runToolCommand,
+  requiredSetupModules,
+  setupModuleRequirement,
   USAGE,
 } from "./onyx"
 import { runProcess } from "./lib/process"
@@ -22,8 +25,9 @@ import { runProcess } from "./lib/process"
 describe("campaign CLI surface", () => {
   test("usage exposes campaigns and not legacy branch commands", () => {
     expect(USAGE).toContain("onyx campaign setup")
-    expect(USAGE).toContain("onyx setup baseline")
-    expect(USAGE).toContain("onyx setup approve")
+    expect(USAGE).toContain("onyx setup init")
+    expect(USAGE).toContain("onyx setup validate")
+    expect(USAGE).toContain("onyx setup require")
     expect(USAGE).toContain("onyx research start --campaign")
     expect(USAGE).toContain("onyx research should-stop")
     expect(USAGE).toContain("onyx research finish")
@@ -51,13 +55,11 @@ describe("local research protocol", () => {
       resultRef:
         "refs/onyx/experiments/11111111-1111-4111-8111-111111111111/local/fast-eval/abc",
       status: "succeeded",
-      setupId: "22222222-2222-4222-8222-222222222222",
-      contractHash: "sha256:test",
-      contractCompliance: {
+      setupCompliance: {
         status: "passed",
         protectedPathsChanged: [],
         outOfScopePathsChanged: [],
-        contractPathsChanged: [],
+        setupPathsChanged: [],
         notes: null,
       },
       primaryMetricName: "score",
@@ -106,13 +108,11 @@ describe("local research protocol", () => {
           resultCommitSha: "1234567",
           resultRef: `refs/onyx/experiments/campaign/local/fast-eval/${index}`,
           status: "succeeded",
-          setupId: "22222222-2222-4222-8222-222222222222",
-          contractHash: "sha256:test",
-          contractCompliance: {
+          setupCompliance: {
             status: "passed",
             protectedPathsChanged: [],
             outOfScopePathsChanged: [],
-            contractPathsChanged: [],
+            setupPathsChanged: [],
             notes: null,
           },
           primaryMetricName: "score",
@@ -193,6 +193,42 @@ describe("metrics", () => {
     expect(parseMetricLines("METRIC score=1.25\n", "score")).toEqual({
       score: 1.25,
     })
+  })
+})
+
+describe("setup modules", () => {
+  test("fundamental modules remain required and conditional modules default optional", () => {
+    const setup = normalizeSetupFile({
+      schemaVersion: 1,
+      goal: "Improve the target metric.",
+      metric: { name: "score", unit: null, direction: "maximize" },
+      projectPath: "",
+      editableScope: ["src"],
+      protectedPaths: ["onyx/setup.json", "onyx/validation.json"],
+      commands: {
+        evaluate: {
+          command: "bash",
+          args: ["onyx/eval.sh"],
+          shell: false,
+          cwd: "project",
+          env: {},
+          resources: [],
+          timeoutSeconds: 600,
+          leaseTimeoutSeconds: 120,
+          outputLimitBytes: 4000,
+        },
+      },
+      modules: {
+        setup_spec: { required: false, reason: "attempted override" },
+        hardware: { required: true, reason: "physical rig required" },
+      },
+    })
+
+    expect(setupModuleRequirement(setup, "setup_spec").required).toBe(true)
+    expect(setupModuleRequirement(setup, "resources").required).toBe(false)
+    expect(setupModuleRequirement(setup, "hardware").required).toBe(true)
+    expect(requiredSetupModules(setup)).toContain("setup_spec")
+    expect(requiredSetupModules(setup)).toContain("hardware")
   })
 })
 

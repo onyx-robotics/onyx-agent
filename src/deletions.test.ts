@@ -10,7 +10,7 @@ import type { LocalResearchRecord } from "./protocol"
 const CAMPAIGN_DELETED_AT = "2026-06-10T12:00:00.000Z"
 const BEFORE_DELETE = "2026-06-09T00:00:00.000Z"
 const AFTER_DELETE = "2026-06-11T00:00:00.000Z"
-const setupContract = {
+const setup = {
   schemaVersion: 1 as const,
   goal: "Improve score",
   metric: {
@@ -48,7 +48,7 @@ const setupContract = {
     maxMinutes: null,
     patience: null,
   },
-  contractHash: "sha256:test",
+  modules: {},
 }
 
 const deletions: ApiProjectDeletions = {
@@ -80,7 +80,7 @@ function campaignStarted(
     createdAt,
     name,
     baseCommitSha: "abcdef1",
-    setupContract,
+    setup,
     metricName: "score",
     metricDirection: "maximize",
   }
@@ -102,13 +102,11 @@ function experimentLogged(
     resultCommitSha: "1234567",
     resultRef: `refs/onyx/experiments/${campaignName}/${runRef}`,
     status: "succeeded",
-    setupId: "44444444-4444-4444-8444-444444444444",
-    contractHash: setupContract.contractHash,
-    contractCompliance: {
+    setupCompliance: {
       status: "passed",
       protectedPathsChanged: [],
       outOfScopePathsChanged: [],
-      contractPathsChanged: [],
+      setupPathsChanged: [],
       notes: null,
     },
     primaryMetricName: "score",

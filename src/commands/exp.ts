@@ -5,7 +5,7 @@ import type {
 
 import { listProjectCampaigns, resolveProject } from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
-import { readSetupContract, type ResearchSetupContract } from "../lib/contract"
+import { readSetupFile, type ResearchSetupFile } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, repoRoot } from "../lib/git"
 import {
@@ -60,7 +60,7 @@ function validateStatus(value: string): ExperimentStatus {
     value === "succeeded" ||
     value === "failed" ||
     value === "checks_failed" ||
-    value === "contract_violation" ||
+    value === "setup_violation" ||
     value === "accepted" ||
     value === "rejected"
   ) {
@@ -68,7 +68,7 @@ function validateStatus(value: string): ExperimentStatus {
   }
 
   throw new Error(
-    "--status must be queued, running, succeeded, failed, checks_failed, contract_violation, accepted, or rejected"
+    "--status must be queued, running, succeeded, failed, checks_failed, setup_violation, accepted, or rejected"
   )
 }
 
@@ -132,47 +132,47 @@ async function changedProjectPaths({
   ).sort()
 }
 
-function contractCompliance({
-  contract,
+function setupCompliance({
+  setup,
   changedPaths,
 }: {
-  contract: ResearchSetupContract
+  setup: ResearchSetupFile
   changedPaths: string[]
-}): LocalResearchCampaignExperimentLoggedRecord["contractCompliance"] {
+}): LocalResearchCampaignExperimentLoggedRecord["setupCompliance"] {
   const defaultProtected = [
     "onyx/onyx.md",
-    "onyx/contract.json",
+    "onyx/setup.json",
+    "onyx/validation.json",
     "onyx/eval.sh",
     "onyx/checks.sh",
-    "onyx/tool-api.json",
     "onyx/tools",
   ]
-  const protectedPaths = [...defaultProtected, ...contract.protectedPaths]
+  const protectedPaths = [...defaultProtected, ...setup.protectedPaths]
   const protectedPathsChanged = changedPaths.filter((path) =>
     protectedPaths.some((scope) => pathMatchesScope(path, scope))
   )
   const outOfScopePathsChanged =
-    contract.editableScope.length === 0
+    setup.editableScope.length === 0
       ? []
       : changedPaths.filter(
           (path) =>
-            !contract.editableScope.some((scope) =>
+            !setup.editableScope.some((scope) =>
               pathMatchesScope(path, scope)
             )
         )
-  const contractPathsChanged = changedPaths.filter((path) =>
+  const setupPathsChanged = changedPaths.filter((path) =>
     defaultProtected.some((scope) => pathMatchesScope(path, scope))
   )
   const violated =
     protectedPathsChanged.length > 0 || outOfScopePathsChanged.length > 0
 
   return {
-    status: violated ? "contract_violation" : "passed",
+    status: violated ? "setup_violation" : "passed",
     protectedPathsChanged,
     outOfScopePathsChanged,
-    contractPathsChanged,
+    setupPathsChanged,
     notes: violated
-      ? "Local diff changed protected or out-of-scope paths under the setup contract."
+      ? "Local diff changed protected or out-of-scope paths under the local setup policy."
       : null,
   }
 }
@@ -246,7 +246,6 @@ async function ensureCampaignMetadata({
   if (cached?.campaignId && cached.metricName && cached.baseCommitSha) {
     return {
       campaignId: cached.campaignId,
-      setupId: cached.setupId,
       laneId: cached.laneId,
       metricName: cached.metricName,
       baseCommitSha: cached.baseCommitSha,
@@ -260,7 +259,7 @@ async function ensureCampaignMetadata({
   )
   if (!campaign) {
     throw new Error(
-      `Campaign ${campaignName} is not synced. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/contract.json, then \`onyx sync\`.`
+      `Campaign ${campaignName} is not synced. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/setup.json, then \`onyx sync\`.`
     )
   }
 
@@ -271,7 +270,6 @@ async function ensureCampaignMetadata({
   state.campaigns[key] = {
     ...state.campaigns[key],
     campaignId: campaign.id,
-    setupId: campaign.activeSetupId ?? undefined,
     projectPath,
     baseCommitSha: campaign.baseCommitSha,
     description: campaign.description,
@@ -284,7 +282,6 @@ async function ensureCampaignMetadata({
 
   return {
     campaignId: campaign.id,
-    setupId: campaign.activeSetupId ?? undefined,
     laneId: state.campaigns[key]?.laneId,
     metricName: campaign.metricName,
     baseCommitSha: campaign.baseCommitSha,
@@ -301,10 +298,10 @@ export async function commandExpRun(args: Args) {
     projectPath,
     campaignName,
   })
-  const contract = await readSetupContract(root, projectPath)
-  if (contract.projectPath !== projectPath) {
+  const setup = await readSetupFile(root, projectPath)
+  if (setup.projectPath !== projectPath) {
     throw new Error(
-      `onyx/contract.json projectPath is "${contract.projectPath}", but the active project path is "${projectPath}".`
+      `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
     )
   }
   const resultCommitSha = await currentCommit(root)
@@ -312,13 +309,6 @@ export async function commandExpRun(args: Args) {
   const timeoutMs = numberOption(args, "timeout", 600) * 1000
   const checksTimeoutMs = numberOption(args, "checks-timeout", 300) * 1000
   const started = new Date()
-  const setupId =
-    args.options.setup ?? process.env.ONYX_SETUP_ID ?? campaign.setupId
-  if (!setupId) {
-    throw new Error(
-      "No active setup id. Run `onyx setup baseline`, then `onyx setup approve`, or pass --setup <id>."
-    )
-  }
   const laneId =
     args.options.lane ?? process.env.ONYX_LANE_ID ?? campaign.laneId
   const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
@@ -329,7 +319,6 @@ export async function commandExpRun(args: Args) {
   const reusableAttempt =
     existingAttempt?.campaignName === campaignName &&
     existingAttempt.projectPath === projectPath &&
-    existingAttempt.setupId === setupId &&
     existingAttempt.baseCommitSha === baseCommitSha &&
     existingAttempt.resultCommitSha === resultCommitSha
       ? existingAttempt
@@ -348,12 +337,11 @@ export async function commandExpRun(args: Args) {
     resultCommitSha,
     resultRef,
     status: "running",
-    contractHash: contract.contractHash,
-    contractCompliance: {
+    setupCompliance: {
       status: "passed",
       protectedPathsChanged: [],
       outOfScopePathsChanged: [],
-      contractPathsChanged: [],
+      setupPathsChanged: [],
       notes: null,
     },
     primaryMetricName: campaign.metricName,
@@ -365,7 +353,6 @@ export async function commandExpRun(args: Args) {
     startedAt: started.toISOString(),
     completedAt: null,
     outputSummary: null,
-    setupId,
     sessionId,
     workerId,
     laneId,
@@ -398,8 +385,7 @@ export async function commandExpRun(args: Args) {
         resultCommitSha,
         resultRef,
         status: "failed",
-        contractHash: contract.contractHash,
-        contractCompliance: initialRun.contractCompliance,
+        setupCompliance: initialRun.setupCompliance,
         primaryMetricName: campaign.metricName,
         primaryMetricValue: null,
         metrics: {},
@@ -412,7 +398,6 @@ export async function commandExpRun(args: Args) {
           reset.outputSummary ??
           summarizeOutput(reset.stdout, reset.stderr) ??
           "Environment reset failed.",
-        setupId,
         sessionId,
         workerId,
         laneId,
@@ -459,8 +444,8 @@ export async function commandExpRun(args: Args) {
     : checks && checks.status !== "passed"
       ? "checks_failed"
       : "succeeded"
-  const compliance = contractCompliance({
-    contract,
+  const compliance = setupCompliance({
+    setup,
     changedPaths: await changedProjectPaths({
       root,
       projectPath,
@@ -469,8 +454,8 @@ export async function commandExpRun(args: Args) {
     }),
   })
   const status: ExperimentStatus =
-    compliance.status === "contract_violation"
-      ? "contract_violation"
+    compliance.status === "setup_violation"
+      ? "setup_violation"
       : measuredStatus
   const outputSummaryParts = [
     result.timedOut ? `Eval timed out after ${timeoutMs / 1000}s.` : "",
@@ -499,8 +484,7 @@ export async function commandExpRun(args: Args) {
     resultCommitSha,
     resultRef,
     status,
-    contractHash: contract.contractHash,
-    contractCompliance: compliance,
+    setupCompliance: compliance,
     primaryMetricName: primary.name,
     primaryMetricValue: primary.value,
     metrics,
@@ -510,7 +494,6 @@ export async function commandExpRun(args: Args) {
     startedAt: started.toISOString(),
     completedAt: completed.toISOString(),
     outputSummary,
-    setupId,
     sessionId,
     workerId,
     laneId,
@@ -533,7 +516,7 @@ export async function commandExpRun(args: Args) {
   if (
     !benchmarkSucceeded ||
     status === "checks_failed" ||
-    status === "contract_violation"
+    status === "setup_violation"
   ) {
     process.exitCode = result.code && result.code !== 0 ? result.code : 1
   }
@@ -549,10 +532,10 @@ export async function commandExpLog(args: Args) {
     projectPath,
     campaignName,
   })
-  const contract = await readSetupContract(root, projectPath)
-  if (contract.projectPath !== projectPath) {
+  const setup = await readSetupFile(root, projectPath)
+  if (setup.projectPath !== projectPath) {
     throw new Error(
-      `onyx/contract.json projectPath is "${contract.projectPath}", but the active project path is "${projectPath}".`
+      `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
     )
   }
   const lastRun = await readLastRun(root)
@@ -620,16 +603,6 @@ export async function commandExpLog(args: Args) {
     args.options["result-ref"] ??
     usableLastRun?.resultRef ??
     `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
-  const setupId =
-    args.options.setup ??
-    usableLastRun?.setupId ??
-    process.env.ONYX_SETUP_ID ??
-    campaign.setupId
-  if (!setupId) {
-    throw new Error(
-      "No active setup id. Run `onyx setup baseline`, then `onyx setup approve`, or pass --setup <id>."
-    )
-  }
   const laneId =
     args.options.lane ??
     usableLastRun?.laneId ??
@@ -642,9 +615,9 @@ export async function commandExpLog(args: Args) {
   const workerId =
     args.options.worker ?? usableLastRun?.workerId ?? process.env.ONYX_WORKER_ID
   const loggedCompliance =
-    usableLastRun?.contractCompliance ??
-    contractCompliance({
-      contract,
+    usableLastRun?.setupCompliance ??
+    setupCompliance({
+      setup,
       changedPaths: await changedProjectPaths({
         root,
         projectPath,
@@ -653,8 +626,8 @@ export async function commandExpLog(args: Args) {
       }),
     })
   const loggedStatus: ExperimentStatus =
-    loggedCompliance.status === "contract_violation"
-      ? "contract_violation"
+    loggedCompliance.status === "setup_violation"
+      ? "setup_violation"
       : status
 
   const record: LocalResearchCampaignExperimentLoggedRecord = {
@@ -670,8 +643,7 @@ export async function commandExpLog(args: Args) {
     resultCommitSha,
     resultRef,
     status: loggedStatus,
-    contractHash: usableLastRun?.contractHash ?? contract.contractHash,
-    contractCompliance: loggedCompliance,
+    setupCompliance: loggedCompliance,
     primaryMetricName: metricName,
     primaryMetricValue: metricValue,
     metrics,
@@ -681,7 +653,6 @@ export async function commandExpLog(args: Args) {
     startedAt: usableLastRun?.startedAt ?? null,
     completedAt: usableLastRun?.completedAt ?? completedAt,
     outputSummary: usableLastRun?.outputSummary ?? null,
-    setupId,
     sessionId,
     workerId,
     laneId,
@@ -724,7 +695,6 @@ export async function commandExpList(args: Args) {
       resultCommitSha: lastRun.resultCommitSha,
       resultRef: lastRun.resultRef,
       status: lastRun.status,
-      contractHash: lastRun.contractHash,
       name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
       description: null,
       primaryMetricName: lastRun.primaryMetricName,
@@ -736,7 +706,6 @@ export async function commandExpList(args: Args) {
       startedAt: lastRun.startedAt ?? null,
       completedAt: lastRun.completedAt ?? null,
       createdAt: lastRun.createdAt,
-      setupId: lastRun.setupId,
       sessionId: lastRun.sessionId,
       workerId: lastRun.workerId,
       laneId: lastRun.laneId,

@@ -6,7 +6,7 @@ import {
   type Args,
 } from "../lib/args"
 import { deleteCampaign, listProjectCampaigns, resolveProject } from "../lib/api"
-import { readSetupContract } from "../lib/contract"
+import { readSetupFile } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, repoRoot } from "../lib/git"
 import { readHistory, rewriteHistory } from "../lib/history"
@@ -24,10 +24,10 @@ export async function commandCampaignCreate(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const name = nameOption(args)
-  const setupContract = await readSetupContract(root, projectPath)
-  if (setupContract.projectPath !== projectPath) {
+  const setup = await readSetupFile(root, projectPath)
+  if (setup.projectPath !== projectPath) {
     throw new Error(
-      `onyx/contract.json projectPath is "${setupContract.projectPath}", but the active project path is "${projectPath}".`
+      `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
     )
   }
 
@@ -45,10 +45,10 @@ export async function commandCampaignCreate(args: Args) {
     description,
     projectPath,
     baseCommitSha,
-    setupContract,
-    metricName: setupContract.metric.name,
-    metricUnit: setupContract.metric.unit,
-    metricDirection: setupContract.metric.direction,
+    setup,
+    metricName: setup.metric.name,
+    metricUnit: setup.metric.unit,
+    metricDirection: setup.metric.direction,
     humanFeedback,
     promotionRefName,
   }
@@ -65,11 +65,10 @@ export async function commandCampaignCreate(args: Args) {
       projectPath,
       baseCommitSha,
       description,
-      metricName: setupContract.metric.name,
-      metricUnit: setupContract.metric.unit,
-      metricDirection: setupContract.metric.direction,
-      setupContract,
-      contractHash: setupContract.contractHash,
+      metricName: setup.metric.name,
+      metricUnit: setup.metric.unit,
+      metricDirection: setup.metric.direction,
+      setup,
       humanFeedback,
       promotionRefName,
     },
@@ -82,7 +81,7 @@ export async function commandCampaignCreate(args: Args) {
     commitSha: baseCommitSha,
     message: name,
   })
-  console.log(`Created setup for campaign ${name}`)
+  console.log(`Created campaign ${name}`)
   console.log(`Base commit: ${baseCommitSha}`)
 
   await flushOutbox(root, args, { quiet: true }).catch(() => {})
