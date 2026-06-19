@@ -32,9 +32,25 @@ import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import { onyxStateDir, readOutbox, readState, writeState } from "../lib/outbox"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
-import { pathExists, runProcess, type ProcessResult } from "../lib/process"
+import {
+  pathExists,
+  runStreamingProcess,
+  type ProcessResult,
+  type StreamingProcessResult,
+} from "../lib/process"
+import { assertSetupCommitted } from "../lib/setup-git"
 import { flushOutbox } from "../lib/sync"
 import { protectedToolPaths } from "../lib/tools"
+import { formatAge } from "../lib/tui"
+import {
+  buildWorkerInvocation,
+  preflightWorkerInvocation,
+  readWorkerLaunchManifests,
+  workerLaunchPaths,
+  writeWorkerLaunchManifest,
+  type WorkerInvocation,
+  type WorkerLaunchManifest,
+} from "../lib/worker-launcher"
 import { renderLaneWorkerPrompt } from "../lib/worker-prompt"
 
 function branchName(ref: string) {
@@ -57,6 +73,16 @@ function positiveNumberOption(args: Args, name: string, fallback: number) {
   const value = Number(raw)
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`--${name} must be a positive number`)
+  }
+  return value
+}
+
+function nonnegativeNumberOption(args: Args, name: string, fallback: number) {
+  const raw = args.options[name]
+  if (raw === undefined) return fallback
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`--${name} must be a nonnegative number`)
   }
   return value
 }
@@ -389,56 +415,10 @@ async function writeWorkerPrompt({
   return { path, markdown }
 }
 
-function buildWorkerInvocation({
-  agentKind,
-  workerCommand,
-  worktree,
-  prompt,
-}: {
-  agentKind: string
-  workerCommand?: string
-  worktree: string
-  prompt: string
-}): {
-  command: string
-  args: string[]
-  stdin?: string
-} {
-  if (workerCommand) {
-    return { command: "sh", args: ["-lc", workerCommand] }
-  }
-
-  if (agentKind === "claude") {
-    return {
-      command: "claude",
-      args: ["-p", "--permission-mode", "auto", "--add-dir", worktree, prompt],
-    }
-  }
-
-  if (agentKind !== "codex") {
-    throw new Error(
-      `Unknown --agent ${agentKind}. Use codex, claude, or pass --worker-command.`
-    )
-  }
-
-  return {
-    command: "codex",
-    args: [
-      "exec",
-      "--cd",
-      worktree,
-      "--search",
-      "--sandbox",
-      "workspace-write",
-      "--ask-for-approval",
-      "never",
-      "-",
-    ],
-    stdin: prompt,
-  }
-}
-
-function processFailure(result: ProcessResult, label: string) {
+function processFailure(
+  result: ProcessResult | StreamingProcessResult,
+  label: string
+) {
   if (result.timedOut) return `${label} timed out`
   if (result.code === 0) return null
   return `${label} failed (${result.code ?? "signal"}): ${
@@ -458,6 +438,7 @@ async function withWorkerHeartbeat<T>({
   args,
   phase,
   progressMessage,
+  metadata,
   run,
 }: {
   workerId: string
@@ -465,7 +446,8 @@ async function withWorkerHeartbeat<T>({
   laneId: string
   args: Args
   phase: string
-  progressMessage: string
+  progressMessage: string | (() => string)
+  metadata?: () => Record<string, unknown>
   run: () => Promise<T>
 }): Promise<T> {
   const timer = setInterval(() => {
@@ -477,7 +459,11 @@ async function withWorkerHeartbeat<T>({
         laneId,
         phase,
         event: "heartbeat",
-        progressMessage,
+        progressMessage:
+          typeof progressMessage === "function"
+            ? progressMessage()
+            : progressMessage,
+        metadata: metadata?.(),
       },
       args
     ).catch(() => {})
@@ -492,6 +478,37 @@ async function withWorkerHeartbeat<T>({
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function workerProgress({
+  laneName,
+  logPath,
+  lastOutputAt,
+}: {
+  laneName: string
+  logPath: string
+  lastOutputAt: string | null
+}) {
+  const output = lastOutputAt
+    ? `last output ${formatAge(lastOutputAt, Date.now())} ago`
+    : "no output yet"
+  return `${laneName} worker running; ${output}; log ${logPath}`
+}
+
+function workerMetadata({
+  invocation,
+  manifest,
+}: {
+  invocation: WorkerInvocation
+  manifest: WorkerLaunchManifest
+}) {
+  return {
+    launcher: invocation.agentKind,
+    workerLogPath: manifest.logPath,
+    workerPromptPath: manifest.promptPath,
+    lastOutputAt: manifest.lastOutputAt,
+    version: manifest.version,
+  }
 }
 
 type LaneRunResult = {
@@ -514,6 +531,7 @@ async function runLaneOnce({
   maxIterations,
   endTimeMs,
   workerTimeoutMs,
+  startupTimeoutMs,
   syncSupervisor,
   args,
 }: {
@@ -528,12 +546,14 @@ async function runLaneOnce({
   maxIterations: number
   endTimeMs: number
   workerTimeoutMs: number
+  startupTimeoutMs: number
   syncSupervisor: ReturnType<typeof createSyncSupervisor>
   args: Args
 }): Promise<LaneRunResult> {
   let workerId: string | undefined
   let claimed: ApiLane | null = null
   let resultCommitSha: string | undefined
+  let launchManifest: WorkerLaunchManifest | null = null
 
   try {
     const worker = await registerCampaignWorker(
@@ -604,20 +624,73 @@ async function runLaneOnce({
       worktree,
       prompt: prompt.markdown,
     })
+    const preflight = await preflightWorkerInvocation(invocation, {
+      cwd: worktree,
+      env: process.env,
+    })
+    const launchPaths = await workerLaunchPaths({
+      root,
+      sessionId,
+      laneId: lane.id,
+      laneName: lane.name,
+    })
+    launchManifest = {
+      schemaVersion: 1,
+      agentKind: invocation.agentKind,
+      command: invocation.command,
+      args: invocation.redactedArgs,
+      cwd: worktree,
+      promptPath: prompt.path,
+      logPath: launchPaths.logPath,
+      manifestPath: launchPaths.manifestPath,
+      sessionId,
+      laneId: lane.id,
+      laneName: lane.name,
+      workerId: worker.id,
+      version: preflight.version,
+      startedAt: new Date().toISOString(),
+      lastOutputAt: null,
+      completedAt: null,
+      status: "starting",
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+    }
+    await writeWorkerLaunchManifest(launchManifest)
     const workerResult = await withWorkerHeartbeat({
       workerId: worker.id,
       sessionId,
       laneId: lane.id,
       args,
       phase: "research",
-      progressMessage: `${claimed.name} worker running`,
+      progressMessage: () =>
+        workerProgress({
+          laneName: claimed?.name ?? lane.name,
+          logPath: launchManifest?.logPath ?? launchPaths.logPath,
+          lastOutputAt: launchManifest?.lastOutputAt ?? null,
+        }),
+      metadata: () =>
+        launchManifest
+          ? workerMetadata({ invocation, manifest: launchManifest })
+          : {},
       run: () =>
-        runProcess(invocation.command, invocation.args, {
+        runStreamingProcess(invocation.command, invocation.args, {
           cwd: worktree,
           timeoutMs: Math.max(
             1,
             Math.min(workerTimeoutMs, endTimeMs - Date.now())
           ),
+          startupTimeoutMs,
+          killGraceMs: 5000,
+          logPath: launchPaths.logPath,
+          logHeader: [
+            `# agent: ${invocation.agentKind}`,
+            `# prompt: ${prompt.path}`,
+            `# worker: ${worker.id}`,
+            `# lane: ${lane.id}`,
+          ].join("\n"),
           stdin: invocation.stdin,
           env: {
             ...process.env,
@@ -636,9 +709,34 @@ async function runLaneOnce({
               ? { ONYX_SESSION_STATE_FILE: sessionStatePath }
               : {}),
           },
+          onOutput: ({ at }) => {
+            if (!launchManifest) return
+            launchManifest = {
+              ...launchManifest,
+              status: "running",
+              lastOutputAt: at,
+            }
+            void writeWorkerLaunchManifest(launchManifest).catch(() => {})
+          },
         }),
     })
-    assertProcessSucceeded(workerResult, `Worker process for ${lane.name}`)
+    if (launchManifest) {
+      launchManifest = {
+        ...launchManifest,
+        completedAt: new Date().toISOString(),
+        status: workerResult.code === 0 ? "completed" : "failed",
+        exitCode: workerResult.code,
+        signal: workerResult.signal,
+        timedOut: workerResult.timedOut,
+        startupTimedOut: workerResult.startupTimedOut,
+        lastOutputAt: workerResult.lastOutputAt,
+      }
+      await writeWorkerLaunchManifest(launchManifest)
+    }
+    const workerFailure = processFailure(workerResult, `Worker process for ${lane.name}`)
+    if (workerFailure) {
+      throw new Error(`${workerFailure}. See worker log: ${launchManifest?.logPath ?? launchPaths.logPath}`)
+    }
 
     const commit = await commitIfNeeded(worktree, lane)
     resultCommitSha = commit.commitSha
@@ -692,6 +790,7 @@ async function runLaneOnce({
         body: [
           `Worker process exited successfully.`,
           `Latest commit: ${resultCommitSha ?? "n/a"}`,
+          `Worker log: ${launchManifest?.logPath ?? "n/a"}`,
           workerResult.stdout.trim()
             ? `\nWorker output:\n${workerResult.stdout.trim().slice(-4000)}`
             : "",
@@ -704,6 +803,15 @@ async function runLaneOnce({
     return { lane, workerId: worker.id, resultCommitSha, status: "completed" }
   } catch (error) {
     const message = errorMessage(error)
+    if (launchManifest) {
+      launchManifest = {
+        ...launchManifest,
+        completedAt: new Date().toISOString(),
+        status: "failed",
+        error: message,
+      }
+      await writeWorkerLaunchManifest(launchManifest).catch(() => {})
+    }
     if (workerId) {
       await heartbeatWorker(
         workerId,
@@ -715,6 +823,14 @@ async function runLaneOnce({
           event: "lane_failed",
           progressMessage: message.slice(0, 1000),
           gitLabel: resultCommitSha ?? null,
+          metadata: launchManifest
+            ? {
+                workerLogPath: launchManifest.logPath,
+                workerPromptPath: launchManifest.promptPath,
+                lastOutputAt: launchManifest.lastOutputAt,
+                launcher: launchManifest.agentKind,
+              }
+            : undefined,
         },
         args
       ).catch(() => {})
@@ -726,7 +842,11 @@ async function runLaneOnce({
           workerId,
           status: "lost",
           currentCommitSha: resultCommitSha,
-          metadata: { error: message },
+          metadata: {
+            error: message,
+            workerLogPath: launchManifest?.logPath,
+            lastOutputAt: launchManifest?.lastOutputAt,
+          },
         },
         args
       ).catch(() => {})
@@ -739,7 +859,9 @@ async function runLaneOnce({
         authoredByWorkerId: workerId,
         summaryKind: "lane_summary",
         title: `${lane.name} failed`,
-        body: message,
+        body: launchManifest
+          ? `${message}\n\nWorker log: ${launchManifest.logPath}`
+          : message,
       },
       args
     ).catch(() => {})
@@ -751,6 +873,12 @@ export async function commandResearchStart(args: Args) {
   const root = await repoRoot()
   const { campaign, projectPath } = await campaignForName(root, args)
   const { setup } = await assertLocalSetupReady(root, projectPath)
+  await assertSetupCommitted({
+    root,
+    projectPath,
+    baseCommitSha: campaign.baseCommitSha,
+    requireBaseMatchesHead: true,
+  })
 
   const workerTarget = positiveIntegerOption(
     args,
@@ -759,6 +887,14 @@ export async function commandResearchStart(args: Args) {
   )
   const maxIterations = positiveIntegerOption(args, "max-iterations", 10)
   const maxMinutes = positiveNumberOption(args, "max-minutes", 120)
+  const launchAgent = args.options.agent
+  if (
+    launchAgent !== undefined &&
+    launchAgent !== "codex" &&
+    launchAgent !== "claude"
+  ) {
+    throw new Error("--agent must be codex or claude")
+  }
   const endTimeMs = Date.now() + maxMinutes * 60_000
   const lanePlans = await lanePlansOption(args)
   const result = await createCampaignSession(
@@ -836,8 +972,9 @@ export async function commandResearchStart(args: Args) {
   console.log(`Campaign: ${campaign.name}`)
   console.log(`Lanes: ${result.lanes.length}`)
   for (const lane of result.lanes) {
+    const agentOption = launchAgent ? ` --agent ${launchAgent}` : ""
     console.log(
-      `- ${lane.name}: ${lane.plan.focus}\n  onyx worker run --session ${result.session.id} --lane ${lane.id}`
+      `- ${lane.name}: ${lane.plan.focus}\n  onyx worker run --session ${result.session.id} --lane ${lane.id}${agentOption}`
     )
   }
   console.log("Use `onyx listen` or `onyx research status` to supervise.")
@@ -847,24 +984,68 @@ export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
   const { campaign, overview } = await campaignForName(root, args)
   const state = await readState(root)
+  const projectPath = await resolveProjectPath(root, args)
   console.log(`campaign: ${campaign.name}`)
   console.log(`setup: local onyx/setup.json`)
   const activeSessionId =
-    state.campaigns?.[
-      campaignStateKey(await resolveProjectPath(root, args), campaign.name)
-    ]?.sessionId
+    state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   if (activeSessionId) {
     console.log(
       `session: ${activeSessionId} ${state.sessions?.[activeSessionId]?.status ?? ""}`.trim()
     )
   }
-  console.log(`lanes: ${overview.lanes.length}`)
-  for (const lane of overview.lanes) {
+  const scopeAll = args.options["all-sessions"] === "true"
+  const lanes =
+    activeSessionId && !scopeAll
+      ? overview.lanes.filter((lane) => lane.sessionId === activeSessionId)
+      : overview.lanes
+  const workers =
+    activeSessionId && !scopeAll
+      ? overview.workers.filter((worker) => worker.sessionId === activeSessionId)
+      : overview.workers
+  const manifests = activeSessionId
+    ? await readWorkerLaunchManifests(root, activeSessionId)
+    : []
+  const manifestByWorker = new Map(
+    manifests.map((manifest) => [manifest.workerId, manifest])
+  )
+  const manifestByLane = new Map(
+    manifests.map((manifest) => [manifest.laneId, manifest])
+  )
+
+  console.log(`lanes: ${lanes.length}${scopeAll ? " (all sessions)" : ""}`)
+  for (const lane of lanes) {
+    const manifest = manifestByLane.get(lane.id)
     console.log(
-      `  ${lane.name}: ${lane.status} branch=${lane.branchRef} best=${lane.bestMetricValue ?? "-"}`
+      [
+        `  ${lane.name}: ${lane.status}`,
+        `branch=${lane.branchRef}`,
+        `best=${lane.bestMetricValue ?? "-"}`,
+        manifest?.logPath ? `log=${manifest.logPath}` : null,
+      ]
+        .filter(Boolean)
+        .join(" ")
     )
   }
-  console.log(`workers: ${overview.workers.length}`)
+  console.log(`workers: ${workers.length}`)
+  for (const worker of workers) {
+    const manifest = manifestByWorker.get(worker.id)
+    const lastSeen = formatAge(worker.lastSeenAt, Date.now())
+    const lastOutput = manifest
+      ? formatAge(manifest.lastOutputAt, Date.now())
+      : "—"
+    console.log(
+      [
+        `  ${worker.workerName}: ${worker.status}`,
+        worker.phase ? `phase=${worker.phase}` : null,
+        `seen=${lastSeen}`,
+        `lastOutput=${lastOutput}`,
+        manifest?.logPath ? `log=${manifest.logPath}` : null,
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
+  }
 }
 
 function activeSessionIdFromState({
@@ -1195,6 +1376,8 @@ export async function commandWorkerRun(args: Args) {
   )
   const workerTimeoutMs =
     positiveNumberOption(args, "worker-timeout", 1800) * 1000
+  const startupTimeoutMs =
+    nonnegativeNumberOption(args, "startup-timeout", 90) * 1000
   const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
   const finalSyncTimeoutMs =
     positiveNumberOption(args, "final-sync-timeout", 120) * 1000
@@ -1216,6 +1399,7 @@ export async function commandWorkerRun(args: Args) {
     maxIterations,
     endTimeMs: Date.now() + maxMinutes * 60_000,
     workerTimeoutMs,
+    startupTimeoutMs,
     syncSupervisor,
     args,
   })

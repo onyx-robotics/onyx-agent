@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test"
 import type { LocalResearchHistoryRecord } from "./protocol"
 import {
   appendOutbox,
+  assertSetupCommitted,
   clientRunRef,
   commandSetupInit,
   commandSetupModules,
@@ -14,6 +15,8 @@ import {
   commandSetupValidate,
   localResearchRecordSchema,
   mergeHistory,
+  main,
+  normalizeProjectPath,
   normalizeSetupFile,
   onyxStateDir,
   parseMetricLines,
@@ -27,6 +30,23 @@ import {
   USAGE,
 } from "./onyx"
 import { runProcess } from "./lib/process"
+
+async function commitAll(root: string, message: string) {
+  await runProcess("git", ["add", "-A"], { cwd: root })
+  await runProcess(
+    "git",
+    [
+      "-c",
+      "user.name=Onyx Test",
+      "-c",
+      "user.email=onyx@example.com",
+      "commit",
+      "-m",
+      message,
+    ],
+    { cwd: root }
+  )
+}
 
 describe("campaign CLI surface", () => {
   test("usage exposes campaigns and not legacy branch commands", () => {
@@ -44,6 +64,21 @@ describe("campaign CLI surface", () => {
 
   test("run refs are campaign scoped", () => {
     expect(clientRunRef("fast-eval")).toMatch(/^local\/fast-eval\//)
+  })
+
+  test("global help returns usage before subcommand dispatch", async () => {
+    const lines: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      await main(["research", "start", "--help"])
+    } finally {
+      console.log = originalLog
+    }
+
+    expect(lines.join("\n")).toContain("onyx research start --campaign")
   })
 })
 
@@ -203,6 +238,15 @@ describe("metrics", () => {
 })
 
 describe("setup modules", () => {
+  test("normalizes dot project path to repo root", () => {
+    expect(normalizeProjectPath(".")).toBe("")
+    expect(normalizeProjectPath("./")).toBe("")
+    expect(normalizeProjectPath("packages/agent")).toBe("packages/agent")
+    expect(() => normalizeProjectPath("packages/./agent")).toThrow(
+      "without '.' or '..'"
+    )
+  })
+
   test("fundamental modules remain required and conditional modules default optional", () => {
     const setup = normalizeSetupFile({
       schemaVersion: 1,
@@ -249,6 +293,10 @@ describe("setup modules", () => {
         positional: ["setup", "init"],
         options: { goal: "Improve score", "metric-name": "score" },
       })
+      const evalSh = await readFile(join(root, "onyx", "eval.sh"), "utf8")
+      expect(evalSh).toContain("TODO: replace onyx/eval.sh")
+      expect(evalSh).toContain("METRIC score=<number>")
+      expect(evalSh).toContain("exit 1")
       await commandSetupRequire({
         positional: ["setup", "require", "checks"],
         options: {},
@@ -319,6 +367,62 @@ describe("setup modules", () => {
         validation?.modules.find((item) => item.moduleId === "evaluation")
           ?.status
       ).toBe("passed")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("setup git readiness blocks dirty or missing setup surfaces", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-setup-git-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeFile(join(root, "README.md"), "test\n", "utf8")
+    await commitAll(root, "init")
+    const baseWithoutSetup = (
+      await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+    ).stdout.trim()
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: { goal: "Improve score", "metric-name": "score" },
+      })
+      await commandSetupValidate({
+        positional: ["setup", "validate"],
+        options: {},
+      })
+
+      await expect(
+        assertSetupCommitted({ root, projectPath: "" })
+      ).rejects.toThrow("uncommitted changes")
+
+      await commitAll(root, "add setup")
+      const baseWithSetup = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim()
+
+      await expect(
+        assertSetupCommitted({ root, projectPath: "" })
+      ).resolves.toBeUndefined()
+      await expect(
+        assertSetupCommitted({
+          root,
+          projectPath: "",
+          baseCommitSha: baseWithoutSetup,
+        })
+      ).rejects.toThrow("does not contain required Onyx setup")
+
+      await writeFile(join(root, "onyx", "onyx.md"), "updated guidance\n")
+      await commitAll(root, "update setup")
+      await expect(
+        assertSetupCommitted({
+          root,
+          projectPath: "",
+          baseCommitSha: baseWithSetup,
+          requireBaseMatchesHead: true,
+        })
+      ).rejects.toThrow("differs from campaign base")
     } finally {
       process.chdir(previousCwd)
     }

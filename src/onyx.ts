@@ -65,6 +65,20 @@ export {
   repoRoot,
 } from "./lib/git"
 export {
+  assertSetupCommitted,
+  requiredSetupRepoPaths,
+  setupRepoPath,
+} from "./lib/setup-git"
+export {
+  buildWorkerInvocation,
+  preflightWorkerInvocation,
+  readWorkerLaunchManifests,
+  workerLaunchPaths,
+  writeWorkerLaunchManifest,
+  type WorkerInvocation,
+  type WorkerLaunchManifest,
+} from "./lib/worker-launcher"
+export {
   defaultSkillInstallRoot,
   displaySkillPath,
   installDeveloperSkill,

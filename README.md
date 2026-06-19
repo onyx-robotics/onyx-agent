@@ -68,7 +68,10 @@ onyx agent skill-path
 
 ```bash
 onyx setup init --goal "Improve score" --metric-name score
+# edit onyx/eval.sh so it emits METRIC score=<number>
 onyx setup validate --required
+git add onyx
+git commit -m "Add Onyx setup"
 onyx campaign setup --name fast-eval --description "Improve score"
 onyx tools run evaluate
 onyx research start --campaign fast-eval --agents 4
@@ -88,6 +91,11 @@ research session with deliberate lane plans. Required setup modules are
 `onyx exp run`, which executes reset/eval/check commands, parses metrics, and
 records setup compliance.
 
+`onyx campaign setup` and `onyx research start` require the `onyx/` setup
+surface to be committed. This keeps worker worktrees pinned to a base commit
+that actually contains `setup.json`, `validation.json`, `onyx.md`, and
+`eval.sh`.
+
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
 available to the project.
@@ -104,6 +112,12 @@ onyx research start --campaign fast-eval --agents 4 --lane-plans plans.json --ma
 onyx worker run --session <id> --lane <lane-id> --agent codex
 onyx worker run --session <id> --lane <lane-id> --agent claude
 ```
+
+Codex and Claude are first-class built-in launchers. Both are spawned directly
+in non-interactive mode, receive the worker prompt over stdin, and write live
+stdout/stderr logs plus launch manifests under `.git/onyx/worker-logs/`.
+`onyx research status` shows active-session lanes and workers by default,
+including log paths and last-output age when local manifests are available.
 
 Each lane has a branch under `refs/heads/onyx/<campaign>/lanes/*`, gets a
 generated brief and worker prompt under `.git/onyx/`, polls

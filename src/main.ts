@@ -61,13 +61,13 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> [--agents <n>] [--lane-plans <json>] [--max-iterations <n>] [--max-minutes <n>]
+  onyx research start --campaign <name> [--agents <n>] [--agent codex|claude] [--lane-plans <json>] [--max-iterations <n>] [--max-minutes <n>]
       (creates an async research session and prints worker launch commands)
-  onyx worker run --session <id> [--lane <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
+  onyx worker run --session <id> [--lane <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>]
-  onyx research status [--campaign <name>]
+  onyx research status [--campaign <name>] [--all-sessions]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--title <text>] --body <text>
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
@@ -96,6 +96,26 @@ export async function main(argv = process.argv.slice(2)) {
   const sub = args.positional[1]
 
   try {
+    if (
+      args.options.version === "true" ||
+      command === "--version" ||
+      command === "-v" ||
+      command === "version"
+    ) {
+      console.log(packageJson.version)
+      return
+    }
+
+    if (
+      args.options.help === "true" ||
+      command === "help" ||
+      command === "--help" ||
+      !command
+    ) {
+      console.log(USAGE)
+      return
+    }
+
     if (command === "login") return commandLogin(args)
     if (command === "agent") return commandAgent(args)
     if (command === "profile") return commandProfile(args)
@@ -138,21 +158,6 @@ export async function main(argv = process.argv.slice(2)) {
     if (command === "status") return commandStatus(args)
     if (command === "push") return commandPush(args)
     if (command === "sync") return commandSync(args)
-
-    if (
-      args.options.version === "true" ||
-      command === "--version" ||
-      command === "-v" ||
-      command === "version"
-    ) {
-      console.log(packageJson.version)
-      return
-    }
-
-    if (command === "help" || command === "--help" || !command) {
-      console.log(USAGE)
-      return
-    }
 
     console.error(`Unknown command: ${args.positional.join(" ")}`)
     console.error(USAGE)

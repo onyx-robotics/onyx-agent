@@ -18,6 +18,7 @@ import {
   writeState,
 } from "../lib/outbox"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
+import { assertSetupCommitted } from "../lib/setup-git"
 import { flushOutbox } from "../lib/sync"
 
 export async function commandCampaignCreate(args: Args) {
@@ -31,6 +32,7 @@ export async function commandCampaignCreate(args: Args) {
     )
   }
 
+  await assertSetupCommitted({ root, projectPath })
   const baseCommitSha = await currentCommit(root)
   const description = descriptionOption(args)
   const humanFeedback = args.options["human-feedback"] ?? null

@@ -39,6 +39,10 @@ function splitList(value?: string) {
     .filter(Boolean)
 }
 
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
 function parseModuleList(value?: string): ResearchSetupModuleId[] | null {
   const items = splitList(value)
   if (items.length === 0) return null
@@ -130,7 +134,9 @@ export async function commandSetupInit(args: Args) {
     [
       "#!/usr/bin/env bash",
       "set -euo pipefail",
-      'echo "METRIC score=0"',
+      `echo ${shellQuote(`TODO: replace onyx/eval.sh with a real eval that emits METRIC ${setupFile.metric.name}=<number>`)} >&2`,
+      'echo "Setup validation is static; configure eval before running onyx exp run." >&2',
+      "exit 1",
       "",
     ].join("\n"),
     0o755
