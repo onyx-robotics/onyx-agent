@@ -81,8 +81,16 @@ when connectivity and credentials are available.
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
 `onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
 `onyx/tools/*`, `onyx/eval.sh`, and optional `onyx/checks.sh`; validates
-required setup modules locally; then creates an async research session with
-deliberate lane plans.
+required setup modules locally with static checks; then creates an async
+research session with deliberate lane plans. Required setup modules are
+`setup_spec`, `project_scope`, `agent`, and `evaluation`; optional modules are
+`safety`, `reliability`, `reset`, and `resources`. Runtime rigor remains in
+`onyx exp run`, which executes reset/eval/check commands, parses metrics, and
+records setup compliance.
+
+Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
+Python, Node, hardware vendor CLIs, compiled binaries, or any executable
+available to the project.
 
 Lane workers are driven by the TypeScript-rendered Markdown prompt in
 `src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the

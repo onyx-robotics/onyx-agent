@@ -111,24 +111,78 @@ export const researchKnowledgeKindSchema = z.enum([
 export const researchSetupModuleIdSchema = z.enum([
   "setup_spec",
   "project_scope",
-  "metric",
-  "evaluation_definition",
-  "agent_handoff",
-  "resources",
+  "agent",
+  "evaluation",
+  "safety",
+  "reliability",
   "reset",
-  "evaluation_run",
-  "metric_parsing",
-  "checks",
-  "environment",
-  "hardware",
-  "repeatability",
-  "git_remote",
+  "resources",
 ])
 
 const researchSetupModuleRequirementSchema = z.object({
   required: z.boolean().default(false),
   reason: z.string().trim().max(1000).nullable().default(null),
 })
+
+const legacyResearchSetupModuleIds = {
+  metric: "evaluation",
+  evaluation_definition: "evaluation",
+  evaluation_run: "evaluation",
+  metric_parsing: "evaluation",
+  agent_handoff: "agent",
+  checks: "reliability",
+  repeatability: "reliability",
+  environment: "resources",
+  hardware: "resources",
+  git_remote: "resources",
+} as const
+
+function normalizeResearchSetupModuleId(value: string) {
+  return (
+    legacyResearchSetupModuleIds[
+      value as keyof typeof legacyResearchSetupModuleIds
+    ] ?? value
+  )
+}
+
+const researchSetupModuleIdInputSchema = z.preprocess(
+  (value) =>
+    typeof value === "string" ? normalizeResearchSetupModuleId(value) : value,
+  researchSetupModuleIdSchema
+)
+
+function normalizeResearchSetupModuleRequirements(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value
+
+  const normalized: Record<string, unknown> = {}
+  for (const [key, requirement] of Object.entries(value)) {
+    const moduleId = normalizeResearchSetupModuleId(key)
+    const existing = normalized[moduleId]
+    if (
+      existing &&
+      typeof existing === "object" &&
+      !Array.isArray(existing) &&
+      requirement &&
+      typeof requirement === "object" &&
+      !Array.isArray(requirement)
+    ) {
+      normalized[moduleId] = {
+        ...existing,
+        ...requirement,
+        required:
+          Boolean((existing as { required?: unknown }).required) ||
+          Boolean((requirement as { required?: unknown }).required),
+        reason:
+          (requirement as { reason?: unknown }).reason ??
+          (existing as { reason?: unknown }).reason ??
+          null,
+      }
+    } else {
+      normalized[moduleId] = requirement
+    }
+  }
+  return normalized
+}
 
 const researchSetupCommandSchema = z.object({
   command: z.string().trim().min(1),
@@ -196,9 +250,12 @@ export const researchSetupFileSchema = z.object({
     })
     .default({ maxIterations: null, maxMinutes: null, patience: null }),
   modules: z
-    .partialRecord(
-      researchSetupModuleIdSchema,
-      researchSetupModuleRequirementSchema
+    .preprocess(
+      normalizeResearchSetupModuleRequirements,
+      z.partialRecord(
+        researchSetupModuleIdSchema,
+        researchSetupModuleRequirementSchema
+      )
     )
     .default({}),
 })
@@ -212,7 +269,7 @@ export const researchSetupModuleStatusSchema = z.enum([
 ])
 
 export const researchSetupValidationModuleResultSchema = z.object({
-  moduleId: researchSetupModuleIdSchema,
+  moduleId: researchSetupModuleIdInputSchema,
   status: researchSetupModuleStatusSchema,
   required: z.boolean(),
   summary: z.string().trim().max(1000).nullable().default(null),

@@ -19,11 +19,9 @@ import {
   type ResearchSetupValidationFile,
   type ResearchSetupValidationModuleResult,
 } from "../lib/contract"
-import { currentCommit, repoRoot } from "../lib/git"
-import { parseMetricLines } from "../lib/metrics"
-import { onyxPath, resolveProjectPath, scopedRoot } from "../lib/project"
-import { pathExists, runProcess } from "../lib/process"
-import { hasToolCommand, runToolCommand } from "../lib/tools"
+import { repoRoot } from "../lib/git"
+import { onyxPath, resolveProjectPath } from "../lib/project"
+import { pathExists } from "../lib/process"
 
 const PROTECTED_SETUP_PATHS = [
   "onyx/setup.json",
@@ -129,15 +127,18 @@ export async function commandSetupInit(args: Args) {
   )
   const wroteEval = await writeIfMissing(
     onyxPath(root, projectPath, "eval.sh"),
-    ["#!/usr/bin/env bash", "set -euo pipefail", "echo \"METRIC score=0\"", ""].join("\n"),
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      'echo "METRIC score=0"',
+      "",
+    ].join("\n"),
     0o755
   )
 
   console.log(`setup: ${dir}`)
   console.log(wroteSetup ? "created onyx/setup.json" : "kept onyx/setup.json")
-  console.log(
-    wroteInstructions ? "created onyx/onyx.md" : "kept onyx/onyx.md"
-  )
+  console.log(wroteInstructions ? "created onyx/onyx.md" : "kept onyx/onyx.md")
   console.log(wroteEval ? "created onyx/eval.sh" : "kept onyx/eval.sh")
 }
 
@@ -177,7 +178,6 @@ async function validateModule({
   setupReadError,
   moduleId,
   required,
-  evalCache,
 }: {
   root: string
   projectPath: string
@@ -185,7 +185,6 @@ async function validateModule({
   setupReadError: unknown
   moduleId: ResearchSetupModuleId
   required: boolean
-  evalCache: { value?: Awaited<ReturnType<typeof runToolCommand>> }
 }): Promise<ResearchSetupValidationModuleResult> {
   const startedAt = Date.now()
   const done = (
@@ -211,7 +210,10 @@ async function validateModule({
           : "onyx/setup.json is missing or invalid."
       )
     }
-    return done("passed", "onyx/setup.json exists and matches the setup schema.")
+    return done(
+      "passed",
+      "onyx/setup.json exists and matches the setup schema."
+    )
   }
 
   if (!setup) {
@@ -228,24 +230,20 @@ async function validateModule({
         `setup projectPath "${setup.projectPath}" does not match active project path "${projectPath}".`
       )
     }
-    return done("passed", "Project path, editable scope, and protected paths are schema-valid.")
-  }
-
-  if (moduleId === "metric") {
     return done(
       "passed",
-      `Metric ${setup.metric.name} is defined with ${setup.metric.direction} direction.`
+      "Project path, editable scope, and protected paths are schema-valid."
     )
   }
 
-  if (moduleId === "evaluation_definition") {
+  if (moduleId === "evaluation") {
     return done(
       "passed",
-      `Evaluation command is declared: ${setup.commands.evaluate.command}.`
+      `Evaluation declares metric ${setup.metric.name} (${setup.metric.direction}) and command ${setup.commands.evaluate.command}.`
     )
   }
 
-  if (moduleId === "agent_handoff") {
+  if (moduleId === "agent") {
     const path = onyxPath(root, projectPath, "onyx.md")
     if (!(await pathExists(path))) {
       return done("failed", "onyx/onyx.md is missing.")
@@ -256,101 +254,83 @@ async function validateModule({
       : done("failed", "onyx/onyx.md is too sparse to guide workers.")
   }
 
-  if (moduleId === "resources") {
-    const count = Object.keys(setup.resources).length
-    if (count === 0) {
-      return done(required ? "failed" : "skipped", "No resources are declared.")
-    }
-    return done("passed", `${count} resource declaration(s) are schema-valid.`)
-  }
-
   if (moduleId === "reset") {
     if (!setup.commands.reset) {
-      return done(required ? "failed" : "skipped", "No reset command is declared.")
-    }
-    const run = await runToolCommand({ root, projectPath, name: "reset" })
-    return done(run.code === 0 && !run.timedOut ? "passed" : "failed", "Reset command executed.", {
-      outputSummary: run.outputSummary,
-    })
-  }
-
-  if (moduleId === "evaluation_run" || moduleId === "metric_parsing") {
-    evalCache.value ??= await runToolCommand({
-      root,
-      projectPath,
-      name: "evaluate",
-    })
-    const run = evalCache.value
-    if (moduleId === "evaluation_run") {
       return done(
-        run.code === 0 && !run.timedOut ? "passed" : "failed",
-        "Evaluation command executed.",
-        { outputSummary: run.outputSummary }
+        required ? "failed" : "skipped",
+        "No reset command is declared."
       )
     }
-    const metrics = parseMetricLines(run.stdout, setup.metric.name)
-    const hasMetric = Object.hasOwn(metrics, setup.metric.name)
     return done(
-      hasMetric ? "passed" : "failed",
-      hasMetric
-        ? `Evaluation output contains METRIC ${setup.metric.name}=<number>.`
-        : `Evaluation output did not contain METRIC ${setup.metric.name}=<number>.`,
-      { outputSummary: run.outputSummary, evidence: { metrics } }
+      "passed",
+      `Reset command is declared: ${setup.commands.reset.command}.`
     )
   }
 
-  if (moduleId === "checks") {
-    const hasCheck =
-      (await hasToolCommand({ root, projectPath, name: "check" })) ||
-      (await pathExists(onyxPath(root, projectPath, "checks.sh")))
-    if (!hasCheck) {
-      return done(required ? "failed" : "skipped", "No checks command is declared.")
+  if (moduleId === "safety") {
+    const safetySignals = [
+      setup.protectedPaths.length > 0,
+      setup.editableScope.length > 0,
+      setup.constraints.length > 0,
+      setup.riskModel.risks.length > 0,
+      setup.riskModel.antiGamingChecks.length > 0,
+    ].filter(Boolean).length
+    if (safetySignals === 0) {
+      return done(
+        required ? "failed" : "skipped",
+        "No safety policy is declared."
+      )
     }
-    const run = await runToolCommand({ root, projectPath, name: "check" })
-    return done(run.code === 0 && !run.timedOut ? "passed" : "failed", "Checks command executed.", {
-      outputSummary: run.outputSummary,
-    })
+    return done(
+      "passed",
+      "Safety policy is declared through scope, constraints, or risk settings."
+    )
   }
 
-  if (moduleId === "git_remote") {
-    const remote = await runProcess("git", ["remote", "get-url", "origin"], {
-      cwd: scopedRoot(root, projectPath),
-      timeoutMs: 10_000,
-    })
-    const head = await currentCommit(root).catch(() => null)
-    if (remote.code !== 0 || !head) {
-      return done(required ? "failed" : "warning", "Could not resolve origin remote and current commit.", {
-        outputSummary: [remote.stdout.trim(), remote.stderr.trim()].filter(Boolean).join("\n") || null,
-      })
+  if (moduleId === "reliability") {
+    const hasCheckCommand = Boolean(setup.commands.check)
+    const hasChecksFile = await pathExists(
+      onyxPath(root, projectPath, "checks.sh")
+    )
+    const hasRepeatability = setup.measurement.trials >= 2
+    const hasNotes = Boolean(setup.measurement.notes)
+    if (!hasCheckCommand && !hasChecksFile && !hasRepeatability && !hasNotes) {
+      return done(
+        required ? "failed" : "skipped",
+        "No reliability policy is declared."
+      )
     }
-    return done("passed", "Origin remote and current commit are available.", {
-      evidence: { remote: remote.stdout.trim(), head },
-    })
+    return done(
+      "passed",
+      "Reliability policy is declared through checks, repeatability, or measurement notes."
+    )
   }
 
-  if (moduleId === "repeatability") {
-    const trials = setup.measurement.trials
-    if (trials < 2) {
-      return done(required ? "failed" : "skipped", "Repeatability requires measurement.trials >= 2.")
+  if (moduleId === "resources") {
+    const declared = new Set(Object.keys(setup.resources))
+    const referenced = new Set(
+      [
+        ...(setup.commands.reset?.resources ?? []),
+        ...setup.commands.evaluate.resources,
+        ...(setup.commands.check?.resources ?? []),
+      ].filter(Boolean)
+    )
+    const missing = [...referenced].filter(
+      (resource) => !declared.has(resource)
+    )
+    if (missing.length > 0) {
+      return done(
+        "failed",
+        `Command resource(s) are undeclared: ${missing.join(", ")}.`
+      )
     }
-    const values: number[] = []
-    let outputSummary: string | null = null
-    for (let index = 0; index < trials; index += 1) {
-      const run = await runToolCommand({ root, projectPath, name: "evaluate" })
-      outputSummary = run.outputSummary
-      const metrics = parseMetricLines(run.stdout, setup.metric.name)
-      const value = metrics[setup.metric.name]
-      if (typeof value !== "number") {
-        return done("failed", `Trial ${index + 1} did not emit ${setup.metric.name}.`, {
-          outputSummary,
-        })
-      }
-      values.push(value)
+    if (declared.size === 0 && referenced.size === 0) {
+      return done(required ? "failed" : "skipped", "No resources are declared.")
     }
-    return done("passed", `${trials} evaluation trials emitted ${setup.metric.name}.`, {
-      evidence: { values },
-      outputSummary,
-    })
+    return done(
+      "passed",
+      `${declared.size} resource declaration(s) are schema-valid.`
+    )
   }
 
   return done(
@@ -396,7 +376,6 @@ export async function commandSetupValidate(args: Args) {
   const byModule = new Map(
     (existing?.modules ?? []).map((item) => [item.moduleId, item])
   )
-  const evalCache: { value?: Awaited<ReturnType<typeof runToolCommand>> } = {}
 
   for (const moduleId of selected) {
     const required = setup
@@ -411,7 +390,6 @@ export async function commandSetupValidate(args: Args) {
         setupReadError,
         moduleId,
         required,
-        evalCache,
       })
     )
   }
@@ -449,7 +427,9 @@ export async function commandSetupValidate(args: Args) {
   await writeValidationFile(root, projectPath, validation)
 
   console.log(`setup validation: ${status}`)
-  for (const item of modules.filter((module) => selected.includes(module.moduleId))) {
+  for (const item of modules.filter((module) =>
+    selected.includes(module.moduleId)
+  )) {
     console.log(
       `${item.moduleId}: ${item.status}${item.required ? " required" : " optional"} - ${item.summary ?? ""}`
     )
@@ -465,7 +445,9 @@ export async function commandSetupModules(args: Args) {
 
   for (const moduleId of SETUP_MODULE_IDS) {
     const requirement = setupModuleRequirement(setup, moduleId)
-    const latest = validation?.modules.find((item) => item.moduleId === moduleId)
+    const latest = validation?.modules.find(
+      (item) => item.moduleId === moduleId
+    )
     console.log(
       `${moduleId}: ${requirement.required ? "required" : "optional"}; latest=${latest?.status ?? "not_run"}`
     )
@@ -483,7 +465,9 @@ async function setModuleRequirement({
   const projectPath = await resolveProjectPath(root, args)
   const moduleId = parseSetupModuleId(args.positional[2] ?? "")
   if (!required && isFundamentalSetupModule(moduleId)) {
-    throw new Error(`${moduleId} is fundamental for Onyx and cannot be optional.`)
+    throw new Error(
+      `${moduleId} is fundamental for Onyx and cannot be optional.`
+    )
   }
   const setup = await readSetupFile(root, projectPath)
   setup.modules = {

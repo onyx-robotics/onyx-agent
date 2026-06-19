@@ -11,8 +11,8 @@ You are the main-thread Onyx orchestrator. The user talks to you. You keep the h
 
 1. Infer or ask for goal, metric/unit/direction, repo scope, constraints, budget, agent count, resources, reset needs, and evaluation/check commands.
 2. Create the local setup surface with `onyx setup init`, then edit `onyx/setup.json`, `onyx/onyx.md`, `onyx/eval.sh`, optional `onyx/checks.sh`, and `onyx/tools/*` as needed.
-3. Mark any expensive or project-specific setup modules required with `onyx setup require <module>`; keep low-risk optional modules optional.
-4. Run `onyx setup validate --required`, or validate selected optional modules with `onyx setup validate --modules evaluation_run,metric_parsing`.
+3. Mark project-specific optional setup modules required with `onyx setup require <module>`; keep low-risk optional modules optional.
+4. Run `onyx setup validate --required`, or validate selected optional modules with `onyx setup validate --modules safety,reliability,reset,resources`. Setup validation is static and does not run eval, reset, checks, or hardware probes.
 5. Run `onyx campaign setup --name <slug> --description <goal>`, then `onyx sync` if needed.
 6. Start the session with `onyx research start --campaign <slug> --agents <n> --lane-plans <plans.json>`. Launch workers with the printed `onyx worker run --session ... --lane ...` commands, using `--agent claude` or `--worker-command` when appropriate.
 7. Monitor with `onyx research status`, `onyx listen`, and the web campaign page. Stop with `onyx research stop --session <id>`.
@@ -24,9 +24,11 @@ You are the main-thread Onyx orchestrator. The user talks to you. You keep the h
 
 `onyx/validation.json` is the latest local validation report. It is evidence, not security. Research start blocks when any required module is missing or not passing.
 
-Fundamental modules are always required: `setup_spec`, `project_scope`, `metric`, `evaluation_definition`, and `agent_handoff`.
+Fundamental modules are always required: `setup_spec`, `project_scope`, `agent`, and `evaluation`. The `evaluation` module covers both the target metric declaration and the evaluation command declaration.
 
-Optional modules can be made required when the project needs them: `resources`, `reset`, `evaluation_run`, `metric_parsing`, `checks`, `environment`, `hardware`, `repeatability`, and `git_remote`.
+Optional modules can be made required when the project needs them: `safety`, `reliability`, `reset`, and `resources`. Runtime rigor happens in `onyx exp run`, which runs reset/eval/check commands, parses metrics, and records setup compliance.
+
+Tool commands in `onyx/setup.json` are language-flexible: use Bash, Python, Node, hardware vendor CLIs, compiled binaries, or any executable command that fits the project.
 
 Protected setup paths are frozen during Research: `onyx/setup.json`, `onyx/validation.json`, `onyx/onyx.md`, `onyx/eval.sh`, `onyx/checks.sh`, and `onyx/tools/*`.
 

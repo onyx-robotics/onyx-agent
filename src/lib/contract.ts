@@ -22,21 +22,15 @@ export type {
 export const FUNDAMENTAL_SETUP_MODULE_IDS = [
   "setup_spec",
   "project_scope",
-  "metric",
-  "evaluation_definition",
-  "agent_handoff",
+  "agent",
+  "evaluation",
 ] as const satisfies readonly ResearchSetupModuleId[]
 
 export const CONDITIONAL_SETUP_MODULE_IDS = [
-  "resources",
+  "safety",
+  "reliability",
   "reset",
-  "evaluation_run",
-  "metric_parsing",
-  "checks",
-  "environment",
-  "hardware",
-  "repeatability",
-  "git_remote",
+  "resources",
 ] as const satisfies readonly ResearchSetupModuleId[]
 
 export const SETUP_MODULE_IDS = [
@@ -63,14 +57,32 @@ export function normalizeValidationFile(
 }
 
 export function parseSetupModuleId(value: string): ResearchSetupModuleId {
-  return researchSetupModuleIdSchema.parse(value)
+  return researchSetupModuleIdSchema.parse(normalizeSetupModuleId(value))
+}
+
+export function normalizeSetupModuleId(value: string) {
+  const legacy: Record<string, ResearchSetupModuleId> = {
+    metric: "evaluation",
+    evaluation_definition: "evaluation",
+    evaluation_run: "evaluation",
+    metric_parsing: "evaluation",
+    agent_handoff: "agent",
+    checks: "reliability",
+    repeatability: "reliability",
+    environment: "resources",
+    hardware: "resources",
+    git_remote: "resources",
+  }
+  return legacy[value] ?? value
 }
 
 export async function readSetupFile(
   root: string,
   projectPath: string
 ): Promise<ResearchSetupFile> {
-  const parsed: unknown = JSON.parse(await readFile(setupPath(root, projectPath), "utf8"))
+  const parsed: unknown = JSON.parse(
+    await readFile(setupPath(root, projectPath), "utf8")
+  )
   return normalizeSetupFile(parsed)
 }
 

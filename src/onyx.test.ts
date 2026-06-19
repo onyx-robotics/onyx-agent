@@ -8,12 +8,18 @@ import type { LocalResearchHistoryRecord } from "./protocol"
 import {
   appendOutbox,
   clientRunRef,
+  commandSetupInit,
+  commandSetupModules,
+  commandSetupRequire,
+  commandSetupValidate,
   localResearchRecordSchema,
   mergeHistory,
   normalizeSetupFile,
   onyxStateDir,
   parseMetricLines,
   readOutbox,
+  readSetupFile,
+  readValidationFile,
   renderExperimentTable,
   runToolCommand,
   requiredSetupModules,
@@ -225,10 +231,97 @@ describe("setup modules", () => {
     })
 
     expect(setupModuleRequirement(setup, "setup_spec").required).toBe(true)
-    expect(setupModuleRequirement(setup, "resources").required).toBe(false)
-    expect(setupModuleRequirement(setup, "hardware").required).toBe(true)
+    expect(setupModuleRequirement(setup, "reliability").required).toBe(false)
+    expect(setupModuleRequirement(setup, "resources").required).toBe(true)
     expect(requiredSetupModules(setup)).toContain("setup_spec")
-    expect(requiredSetupModules(setup)).toContain("hardware")
+    expect(requiredSetupModules(setup)).toContain("resources")
+    expect(requiredSetupModules(setup)).toContain("evaluation")
+    expect(requiredSetupModules(setup)).toContain("agent")
+  })
+
+  test("setup commands write and print canonical module ids", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-setup-"))
+    const previousCwd = process.cwd()
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: { goal: "Improve score", "metric-name": "score" },
+      })
+      await commandSetupRequire({
+        positional: ["setup", "require", "checks"],
+        options: {},
+      })
+      await commandSetupRequire({
+        positional: ["setup", "require", "agent_handoff"],
+        options: {},
+      })
+
+      const setup = await readSetupFile(root, "")
+      expect(Object.keys(setup.modules).sort()).toEqual([
+        "agent",
+        "evaluation",
+        "project_scope",
+        "reliability",
+        "setup_spec",
+      ])
+      expect(setup.modules.reliability?.required).toBe(true)
+
+      const lines: string[] = []
+      const originalLog = console.log
+      console.log = (...items: unknown[]) => {
+        lines.push(items.join(" "))
+      }
+      try {
+        await commandSetupModules({
+          positional: ["setup", "modules"],
+          options: {},
+        })
+      } finally {
+        console.log = originalLog
+      }
+      expect(lines).toContain("agent: required; latest=not_run")
+      expect(lines).toContain("evaluation: required; latest=not_run")
+      expect(lines).toContain("reliability: required; latest=not_run")
+      expect(lines.some((line) => line.startsWith("checks:"))).toBe(false)
+      expect(lines.some((line) => line.startsWith("agent_handoff:"))).toBe(
+        false
+      )
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("setup validation is static and does not execute eval", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-validate-"))
+    const previousCwd = process.cwd()
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: { goal: "Improve score", "metric-name": "score" },
+      })
+      await writeFile(
+        join(root, "onyx", "eval.sh"),
+        ["#!/usr/bin/env bash", "exit 42", ""].join("\n"),
+        "utf8"
+      )
+      await commandSetupValidate({
+        positional: ["setup", "validate"],
+        options: {},
+      })
+
+      const validation = await readValidationFile(root, "")
+      expect(validation?.status).toBe("passed")
+      expect(
+        validation?.modules.find((item) => item.moduleId === "evaluation")
+          ?.status
+      ).toBe("passed")
+    } finally {
+      process.chdir(previousCwd)
+    }
   })
 })
 

@@ -30,12 +30,7 @@ import {
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
-import {
-  onyxStateDir,
-  readOutbox,
-  readState,
-  writeState,
-} from "../lib/outbox"
+import { onyxStateDir, readOutbox, readState, writeState } from "../lib/outbox"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import { pathExists, runProcess, type ProcessResult } from "../lib/process"
 import { flushOutbox } from "../lib/sync"
@@ -231,25 +226,23 @@ async function recheckCheapRequiredSetupModules({
     )
   }
 
-  if (required.has("metric") && setup.metric.name.trim().length === 0) {
-    failures.push("metric is missing")
+  if (required.has("evaluation")) {
+    if (setup.metric.name.trim().length === 0) {
+      failures.push("evaluation is missing a metric")
+    }
+    if (setup.commands.evaluate.command.trim().length === 0) {
+      failures.push("evaluation is missing a command")
+    }
   }
 
-  if (
-    required.has("evaluation_definition") &&
-    setup.commands.evaluate.command.trim().length === 0
-  ) {
-    failures.push("evaluation_definition is missing")
-  }
-
-  if (required.has("agent_handoff")) {
+  if (required.has("agent")) {
     const instructionsPath = onyxPath(root, projectPath, "onyx.md")
     if (!(await pathExists(instructionsPath))) {
-      failures.push("agent_handoff is missing onyx/onyx.md")
+      failures.push("agent is missing onyx/onyx.md")
     } else {
       const instructions = await readFile(instructionsPath, "utf8")
       if (instructions.trim().length < 20) {
-        failures.push("agent_handoff has too little guidance in onyx/onyx.md")
+        failures.push("agent has too little guidance in onyx/onyx.md")
       }
     }
   }
