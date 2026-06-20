@@ -9,7 +9,7 @@ import {
 import { emitEvent } from "../lib/events"
 import { repoRoot } from "../lib/git"
 import { hydrateHistoryFromApi } from "../lib/history"
-import { readLastRun, readOutbox, readState } from "../lib/outbox"
+import { readLastRuns, readOutbox, readState } from "../lib/outbox"
 import { resolveProjectPath } from "../lib/project"
 import { flushOutbox } from "../lib/sync"
 
@@ -92,7 +92,7 @@ export async function commandStatus(args: Args) {
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
   const { records, corrupt } = await readOutbox(root)
-  const lastRun = await readLastRun(root)
+  const lastRuns = await readLastRuns(root)
   const experiments = records.filter(
     (record) => record.type === "campaign_experiment_logged"
   ).length
@@ -121,9 +121,12 @@ export async function commandStatus(args: Args) {
       corrupt ? `, ${corrupt} unreadable` : ""
     }`
   )
-  if (lastRun) {
+  if (lastRuns.length > 0) {
+    const lastRun = lastRuns[0]!
     console.log(
-      `last run: ${lastRun.resultCommitSha.slice(0, 7)} (${lastRun.status}, ${lastRun.primaryMetricName}=${lastRun.primaryMetricValue ?? "null"})`
+      `last run: ${lastRun.resultCommitSha.slice(0, 7)} (${lastRun.status}, ${lastRun.primaryMetricName}=${lastRun.primaryMetricValue ?? "null"})${
+        lastRuns.length > 1 ? `, ${lastRuns.length - 1} more unlogged` : ""
+      }`
     )
   }
 

@@ -84,10 +84,10 @@ Do not edit protected setup paths during Research. If setup/eval/tools need to c
 2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, restore only in-scope files from the best commit and commit that forward; do not rewrite history.
 3. Pick a concrete research idea for this hypothesis. Use peer progress as inspiration, but do not duplicate an already-failed idea.
 4. Before each iteration and before any sweep that might take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n>\`. Stop cleanly if it exits 0.
-5. Edit only in-scope project files, commit the result, then run \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha>\`.
-6. Inspect the output, metric, and checks result. Record every attempt with \`onyx exp log --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
+5. Edit only in-scope project files, commit the result, then run \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha>\`; copy the printed runRef.
+6. Inspect the output, metric, and checks result. Record every attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
 7. Publish concise shared learnings with \`onyx knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
-8. Periodically update a concise hypothesis summary with \`onyx summary upsert\` if available; otherwise include the summary in final output.
+8. Periodically review summaries with \`onyx summary list\` and update a concise hypothesis summary with \`onyx summary upsert\` if available; otherwise include the summary in final output.
 9. Run \`onyx sync\` or \`onyx push\` periodically when network access is available.
 
 ## Research Rules

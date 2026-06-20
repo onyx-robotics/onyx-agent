@@ -69,6 +69,16 @@ export type LastRunRecord = Omit<
   createdAt: string
 }
 
+export type LastRunSelector = {
+  runRef?: string
+  campaignName?: string
+  projectPath?: string
+  sessionId?: string
+  workerId?: string
+  hypothesisId?: string
+  legacyOnly?: boolean
+}
+
 export async function onyxStateDir(root: string) {
   const dir = join(await gitCommonDir(root), "onyx")
   await mkdir(dir, { recursive: true })
@@ -91,6 +101,20 @@ export async function statePath(root: string) {
 
 export async function lastRunPath(root: string) {
   return join(await onyxStateDir(root), "last-run.json")
+}
+
+export async function lastRunsDir(root: string) {
+  const dir = join(await onyxStateDir(root), "last-runs")
+  await mkdir(dir, { recursive: true })
+  return dir
+}
+
+function lastRunFileName(runRef: string) {
+  return `${encodeURIComponent(runRef)}.json`
+}
+
+export async function scopedLastRunPath(root: string, runRef: string) {
+  return join(await lastRunsDir(root), lastRunFileName(runRef))
 }
 
 export function clientRunRef(campaignName: string) {
@@ -214,9 +238,9 @@ export async function writeState(root: string, state: CliState) {
   await rename(tmp, path)
 }
 
-export async function readLastRun(root: string): Promise<LastRunRecord | null> {
+async function readLastRunFile(path: string): Promise<LastRunRecord | null> {
   try {
-    const parsed = JSON.parse(await readFile(await lastRunPath(root), "utf8"))
+    const parsed = JSON.parse(await readFile(path, "utf8"))
     if (
       parsed &&
       typeof parsed === "object" &&
@@ -232,16 +256,103 @@ export async function readLastRun(root: string): Promise<LastRunRecord | null> {
   return null
 }
 
+function shouldWriteScopedLastRun(record: LastRunRecord) {
+  return Boolean(record.workerId || record.sessionId || record.hypothesisId)
+}
+
+function matchesLastRunSelector(
+  record: LastRunRecord,
+  selector: LastRunSelector
+) {
+  return (
+    (!selector.runRef || record.runRef === selector.runRef) &&
+    (!selector.campaignName || record.campaignName === selector.campaignName) &&
+    (selector.projectPath === undefined ||
+      record.projectPath === selector.projectPath) &&
+    (!selector.sessionId || record.sessionId === selector.sessionId) &&
+    (!selector.workerId || record.workerId === selector.workerId) &&
+    (!selector.hypothesisId || record.hypothesisId === selector.hypothesisId)
+  )
+}
+
+export async function readLastRuns(root: string): Promise<LastRunRecord[]> {
+  const byRunRef = new Map<string, LastRunRecord>()
+  const legacy = await readLastRunFile(await lastRunPath(root))
+  if (legacy) byRunRef.set(legacy.runRef, legacy)
+
+  let entries: string[] = []
+  try {
+    entries = await readdir(await lastRunsDir(root))
+  } catch {
+    entries = []
+  }
+
+  await Promise.all(
+    entries
+      .filter((entry) => entry.endsWith(".json"))
+      .map(async (entry) => {
+        const record = await readLastRunFile(join(await lastRunsDir(root), entry))
+        if (record) byRunRef.set(record.runRef, record)
+      })
+  )
+
+  return [...byRunRef.values()].sort((a, b) =>
+    a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0
+  )
+}
+
+export async function readLastRun(
+  root: string,
+  selector: LastRunSelector = {}
+): Promise<LastRunRecord | null> {
+  if (selector.legacyOnly) {
+    const legacy = await readLastRunFile(await lastRunPath(root))
+    return legacy && matchesLastRunSelector(legacy, selector) ? legacy : null
+  }
+
+  const runs = await readLastRuns(root)
+  return runs.find((record) => matchesLastRunSelector(record, selector)) ?? null
+}
+
 export async function writeLastRun(root: string, record: LastRunRecord) {
-  const path = await lastRunPath(root)
+  const path = shouldWriteScopedLastRun(record)
+    ? await scopedLastRunPath(root, record.runRef)
+    : await lastRunPath(root)
   const tmp = `${path}.tmp`
   await writeFile(tmp, `${JSON.stringify(record, null, 2)}\n`, "utf8")
   await rename(tmp, path)
 }
 
-export async function clearLastRun(root: string) {
+export async function clearLastRun(
+  root: string,
+  selector: LastRunSelector = { legacyOnly: true }
+) {
+  if (selector.runRef && !selector.legacyOnly) {
+    await unlink(await scopedLastRunPath(root, selector.runRef)).catch(() => {})
+    const legacy = await readLastRunFile(await lastRunPath(root))
+    if (legacy?.runRef === selector.runRef) {
+      await unlink(await lastRunPath(root)).catch(() => {})
+    }
+    return
+  }
+
+  const runs = selector.legacyOnly
+    ? [await readLastRunFile(await lastRunPath(root))]
+    : await readLastRuns(root)
+  await Promise.all(
+    runs
+      .filter((record): record is LastRunRecord => Boolean(record))
+      .filter((record) => matchesLastRunSelector(record, selector))
+      .map(async (record) => {
+        const path = shouldWriteScopedLastRun(record)
+          ? await scopedLastRunPath(root, record.runRef)
+          : await lastRunPath(root)
+        await unlink(path).catch(() => {})
+      })
+  )
+
   try {
-    await unlink(await lastRunPath(root))
+    if (selector.legacyOnly) await unlink(await lastRunPath(root))
   } catch {
     // no last run to clear
   }

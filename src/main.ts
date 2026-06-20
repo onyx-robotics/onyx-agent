@@ -22,6 +22,7 @@ import {
   commandResearchStop,
   commandKnowledgeAdd,
   commandKnowledgeList,
+  commandSummaryList,
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
@@ -64,7 +65,7 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json>] [--max-iterations <n>] [--max-minutes <n>]
+  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-iterations <n>] [--max-minutes <n>]
       (creates an async research session and prints worker launch commands)
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]
@@ -74,10 +75,11 @@ Usage:
   onyx research finish [--campaign <name>] [--session <id>]
   onyx research status [--campaign <name>] [--all-sessions]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--title <text>] --body <text>
+  onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
-  onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
+  onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
   onyx status
@@ -167,6 +169,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandResearchStatus(args)
     if (command === "summary" && sub === "upsert")
       return commandSummaryUpsert(args)
+    if (command === "summary" && sub === "list")
+      return commandSummaryList(args)
     if (command === "knowledge" && sub === "add")
       return commandKnowledgeAdd(args)
     if (command === "knowledge" && sub === "list")

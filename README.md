@@ -82,7 +82,8 @@ onyx push
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
 `onyx exp run --no-log` is reserved for transient checks such as worker
-preflight and does not read, write, restore, or clear `.git/onyx/last-run.json`.
+preflight and does not read, write, restore, or clear `.git/onyx/last-run.json`
+or scoped worker records under `.git/onyx/last-runs/`.
 
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
 `onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
@@ -113,10 +114,10 @@ To run multiple local research hypotheses directly from the CLI, choose a built-
 agent launcher:
 
 ```bash
-onyx research hypotheses --example > plans.json
-onyx research start --campaign fast-eval --workers 4 --hypotheses plans.json --max-minutes 10
-onyx worker run --session <id> --hypothesis <hypothesis-id> --agent codex
-onyx worker run --session <id> --hypothesis <hypothesis-id> --agent claude
+plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
+onyx research start --campaign fast-eval --workers 4 --hypotheses "$plans" --max-minutes 10
+onyx worker run --session <id> --hypothesis <hypothesis-id> --agent codex --max-minutes 10
+onyx worker run --session <id> --hypothesis <hypothesis-id> --agent claude --max-minutes 10
 onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 

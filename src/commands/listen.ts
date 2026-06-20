@@ -10,7 +10,12 @@ import type {
 import { readEvents } from "../lib/events"
 import { gitResult, repoRoot } from "../lib/git"
 import { historyPath, readHistory } from "../lib/history"
-import { onyxStateDir, readLastRun, readOutbox, readState } from "../lib/outbox"
+import {
+  onyxStateDir,
+  readLastRuns,
+  readOutbox,
+  readState,
+} from "../lib/outbox"
 import { campaignStateKey } from "../lib/project"
 import { formatAge, renderFrame, type ListenModel } from "../lib/tui"
 
@@ -108,9 +113,14 @@ async function buildModel(root: string): Promise<ListenModel> {
     a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0
   )
 
-  // Surface a measured-but-unlogged run at the bottom of the table.
-  const lastRun = await readLastRun(root)
-  if (lastRun && !rows.some((row) => row.runRef === lastRun.runRef)) {
+  // Surface measured-but-unlogged runs at the bottom of the table.
+  for (const lastRun of await readLastRuns(root)) {
+    if (
+      rows.some((row) => row.runRef === lastRun.runRef) ||
+      (campaignName && lastRun.campaignName !== campaignName)
+    ) {
+      continue
+    }
     rows.push({
       schemaVersion: 1,
       source: "local",

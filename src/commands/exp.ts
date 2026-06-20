@@ -24,9 +24,11 @@ import {
   clientRunRef,
   readOutbox,
   readLastRun,
+  readLastRuns,
   readState,
   writeLastRun,
   writeState,
+  type LastRunSelector,
   type LastRunRecord,
 } from "../lib/outbox"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
@@ -90,6 +92,33 @@ function parseAgentNotes(value?: string): Record<string, unknown> {
 
 function safeRefSegment(value: string) {
   return value.replace(/[^A-Za-z0-9._/-]+/g, "-")
+}
+
+function lastRunSelectorForContext({
+  campaignName,
+  projectPath,
+  runRef,
+  sessionId,
+  workerId,
+  hypothesisId,
+}: {
+  campaignName: string
+  projectPath: string
+  runRef?: string
+  sessionId?: string
+  workerId?: string
+  hypothesisId?: string
+}): LastRunSelector {
+  const selector: LastRunSelector = { campaignName, projectPath }
+  if (runRef) {
+    selector.runRef = runRef
+    return selector
+  }
+  if (sessionId) selector.sessionId = sessionId
+  if (workerId) selector.workerId = workerId
+  if (hypothesisId) selector.hypothesisId = hypothesisId
+  if (!sessionId && !workerId && !hypothesisId) selector.legacyOnly = true
+  return selector
 }
 
 function pathMatchesScope(path: string, scope: string) {
@@ -317,7 +346,14 @@ export async function commandExpRun(args: Args) {
   const baseCommitSha =
     args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
   const noLog = optionalFlag(args, "no-log")
-  const existingAttempt = noLog ? null : await readLastRun(root)
+  const lastRunSelector = lastRunSelectorForContext({
+    campaignName,
+    projectPath,
+    sessionId,
+    workerId,
+    hypothesisId,
+  })
+  const existingAttempt = noLog ? null : await readLastRun(root, lastRunSelector)
   const reusableAttempt =
     existingAttempt?.campaignName === campaignName &&
     existingAttempt.projectPath === projectPath &&
@@ -473,7 +509,7 @@ export async function commandExpRun(args: Args) {
       JSON.stringify({ metrics, status, checks, compliance }, null, 2)
     )
     if (result.code !== 0) process.exitCode = result.code ?? 1
-    return
+    return { runRef, status, metrics, checks, compliance }
   }
 
   const record: LastRunRecord = {
@@ -513,7 +549,9 @@ export async function commandExpRun(args: Args) {
   console.log(
     `Measured ${resultCommitSha.slice(0, 7)} (${primary.name}=${primary.value ?? "null"}, ${status}); runRef ${runRef}`
   )
-  console.log("Run `onyx exp log --description <text>` to record this result.")
+  console.log(
+    `Run \`onyx exp log --run-ref ${runRef} --description <text>\` to record this result.`
+  )
 
   if (
     !benchmarkSucceeded ||
@@ -522,6 +560,8 @@ export async function commandExpRun(args: Args) {
   ) {
     process.exitCode = result.code && result.code !== 0 ? result.code : 1
   }
+
+  return { runRef, status, metrics, checks, compliance }
 }
 
 export async function commandExpLog(args: Args) {
@@ -540,12 +580,31 @@ export async function commandExpLog(args: Args) {
       `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
     )
   }
-  const lastRun = await readLastRun(root)
+  const contextSessionId = args.options.session ?? process.env.ONYX_SESSION_ID
+  const contextWorkerId = args.options.worker ?? process.env.ONYX_WORKER_ID
+  const contextHypothesisId =
+    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID
+  const lastRun = await readLastRun(
+    root,
+    lastRunSelectorForContext({
+      campaignName,
+      projectPath,
+      runRef: args.options["run-ref"],
+      sessionId: contextSessionId,
+      workerId: contextWorkerId,
+      hypothesisId: contextHypothesisId,
+    })
+  )
   const usableLastRun =
     lastRun?.campaignName === campaignName &&
     lastRun.projectPath === projectPath
       ? lastRun
       : null
+  if (args.options["run-ref"] && !usableLastRun) {
+    throw new Error(
+      `No measured run found for --run-ref ${args.options["run-ref"]}. Run \`onyx exp list --json\` to inspect unlogged local runs.`
+    )
+  }
   const resultCommitSha =
     args.options.commit ??
     usableLastRun?.resultCommitSha ??
@@ -672,7 +731,7 @@ export async function commandExpLog(args: Args) {
   console.log(
     `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}`
   )
-  if (usableLastRun) await clearLastRun(root)
+  if (usableLastRun) await clearLastRun(root, { runRef: usableLastRun.runRef })
 }
 
 export async function commandExpList(args: Args) {
@@ -698,8 +757,9 @@ export async function commandExpList(args: Args) {
     seenRunRefs.add(record.runRef)
   }
 
-  const lastRun = await readLastRun(root)
-  if (lastRun && !seenRunRefs.has(lastRun.runRef)) {
+  const lastRuns = await readLastRuns(root)
+  for (const lastRun of lastRuns) {
+    if (seenRunRefs.has(lastRun.runRef)) continue
     rows.push({
       schemaVersion: 1,
       source: "local",

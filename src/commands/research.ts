@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import {
@@ -24,6 +24,7 @@ import {
   upsertCampaignSummary,
   type ApiCampaign,
   type ApiHypothesis,
+  type ApiSummary,
 } from "../lib/api"
 import {
   readSetupFile,
@@ -116,11 +117,20 @@ function workerHardStopGraceMs(shutdownCushionMs: number) {
 }
 
 async function hypothesisPlansOption(args: Args) {
-  const path = args.options["hypotheses"]
-  if (!path) return undefined
-  const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
+  const json = args.options["hypotheses"]
+  if (!json) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(json)
+  } catch (error) {
+    throw new Error(
+      `--hypotheses must be an inline JSON array, for example --hypotheses '[{"focus":"...","statement":"..."}]'. ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
   if (!Array.isArray(parsed)) {
-    throw new Error("--hypotheses must point to a JSON array")
+    throw new Error("--hypotheses must be an inline JSON array")
   }
   return parsed.map((plan) => researchHypothesisPlanSchema.parse(plan))
 }
@@ -176,6 +186,120 @@ async function hypothesisPlanOption(
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function safeFileSegment(value: string) {
+  return (
+    value
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80) || "item"
+  )
+}
+
+function workerBudgetOptions({
+  maxIterations,
+  maxMinutes,
+}: {
+  maxIterations: number
+  maxMinutes: number
+}) {
+  return ` --max-iterations ${maxIterations} --max-minutes ${maxMinutes}`
+}
+
+async function createWorkerTempDir({
+  root,
+  sessionId,
+  workerId,
+}: {
+  root: string
+  sessionId: string
+  workerId: string
+}) {
+  const dir = join(
+    await onyxStateDir(root),
+    "worker-tmp",
+    safeFileSegment(sessionId),
+    safeFileSegment(workerId)
+  )
+  await mkdir(dir, { recursive: true })
+  return dir
+}
+
+function jsonTextFragments(value: unknown): string[] {
+  if (!value || typeof value !== "object") return []
+  const record = value as Record<string, unknown>
+  const fragments: string[] = []
+  for (const key of ["result", "text", "delta"]) {
+    if (typeof record[key] === "string") fragments.push(record[key] as string)
+  }
+  const content = record.content
+  if (Array.isArray(content)) {
+    for (const item of content) fragments.push(...jsonTextFragments(item))
+  }
+  const message = record.message
+  if (message && typeof message === "object") {
+    fragments.push(...jsonTextFragments(message))
+  }
+  return fragments
+}
+
+export function summarizeWorkerOutput(result: StreamingProcessResult) {
+  const finalFragments: string[] = []
+  const jsonFragments: string[] = []
+  const plainLines: string[] = []
+  for (const line of result.stdout.split("\n")) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      const resultText =
+        parsed && typeof parsed === "object"
+          ? (parsed as Record<string, unknown>).result
+          : null
+      if (typeof resultText === "string") {
+        finalFragments.push(resultText)
+        continue
+      }
+      const fragments = jsonTextFragments(parsed)
+      if (fragments.length > 0) jsonFragments.push(...fragments)
+    } catch {
+      plainLines.push(trimmed)
+    }
+  }
+
+  const parsed = (finalFragments.length > 0 ? finalFragments : jsonFragments)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim()
+  if (parsed) return parsed.slice(-4000)
+
+  const plain = plainLines.join("\n").trim()
+  if (plain) return plain.slice(-4000)
+
+  const raw = result.stdout.trim()
+  return raw ? raw.slice(-1200) : null
+}
+
+const SUMMARY_KINDS = [
+  "campaign_brief",
+  "session_brief",
+  "hypothesis_summary",
+  "transfer_brief",
+  "setup_notes",
+] as const
+
+type SummaryKind = ApiSummary["summaryKind"]
+
+function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
+  const kind = args.options.kind ?? fallback
+  if (!SUMMARY_KINDS.includes(kind as SummaryKind)) {
+    throw new Error(
+      "--kind must be campaign_brief, session_brief, hypothesis_summary, transfer_brief, or setup_notes"
+    )
+  }
+  return kind as SummaryKind
 }
 
 function createSyncSupervisor({
@@ -579,6 +703,7 @@ async function finalizeHypothesisAttempt({
       }))
     ) {
       let measurementError: string | null = null
+      let measuredRunRef: string | null = null
       await withoutProcessExitCode(() =>
         commandExpRun({
           positional: ["exp", "run"],
@@ -591,10 +716,14 @@ async function finalizeHypothesisAttempt({
             "checks-timeout": "120",
           },
         })
-      ).catch((error) => {
-        measurementError = errorMessage(error)
-        manifest.error = measurementError
-      })
+      )
+        .then((result) => {
+          measuredRunRef = result?.runRef ?? null
+        })
+        .catch((error) => {
+          measurementError = errorMessage(error)
+          manifest.error = measurementError
+        })
       await withoutProcessExitCode(() =>
         commandExpLog({
           positional: ["exp", "log"],
@@ -606,6 +735,7 @@ async function finalizeHypothesisAttempt({
             hypothesis: hypothesis.id,
             session: sessionId,
             worker: workerId,
+            ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
             ...(measurementError
               ? { status: "failed", "allow-unmeasured": "true" }
               : {}),
@@ -864,6 +994,12 @@ async function runHypothesisOnce({
   let resultCommitSha: string | undefined
   let launchManifest: WorkerLaunchManifest | null = null
   let workerShim: WorkerOnyxShim | null = null
+  let workerTempDir: string | null = null
+  const cleanupWorkerTempDir = async () => {
+    if (!workerTempDir) return
+    await rm(workerTempDir, { recursive: true, force: true }).catch(() => {})
+    workerTempDir = null
+  }
 
   try {
     const worker = await registerCampaignWorker(
@@ -933,6 +1069,11 @@ async function runHypothesisOnce({
       endTimeMs,
     })
     workerShim = await writeWorkerOnyxShim({ root, sessionId })
+    workerTempDir = await createWorkerTempDir({
+      root,
+      sessionId,
+      workerId: worker.id,
+    })
     const workerBaseEnv = workerEnvironment({
       baseEnv: process.env,
       shim: workerShim,
@@ -950,6 +1091,9 @@ async function runHypothesisOnce({
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_SETUP_FILE: setupPath(root, projectPath),
       ONYX_VALIDATION_FILE: validationPath(root, projectPath),
+      TMPDIR: workerTempDir,
+      TMP: workerTempDir,
+      TEMP: workerTempDir,
       ONYX_RESEARCH_DEADLINE_AT: new Date(
         prompt.researchDeadlineMs
       ).toISOString(),
@@ -1120,6 +1264,7 @@ async function runHypothesisOnce({
       },
       args
     )
+    const workerOutputSummary = summarizeWorkerOutput(workerResult)
     await upsertCampaignSummary(
       campaign.id,
       {
@@ -1142,15 +1287,14 @@ async function runHypothesisOnce({
             ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
             : "",
           `Worker log: ${launchManifest?.logPath ?? "n/a"}`,
-          workerResult.stdout.trim()
-            ? `\nWorker output:\n${workerResult.stdout.trim().slice(-4000)}`
-            : "",
+          workerOutputSummary ? `\nWorker output:\n${workerOutputSummary}` : "",
         ]
           .filter(Boolean)
           .join("\n"),
       },
       args
     )
+    await cleanupWorkerTempDir()
     return {
       hypothesis,
       workerId: worker.id,
@@ -1205,6 +1349,7 @@ async function runHypothesisOnce({
       },
       args
     ).catch(() => {})
+    await cleanupWorkerTempDir()
     return {
       hypothesis,
       workerId,
@@ -1321,6 +1466,7 @@ export async function commandResearchStart(args: Args) {
   console.log(`Workers: 0/${workerTarget}`)
   console.log(`Hypotheses: ${result.hypotheses.length}`)
   const agentOption = launchAgent ? ` --agent ${launchAgent}` : ""
+  const budgetOptions = workerBudgetOptions({ maxIterations, maxMinutes })
   if (result.hypotheses.length === 0) {
     console.log(
       "No hypotheses were created. Add one with `onyx research hypothesis add --session " +
@@ -1332,7 +1478,7 @@ export async function commandResearchStart(args: Args) {
       const hypothesis = result.hypotheses[index % result.hypotheses.length]
       if (!hypothesis) continue
       console.log(
-        `- worker ${index + 1}: ${hypothesis.name}: ${hypothesis.plan.focus}\n  onyx worker run --session ${result.session.id} --hypothesis ${hypothesis.id}${agentOption}`
+        `- worker ${index + 1}: ${hypothesis.name}: ${hypothesis.plan.focus}\n  onyx worker run --session ${result.session.id} --hypothesis ${hypothesis.id}${agentOption}${budgetOptions}`
       )
     }
   }
@@ -1452,8 +1598,9 @@ export async function commandResearchHypothesisAdd(args: Args) {
   if (sessionId) console.log(`Session: ${sessionId}`)
   console.log(`Hypothesis: ${hypothesis.name}: ${hypothesis.plan.focus}`)
   if (sessionId) {
+    const budgetOptions = workerBudgetOptions({ maxIterations, maxMinutes })
     console.log(
-      `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}`
+      `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}${budgetOptions}`
     )
   } else {
     console.log("Start or choose a research session before launching a worker.")
@@ -1500,7 +1647,18 @@ export async function commandResearchStatus(args: Args) {
       ["idle", "running", "stale"].includes(worker.status)
     ).length
     const target = sessionState?.session.workerTarget ?? "?"
-    console.log(`worker slots: ${activeWorkers}/${target}`)
+    const sessionStatus =
+      sessionState?.session.status ??
+      state.sessions?.[activeSessionId]?.status ??
+      null
+    const stopping =
+      sessionStatus === "stop_requested" ||
+      state.sessions?.[activeSessionId]?.stopRequested
+    console.log(
+      `worker slots: ${activeWorkers}/${target}${
+        stopping ? " (stop requested; open slots are intentionally idle)" : ""
+      }`
+    )
   }
   console.log(
     `hypotheses: ${hypotheses.length}${scopeAll ? " (all sessions)" : ""}`
@@ -1849,18 +2007,7 @@ export async function commandResearchFinish(args: Args) {
 export async function commandSummaryUpsert(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const { campaign } = await campaignForName(root, args)
-  const kind = args.options.kind ?? "hypothesis_summary"
-  if (
-    kind !== "campaign_brief" &&
-    kind !== "session_brief" &&
-    kind !== "hypothesis_summary" &&
-    kind !== "transfer_brief" &&
-    kind !== "setup_notes"
-  ) {
-    throw new Error(
-      "--kind must be campaign_brief, session_brief, hypothesis_summary, transfer_brief, or setup_notes"
-    )
-  }
+  const kind = summaryKindOption(args, "hypothesis_summary")
   const title = args.options.title ?? `${kind} ${new Date().toISOString()}`
   const body = args.options.body
   if (!body) throw new Error("Pass --body <text>.")
@@ -1878,6 +2025,63 @@ export async function commandSummaryUpsert(args: Args) {
     args
   )
   console.log(`Updated ${kind} for ${campaign.name}`)
+}
+
+function summaryScope(summary: ApiSummary) {
+  return [
+    summary.sessionId ? `session=${summary.sessionId}` : null,
+    summary.hypothesisId ? `hypothesis=${summary.hypothesisId}` : null,
+    summary.authoredByWorkerId ? `worker=${summary.authoredByWorkerId}` : null,
+  ]
+    .filter(Boolean)
+    .join(" ")
+}
+
+export async function commandSummaryList(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign } = await campaignForName(root, args)
+  const overview = await getCampaignOverview(campaign.id, args)
+  const kind = args.options.kind
+    ? summaryKindOption(args, "hypothesis_summary")
+    : null
+  const limit = positiveIntegerOption(args, "limit", 20)
+  const matchingSummaries = overview.summaries.filter(
+    (summary) => !kind || summary.summaryKind === kind
+  )
+  const summaries = matchingSummaries.slice(0, limit)
+
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(summaries, null, 2))
+    return
+  }
+
+  if (summaries.length === 0) {
+    console.log(
+      kind
+        ? `No ${kind} summaries found for ${campaign.name}.`
+        : `No summaries found for ${campaign.name}.`
+    )
+    return
+  }
+
+  for (const summary of summaries) {
+    const scope = summaryScope(summary)
+    const preview = summary.body.replace(/\s+/g, " ").trim().slice(0, 180)
+    console.log(
+      [
+        `${summary.summaryKind}${summary.isCurrent ? " current" : ""}: ${summary.title}`,
+        scope || null,
+        preview ? `- ${preview}` : null,
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
+  }
+  if (matchingSummaries.length > summaries.length) {
+    console.log(
+      `... ${matchingSummaries.length - summaries.length} more; raise --limit to see more.`
+    )
+  }
 }
 
 export async function commandKnowledgeAdd(args: Args) {

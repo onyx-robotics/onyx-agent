@@ -10,10 +10,13 @@ import {
   assertSetupCommitted,
   campaignStateKey,
   clientRunRef,
+  commandExpLog,
   commandExpRun,
   commandExpList,
+  commandResearchStart,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
+  commandSummaryList,
   commandSetupInit,
   commandSetupModules,
   commandSetupRequire,
@@ -31,11 +34,13 @@ import {
   readOutbox,
   readSetupFile,
   readLastRun,
+  readLastRuns,
   readValidationFile,
   renderExperimentTable,
   runToolCommand,
   requiredSetupModules,
   setupModuleRequirement,
+  summarizeWorkerOutput,
   USAGE,
   writeLastRun,
   writeSetupFile,
@@ -69,6 +74,11 @@ async function writeResearchSmokeRepo() {
   await writeFile(
     join(root, "onyx", "onyx.md"),
     "Use the configured eval command and keep changes small.\n",
+    "utf8"
+  )
+  await writeFile(
+    join(root, "onyx", "eval.sh"),
+    "#!/usr/bin/env sh\nprintf 'METRIC score=1.25\\n'\n",
     "utf8"
   )
   await writeSetupFile(
@@ -550,6 +560,482 @@ describe("exp run", () => {
   })
 })
 
+describe("exp log", () => {
+  test("uses explicit scoped run refs without consuming another worker run", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const workerOneId = "77777777-7777-4777-8777-777777777771"
+    const workerTwoId = "77777777-7777-4777-8777-777777777772"
+    const hypothesisOneId = "88888888-8888-4888-8888-888888888881"
+    const hypothesisTwoId = "88888888-8888-4888-8888-888888888882"
+    const makeRun = (workerId: string, hypothesisId: string, value: number) => ({
+      schemaVersion: 1 as const,
+      createdAt: `2026-06-20T00:00:0${value}.000Z`,
+      runRef: `local/smoke/${workerId}`,
+      campaignName,
+      projectPath: "",
+      baseCommitSha,
+      resultCommitSha: baseCommitSha,
+      resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/${workerId}`,
+      status: "succeeded" as const,
+      setupCompliance: {
+        status: "passed" as const,
+        protectedPathsChanged: [],
+        outOfScopePathsChanged: [],
+        setupPathsChanged: [],
+        notes: null,
+      },
+      primaryMetricName: "score",
+      primaryMetricValue: value,
+      metrics: { score: value },
+      agentNotes: {},
+      checks: null,
+      durationMs: value,
+      startedAt: "2026-06-20T00:00:00.000Z",
+      completedAt: `2026-06-20T00:00:0${value}.000Z`,
+      outputSummary: `worker ${workerId}`,
+      sessionId,
+      workerId,
+      hypothesisId,
+    })
+    const workerOne = makeRun(workerOneId, hypothesisOneId, 1)
+    const workerTwo = makeRun(workerTwoId, hypothesisTwoId, 2)
+    await writeLastRun(root, workerOne)
+    await writeLastRun(root, workerTwo)
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await commandExpLog({
+        positional: ["exp", "log"],
+        options: {
+          campaign: campaignName,
+          "run-ref": workerTwo.runRef,
+          session: sessionId,
+          worker: workerTwoId,
+          hypothesis: hypothesisTwoId,
+          name: "worker-two-result",
+          description: "logged the second worker",
+        },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const { records } = await readOutbox(root)
+    const logged = records.find(
+      (record) =>
+        record.type === "campaign_experiment_logged" &&
+        record.runRef === workerTwo.runRef
+    )
+    expect(logged).toMatchObject({
+      name: "worker-two-result",
+      description: "logged the second worker",
+      workerId: workerTwoId,
+      hypothesisId: hypothesisTwoId,
+      primaryMetricValue: 2,
+      outputSummary: `worker ${workerTwoId}`,
+    })
+    const remainingRuns = await readLastRuns(root)
+    expect(remainingRuns.map((run) => run.runRef)).toEqual([workerOne.runRef])
+  })
+
+  test("--run-ref fails clearly when the measured run is missing", async () => {
+    const { root, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandExpLog({
+          positional: ["exp", "log"],
+          options: {
+            campaign: campaignName,
+            "run-ref": "local/smoke/missing",
+            name: "missing",
+            description: "missing",
+          },
+        })
+      ).rejects.toThrow("No measured run found for --run-ref")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+})
+
+describe("research start", () => {
+  test("accepts inline hypothesis JSON and prints budgeted worker commands", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const hypothesisId = "66666666-6666-4666-8666-666666666666"
+    const campaign = {
+      id: campaignId,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
+    const plan = {
+      focus: "Inline search",
+      statement: "Inline JSON can seed the session.",
+      startingPoints: ["src"],
+      avoidList: ["onyx/setup.json"],
+      successSignals: ["METRIC score improves"],
+      giveUpSignals: ["No movement"],
+    }
+    let sessionBody: unknown = null
+    const logs: string[] = []
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    try {
+      process.chdir(root)
+      await withMockResearchApi(
+        (request) => {
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/overview`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign,
+                  workers: [],
+                  hypotheses: [],
+                  summaries: [],
+                  knowledge: [],
+                  bestExperiment: null,
+                  latestExperiments: [],
+                  counts: {
+                    experiments: 0,
+                    hypothesisCount: 0,
+                    activeWorkers: 0,
+                  },
+                },
+              },
+            }
+          }
+          if (
+            request.method === "POST" &&
+            request.path ===
+              `/api/v1/research/campaigns/${campaignId}/sessions`
+          ) {
+            sessionBody = request.body
+            return {
+              status: 201,
+              body: {
+                data: {
+                  session: {
+                    id: sessionId,
+                    campaignId,
+                    name: "session",
+                    status: "running",
+                    workerTarget: 1,
+                    metadata: (request.body as { metadata: unknown }).metadata,
+                  },
+                  hypotheses: [
+                    {
+                      id: hypothesisId,
+                      campaignId,
+                      createdBySessionId: sessionId,
+                      name: "inline",
+                      description: null,
+                      status: "active",
+                      baseCommitSha,
+                      bestExperimentId: null,
+                      bestMetricValue: null,
+                      lastWorkedAt: null,
+                      plan,
+                      metadata: {},
+                      createdAt: "2026-06-20T00:00:00.000Z",
+                      updatedAt: "2026-06-20T00:00:00.000Z",
+                    },
+                  ],
+                },
+              },
+            }
+          }
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/brief`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign,
+                  bestExperiment: null,
+                  recentExperiments: [],
+                  hypotheses: [],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  recommendedContext: [],
+                  markdown: "brief",
+                },
+              },
+            }
+          }
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/sessions/${sessionId}/state`
+          ) {
+            return {
+              body: {
+                data: {
+                  session: {
+                    id: sessionId,
+                    campaignId,
+                    name: "session",
+                    status: "running",
+                    workerTarget: 1,
+                    metadata: {},
+                  },
+                  campaign,
+                  latestExperiments: [],
+                  bestExperiment: null,
+                  hypotheses: [],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  updatedAt: "2026-06-20T00:00:00.000Z",
+                },
+              },
+            }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        () =>
+          commandResearchStart({
+            positional: ["research", "start"],
+            options: {
+              campaign: campaignName,
+              workers: "1",
+              agent: "claude",
+              hypotheses: JSON.stringify([plan]),
+              "max-iterations": "3",
+              "max-minutes": "10",
+            },
+          })
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    expect(sessionBody).toMatchObject({
+      workerTarget: 1,
+      hypotheses: [plan],
+      metadata: {
+        maxIterations: 3,
+        maxMinutes: 10,
+        agentKind: "claude",
+      },
+    })
+    expect(logs).toContain(`Research session: ${sessionId}`)
+    expect(logs).toContain(
+      `- worker 1: inline: Inline search\n  onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent claude --max-iterations 3 --max-minutes 10`
+    )
+  })
+
+  test("rejects a hypotheses file path", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const campaign = {
+      id: campaignId,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
+    const path = join(root, "onyx", "hypotheses.json")
+    await writeFile(path, "[]\n", "utf8")
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await withMockResearchApi(
+        (request) => {
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/overview`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign,
+                  workers: [],
+                  hypotheses: [],
+                  summaries: [],
+                  knowledge: [],
+                  bestExperiment: null,
+                  latestExperiments: [],
+                  counts: {
+                    experiments: 0,
+                    hypothesisCount: 0,
+                    activeWorkers: 0,
+                  },
+                },
+              },
+            }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        async () => {
+          await expect(
+            commandResearchStart({
+              positional: ["research", "start"],
+              options: {
+                campaign: campaignName,
+                hypotheses: path,
+              },
+            })
+          ).rejects.toThrow("--hypotheses must be an inline JSON array")
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+})
+
+describe("summary CLI", () => {
+  test("lists campaign summaries as text", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const campaign = {
+      id: campaignId,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
+    const overview = {
+      campaign,
+      workers: [],
+      hypotheses: [],
+      summaries: [
+        {
+          id: "summary-1",
+          campaignId,
+          sessionId: "session-1",
+          hypothesisId: "hypothesis-1",
+          authoredByWorkerId: "worker-1",
+          summaryKind: "hypothesis_summary",
+          title: "Tuning completed",
+          body: "Score improved after a small gain sweep.",
+          isCurrent: true,
+        },
+        {
+          id: "summary-2",
+          campaignId,
+          sessionId: null,
+          hypothesisId: null,
+          authoredByWorkerId: null,
+          summaryKind: "campaign_brief",
+          title: "Campaign brief",
+          body: "Overall campaign context.",
+          isCurrent: false,
+        },
+      ],
+      knowledge: [],
+      bestExperiment: null,
+      latestExperiments: [],
+      counts: { experiments: 0, hypothesisCount: 0, activeWorkers: 0 },
+    }
+    const previousCwd = process.cwd()
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    try {
+      process.chdir(root)
+      await withMockResearchApi(
+        (request) => {
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/overview`
+          ) {
+            return { body: { data: overview } }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        () =>
+          commandSummaryList({
+            positional: ["summary", "list"],
+            options: { campaign: campaignName, kind: "hypothesis_summary" },
+          })
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    expect(logs.join("\n")).toContain(
+      "hypothesis_summary current: Tuning completed"
+    )
+    expect(logs.join("\n")).toContain("worker=worker-1")
+    expect(logs.join("\n")).not.toContain("Campaign brief")
+  })
+})
+
+describe("worker output summaries", () => {
+  test("uses final stream-json result before partial assistant text", () => {
+    const summary = summarizeWorkerOutput({
+      code: 0,
+      stdout: [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "partial text" }] },
+        }),
+        JSON.stringify({ type: "result", result: "clean final answer" }),
+      ].join("\n"),
+      stderr: "",
+      timedOut: false,
+      signal: null,
+      startupTimedOut: false,
+      lastOutputAt: null,
+      logPath: "/tmp/worker.log",
+    })
+
+    expect(summary).toBe("clean final answer")
+  })
+})
+
 describe("research hypothesis add", () => {
   test("prints setup-aware hypothesis plan examples", async () => {
     const { root } = await writeResearchSmokeRepo()
@@ -733,7 +1219,7 @@ describe("research hypothesis add", () => {
     })
     expect(logs).toContain(`Research hypothesis: ${hypothesisId}`)
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent claude`
+      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent claude --max-iterations 10 --max-minutes 5`
     )
   })
 
@@ -886,7 +1372,7 @@ describe("research hypothesis add", () => {
       plan: { focus: "Replacement search" },
     })
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent codex`
+      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent codex --max-iterations 10 --max-minutes 5`
     )
   })
 })
