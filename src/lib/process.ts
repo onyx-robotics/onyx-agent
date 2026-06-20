@@ -84,6 +84,7 @@ export async function runStreamingProcess(
   await mkdir(dirname(options.logPath), { recursive: true })
 
   return new Promise((resolveProcess, reject) => {
+    const useProcessGroup = process.platform !== "win32"
     const log = createWriteStream(options.logPath, { flags: "a" })
     const startedAt = new Date().toISOString()
     log.write(
@@ -102,6 +103,7 @@ export async function runStreamingProcess(
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
+      detached: useProcessGroup,
       stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     })
     const stdout: Buffer[] = []
@@ -112,13 +114,25 @@ export async function runStreamingProcess(
     let forceKill: ReturnType<typeof setTimeout> | null = null
     let lastOutputAt: string | null = null
 
+    const killChild = (signal: NodeJS.Signals) => {
+      if (useProcessGroup && child.pid) {
+        try {
+          process.kill(-child.pid, signal)
+          return
+        } catch {
+          // Fall back to killing the direct child below.
+        }
+      }
+      child.kill(signal)
+    }
+
     const terminate = (startup: boolean) => {
       if (closed) return
       timedOut = true
       startupTimedOut = startupTimedOut || startup
-      child.kill("SIGTERM")
+      killChild("SIGTERM")
       forceKill = setTimeout(() => {
-        if (!closed) child.kill("SIGKILL")
+        if (!closed) killChild("SIGKILL")
       }, options.killGraceMs ?? 5000)
     }
 
