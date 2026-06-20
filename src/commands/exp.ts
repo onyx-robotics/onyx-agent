@@ -22,6 +22,7 @@ import {
   appendOutbox,
   clearLastRun,
   clientRunRef,
+  readOutbox,
   readLastRun,
   readState,
   writeLastRun,
@@ -156,9 +157,7 @@ function setupCompliance({
       ? []
       : changedPaths.filter(
           (path) =>
-            !setup.editableScope.some((scope) =>
-              pathMatchesScope(path, scope)
-            )
+            !setup.editableScope.some((scope) => pathMatchesScope(path, scope))
         )
   const setupPathsChanged = changedPaths.filter((path) =>
     defaultProtected.some((scope) => pathMatchesScope(path, scope))
@@ -454,9 +453,7 @@ export async function commandExpRun(args: Args) {
     }),
   })
   const status: ExperimentStatus =
-    compliance.status === "setup_violation"
-      ? "setup_violation"
-      : measuredStatus
+    compliance.status === "setup_violation" ? "setup_violation" : measuredStatus
   const outputSummaryParts = [
     result.timedOut ? `Eval timed out after ${timeoutMs / 1000}s.` : "",
     result.code === 0 && primary.value === null
@@ -467,6 +464,11 @@ export async function commandExpRun(args: Args) {
   const outputSummary = outputSummaryParts.join("\n").slice(0, 4000) || null
 
   if (optionalFlag(args, "no-log")) {
+    if (existingAttempt) {
+      await writeLastRun(root, existingAttempt)
+    } else {
+      await clearLastRun(root)
+    }
     console.log(
       JSON.stringify({ metrics, status, checks, compliance }, null, 2)
     )
@@ -626,9 +628,7 @@ export async function commandExpLog(args: Args) {
       }),
     })
   const loggedStatus: ExperimentStatus =
-    loggedCompliance.status === "setup_violation"
-      ? "setup_violation"
-      : status
+    loggedCompliance.status === "setup_violation" ? "setup_violation" : status
 
   const record: LocalResearchCampaignExperimentLoggedRecord = {
     schemaVersion: 1,
@@ -683,9 +683,23 @@ export async function commandExpList(args: Args) {
   }
 
   const rows: LocalResearchHistoryRecord[] = [...records]
+  const seenRunRefs = new Set(rows.map((row) => row.runRef))
+  const { records: pendingOutbox, corrupt: corruptOutbox } =
+    await readOutbox(root)
+  if (corruptOutbox > 0) {
+    console.warn(
+      `Skipped ${corruptOutbox} unreadable pending outbox record(s).`
+    )
+  }
+  for (const record of pendingOutbox) {
+    if (record.type !== "campaign_experiment_logged") continue
+    if (seenRunRefs.has(record.runRef)) continue
+    rows.push(experimentRecordToHistory(record))
+    seenRunRefs.add(record.runRef)
+  }
 
   const lastRun = await readLastRun(root)
-  if (lastRun && !rows.some((row) => row.runRef === lastRun.runRef)) {
+  if (lastRun && !seenRunRefs.has(lastRun.runRef)) {
     rows.push({
       schemaVersion: 1,
       source: "local",
@@ -710,6 +724,7 @@ export async function commandExpList(args: Args) {
       workerId: lastRun.workerId,
       laneId: lastRun.laneId,
     })
+    seenRunRefs.add(lastRun.runRef)
   }
 
   let filtered = rows
@@ -758,8 +773,8 @@ export async function commandExpList(args: Args) {
 
   if (limited.length === 0) {
     console.log(
-      records.length === 0
-        ? "No experiments recorded yet. Run `onyx sync` to hydrate from the Onyx app."
+      rows.length === 0
+        ? "No local experiments recorded yet. Run `onyx sync` to hydrate from the Onyx app, or `onyx exp run`/`onyx exp log` to create one locally."
         : "No experiments matched the given filters."
     )
     return

@@ -71,12 +71,7 @@ export type ApiSession = {
   id: string
   campaignId: string
   name: string
-  status:
-    | "running"
-    | "stop_requested"
-    | "completed"
-    | "failed"
-    | "stopped"
+  status: "running" | "stop_requested" | "completed" | "failed" | "stopped"
   workerTarget: number | null
   metadata: Record<string, unknown>
 }
@@ -136,7 +131,12 @@ export type ApiKnowledge = {
   laneId: string | null
   authoredByWorkerId: string | null
   experimentId: string | null
-  kind: "insight" | "dead_end" | "promising_direction" | "risk" | "transfer_note"
+  kind:
+    | "insight"
+    | "dead_end"
+    | "promising_direction"
+    | "risk"
+    | "transfer_note"
   title: string
   body: string
   confidence: number | null
@@ -587,6 +587,20 @@ export async function createCampaignKnowledge(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/knowledge`,
       body,
+      args
+    )
+  )
+}
+
+export async function listCampaignKnowledge(
+  campaignId: string,
+  args?: Args
+): Promise<ApiKnowledge[]> {
+  return apiData<ApiKnowledge[]>(
+    await callApi(
+      "GET",
+      `/api/v1/research/campaigns/${campaignId}/knowledge`,
+      undefined,
       args
     )
   )

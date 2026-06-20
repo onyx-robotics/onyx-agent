@@ -236,6 +236,19 @@ async function validateModule({
         `setup projectPath "${setup.projectPath}" does not match active project path "${projectPath}".`
       )
     }
+    if (setup.editableScope.length === 0) {
+      return done(
+        "passed",
+        "Project path and protected paths are schema-valid. Warning: editableScope is empty, so workers may edit any non-protected path.",
+        {
+          evidence: {
+            warnings: [
+              "Set editableScope to the intended source paths, or enforce physical/safety limits in checks.sh.",
+            ],
+          },
+        }
+      )
+    }
     return done(
       "passed",
       "Project path, editable scope, and protected paths are schema-valid."
@@ -438,6 +451,11 @@ export async function commandSetupValidate(args: Args) {
   )) {
     console.log(
       `${item.moduleId}: ${item.status}${item.required ? " required" : " optional"} - ${item.summary ?? ""}`
+    )
+  }
+  if (setup?.editableScope.length === 0) {
+    console.warn(
+      "warning: editableScope is empty; workers may edit any non-protected path. Set editableScope or enforce physical/safety limits in onyx/checks.sh."
     )
   }
   console.log(`wrote ${validationPath(root, projectPath)}`)

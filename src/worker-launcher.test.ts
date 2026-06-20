@@ -11,10 +11,13 @@ import { join } from "node:path"
 
 import { describe, expect, test } from "bun:test"
 
-import { runStreamingProcess } from "./lib/process"
+import { writeConfig } from "./lib/config"
+import { runProcess, runStreamingProcess } from "./lib/process"
 import {
   buildWorkerInvocation,
   preflightWorkerInvocation,
+  writeWorkerLaunchManifest,
+  writeWorkerOnyxShim,
 } from "./lib/worker-launcher"
 
 async function writeFakeAgent(path: string, version: string) {
@@ -44,18 +47,47 @@ async function writeFakeAgent(path: string, version: string) {
   await chmod(path, 0o755)
 }
 
+async function writeFakeOnyx(path: string) {
+  await writeFile(
+    path,
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      'if [[ "${1:-}" == "--version" ]]; then',
+      '  echo "onyx fake 1.0"',
+      "  exit 0",
+      "fi",
+      'if [[ "${1:-}" == "--help" ]]; then',
+      '  echo "onyx research should-stop"',
+      '  echo "onyx knowledge add"',
+      '  echo "onyx knowledge list"',
+      '  echo "onyx summary upsert"',
+      '  echo "onyx exp run [--campaign"',
+      "  exit 0",
+      "fi",
+      'echo "onyx fake command $*"',
+      "",
+    ].join("\n"),
+    "utf8"
+  )
+  await chmod(path, 0o755)
+}
+
 describe("worker launchers", () => {
-  test("builds direct Codex and Claude invocations without prompt argv", () => {
+  test("builds direct Codex and Claude invocations with git writable roots", () => {
     const prompt = "SECRET_PROMPT"
+    const addedWritableRoots = ["/tmp/worktree/.git", "/tmp/repo/.git"]
     const codex = buildWorkerInvocation({
       agentKind: "codex",
       worktree: "/tmp/worktree",
       prompt,
+      addedWritableRoots,
     })
     const claude = buildWorkerInvocation({
       agentKind: "claude",
       worktree: "/tmp/worktree",
       prompt,
+      addedWritableRoots,
     })
 
     expect(codex.command).toBe("codex")
@@ -68,6 +100,10 @@ describe("worker launchers", () => {
       "exec",
       "--cd",
       "/tmp/worktree",
+      "--add-dir",
+      "/tmp/worktree/.git",
+      "--add-dir",
+      "/tmp/repo/.git",
       "--json",
       "--color",
       "never",
@@ -89,6 +125,10 @@ describe("worker launchers", () => {
       "auto",
       "--add-dir",
       "/tmp/worktree",
+      "--add-dir",
+      "/tmp/worktree/.git",
+      "--add-dir",
+      "/tmp/repo/.git",
       "--no-session-persistence",
     ])
     expect(claude.stdin).toBe(prompt)
@@ -101,7 +141,9 @@ describe("worker launchers", () => {
     const worktree = join(root, "worktree")
     await mkdir(bin)
     await mkdir(worktree)
+    await runProcess("git", ["init"], { cwd: worktree })
     await writeFakeAgent(join(bin, "codex"), "codex fake 1.0")
+    await writeFakeOnyx(join(bin, "onyx"))
 
     const argsFile = join(root, "args.txt")
     const cwdFile = join(root, "cwd.txt")
@@ -125,15 +167,19 @@ describe("worker launchers", () => {
     expect(preflight.version).toContain("codex fake 1.0")
 
     const logPath = join(root, "worker.log")
-    const result = await runStreamingProcess(invocation.command, invocation.args, {
-      cwd: worktree,
-      env,
-      stdin: invocation.stdin,
-      logPath,
-      timeoutMs: 5000,
-      startupTimeoutMs: 1000,
-      killGraceMs: 100,
-    })
+    const result = await runStreamingProcess(
+      invocation.command,
+      invocation.args,
+      {
+        cwd: worktree,
+        env,
+        stdin: invocation.stdin,
+        logPath,
+        timeoutMs: 5000,
+        startupTimeoutMs: 1000,
+        killGraceMs: 100,
+      }
+    )
 
     expect(result.code).toBe(0)
     expect(await readFile(stdinFile, "utf8")).toBe("do useful work")
@@ -150,7 +196,9 @@ describe("worker launchers", () => {
     const worktree = join(root, "worktree")
     await mkdir(bin)
     await mkdir(worktree)
+    await runProcess("git", ["init"], { cwd: worktree })
     await writeFakeAgent(join(bin, "claude"), "claude fake 2.0")
+    await writeFakeOnyx(join(bin, "onyx"))
 
     const env = {
       ...process.env,
@@ -170,6 +218,105 @@ describe("worker launchers", () => {
     })
 
     expect(preflight.version).toContain("claude fake 2.0")
+  })
+
+  test("writes launch manifests after creating parent directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-manifest-"))
+    const manifestPath = join(root, "missing", "worker.manifest.json")
+
+    await writeWorkerLaunchManifest({
+      schemaVersion: 1,
+      agentKind: "codex",
+      command: "codex",
+      args: ["exec"],
+      onyxShimPath: null,
+      addedWritableRoots: [],
+      cwd: root,
+      promptPath: join(root, "prompt.md"),
+      logPath: join(root, "worker.log"),
+      manifestPath,
+      sessionId: "session",
+      laneId: "lane",
+      laneName: "lane-one",
+      workerId: "worker",
+      version: null,
+      startedAt: "2026-06-20T00:00:00.000Z",
+      lastOutputAt: null,
+      completedAt: null,
+      status: "starting",
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+      preflight: null,
+      finalization: null,
+    })
+
+    expect(await readFile(manifestPath, "utf8")).toContain('"schemaVersion": 1')
+  })
+
+  test("dev-mode onyx shim dispatches through linked checkout with bypass", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-shim-root-"))
+    const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-shim-config-"))
+    const checkout = await mkdtemp(join(tmpdir(), "onyx-worker-shim-checkout-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await mkdir(join(checkout, "bin"), { recursive: true })
+    await mkdir(join(checkout, "skills", "onyx"), { recursive: true })
+    const binPath = join(checkout, "bin", "onyx.js")
+    await writeFile(
+      binPath,
+      [
+        "#!/usr/bin/env bun",
+        'if (process.env.ONYX_LAUNCHER_BYPASS !== "1") process.exit(42)',
+        'if (process.argv.includes("--help")) {',
+        '  console.log("onyx research should-stop")',
+        '  console.log("onyx knowledge add")',
+        '  console.log("onyx knowledge list")',
+        '  console.log("onyx summary upsert")',
+        '  console.log("onyx exp run [--campaign")',
+        "  process.exit(0)",
+        "}",
+        'console.log("linked checkout")',
+        "",
+      ].join("\n"),
+      "utf8"
+    )
+    await chmod(binPath, 0o755)
+
+    const previousConfigHome = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = configHome
+    try {
+      await writeConfig({
+        currentProfile: "",
+        profiles: {},
+        developer: {
+          mode: "dev",
+          checkout: {
+            root: checkout,
+            binPath,
+            skillPath: join(checkout, "skills", "onyx", "SKILL.md"),
+          },
+        },
+      })
+
+      const shim = await writeWorkerOnyxShim({ root, sessionId: "session" })
+      expect(shim.mode).toBe("dev")
+      expect(shim.target).toBe(binPath)
+      const help = await runProcess(shim.onyxPath, ["--help"], {
+        timeoutMs: 5000,
+      })
+      expect(help.code).toBe(0)
+      expect(help.stdout).toContain("onyx research should-stop")
+      expect(help.stdout).toContain("onyx knowledge list")
+      expect(help.stdout).toContain("onyx summary upsert")
+    } finally {
+      if (previousConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME
+      } else {
+        process.env.XDG_CONFIG_HOME = previousConfigHome
+      }
+    }
   })
 
   test("startup timeout kills silent workers", async () => {

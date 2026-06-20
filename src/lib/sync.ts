@@ -286,10 +286,14 @@ export async function flushOutbox(
     state.projectId = project.id
   } catch (error) {
     if (!options.quiet) {
+      const hasQueuedCampaignSetup = records.some(
+        (record) => record.type === "campaign_started"
+      )
+      const detail = error instanceof Error ? error.message : String(error)
       console.warn(
-        `Project lookup skipped; campaign sync will lazily create it if GitHub access is available (${
-          error instanceof Error ? error.message : String(error)
-        })`
+        hasQueuedCampaignSetup
+          ? `Project lookup skipped before campaign sync; the queued campaign setup can create or reuse the project. If sync reports a missing base commit, push the base commit and run \`onyx sync\` again. (${detail})`
+          : `Project lookup skipped; grant Onyx GitHub access to this repository or run \`onyx campaign setup\` before syncing. (${detail})`
       )
     }
   }
@@ -331,14 +335,13 @@ export async function flushOutbox(
         skippedDeleted += 1
         continue
       }
-      if (!(error instanceof ApiError) || error.status !== 409) {
-        if (!options.quiet) {
-          console.warn(
-            `Keeping queued record after error: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          )
-        }
+      if (!options.quiet) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn(
+          error instanceof ApiError && error.status === 409
+            ? `Keeping queued record after conflict: ${message}`
+            : `Keeping queued record after error: ${message}`
+        )
       }
       remaining.push(record)
     }

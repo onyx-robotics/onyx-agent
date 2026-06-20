@@ -21,7 +21,10 @@ const baseInput = {
   metricLabel: "tracking_error (m), minimize",
   minutesRemaining: 10,
   protectedPaths: ["onyx/onyx.md", "onyx/setup.json"],
+  researchDeadlineIso: "2026-06-20T14:08:30.000Z",
   setupFilePath: "/repo/onyx/setup.json",
+  shutdownCushionSeconds: 90,
+  shutdownDeadlineIso: "2026-06-20T14:10:00.000Z",
   validationFilePath: "/repo/onyx/validation.json",
   researchSpecPath: "onyx/onyx.md",
   sessionId: "session_123",
@@ -35,10 +38,18 @@ describe("lane worker prompt", () => {
     expect(prompt).toContain("# Onyx Lane Worker: lane-1")
     expect(prompt).toContain("- Name: drone-controller")
     expect(prompt).toContain("- Metric: tracking_error (m), minimize")
+    expect(prompt).toContain(
+      "- Stop starting new research by: 2026-06-20T14:08:30.000Z"
+    )
+    expect(prompt).toContain(
+      "- Final shutdown deadline: 2026-06-20T14:10:00.000Z"
+    )
     expect(prompt).toContain("- Setup file: /repo/onyx/setup.json")
     expect(prompt).toContain("- Validation report: /repo/onyx/validation.json")
     expect(prompt).toContain("- Focus: Reduce controller overshoot")
     expect(prompt).toContain("onyx knowledge add")
+    expect(prompt).toContain("Make one small, measured, logged attempt early")
+    expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
     expect(prompt).toContain("Primary metric is king")
     expect(prompt).toContain("Do not ask whether to continue")
     expect(prompt).not.toContain("Peer lane state")

@@ -1,8 +1,13 @@
-import { readdir, readFile, writeFile } from "node:fs/promises"
-import { join } from "node:path"
+import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises"
+import { delimiter } from "node:path"
+import { dirname, join } from "node:path"
 
 import { onyxStateDir } from "./outbox"
+import { readConfig } from "./config"
+import { gitCommonDir, gitDir } from "./git"
 import { pathExists, runProcess } from "./process"
+
+const ONYX_LAUNCHER_BYPASS = "ONYX_LAUNCHER_BYPASS"
 
 export type BuiltInWorkerAgent = "codex" | "claude"
 export type WorkerAgentKind = BuiltInWorkerAgent | "custom"
@@ -14,6 +19,35 @@ export type WorkerInvocation = {
   redactedArgs: string[]
   stdin?: string
   preflightArgs?: string[]
+  addedWritableRoots: string[]
+}
+
+export type WorkerPreflightCheck = {
+  name: string
+  status: "passed" | "failed"
+  output: string | null
+}
+
+export type WorkerPreflightResult = {
+  version: string | null
+  onyxVersion: string | null
+  checks: WorkerPreflightCheck[]
+}
+
+export type WorkerOnyxShim = {
+  binDir: string
+  onyxPath: string
+  mode: "dev" | "release"
+  target: string
+}
+
+export type WorkerFinalizationManifest = {
+  attempted: boolean
+  salvaged: boolean
+  commitSha: string | null
+  experimentLogged: boolean
+  lanePushStatus: "not_attempted" | "pushed" | "failed"
+  error: string | null
 }
 
 export type WorkerLaunchManifest = {
@@ -21,6 +55,8 @@ export type WorkerLaunchManifest = {
   agentKind: WorkerAgentKind
   command: string
   args: string[]
+  onyxShimPath: string | null
+  addedWritableRoots: string[]
   cwd: string
   promptPath: string
   logPath: string
@@ -39,6 +75,8 @@ export type WorkerLaunchManifest = {
   timedOut: boolean
   startupTimedOut: boolean
   error: string | null
+  preflight: WorkerPreflightResult | null
+  finalization: WorkerFinalizationManifest | null
 }
 
 function safeSegment(value: string) {
@@ -50,16 +88,96 @@ function safeSegment(value: string) {
   )
 }
 
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function unique(values: string[]) {
+  return [...new Set(values.filter(Boolean))]
+}
+
+export async function workerGitWritableRoots(worktree: string) {
+  return unique([await gitDir(worktree), await gitCommonDir(worktree)])
+}
+
+export async function writeWorkerOnyxShim({
+  root,
+  sessionId,
+}: {
+  root: string
+  sessionId: string
+}): Promise<WorkerOnyxShim> {
+  const dir = join(await onyxStateDir(root), "worker-bin", sessionId)
+  await mkdir(dir, { recursive: true })
+  const onyxPath = join(dir, "onyx")
+  const config = await readConfig()
+
+  let mode: WorkerOnyxShim["mode"] = "release"
+  let target = "onyx"
+  let script: string
+  if (config.developer.mode === "dev" && config.developer.checkout) {
+    const checkout = config.developer.checkout
+    if (!(await pathExists(checkout.binPath))) {
+      throw new Error(
+        `Onyx developer mode is active, but the linked CLI entrypoint is missing: ${checkout.binPath}. Run \`onyx developer link <path>\` again or switch back with \`onyx developer use release\`.`
+      )
+    }
+    mode = "dev"
+    target = checkout.binPath
+    script = [
+      "#!/usr/bin/env sh",
+      "set -eu",
+      `exec env ${ONYX_LAUNCHER_BYPASS}=1 bun ${shellQuote(checkout.binPath)} "$@"`,
+      "",
+    ].join("\n")
+  } else {
+    const resolved = await runProcess("sh", ["-lc", "command -v onyx"], {
+      timeoutMs: 5000,
+    })
+    if (resolved.code !== 0 || !resolved.stdout.trim()) {
+      throw new Error(
+        "Unable to resolve the Onyx CLI on PATH for worker launch. Install `onyx`, or use developer mode with `onyx developer link <path>`."
+      )
+    }
+    target = resolved.stdout.trim().split("\n")[0]!
+    script = [
+      "#!/usr/bin/env sh",
+      "set -eu",
+      `exec env ${ONYX_LAUNCHER_BYPASS}=1 ${shellQuote(target)} "$@"`,
+      "",
+    ].join("\n")
+  }
+
+  await writeFile(onyxPath, script, "utf8")
+  await chmod(onyxPath, 0o755)
+  return { binDir: dir, onyxPath, mode, target }
+}
+
+export function workerEnvironment({
+  baseEnv,
+  shim,
+}: {
+  baseEnv: NodeJS.ProcessEnv
+  shim: WorkerOnyxShim
+}) {
+  return {
+    ...baseEnv,
+    PATH: [shim.binDir, baseEnv.PATH ?? ""].filter(Boolean).join(delimiter),
+  }
+}
+
 export function buildWorkerInvocation({
   agentKind,
   workerCommand,
   worktree,
   prompt,
+  addedWritableRoots = [],
 }: {
   agentKind: string
   workerCommand?: string
   worktree: string
   prompt: string
+  addedWritableRoots?: string[]
 }): WorkerInvocation {
   if (workerCommand) {
     return {
@@ -67,10 +185,15 @@ export function buildWorkerInvocation({
       command: "sh",
       args: ["-lc", workerCommand],
       redactedArgs: ["-lc", "<worker-command>"],
+      addedWritableRoots: [],
     }
   }
 
   if (agentKind === "codex") {
+    const writableArgs = addedWritableRoots.flatMap((root) => [
+      "--add-dir",
+      root,
+    ])
     const args = [
       "--search",
       "--sandbox",
@@ -80,6 +203,7 @@ export function buildWorkerInvocation({
       "exec",
       "--cd",
       worktree,
+      ...writableArgs,
       "--json",
       "--color",
       "never",
@@ -93,10 +217,14 @@ export function buildWorkerInvocation({
       redactedArgs: args,
       preflightArgs: args.slice(0, -1).concat("--help"),
       stdin: prompt,
+      addedWritableRoots,
     }
   }
 
   if (agentKind === "claude") {
+    const writableArgs = unique([worktree, ...addedWritableRoots]).flatMap(
+      (root) => ["--add-dir", root]
+    )
     const args = [
       "--print",
       "--input-format",
@@ -106,8 +234,7 @@ export function buildWorkerInvocation({
       "--include-partial-messages",
       "--permission-mode",
       "auto",
-      "--add-dir",
-      worktree,
+      ...writableArgs,
       "--no-session-persistence",
     ]
     return {
@@ -117,6 +244,7 @@ export function buildWorkerInvocation({
       redactedArgs: args,
       preflightArgs: args.concat("--help"),
       stdin: prompt,
+      addedWritableRoots,
     }
   }
 
@@ -127,10 +255,16 @@ export function buildWorkerInvocation({
 
 export async function preflightWorkerInvocation(
   invocation: WorkerInvocation,
-  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }
-) {
+  options: {
+    cwd: string
+    env?: NodeJS.ProcessEnv
+    timeoutMs?: number
+    campaignName?: string
+    sessionId?: string
+  }
+): Promise<WorkerPreflightResult> {
   if (invocation.agentKind === "custom") {
-    return { version: null }
+    return { version: null, onyxVersion: null, checks: [] }
   }
 
   let version: string | null = null
@@ -166,11 +300,15 @@ export async function preflightWorkerInvocation(
   }
 
   if (invocation.preflightArgs) {
-    const result = await runProcess(invocation.command, invocation.preflightArgs, {
-      cwd: options.cwd,
-      env: options.env,
-      timeoutMs: options.timeoutMs ?? 10_000,
-    })
+    const result = await runProcess(
+      invocation.command,
+      invocation.preflightArgs,
+      {
+        cwd: options.cwd,
+        env: options.env,
+        timeoutMs: options.timeoutMs ?? 10_000,
+      }
+    )
     if (result.code !== 0 || result.timedOut) {
       throw new Error(
         `${invocation.command} argument preflight failed: ${
@@ -182,7 +320,117 @@ export async function preflightWorkerInvocation(
     }
   }
 
-  return { version }
+  const checks: WorkerPreflightCheck[] = []
+  let onyxVersion: string | null = null
+  const runCheck = async (
+    name: string,
+    command: string,
+    args: string[],
+    optionsOverride: { allowExitCodes?: number[] } = {}
+  ) => {
+    const result = await runProcess(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      timeoutMs: options.timeoutMs ?? 10_000,
+    })
+    const output = [result.stdout.trim(), result.stderr.trim()]
+      .filter(Boolean)
+      .join("\n")
+    const allowed = optionsOverride.allowExitCodes ?? [0]
+    const passed =
+      !result.timedOut &&
+      result.code !== null &&
+      allowed.includes(result.code) &&
+      !output.includes("Unknown command:")
+    checks.push({
+      name,
+      status: passed ? "passed" : "failed",
+      output: output || null,
+    })
+    if (!passed) {
+      throw new Error(
+        `Worker environment preflight failed (${name}): ${
+          result.timedOut ? "timed out" : output || `exit ${result.code}`
+        }`
+      )
+    }
+    return result
+  }
+
+  const onyxHelp = await runCheck("onyx surface", "onyx", ["--help"])
+  const help = onyxHelp.stdout
+  for (const required of [
+    "onyx research should-stop",
+    "onyx knowledge add",
+    "onyx knowledge list",
+    "onyx summary upsert",
+    "onyx exp run [--campaign",
+  ]) {
+    if (!help.includes(required)) {
+      const output = `Onyx CLI surface is missing ${required}. The worker is likely resolving a stale bundled CLI instead of the orchestrator's CLI.`
+      checks.push({
+        name: `onyx capability ${required}`,
+        status: "failed",
+        output,
+      })
+      throw new Error(output)
+    }
+  }
+  checks.push({
+    name: "onyx capability surface",
+    status: "passed",
+    output: null,
+  })
+
+  const versionResult = await runCheck("onyx version", "onyx", ["--version"])
+  onyxVersion =
+    [versionResult.stdout.trim(), versionResult.stderr.trim()]
+      .filter(Boolean)
+      .join("\n") || null
+
+  await runCheck("git metadata write", "git", [
+    "update-index",
+    "-q",
+    "--refresh",
+  ])
+
+  if (options.sessionId) {
+    await runCheck(
+      "onyx should-stop",
+      "onyx",
+      [
+        "research",
+        "should-stop",
+        "--session",
+        options.sessionId,
+        "--iteration",
+        "0",
+        "--json",
+      ],
+      { allowExitCodes: [0, 1] }
+    )
+  }
+
+  if (options.campaignName) {
+    await runCheck(
+      "onyx exp run",
+      "onyx",
+      [
+        "exp",
+        "run",
+        "--campaign",
+        options.campaignName,
+        "--timeout",
+        "120",
+        "--checks-timeout",
+        "120",
+        "--no-log",
+      ],
+      { allowExitCodes: [0, 1] }
+    )
+  }
+
+  return { version, onyxVersion, checks }
 }
 
 export async function workerLaunchPaths({
@@ -208,6 +456,7 @@ export async function workerLaunchPaths({
 export async function writeWorkerLaunchManifest(
   manifest: WorkerLaunchManifest
 ) {
+  await mkdir(dirname(manifest.manifestPath), { recursive: true })
   await writeFile(
     manifest.manifestPath,
     `${JSON.stringify(manifest, null, 2)}\n`,

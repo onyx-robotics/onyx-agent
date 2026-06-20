@@ -9,6 +9,7 @@ import {
   appendOutbox,
   assertSetupCommitted,
   clientRunRef,
+  commandExpList,
   commandSetupInit,
   commandSetupModules,
   commandSetupRequire,
@@ -55,8 +56,10 @@ describe("campaign CLI surface", () => {
     expect(USAGE).toContain("onyx setup validate")
     expect(USAGE).toContain("onyx setup require")
     expect(USAGE).toContain("onyx research start --campaign")
+    expect(USAGE).toContain("onyx research lane-plans --example")
     expect(USAGE).toContain("onyx research should-stop")
     expect(USAGE).toContain("onyx research finish")
+    expect(USAGE).toContain("onyx knowledge list")
     expect(USAGE).toContain("onyx tools run")
     expect(USAGE).not.toContain("onyx campaign create")
     expect(USAGE).not.toContain("onyx branch create")
@@ -204,6 +207,57 @@ describe("history helpers", () => {
 
   test("canonical API records replace provisional local rows by runRef", () => {
     expect(mergeHistory([api], [local])).toEqual([api])
+  })
+
+  test("exp list includes pending local outbox experiments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-exp-list-outbox-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeFile(join(root, "README.md"), "test\n", "utf8")
+    await commitAll(root, "init")
+    await appendOutbox(root, {
+      schemaVersion: 1,
+      type: "campaign_experiment_logged",
+      createdAt: "2026-06-17T12:00:00.000Z",
+      runRef: "local/fast-eval/outbox-only",
+      campaignName: "fast-eval",
+      name: "outbox-only",
+      baseCommitSha: "abcdef1",
+      resultCommitSha: "1234567",
+      resultRef: "refs/onyx/experiments/campaign/local/fast-eval/outbox-only",
+      status: "succeeded",
+      setupCompliance: {
+        status: "passed",
+        protectedPathsChanged: [],
+        outOfScopePathsChanged: [],
+        setupPathsChanged: [],
+        notes: null,
+      },
+      primaryMetricName: "score",
+      primaryMetricValue: 1,
+      metrics: { score: 1 },
+      agentNotes: {},
+    })
+
+    const previousCwd = process.cwd()
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandExpList({
+        positional: ["exp", "list"],
+        options: { json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const rows = JSON.parse(logs.join("\n")) as LocalResearchHistoryRecord[]
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.runRef).toBe("local/fast-eval/outbox-only")
   })
 })
 
@@ -405,6 +459,16 @@ describe("setup modules", () => {
       await expect(
         assertSetupCommitted({ root, projectPath: "" })
       ).resolves.toBeUndefined()
+      await writeFile(join(root, "onyx", "lane-plans.json"), "[]\n")
+      await expect(
+        assertSetupCommitted({ root, projectPath: "" })
+      ).resolves.toBeUndefined()
+      await mkdir(join(root, "onyx", "tools"), { recursive: true })
+      await writeFile(join(root, "onyx", "tools", "helper.sh"), "echo helper\n")
+      await expect(
+        assertSetupCommitted({ root, projectPath: "" })
+      ).rejects.toThrow("uncommitted changes")
+      await commitAll(root, "add scratch and tool")
       await expect(
         assertSetupCommitted({
           root,

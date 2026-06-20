@@ -13,6 +13,14 @@ export function requiredSetupRepoPaths(projectPath: string) {
   ]
 }
 
+export function protectedSetupRepoPaths(projectPath: string) {
+  return [
+    ...requiredSetupRepoPaths(projectPath),
+    setupRepoPath(projectPath, "checks.sh"),
+    setupRepoPath(projectPath, "tools"),
+  ]
+}
+
 export async function assertSetupCommitted({
   root,
   projectPath,
@@ -24,14 +32,17 @@ export async function assertSetupCommitted({
   baseCommitSha?: string
   requireBaseMatchesHead?: boolean
 }) {
-  const setupDir = setupRepoPath(projectPath)
-  const status = await git(["status", "--porcelain", "--", setupDir], root)
+  const protectedPaths = protectedSetupRepoPaths(projectPath)
+  const status = await git(
+    ["status", "--porcelain", "--", ...protectedPaths],
+    root
+  )
   if (status.trim()) {
     throw new Error(
       [
-        "The onyx/ setup surface has uncommitted changes.",
+        "The protected Onyx setup surface has uncommitted changes.",
         "Commit the setup files before creating or starting a campaign:",
-        `  git add ${setupDir}`,
+        `  git add ${protectedPaths.join(" ")}`,
         '  git commit -m "Add Onyx setup"',
       ].join("\n")
     )
@@ -56,7 +67,13 @@ export async function assertSetupCommitted({
 
   if (requireBaseMatchesHead) {
     const changed = await git(
-      ["diff", "--name-only", `${baseCommitSha}..HEAD`, "--", setupDir],
+      [
+        "diff",
+        "--name-only",
+        `${baseCommitSha}..HEAD`,
+        "--",
+        ...protectedPaths,
+      ],
       root
     )
     if (changed.trim()) {

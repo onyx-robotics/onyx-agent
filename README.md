@@ -72,6 +72,7 @@ onyx setup init --goal "Improve score" --metric-name score
 onyx setup validate --required
 git add onyx
 git commit -m "Add Onyx setup"
+git push origin HEAD
 onyx campaign setup --name fast-eval --description "Improve score"
 onyx tools run evaluate
 onyx research start --campaign fast-eval --agents 4
@@ -94,7 +95,9 @@ records setup compliance.
 `onyx campaign setup` and `onyx research start` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
-`eval.sh`.
+`eval.sh`. GitHub-backed campaigns also require that base commit to be present
+on the repository remote; the CLI warns when it is missing, while the bundled
+`/onyx` skill pushes the setup base before campaign sync.
 
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
@@ -108,24 +111,29 @@ To run multiple local research lanes directly from the CLI, choose a built-in
 agent launcher:
 
 ```bash
+onyx research lane-plans --example > plans.json
 onyx research start --campaign fast-eval --agents 4 --lane-plans plans.json --max-minutes 10
 onyx worker run --session <id> --lane <lane-id> --agent codex
 onyx worker run --session <id> --lane <lane-id> --agent claude
 ```
 
 Codex and Claude are first-class built-in launchers. Both are spawned directly
-in non-interactive mode, receive the worker prompt over stdin, and write live
-stdout/stderr logs plus launch manifests under `.git/onyx/worker-logs/`.
+in non-interactive mode with the same Onyx CLI surface as the orchestrator,
+receive the worker prompt over stdin, and write live stdout/stderr logs plus
+launch manifests under `.git/onyx/worker-logs/`.
 `onyx research status` shows active-session lanes and workers by default,
-including log paths and last-output age when local manifests are available.
+including log paths, last-output age, timeout state, and manifest errors when
+local manifests are available.
 
 Each lane has a branch under `refs/heads/onyx/<campaign>/lanes/*`, gets a
 generated brief and worker prompt under `.git/onyx/`, polls
 `onyx research should-stop`, runs the setup contract through `onyx exp run`,
 pushes `refs/onyx/experiments/<campaignId>/<runRef>`, and reports the
 experiment with setup/session/lane/worker context. Workers publish shared
-learning with `onyx knowledge add`. Use `--worker-command` only for custom
-harnesses.
+learning with `onyx knowledge add` and read it back with `onyx knowledge list`.
+After the agent exits, the worker harness performs one final best-effort
+commit, measurement, local experiment log, and lane-ref push so useful offline
+work is not lost. Use `--worker-command` only for custom harnesses.
 
 Stop and finalize campaigns explicitly:
 

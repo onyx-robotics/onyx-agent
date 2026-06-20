@@ -14,11 +14,13 @@ import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
 import {
   commandResearchFinish,
+  commandResearchLanePlans,
   commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
   commandResearchStop,
   commandKnowledgeAdd,
+  commandKnowledgeList,
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
@@ -63,6 +65,7 @@ Usage:
   onyx campaign delete --name <name> [--project-path <path>]
   onyx research start --campaign <name> [--agents <n>] [--agent codex|claude] [--lane-plans <json>] [--max-iterations <n>] [--max-minutes <n>]
       (creates an async research session and prints worker launch commands)
+  onyx research lane-plans --example
   onyx worker run --session <id> [--lane <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
@@ -70,6 +73,7 @@ Usage:
   onyx research status [--campaign <name>] [--all-sessions]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--title <text>] --body <text>
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
+  onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
   onyx exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
@@ -138,6 +142,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandCampaignDelete(args)
     if (command === "research" && sub === "start")
       return commandResearchStart(args)
+    if (command === "research" && sub === "lane-plans")
+      return commandResearchLanePlans(args)
     if (command === "research" && sub === "should-stop")
       return commandResearchShouldStop(args)
     if (command === "research" && sub === "stop")
@@ -150,6 +156,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandSummaryUpsert(args)
     if (command === "knowledge" && sub === "add")
       return commandKnowledgeAdd(args)
+    if (command === "knowledge" && sub === "list")
+      return commandKnowledgeList(args)
     if (command === "worker" && sub === "run") return commandWorkerRun(args)
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "exp" && sub === "log") return commandExpLog(args)

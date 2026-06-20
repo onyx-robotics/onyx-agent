@@ -66,6 +66,7 @@ export {
 } from "./lib/git"
 export {
   assertSetupCommitted,
+  protectedSetupRepoPaths,
   requiredSetupRepoPaths,
   setupRepoPath,
 } from "./lib/setup-git"
@@ -73,7 +74,10 @@ export {
   buildWorkerInvocation,
   preflightWorkerInvocation,
   readWorkerLaunchManifests,
+  workerEnvironment,
+  workerGitWritableRoots,
   workerLaunchPaths,
+  writeWorkerOnyxShim,
   writeWorkerLaunchManifest,
   type WorkerInvocation,
   type WorkerLaunchManifest,
@@ -116,11 +120,13 @@ export { commandPush, commandStatus, commandSync } from "./commands/sync"
 export { commandToolsRun } from "./commands/tools"
 export {
   commandResearchFinish,
+  commandResearchLanePlans,
   commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
   commandResearchStop,
   commandKnowledgeAdd,
+  commandKnowledgeList,
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"

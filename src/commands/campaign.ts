@@ -1,11 +1,11 @@
 import type { LocalResearchCampaignStartedRecord } from "../protocol"
 
+import { descriptionOption, nameOption, type Args } from "../lib/args"
 import {
-  descriptionOption,
-  nameOption,
-  type Args,
-} from "../lib/args"
-import { deleteCampaign, listProjectCampaigns, resolveProject } from "../lib/api"
+  deleteCampaign,
+  listProjectCampaigns,
+  resolveProject,
+} from "../lib/api"
 import { readSetupFile } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, repoRoot } from "../lib/git"
@@ -86,7 +86,22 @@ export async function commandCampaignCreate(args: Args) {
   console.log(`Created campaign ${name}`)
   console.log(`Base commit: ${baseCommitSha}`)
 
-  await flushOutbox(root, args, { quiet: true }).catch(() => {})
+  const syncResult = await flushOutbox(root, args).catch((error) => {
+    console.warn(
+      `Campaign sync skipped: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+    return null
+  })
+  if (syncResult && syncResult.pending > 0) {
+    console.warn(
+      [
+        "Campaign setup is saved locally but not fully synced.",
+        "If the server says the base commit is missing, push the base commit to the repository remote, then run `onyx sync`.",
+      ].join(" ")
+    )
+  }
 }
 
 export async function commandCampaignUse(args: Args) {
