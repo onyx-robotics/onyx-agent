@@ -26,6 +26,7 @@ import {
   readLastRun,
   readLastRuns,
   readState,
+  withOnyxLock,
   writeLastRun,
   writeState,
   type LastRunSelector,
@@ -73,6 +74,17 @@ function validateStatus(value: string): ExperimentStatus {
   throw new Error(
     "--status must be queued, running, succeeded, failed, checks_failed, setup_violation, accepted, or rejected"
   )
+}
+
+function comparableExperimentRecord(
+  record: LocalResearchCampaignExperimentLoggedRecord
+) {
+  const comparable: Partial<LocalResearchCampaignExperimentLoggedRecord> = {
+    ...record,
+  }
+  delete comparable.createdAt
+  delete comparable.sync
+  return JSON.stringify(comparable)
 }
 
 function parseAgentNotes(value?: string): Record<string, unknown> {
@@ -601,6 +613,19 @@ export async function commandExpLog(args: Args) {
       ? lastRun
       : null
   if (args.options["run-ref"] && !usableLastRun) {
+    const { records } = await readOutbox(root)
+    const queued = records.find(
+      (record) =>
+        record.type === "campaign_experiment_logged" &&
+        record.runRef === args.options["run-ref"] &&
+        record.campaignName === campaignName
+    )
+    if (queued) {
+      console.log(
+        `Experiment ${args.options["run-ref"]} is already queued for campaign ${campaignName}`
+      )
+      return
+    }
     throw new Error(
       `No measured run found for --run-ref ${args.options["run-ref"]}. Run \`onyx exp list --json\` to inspect unlogged local runs.`
     )
@@ -716,7 +741,32 @@ export async function commandExpLog(args: Args) {
     workerId,
     hypothesisId,
   }
-  await appendOutbox(root, record)
+  let duplicateQueued = false
+  await withOnyxLock(root, "outbox", async () => {
+    const { records } = await readOutbox(root)
+    const existing = records.find(
+      (queued): queued is LocalResearchCampaignExperimentLoggedRecord =>
+        queued.type === "campaign_experiment_logged" &&
+        queued.runRef === record.runRef
+    )
+    if (existing) {
+      if (comparableExperimentRecord(existing) === comparableExperimentRecord(record)) {
+        duplicateQueued = true
+        return
+      }
+      throw new Error(
+        `Experiment runRef ${record.runRef} is already queued with different content. Use a new runRef for a distinct experiment.`
+      )
+    }
+    await appendOutbox(root, record)
+  })
+  if (duplicateQueued) {
+    if (usableLastRun) await clearLastRun(root, { runRef: usableLastRun.runRef })
+    console.log(
+      `Experiment ${record.runRef} is already queued for campaign ${campaignName}`
+    )
+    return
+  }
   await flushOutbox(root, args, { quiet: true }).catch(() => {})
   await appendHistory(root, experimentRecordToHistory(record)).catch(() => {})
   await emitEvent(root, {

@@ -82,7 +82,14 @@ export type ApiWorker = {
   sessionId: string | null
   hypothesisId: string
   workerName: string
-  status: "idle" | "running" | "stale" | "lost" | "stopped"
+  status:
+    | "idle"
+    | "running"
+    | "stale"
+    | "lost"
+    | "completed"
+    | "failed"
+    | "stopped"
   currentExperimentId: string | null
   phase: string | null
   progressMessage: string | null
@@ -552,7 +559,14 @@ export async function registerCampaignWorker(
 export async function heartbeatWorker(
   workerId: string,
   body: {
-    status?: "idle" | "running" | "stale" | "lost" | "stopped"
+    status?:
+      | "idle"
+      | "running"
+      | "stale"
+      | "lost"
+      | "completed"
+      | "failed"
+      | "stopped"
     sessionId?: string
     hypothesisId?: string
     experimentId?: string | null

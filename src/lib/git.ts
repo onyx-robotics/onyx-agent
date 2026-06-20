@@ -44,11 +44,25 @@ export async function pushRefs(
   refs: Array<{ commitSha: string; ref: string }>
 ) {
   if (refs.length === 0) return
+  const byRef = new Map<string, string>()
+  for (const entry of refs) {
+    const existing = byRef.get(entry.ref)
+    if (existing && existing !== entry.commitSha) {
+      throw new Error(
+        `Conflicting push destinations for ${entry.ref}: ${existing} and ${entry.commitSha}`
+      )
+    }
+    byRef.set(entry.ref, entry.commitSha)
+  }
+  const uniqueRefs = [...byRef.entries()].map(([ref, commitSha]) => ({
+    commitSha,
+    ref,
+  }))
   await git(
     [
       "push",
       "origin",
-      ...refs.map((entry) => `${entry.commitSha}:${entry.ref}`),
+      ...uniqueRefs.map((entry) => `${entry.commitSha}:${entry.ref}`),
     ],
     root
   )

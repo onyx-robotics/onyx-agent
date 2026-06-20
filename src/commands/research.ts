@@ -37,7 +37,13 @@ import {
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import { readHistory } from "../lib/history"
-import { onyxStateDir, readOutbox, readState, writeState } from "../lib/outbox"
+import {
+  onyxStateDir,
+  readOutbox,
+  readOutboxConflictCount,
+  readState,
+  writeState,
+} from "../lib/outbox"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
   pathExists,
@@ -300,6 +306,17 @@ function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
     )
   }
   return kind as SummaryKind
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function optionalUuid(value: string | undefined, label: string) {
+  if (value === undefined) return undefined
+  if (!UUID_PATTERN.test(value)) {
+    throw new Error(`${label} must be a UUID, not "${value}".`)
+  }
+  return value
 }
 
 function createSyncSupervisor({
@@ -679,6 +696,7 @@ async function finalizeHypothesisAttempt({
     commitSha: null,
     experimentLogged: false,
     workerBranchPushStatus: "not_attempted",
+    rootDriftStatus: "not_checked",
     error: null,
   }
 
@@ -688,7 +706,14 @@ async function finalizeHypothesisAttempt({
     const hasResult =
       (Boolean(dirty) && dirty.length > 0) ||
       headBefore !== hypothesis.baseCommitSha
-    if (!hasResult) return manifest
+    if (!hasResult) {
+      const rootStatus = await mainWorktreeStatus(root)
+      manifest.rootDriftStatus = rootStatus ? "dirty" : "clean"
+      if (rootStatus) {
+        manifest.error = `main checkout changed during worker run:\n${rootStatus}`
+      }
+      return manifest
+    }
 
     manifest.attempted = true
     const commit = await commitIfNeeded(worktree, hypothesis)
@@ -779,6 +804,17 @@ async function finalizeHypothesisAttempt({
         "worker branch push failed"
     }
 
+    const rootStatus = await mainWorktreeStatus(root)
+    manifest.rootDriftStatus = rootStatus ? "dirty" : "clean"
+    if (rootStatus) {
+      manifest.error = [
+        manifest.error,
+        `main checkout changed during worker run:\n${rootStatus}`,
+      ]
+        .filter(Boolean)
+        .join("; ")
+    }
+
     return manifest
   } catch (error) {
     manifest.error = errorMessage(error)
@@ -788,6 +824,7 @@ async function finalizeHypothesisAttempt({
 
 async function writeWorkerPrompt({
   root,
+  worktree,
   projectPath,
   campaign,
   setup,
@@ -800,6 +837,7 @@ async function writeWorkerPrompt({
   endTimeMs,
 }: {
   root: string
+  worktree: string
   projectPath: string
   campaign: ApiCampaign
   setup: ResearchSetupFile
@@ -832,16 +870,16 @@ async function writeWorkerPrompt({
     metricLabel: `${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
     minutesRemaining,
     protectedPaths,
+    projectRoot: projectPath ? join(worktree, projectPath) : worktree,
     researchDeadlineIso: new Date(researchDeadlineMs).toISOString(),
-    setupFilePath: setupPath(root, projectPath),
+    setupFilePath: setupPath(worktree, projectPath),
     shutdownCushionSeconds: Math.ceil(shutdownCushionMs / 1000),
     shutdownDeadlineIso: new Date(shutdownDeadlineMs).toISOString(),
-    validationFilePath: validationPath(root, projectPath),
-    researchSpecPath: projectPath
-      ? `${projectPath}/onyx/onyx.md`
-      : "onyx/onyx.md",
+    validationFilePath: validationPath(worktree, projectPath),
+    researchSpecPath: onyxPath(worktree, projectPath, "onyx.md"),
     sessionId,
     sessionStatePath,
+    worktreeRoot: worktree,
     workerBranch,
   })
 
@@ -913,6 +951,18 @@ async function withWorkerHeartbeat<T>({
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function mainWorktreeStatus(root: string) {
+  return (await git(["status", "--porcelain"], root)).trim()
+}
+
+async function assertMainWorktreeClean(root: string, label: string) {
+  const status = await mainWorktreeStatus(root)
+  if (!status) return
+  throw new Error(
+    `Main checkout must be clean ${label}. Commit, stash, or reset these changes before launching workers:\n${status}`
+  )
 }
 
 function workerProgress({
@@ -1057,6 +1107,7 @@ async function runHypothesisOnce({
     ])
     const prompt = await writeWorkerPrompt({
       root,
+      worktree,
       projectPath,
       campaign,
       setup,
@@ -1089,8 +1140,11 @@ async function runHypothesisOnce({
       ONYX_WORKER_ID: worker.id,
       ONYX_BRIEF_FILE: briefPath,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
-      ONYX_SETUP_FILE: setupPath(root, projectPath),
-      ONYX_VALIDATION_FILE: validationPath(root, projectPath),
+      ONYX_WORKTREE_ROOT: worktree,
+      ONYX_PROJECT_ROOT: projectPath ? join(worktree, projectPath) : worktree,
+      ONYX_SETUP_FILE: setupPath(worktree, projectPath),
+      ONYX_VALIDATION_FILE: validationPath(worktree, projectPath),
+      ONYX_RESEARCH_SPEC_FILE: onyxPath(worktree, projectPath, "onyx.md"),
       TMPDIR: workerTempDir,
       TMP: workerTempDir,
       TEMP: workerTempDir,
@@ -1240,6 +1294,12 @@ async function runHypothesisOnce({
       await writeWorkerLaunchManifest(launchManifest)
     }
     if (finalization.experimentLogged) syncSupervisor.request()
+    if (finalization.rootDriftStatus === "dirty") {
+      throw new Error(
+        finalization.error ??
+          "Main checkout changed during worker run; see worker manifest."
+      )
+    }
 
     if (workerFailure) {
       throw new Error(
@@ -1254,7 +1314,7 @@ async function runHypothesisOnce({
     await heartbeatWorker(
       worker.id,
       {
-        status: "stopped",
+        status: "completed",
         sessionId,
         hypothesisId: hypothesis.id,
         phase: "completed",
@@ -1316,7 +1376,7 @@ async function runHypothesisOnce({
       await heartbeatWorker(
         workerId,
         {
-          status: "stopped",
+          status: "failed",
           sessionId,
           hypothesisId: hypothesis.id,
           phase: "failed",
@@ -1363,7 +1423,7 @@ async function runHypothesisOnce({
 export async function commandResearchStart(args: Args) {
   const root = await repoRoot()
   const { campaign, projectPath } = await campaignForName(root, args)
-  const { setup } = await assertLocalSetupReady(root, projectPath)
+  await assertLocalSetupReady(root, projectPath)
   await assertSetupCommitted({
     root,
     projectPath,
@@ -1430,7 +1490,7 @@ export async function commandResearchStart(args: Args) {
 
   await Promise.all(
     result.hypotheses.map(async (hypothesis) => {
-      const [briefPath, sessionStatePath] = await Promise.all([
+      await Promise.all([
         writeBrief({
           root,
           campaignId: campaign.id,
@@ -1445,19 +1505,6 @@ export async function commandResearchStart(args: Args) {
           args,
         }).catch(() => null),
       ])
-      await writeWorkerPrompt({
-        root,
-        projectPath,
-        campaign,
-        setup,
-        sessionId: result.session.id,
-        hypothesis,
-        workerBranch: "assigned when worker starts",
-        briefPath,
-        sessionStatePath,
-        maxIterations,
-        endTimeMs,
-      })
     })
   )
 
@@ -1508,7 +1555,7 @@ export async function commandResearchHypothesisAdd(args: Args) {
     : null
   const campaign =
     before?.campaign ?? (await campaignForName(root, args)).campaign
-  const { setup } = await assertLocalSetupReady(root, projectPath)
+  await assertLocalSetupReady(root, projectPath)
   const sessionMetadata = before?.session.metadata ?? {}
   const agentKind =
     args.options.agent ??
@@ -1567,7 +1614,7 @@ export async function commandResearchHypothesisAdd(args: Args) {
 
   const hypothesis = result.hypothesis
   if (sessionId) {
-    const [briefPath, sessionStatePath] = await Promise.all([
+    await Promise.all([
       writeBrief({
         root,
         campaignId: campaign.id,
@@ -1579,19 +1626,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
         () => null
       ),
     ])
-    await writeWorkerPrompt({
-      root,
-      projectPath,
-      campaign,
-      setup,
-      sessionId,
-      hypothesis,
-      workerBranch: "assigned when worker starts",
-      briefPath,
-      sessionStatePath,
-      maxIterations,
-      endTimeMs,
-    })
   }
 
   console.log(`Research hypothesis: ${hypothesis.id}`)
@@ -1610,19 +1644,14 @@ export async function commandResearchHypothesisAdd(args: Args) {
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
   const { campaign } = await campaignForName(root, args)
-  await reconcileCampaign(campaign.id, args).catch(() => {})
+  if (args.options.reconcile === "true") {
+    await reconcileCampaign(campaign.id, args).catch(() => {})
+  }
   const overview = await getCampaignOverview(campaign.id, args)
   const state = await readState(root)
   const projectPath = await resolveProjectPath(root, args)
-  console.log(`campaign: ${campaign.name}`)
-  console.log(`setup: local onyx/setup.json`)
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
-  if (activeSessionId) {
-    console.log(
-      `session: ${activeSessionId} ${state.sessions?.[activeSessionId]?.status ?? ""}`.trim()
-    )
-  }
   const scopeAll = args.options["all-sessions"] === "true"
   const hypotheses = overview.hypotheses
   const workers =
@@ -1637,28 +1666,95 @@ export async function commandResearchStatus(args: Args) {
   const manifestByWorker = new Map(
     manifests.map((manifest) => [manifest.workerId, manifest])
   )
+  const sessionState = activeSessionId
+    ? await getResearchSessionState(activeSessionId, args).catch(() => null)
+    : null
+  const activeWorkers = workers.filter((worker) =>
+    ["idle", "running", "stale"].includes(worker.status)
+  ).length
+  const target = sessionState?.session.workerTarget ?? null
+  const openSlots =
+    typeof target === "number" ? Math.max(0, target - activeWorkers) : null
+  const sessionStatus =
+    sessionState?.session.status ??
+    (activeSessionId ? state.sessions?.[activeSessionId]?.status : null) ??
+    null
+  const stopping =
+    sessionStatus === "stop_requested" ||
+    (activeSessionId
+      ? Boolean(state.sessions?.[activeSessionId]?.stopRequested)
+      : false)
+  const { records, corrupt } = await readOutbox(root)
+  const conflicts = await readOutboxConflictCount(root)
+  const pendingExperiments = records.filter(
+    (record) => record.type === "campaign_experiment_logged"
+  ).length
+  const pendingCampaigns = records.filter(
+    (record) => record.type === "campaign_started"
+  ).length
+  const launchSuggestions =
+    activeSessionId && openSlots && openSlots > 0 && !stopping
+      ? hypotheses
+          .filter((hypothesis) => hypothesis.status === "active")
+          .slice(0, openSlots)
+          .map(
+            (hypothesis) =>
+              `onyx worker run --session ${activeSessionId} --hypothesis ${hypothesis.id}`
+          )
+      : []
+
+  if (args.options.json === "true") {
+    console.log(
+      JSON.stringify(
+        {
+          campaign: overview.campaign,
+          session: activeSessionId
+            ? {
+                id: activeSessionId,
+                status: sessionStatus,
+                workerTarget: target,
+                activeWorkers,
+                openSlots,
+                stopping,
+              }
+            : null,
+          hypotheses,
+          workers,
+          outbox: {
+            pendingExperiments,
+            pendingCampaigns,
+            corrupt,
+            conflicts,
+          },
+          launchSuggestions,
+        },
+        null,
+        2
+      )
+    )
+    return
+  }
+
+  console.log(`campaign: ${campaign.name}`)
+  console.log(`setup: local onyx/setup.json`)
+  if (activeSessionId) {
+    console.log(`session: ${activeSessionId} ${sessionStatus ?? ""}`.trim())
+  }
+  console.log(
+    `outbox: ${pendingExperiments} experiment(s), ${pendingCampaigns} campaign(s) pending${
+      corrupt ? `, ${corrupt} unreadable` : ""
+    }${conflicts ? `, ${conflicts} conflict(s)` : ""}`
+  )
 
   if (activeSessionId) {
-    const sessionState = await getResearchSessionState(
-      activeSessionId,
-      args
-    ).catch(() => null)
-    const activeWorkers = workers.filter((worker) =>
-      ["idle", "running", "stale"].includes(worker.status)
-    ).length
-    const target = sessionState?.session.workerTarget ?? "?"
-    const sessionStatus =
-      sessionState?.session.status ??
-      state.sessions?.[activeSessionId]?.status ??
-      null
-    const stopping =
-      sessionStatus === "stop_requested" ||
-      state.sessions?.[activeSessionId]?.stopRequested
     console.log(
-      `worker slots: ${activeWorkers}/${target}${
+      `worker slots: ${activeWorkers}/${target ?? "?"}${
         stopping ? " (stop requested; open slots are intentionally idle)" : ""
       }`
     )
+    for (const suggestion of launchSuggestions) {
+      console.log(`next worker: ${suggestion}`)
+    }
   }
   console.log(
     `hypotheses: ${hypotheses.length}${scopeAll ? " (all sessions)" : ""}`
@@ -2011,13 +2107,24 @@ export async function commandSummaryUpsert(args: Args) {
   const title = args.options.title ?? `${kind} ${new Date().toISOString()}`
   const body = args.options.body
   if (!body) throw new Error("Pass --body <text>.")
+  const sessionId = optionalUuid(
+    args.options.session ?? process.env.ONYX_SESSION_ID,
+    "--session"
+  )
+  const hypothesisId = optionalUuid(
+    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
+    "--hypothesis"
+  )
+  const authoredByWorkerId = optionalUuid(
+    args.options.worker ?? process.env.ONYX_WORKER_ID,
+    "--worker"
+  )
   await upsertCampaignSummary(
     campaign.id,
     {
-      sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-      hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
-      authoredByWorkerId:
-        args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+      sessionId,
+      hypothesisId,
+      authoredByWorkerId,
       summaryKind: kind,
       title,
       body,
@@ -2193,6 +2300,7 @@ export async function commandWorkerRun(args: Args) {
   }
   const campaign = sessionState.campaign
   const { setup } = await assertLocalSetupReady(root, projectPath)
+  await assertMainWorktreeClean(root, "before launching a worker")
 
   const requestedHypothesisId =
     args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID

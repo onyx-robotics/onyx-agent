@@ -73,8 +73,8 @@ Usage:
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>]
-  onyx research status [--campaign <name>] [--all-sessions]
-  onyx summary upsert [--campaign <name>] [--kind <kind>] [--title <text>] --body <text>
+  onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
+  onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text>
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]

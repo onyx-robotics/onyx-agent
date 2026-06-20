@@ -3,6 +3,8 @@ import {
   readdir,
   readFile,
   rename,
+  rm,
+  stat,
   unlink,
   writeFile,
 } from "node:fs/promises"
@@ -95,8 +97,77 @@ export async function outboxSpoolDir(root: string) {
   return dir
 }
 
+export async function outboxConflictDir(root: string) {
+  const dir = join(await onyxStateDir(root), "outbox.d", "conflicts")
+  await mkdir(dir, { recursive: true })
+  return dir
+}
+
 export async function statePath(root: string) {
   return join(await onyxStateDir(root), "state.json")
+}
+
+async function locksDir(root: string) {
+  const dir = join(await onyxStateDir(root), "locks")
+  await mkdir(dir, { recursive: true })
+  return dir
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function uniqueTempPath(path: string) {
+  return `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
+}
+
+export async function withOnyxLock<T>(
+  root: string,
+  name: string,
+  fn: () => Promise<T>,
+  options: { timeoutMs?: number; staleMs?: number } = {}
+): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? 30_000
+  const staleMs = options.staleMs ?? 120_000
+  const path = join(await locksDir(root), `${name}.lock`)
+  const deadline = Date.now() + timeoutMs
+
+  while (true) {
+    try {
+      await mkdir(path)
+      await writeFile(
+        join(path, "owner.json"),
+        `${JSON.stringify(
+          {
+            pid: process.pid,
+            createdAt: new Date().toISOString(),
+          },
+          null,
+          2
+        )}\n`,
+        "utf8"
+      )
+      break
+    } catch {
+      const ageMs = await stat(path)
+        .then((entry) => Date.now() - entry.mtimeMs)
+        .catch(() => 0)
+      if (ageMs > staleMs) {
+        await rm(path, { recursive: true, force: true }).catch(() => {})
+        continue
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for local Onyx ${name} lock.`)
+      }
+      await sleep(50 + Math.floor(Math.random() * 100))
+    }
+  }
+
+  try {
+    return await fn()
+  } finally {
+    await rm(path, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 export async function lastRunPath(root: string) {
@@ -126,9 +197,31 @@ export async function appendOutbox(root: string, record: LocalResearchRecord) {
   const dir = await outboxSpoolDir(root)
   const name = `${Date.now()}-${process.pid}-${randomUUID()}.json`
   const path = join(dir, name)
-  const tmp = `${path}.tmp`
+  const tmp = uniqueTempPath(path)
   await writeFile(tmp, `${JSON.stringify(validated)}\n`, "utf8")
   await rename(tmp, path)
+}
+
+export async function quarantineOutboxRecord(
+  root: string,
+  record: LocalResearchRecord,
+  reason: string
+) {
+  const dir = await outboxConflictDir(root)
+  const name = `${Date.now()}-${process.pid}-${randomUUID()}.json`
+  const path = join(dir, name)
+  const tmp = uniqueTempPath(path)
+  await writeFile(
+    tmp,
+    `${JSON.stringify({ reason, record }, null, 2)}\n`,
+    "utf8"
+  )
+  await rename(tmp, path)
+}
+
+export async function readOutboxConflictCount(root: string) {
+  const files = await readdir(await outboxConflictDir(root)).catch(() => [])
+  return files.filter((file) => file.endsWith(".json")).length
 }
 
 /**
@@ -198,6 +291,13 @@ export async function rewriteOutbox(
   root: string,
   records: LocalResearchRecord[]
 ) {
+  await withOnyxLock(root, "outbox", () => rewriteOutboxUnlocked(root, records))
+}
+
+export async function rewriteOutboxUnlocked(
+  root: string,
+  records: LocalResearchRecord[]
+) {
   const legacyPath = await outboxPath(root)
   await unlink(legacyPath).catch(() => {})
 
@@ -232,10 +332,28 @@ export async function readState(root: string): Promise<CliState> {
 }
 
 export async function writeState(root: string, state: CliState) {
+  await withOnyxLock(root, "state", async () => {
+    await writeStateUnlocked(root, state)
+  })
+}
+
+async function writeStateUnlocked(root: string, state: CliState) {
   const path = await statePath(root)
-  const tmp = `${path}.tmp`
+  const tmp = uniqueTempPath(path)
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8")
   await rename(tmp, path)
+}
+
+export async function updateState(
+  root: string,
+  updater: (state: CliState) => Promise<void> | void
+): Promise<CliState> {
+  return withOnyxLock(root, "state", async () => {
+    const state = await readState(root)
+    await updater(state)
+    await writeStateUnlocked(root, state)
+    return state
+  })
 }
 
 async function readLastRunFile(path: string): Promise<LastRunRecord | null> {
@@ -318,7 +436,7 @@ export async function writeLastRun(root: string, record: LastRunRecord) {
   const path = shouldWriteScopedLastRun(record)
     ? await scopedLastRunPath(root, record.runRef)
     : await lastRunPath(root)
-  const tmp = `${path}.tmp`
+  const tmp = uniqueTempPath(path)
   await writeFile(tmp, `${JSON.stringify(record, null, 2)}\n`, "utf8")
   await rename(tmp, path)
 }

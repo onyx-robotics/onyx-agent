@@ -12,6 +12,7 @@ import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 
 import { writeConfig } from "./lib/config"
+import { currentCommit, pushRefs } from "./lib/git"
 import { runProcess, runStreamingProcess } from "./lib/process"
 import {
   buildWorkerInvocation,
@@ -331,5 +332,56 @@ describe("worker launchers", () => {
 
     expect(result.timedOut).toBe(true)
     expect(result.startupTimedOut).toBe(true)
+  })
+
+  test("pushRefs dedupes duplicate destinations and rejects conflicts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-pushrefs-root-"))
+    const remote = await mkdtemp(join(tmpdir(), "onyx-pushrefs-remote-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await runProcess("git", ["init", "--bare"], { cwd: remote })
+    await runProcess("git", ["remote", "add", "origin", remote], { cwd: root })
+    await writeFile(join(root, "README.md"), "one\n", "utf8")
+    await runProcess("git", ["add", "README.md"], { cwd: root })
+    await runProcess(
+      "git",
+      [
+        "-c",
+        "user.name=Onyx Test",
+        "-c",
+        "user.email=onyx@example.com",
+        "commit",
+        "-m",
+        "one",
+      ],
+      { cwd: root }
+    )
+    const first = await currentCommit(root)
+    await writeFile(join(root, "README.md"), "two\n", "utf8")
+    await runProcess("git", ["add", "README.md"], { cwd: root })
+    await runProcess(
+      "git",
+      [
+        "-c",
+        "user.name=Onyx Test",
+        "-c",
+        "user.email=onyx@example.com",
+        "commit",
+        "-m",
+        "two",
+      ],
+      { cwd: root }
+    )
+    const second = await currentCommit(root)
+
+    await pushRefs(root, [
+      { commitSha: first, ref: "refs/onyx/experiments/test/run" },
+      { commitSha: first, ref: "refs/onyx/experiments/test/run" },
+    ])
+    await expect(
+      pushRefs(root, [
+        { commitSha: first, ref: "refs/onyx/experiments/test/conflict" },
+        { commitSha: second, ref: "refs/onyx/experiments/test/conflict" },
+      ])
+    ).rejects.toThrow("Conflicting push destinations")
   })
 })

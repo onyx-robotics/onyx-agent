@@ -16,6 +16,7 @@ export type HypothesisWorkerPromptInput = {
   metricLabel: string
   minutesRemaining: number
   protectedPaths: string[]
+  projectRoot: string
   researchDeadlineIso: string
   setupFilePath: string
   shutdownCushionSeconds: number
@@ -24,6 +25,7 @@ export type HypothesisWorkerPromptInput = {
   researchSpecPath: string
   sessionId: string
   sessionStatePath: string | null
+  worktreeRoot: string
   workerBranch: string
 }
 
@@ -51,6 +53,8 @@ You are an autonomous Onyx research hypothesis worker. Do not ask the user quest
 - Session: ${input.sessionId}
 - Hypothesis: ${input.hypothesisId} (${input.hypothesisName})
 - Worker branch: ${input.workerBranch}
+- Worktree root: ${input.worktreeRoot}
+- Project root: ${input.projectRoot}
 - Max iterations: ${input.maxIterations}
 - Time budget remaining at launch: ${input.minutesRemaining} minute(s)
 - Stop starting new research by: ${input.researchDeadlineIso}
@@ -78,6 +82,10 @@ ${markdownList(input.protectedPaths)}
 
 Do not edit protected setup paths during Research. If setup/eval/tools need to change, stop and summarize why a new setup version is needed.
 
+## Worktree Boundary
+
+Your current working directory is the worker worktree. Treat \`${input.projectRoot}\` as the only project root for edits, shell commands, git commands, evals, checks, and Onyx CLI commands. Do not \`cd\` into a parent checkout or any similarly named repository outside this worktree. Context files under \`.git/onyx\` are read-only coordination files; source edits belong under \`${input.projectRoot}\`.
+
 ## Loop
 
 1. Read the setup file, validation report, research spec, campaign brief, peer state, recent experiments, shared knowledge, git status, and relevant source files. Use \`onyx knowledge list --campaign "$ONYX_CAMPAIGN_NAME"\` when network access is available; otherwise read \`ONYX_SESSION_STATE_FILE\`. Understand the workload before editing.
@@ -87,7 +95,7 @@ Do not edit protected setup paths during Research. If setup/eval/tools need to c
 5. Edit only in-scope project files, commit the result, then run \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha>\`; copy the printed runRef.
 6. Inspect the output, metric, and checks result. Record every attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
 7. Publish concise shared learnings with \`onyx knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
-8. Periodically review summaries with \`onyx summary list\` and update a concise hypothesis summary with \`onyx summary upsert\` if available; otherwise include the summary in final output.
+8. Periodically review summaries with \`onyx summary list\` and update a concise hypothesis summary with \`onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"\` if available; otherwise include the summary in final output. Do not pipe mutation commands through \`tail\`, \`head\`, or other filters that can hide failed exits.
 9. Run \`onyx sync\` or \`onyx push\` periodically when network access is available.
 
 ## Research Rules

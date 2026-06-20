@@ -83,6 +83,8 @@ export const researchWorkerStatusSchema = z.enum([
   "running",
   "stale",
   "lost",
+  "completed",
+  "failed",
   "stopped",
 ])
 export const researchExperimentGitStatusSchema = z.enum([

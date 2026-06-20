@@ -23,6 +23,7 @@ export {
   readOutbox,
   scopedLastRunPath,
   readState,
+  updateState,
   rewriteOutbox,
   statePath,
   writeLastRun,

@@ -12,6 +12,7 @@ import { gitResult, repoRoot } from "../lib/git"
 import { historyPath, readHistory } from "../lib/history"
 import {
   onyxStateDir,
+  readOutboxConflictCount,
   readLastRuns,
   readOutbox,
   readState,
@@ -194,7 +195,10 @@ async function buildModel(root: string): Promise<ListenModel> {
     evalInFlight ||
     (lastActivityMs > 0 && nowMs - lastActivityMs < ACTIVE_WINDOW_MS)
 
-  const { records: outboxRecords } = await readOutbox(root)
+  const [{ records: outboxRecords }, conflictCount] = await Promise.all([
+    readOutbox(root),
+    readOutboxConflictCount(root),
+  ])
 
   return {
     projectName: basename(root),
@@ -207,6 +211,7 @@ async function buildModel(root: string): Promise<ListenModel> {
     active,
     rows,
     pendingOutbox: outboxRecords.length,
+    conflictOutbox: conflictCount,
     syncedCount: records.filter((record) => record.source === "api").length,
   }
 }

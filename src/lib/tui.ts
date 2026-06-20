@@ -217,9 +217,8 @@ export function renderExperimentTable(
   const lines = [dim(truncate(header, columns), color)]
   for (const row of rows) {
     const glyph = glyphFor(row.status)
-    const commit = "resultCommitSha" in row
-      ? String(row.resultCommitSha).slice(0, 7)
-      : "·"
+    const commit =
+      "resultCommitSha" in row ? String(row.resultCommitSha).slice(0, 7) : "·"
     const statusPadded = pad(glyph.label, STATUS_W, "right")
     lines.push(
       truncateAnsi(
@@ -279,6 +278,7 @@ export type ListenModel = {
   /** Ascending by recency — the most recent experiment renders at the bottom. */
   rows: ExperimentRow[]
   pendingOutbox: number
+  conflictOutbox: number
   syncedCount: number
 }
 
@@ -344,7 +344,7 @@ export function renderFrame(
   )}`
   const footer = dim(
     truncate(
-      ` outbox ${model.pendingOutbox} pending · ${model.syncedCount} synced · q quit`,
+      ` outbox ${model.pendingOutbox} pending · ${model.conflictOutbox} conflict(s) · ${model.syncedCount} synced · q quit`,
       columns
     ),
     color

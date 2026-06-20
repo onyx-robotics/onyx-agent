@@ -16,7 +16,9 @@ import {
   commandResearchStart,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
+  commandResearchStatus,
   commandSummaryList,
+  commandSummaryUpsert,
   commandSetupInit,
   commandSetupModules,
   commandSetupRequire,
@@ -32,6 +34,7 @@ import {
   parseArgs,
   parseMetricLines,
   readOutbox,
+  readState,
   readSetupFile,
   readLastRun,
   readLastRuns,
@@ -41,6 +44,7 @@ import {
   requiredSetupModules,
   setupModuleRequirement,
   summarizeWorkerOutput,
+  updateState,
   USAGE,
   writeLastRun,
   writeSetupFile,
@@ -364,6 +368,25 @@ describe("local research protocol", () => {
     })
     expect(new Set(runRefs).size).toBe(100)
   })
+
+  test("serializes concurrent state updates through the local lock", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-state-lock-"))
+    await runProcess("git", ["init"], { cwd: root })
+
+    await Promise.all(
+      Array.from({ length: 50 }, (_, index) =>
+        updateState(root, (state) => {
+          state.campaigns = state.campaigns ?? {}
+          state.campaigns[`campaign-${index}`] = {
+            campaignId: `campaign-${index}`,
+          }
+        })
+      )
+    )
+
+    const state = await readState(root)
+    expect(Object.keys(state.campaigns ?? {})).toHaveLength(50)
+  })
 })
 
 describe("history helpers", () => {
@@ -621,6 +644,18 @@ describe("exp log", () => {
           description: "logged the second worker",
         },
       })
+      await commandExpLog({
+        positional: ["exp", "log"],
+        options: {
+          campaign: campaignName,
+          "run-ref": workerTwo.runRef,
+          session: sessionId,
+          worker: workerTwoId,
+          hypothesis: hypothesisTwoId,
+          name: "worker-two-result",
+          description: "logged the second worker",
+        },
+      })
     } finally {
       process.chdir(previousCwd)
       console.log = originalLog
@@ -640,6 +675,13 @@ describe("exp log", () => {
       primaryMetricValue: 2,
       outputSummary: `worker ${workerTwoId}`,
     })
+    expect(
+      records.filter(
+        (record) =>
+          record.type === "campaign_experiment_logged" &&
+          record.runRef === workerTwo.runRef
+      )
+    ).toHaveLength(1)
     const remainingRuns = await readLastRuns(root)
     expect(remainingRuns.map((run) => run.runRef)).toEqual([workerOne.runRef])
   })
@@ -923,6 +965,73 @@ describe("research start", () => {
 })
 
 describe("summary CLI", () => {
+  test("rejects non-UUID summary identity flags locally", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const campaign = {
+      id: campaignId,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await withMockResearchApi(
+        (request) => {
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/overview`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign,
+                  workers: [],
+                  hypotheses: [],
+                  summaries: [],
+                  knowledge: [],
+                  bestExperiment: null,
+                  latestExperiments: [],
+                  counts: {
+                    experiments: 0,
+                    hypothesisCount: 0,
+                    activeWorkers: 0,
+                  },
+                },
+              },
+            }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        async () => {
+          await expect(
+            commandSummaryUpsert({
+              positional: ["summary", "upsert"],
+              options: {
+                campaign: campaignName,
+                hypothesis: "hypothesis-1",
+                body: "summary",
+              },
+            })
+          ).rejects.toThrow("--hypothesis must be a UUID")
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
   test("lists campaign summaries as text", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
       await writeResearchSmokeRepo()
@@ -1033,6 +1142,102 @@ describe("worker output summaries", () => {
     })
 
     expect(summary).toBe("clean final answer")
+  })
+})
+
+describe("research status", () => {
+  test("is read-only unless --reconcile is passed", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const campaign = {
+      id: campaignId,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await withMockResearchApi(
+        (request) => {
+          if (request.method === "POST") {
+            throw new Error(`Unexpected write ${request.path}`)
+          }
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/overview`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign,
+                  workers: [],
+                  hypotheses: [],
+                  summaries: [],
+                  knowledge: [],
+                  bestExperiment: null,
+                  latestExperiments: [],
+                  counts: {
+                    experiments: 0,
+                    hypothesisCount: 0,
+                    activeWorkers: 0,
+                  },
+                },
+              },
+            }
+          }
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/sessions/${sessionId}/state`
+          ) {
+            return {
+              body: {
+                data: {
+                  session: {
+                    id: sessionId,
+                    campaignId,
+                    name: "session",
+                    status: "running",
+                    workerTarget: 2,
+                    metadata: {},
+                  },
+                  campaign,
+                  latestExperiments: [],
+                  bestExperiment: null,
+                  hypotheses: [],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  updatedAt: "2026-06-20T00:00:00.000Z",
+                },
+              },
+            }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        () =>
+          commandResearchStatus({
+            positional: ["research", "status"],
+            options: { campaign: campaignName },
+          })
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
   })
 })
 

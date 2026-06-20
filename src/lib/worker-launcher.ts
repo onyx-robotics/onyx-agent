@@ -1,4 +1,12 @@
-import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises"
+import {
+  chmod,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  writeFile,
+} from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { delimiter } from "node:path"
 import { dirname, join } from "node:path"
 
@@ -47,6 +55,7 @@ export type WorkerFinalizationManifest = {
   commitSha: string | null
   experimentLogged: boolean
   workerBranchPushStatus: "not_attempted" | "pushed" | "failed"
+  rootDriftStatus: "not_checked" | "clean" | "dirty"
   error: string | null
 }
 
@@ -458,11 +467,9 @@ export async function writeWorkerLaunchManifest(
   manifest: WorkerLaunchManifest
 ) {
   await mkdir(dirname(manifest.manifestPath), { recursive: true })
-  await writeFile(
-    manifest.manifestPath,
-    `${JSON.stringify(manifest, null, 2)}\n`,
-    "utf8"
-  )
+  const tmp = `${manifest.manifestPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
+  await writeFile(tmp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
+  await rename(tmp, manifest.manifestPath)
 }
 
 export async function readWorkerLaunchManifests(

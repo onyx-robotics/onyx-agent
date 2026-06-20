@@ -22,9 +22,11 @@ import { pushRefs, repositoryUrl } from "./git"
 import { applyHistorySyncUpdates, type HistorySyncUpdate } from "./history"
 import { campaignStateKey, normalizeProjectPath } from "./project"
 import {
+  quarantineOutboxRecord,
   readOutbox,
   readState,
-  rewriteOutbox,
+  rewriteOutboxUnlocked,
+  withOnyxLock,
   writeState,
   type CliState,
 } from "./outbox"
@@ -34,6 +36,7 @@ export type FlushResult = {
   pending: number
   offline: boolean
   skippedDeleted: number
+  conflicts: number
 }
 
 function campaignSecondaryMetrics(
@@ -175,6 +178,80 @@ function experimentRequestFromRecord(
   }
 }
 
+function comparableExperimentRecord(
+  record: LocalResearchCampaignExperimentLoggedRecord
+) {
+  const comparable: Partial<LocalResearchCampaignExperimentLoggedRecord> = {
+    ...record,
+  }
+  delete comparable.createdAt
+  delete comparable.sync
+  return JSON.stringify(comparable)
+}
+
+function dedupeExperimentRecords(
+  records: LocalResearchCampaignExperimentLoggedRecord[]
+) {
+  const byRunRef = new Map<
+    string,
+    LocalResearchCampaignExperimentLoggedRecord[]
+  >()
+  for (const record of records) {
+    const group = byRunRef.get(record.runRef) ?? []
+    group.push(record)
+    byRunRef.set(record.runRef, group)
+  }
+
+  const byRunRefUnique: LocalResearchCampaignExperimentLoggedRecord[] = []
+  const conflicts: LocalResearchCampaignExperimentLoggedRecord[] = []
+  let duplicateCount = 0
+  for (const group of byRunRef.values()) {
+    if (group.length === 1) {
+      byRunRefUnique.push(group[0]!)
+      continue
+    }
+    const first = group[0]!
+    const firstComparable = comparableExperimentRecord(first)
+    const exact = group.every(
+      (record) => comparableExperimentRecord(record) === firstComparable
+    )
+    if (exact) {
+      duplicateCount += group.length - 1
+      byRunRefUnique.push(first)
+    } else {
+      conflicts.push(...group)
+    }
+  }
+
+  const byResultRef = new Map<
+    string,
+    LocalResearchCampaignExperimentLoggedRecord[]
+  >()
+  for (const record of byRunRefUnique) {
+    const group = byResultRef.get(record.resultRef) ?? []
+    group.push(record)
+    byResultRef.set(record.resultRef, group)
+  }
+
+  const unique: LocalResearchCampaignExperimentLoggedRecord[] = []
+  const conflictedRunRefs = new Set(conflicts.map((record) => record.runRef))
+  for (const group of byResultRef.values()) {
+    const commits = new Set(group.map((record) => record.resultCommitSha))
+    if (commits.size > 1) {
+      for (const record of group) conflictedRunRefs.add(record.runRef)
+      conflicts.push(...group)
+      continue
+    }
+    unique.push(...group)
+  }
+
+  return {
+    unique: unique.filter((record) => !conflictedRunRefs.has(record.runRef)),
+    duplicateCount,
+    conflicts,
+  }
+}
+
 async function flushCampaignExperimentBatch({
   root,
   campaignName,
@@ -261,12 +338,28 @@ export async function flushOutbox(
   args: Args,
   options: { quiet?: boolean } = {}
 ): Promise<FlushResult> {
+  return withOnyxLock(root, "outbox", () =>
+    flushOutboxUnlocked(root, args, options)
+  )
+}
+
+async function flushOutboxUnlocked(
+  root: string,
+  args: Args,
+  options: { quiet?: boolean } = {}
+): Promise<FlushResult> {
   const { records, corrupt } = await readOutbox(root)
   if (corrupt > 0 && !options.quiet) {
     console.warn(`Skipped ${corrupt} unreadable outbox record(s).`)
   }
   if (records.length === 0) {
-    return { flushed: 0, pending: 0, offline: false, skippedDeleted: 0 }
+    return {
+      flushed: 0,
+      pending: 0,
+      offline: false,
+      skippedDeleted: 0,
+      conflicts: 0,
+    }
   }
 
   const state = await readState(root)
@@ -308,6 +401,7 @@ export async function flushOutbox(
   }
   const { kept, dropped } = filterDeletedOutboxRecords(records, deletions)
   let skippedDeleted = dropped
+  let conflictCount = 0
 
   const remaining: LocalResearchRecord[] = []
   const historyUpdates = new Map<string, HistorySyncUpdate>()
@@ -348,11 +442,31 @@ export async function flushOutbox(
   }
 
   for (const [campaignName, records] of experimentRecords) {
+    const deduped = dedupeExperimentRecords(records)
+    conflictCount += deduped.conflicts.length
+    for (const record of deduped.conflicts) {
+      await quarantineOutboxRecord(
+        root,
+        record,
+        `Conflicting queued experiment record for runRef ${record.runRef} or resultRef ${record.resultRef}.`
+      ).catch(() => {})
+    }
+    if (deduped.duplicateCount > 0 && !options.quiet) {
+      console.warn(
+        `Dropped ${deduped.duplicateCount} duplicate queued experiment record(s) for ${campaignName}.`
+      )
+    }
+    if (deduped.conflicts.length > 0 && !options.quiet) {
+      console.warn(
+        `Quarantined ${deduped.conflicts.length} conflicting queued experiment record(s) for ${campaignName}.`
+      )
+    }
+    if (deduped.unique.length === 0) continue
     try {
       const result = await flushCampaignExperimentBatch({
         root,
         campaignName,
-        records,
+        records: deduped.unique,
         state,
         args,
       })
@@ -365,16 +479,16 @@ export async function flushOutbox(
     } catch (error) {
       if (!options.quiet) {
         console.warn(
-          `Keeping ${records.length} queued experiment record(s) after error: ${
+          `Keeping ${deduped.unique.length} queued experiment record(s) after error: ${
             error instanceof Error ? error.message : String(error)
           }`
         )
       }
-      remaining.push(...records)
+      remaining.push(...deduped.unique)
     }
   }
 
-  await rewriteOutbox(root, remaining)
+  await rewriteOutboxUnlocked(root, remaining)
   await writeState(root, state)
   await applyHistorySyncUpdates(root, historyUpdates).catch(() => {})
   await emitEvent(root, {
@@ -390,6 +504,11 @@ export async function flushOutbox(
     if (skippedDeleted > 0) {
       console.log(`Skipped ${skippedDeleted} record(s) deleted on the server.`)
     }
+    if (conflictCount > 0) {
+      console.log(
+        `Quarantined ${conflictCount} conflicting record(s) under .git/onyx/outbox.d/conflicts.`
+      )
+    }
   }
 
   return {
@@ -397,5 +516,6 @@ export async function flushOutbox(
     pending: remaining.length,
     offline: false,
     skippedDeleted,
+    conflicts: conflictCount,
   }
 }

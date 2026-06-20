@@ -21,14 +21,17 @@ const baseInput = {
   metricLabel: "tracking_error (m), minimize",
   minutesRemaining: 10,
   protectedPaths: ["onyx/onyx.md", "onyx/setup.json"],
+  projectRoot: "/repo/.git/onyx/worktrees/session-hypothesis",
   researchDeadlineIso: "2026-06-20T14:08:30.000Z",
-  setupFilePath: "/repo/onyx/setup.json",
+  setupFilePath: "/repo/.git/onyx/worktrees/session-hypothesis/onyx/setup.json",
   shutdownCushionSeconds: 90,
   shutdownDeadlineIso: "2026-06-20T14:10:00.000Z",
-  validationFilePath: "/repo/onyx/validation.json",
-  researchSpecPath: "onyx/onyx.md",
+  validationFilePath:
+    "/repo/.git/onyx/worktrees/session-hypothesis/onyx/validation.json",
+  researchSpecPath: "/repo/.git/onyx/worktrees/session-hypothesis/onyx/onyx.md",
   sessionId: "session_123",
   sessionStatePath: null,
+  worktreeRoot: "/repo/.git/onyx/worktrees/session-hypothesis",
 }
 
 describe("hypothesis worker prompt", () => {
@@ -44,9 +47,29 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "- Final shutdown deadline: 2026-06-20T14:10:00.000Z"
     )
-    expect(prompt).toContain("- Setup file: /repo/onyx/setup.json")
-    expect(prompt).toContain("- Validation report: /repo/onyx/validation.json")
+    expect(prompt).toContain(
+      "- Worktree root: /repo/.git/onyx/worktrees/session-hypothesis"
+    )
+    expect(prompt).toContain(
+      "- Project root: /repo/.git/onyx/worktrees/session-hypothesis"
+    )
+    expect(prompt).toContain(
+      "- Setup file: /repo/.git/onyx/worktrees/session-hypothesis/onyx/setup.json"
+    )
+    expect(prompt).toContain(
+      "- Validation report: /repo/.git/onyx/worktrees/session-hypothesis/onyx/validation.json"
+    )
+    expect(prompt).not.toContain(
+      "- Validation report: /repo/onyx/validation.json"
+    )
+    expect(prompt).not.toContain("- Setup file: /repo/onyx/setup.json")
     expect(prompt).toContain("- Focus: Reduce controller overshoot")
+    expect(prompt).toContain(
+      "Treat `/repo/.git/onyx/worktrees/session-hypothesis` as the only project root"
+    )
+    expect(prompt).toContain(
+      'onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
+    )
     expect(prompt).toContain("onyx knowledge add")
     expect(prompt).toContain("Make one small, measured, logged attempt early")
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
