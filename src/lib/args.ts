@@ -1,11 +1,18 @@
 export type Args = {
   positional: string[]
   options: Record<string, string>
+  optionLists?: Record<string, string[]>
 }
 
 export function parseArgs(argv: string[]): Args {
   const positional: string[] = []
   const options: Record<string, string> = {}
+  const optionLists: Record<string, string[]> = {}
+
+  const setOption = (key: string, value: string) => {
+    options[key] = value
+    optionLists[key] = [...(optionLists[key] ?? []), value]
+  }
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!
@@ -18,20 +25,28 @@ export function parseArgs(argv: string[]): Args {
     const eq = key.indexOf("=")
 
     if (eq !== -1) {
-      options[key.slice(0, eq)] = key.slice(eq + 1)
+      setOption(key.slice(0, eq), key.slice(eq + 1))
       continue
     }
 
     const next = argv[i + 1]
     if (next === undefined || next.startsWith("--")) {
-      options[key] = "true"
+      setOption(key, "true")
     } else {
-      options[key] = next
+      setOption(key, next)
       i += 1
     }
   }
 
-  return { positional, options }
+  return { positional, options, optionLists }
+}
+
+export function optionValues(args: Args, name: string): string[] {
+  return (
+    args.optionLists?.[name] ?? (args.options[name] ? [args.options[name]] : [])
+  )
+    .map((value) => value.trim())
+    .filter(Boolean)
 }
 
 export function requireOption(args: Args, name: string): string {

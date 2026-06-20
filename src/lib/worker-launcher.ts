@@ -46,7 +46,7 @@ export type WorkerFinalizationManifest = {
   salvaged: boolean
   commitSha: string | null
   experimentLogged: boolean
-  lanePushStatus: "not_attempted" | "pushed" | "failed"
+  workerBranchPushStatus: "not_attempted" | "pushed" | "failed"
   error: string | null
 }
 
@@ -62,8 +62,8 @@ export type WorkerLaunchManifest = {
   logPath: string
   manifestPath: string
   sessionId: string
-  laneId: string
-  laneName: string
+  hypothesisId: string
+  hypothesisName: string
   workerId: string
   version: string | null
   startedAt: string
@@ -226,6 +226,7 @@ export function buildWorkerInvocation({
       (root) => ["--add-dir", root]
     )
     const args = [
+      "--verbose",
       "--print",
       "--input-format",
       "text",
@@ -436,16 +437,16 @@ export async function preflightWorkerInvocation(
 export async function workerLaunchPaths({
   root,
   sessionId,
-  laneId,
-  laneName,
+  hypothesisId,
+  hypothesisName,
 }: {
   root: string
   sessionId: string
-  laneId: string
-  laneName: string
+  hypothesisId: string
+  hypothesisName: string
 }) {
   const dir = join(await onyxStateDir(root), "worker-logs", sessionId)
-  const base = `${safeSegment(laneName)}-${safeSegment(laneId).slice(0, 8)}`
+  const base = `${safeSegment(hypothesisName)}-${safeSegment(hypothesisId).slice(0, 8)}`
   return {
     dir,
     logPath: join(dir, `${base}.log`),

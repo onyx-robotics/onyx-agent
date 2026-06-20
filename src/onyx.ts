@@ -120,7 +120,8 @@ export { commandPush, commandStatus, commandSync } from "./commands/sync"
 export { commandToolsRun } from "./commands/tools"
 export {
   commandResearchFinish,
-  commandResearchLanePlans,
+  commandResearchHypothesisAdd,
+  commandResearchHypotheses,
   commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,

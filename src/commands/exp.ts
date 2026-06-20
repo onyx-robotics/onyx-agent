@@ -245,7 +245,7 @@ async function ensureCampaignMetadata({
   if (cached?.campaignId && cached.metricName && cached.baseCommitSha) {
     return {
       campaignId: cached.campaignId,
-      laneId: cached.laneId,
+      hypothesisId: cached.hypothesisId,
       metricName: cached.metricName,
       baseCommitSha: cached.baseCommitSha,
     }
@@ -281,7 +281,7 @@ async function ensureCampaignMetadata({
 
   return {
     campaignId: campaign.id,
-    laneId: state.campaigns[key]?.laneId,
+    hypothesisId: state.campaigns[key]?.hypothesisId,
     metricName: campaign.metricName,
     baseCommitSha: campaign.baseCommitSha,
   }
@@ -308,13 +308,16 @@ export async function commandExpRun(args: Args) {
   const timeoutMs = numberOption(args, "timeout", 600) * 1000
   const checksTimeoutMs = numberOption(args, "checks-timeout", 300) * 1000
   const started = new Date()
-  const laneId =
-    args.options.lane ?? process.env.ONYX_LANE_ID ?? campaign.laneId
+  const hypothesisId =
+    args.options.hypothesis ??
+    process.env.ONYX_HYPOTHESIS_ID ??
+    campaign.hypothesisId
   const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
   const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
   const baseCommitSha =
     args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
-  const existingAttempt = await readLastRun(root)
+  const noLog = optionalFlag(args, "no-log")
+  const existingAttempt = noLog ? null : await readLastRun(root)
   const reusableAttempt =
     existingAttempt?.campaignName === campaignName &&
     existingAttempt.projectPath === projectPath &&
@@ -354,9 +357,9 @@ export async function commandExpRun(args: Args) {
     outputSummary: null,
     sessionId,
     workerId,
-    laneId,
+    hypothesisId,
   }
-  await writeLastRun(root, initialRun)
+  if (!noLog) await writeLastRun(root, initialRun)
 
   await emitEvent(root, {
     type: "exp_run_started",
@@ -374,33 +377,35 @@ export async function commandExpRun(args: Args) {
       timeoutSeconds: numberOption(args, "reset-timeout", 120),
     })
     if (reset.code !== 0 || reset.timedOut) {
-      await writeLastRun(root, {
-        schemaVersion: 1,
-        createdAt: new Date().toISOString(),
-        runRef,
-        campaignName,
-        projectPath,
-        baseCommitSha,
-        resultCommitSha,
-        resultRef,
-        status: "failed",
-        setupCompliance: initialRun.setupCompliance,
-        primaryMetricName: campaign.metricName,
-        primaryMetricValue: null,
-        metrics: {},
-        agentNotes: {},
-        checks: null,
-        durationMs: 0,
-        startedAt: started.toISOString(),
-        completedAt: new Date().toISOString(),
-        outputSummary:
-          reset.outputSummary ??
-          summarizeOutput(reset.stdout, reset.stderr) ??
-          "Environment reset failed.",
-        sessionId,
-        workerId,
-        laneId,
-      })
+      if (!noLog) {
+        await writeLastRun(root, {
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+          runRef,
+          campaignName,
+          projectPath,
+          baseCommitSha,
+          resultCommitSha,
+          resultRef,
+          status: "failed",
+          setupCompliance: initialRun.setupCompliance,
+          primaryMetricName: campaign.metricName,
+          primaryMetricValue: null,
+          metrics: {},
+          agentNotes: {},
+          checks: null,
+          durationMs: 0,
+          startedAt: started.toISOString(),
+          completedAt: new Date().toISOString(),
+          outputSummary:
+            reset.outputSummary ??
+            summarizeOutput(reset.stdout, reset.stderr) ??
+            "Environment reset failed.",
+          sessionId,
+          workerId,
+          hypothesisId,
+        })
+      }
       throw new Error("Environment reset failed before evaluation.")
     }
   }
@@ -463,12 +468,7 @@ export async function commandExpRun(args: Args) {
   ].filter(Boolean)
   const outputSummary = outputSummaryParts.join("\n").slice(0, 4000) || null
 
-  if (optionalFlag(args, "no-log")) {
-    if (existingAttempt) {
-      await writeLastRun(root, existingAttempt)
-    } else {
-      await clearLastRun(root)
-    }
+  if (noLog) {
     console.log(
       JSON.stringify({ metrics, status, checks, compliance }, null, 2)
     )
@@ -498,7 +498,7 @@ export async function commandExpRun(args: Args) {
     outputSummary,
     sessionId,
     workerId,
-    laneId,
+    hypothesisId,
   }
   await writeLastRun(root, record)
   await emitEvent(root, {
@@ -605,11 +605,11 @@ export async function commandExpLog(args: Args) {
     args.options["result-ref"] ??
     usableLastRun?.resultRef ??
     `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
-  const laneId =
-    args.options.lane ??
-    usableLastRun?.laneId ??
-    process.env.ONYX_LANE_ID ??
-    campaign.laneId
+  const hypothesisId =
+    args.options.hypothesis ??
+    usableLastRun?.hypothesisId ??
+    process.env.ONYX_HYPOTHESIS_ID ??
+    campaign.hypothesisId
   const sessionId =
     args.options.session ??
     usableLastRun?.sessionId ??
@@ -655,7 +655,7 @@ export async function commandExpLog(args: Args) {
     outputSummary: usableLastRun?.outputSummary ?? null,
     sessionId,
     workerId,
-    laneId,
+    hypothesisId,
   }
   await appendOutbox(root, record)
   await flushOutbox(root, args, { quiet: true }).catch(() => {})
@@ -722,7 +722,7 @@ export async function commandExpList(args: Args) {
       createdAt: lastRun.createdAt,
       sessionId: lastRun.sessionId,
       workerId: lastRun.workerId,
-      laneId: lastRun.laneId,
+      hypothesisId: lastRun.hypothesisId,
     })
     seenRunRefs.add(lastRun.runRef)
   }

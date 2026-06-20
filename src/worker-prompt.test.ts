@@ -1,17 +1,17 @@
 import { describe, expect, test } from "bun:test"
 
-import { renderLaneWorkerPrompt } from "./lib/worker-prompt"
+import { renderHypothesisWorkerPrompt } from "./lib/worker-prompt"
 
 const baseInput = {
-  briefPath: "/repo/.git/onyx/briefs/session/lane.md",
+  briefPath: "/repo/.git/onyx/briefs/session/hypothesis.md",
   campaignName: "drone-controller",
   goal: "Minimize drone tracking error",
-  laneBranch: "refs/heads/onyx/drone/lane-1",
-  laneId: "lane_123",
-  laneName: "lane-1",
-  lanePlan: {
+  hypothesisId: "hypothesis_123",
+  hypothesisName: "hypothesis-1",
+  workerBranch: "onyx/session/hypothesis-1/worker",
+  hypothesisPlan: {
     focus: "Reduce controller overshoot",
-    hypothesis: "Smoother gains can reduce tracking error.",
+    statement: "Smoother gains can reduce tracking error.",
     startingPoints: ["src/controller.ts"],
     avoidList: ["eval changes"],
     successSignals: ["tracking_error decreases"],
@@ -31,11 +31,11 @@ const baseInput = {
   sessionStatePath: null,
 }
 
-describe("lane worker prompt", () => {
-  test("renders lane context and core loop rules", () => {
-    const prompt = renderLaneWorkerPrompt(baseInput)
+describe("hypothesis worker prompt", () => {
+  test("renders hypothesis context and core loop rules", () => {
+    const prompt = renderHypothesisWorkerPrompt(baseInput)
 
-    expect(prompt).toContain("# Onyx Lane Worker: lane-1")
+    expect(prompt).toContain("# Onyx Hypothesis Worker: hypothesis-1")
     expect(prompt).toContain("- Name: drone-controller")
     expect(prompt).toContain("- Metric: tracking_error (m), minimize")
     expect(prompt).toContain(
@@ -52,17 +52,18 @@ describe("lane worker prompt", () => {
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
     expect(prompt).toContain("Primary metric is king")
     expect(prompt).toContain("Do not ask whether to continue")
-    expect(prompt).not.toContain("Peer lane state")
+    expect(prompt).not.toContain("Peer hypothesis state")
   })
 
   test("includes peer session state when present", () => {
-    const prompt = renderLaneWorkerPrompt({
+    const prompt = renderHypothesisWorkerPrompt({
       ...baseInput,
-      sessionStatePath: "/repo/.git/onyx/session-state/session_123/lane-1.json",
+      sessionStatePath:
+        "/repo/.git/onyx/session-state/session_123/hypothesis-1.json",
     })
 
     expect(prompt).toContain(
-      "- Peer lane state: /repo/.git/onyx/session-state/session_123/lane-1.json"
+      "- Peer hypothesis state: /repo/.git/onyx/session-state/session_123/hypothesis-1.json"
     )
   })
 })

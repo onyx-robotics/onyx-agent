@@ -113,6 +113,7 @@ export async function runStreamingProcess(
     let closed = false
     let forceKill: ReturnType<typeof setTimeout> | null = null
     let lastOutputAt: string | null = null
+    let interrupted = false
 
     const killChild = (signal: NodeJS.Signals) => {
       if (useProcessGroup && child.pid) {
@@ -134,6 +135,28 @@ export async function runStreamingProcess(
       forceKill = setTimeout(() => {
         if (!closed) killChild("SIGKILL")
       }, options.killGraceMs ?? 5000)
+    }
+
+    const signalHandlers = new Map<NodeJS.Signals, () => void>()
+    for (const signal of ["SIGINT", "SIGTERM"] as NodeJS.Signals[]) {
+      const handler = () => {
+        if (closed) return
+        if (interrupted) {
+          killChild("SIGKILL")
+          return
+        }
+        interrupted = true
+        terminate(false)
+      }
+      signalHandlers.set(signal, handler)
+      process.on(signal, handler)
+    }
+
+    const removeSignalHandlers = () => {
+      for (const [signal, handler] of signalHandlers) {
+        process.off(signal, handler)
+      }
+      signalHandlers.clear()
     }
 
     const timeout =
@@ -169,6 +192,7 @@ export async function runStreamingProcess(
       if (timeout) clearTimeout(timeout)
       if (startupTimeout) clearTimeout(startupTimeout)
       if (forceKill) clearTimeout(forceKill)
+      removeSignalHandlers()
       log.end(`\n# onyx worker process failed to start: ${error.message}\n`)
       reject(error)
     })
@@ -178,6 +202,7 @@ export async function runStreamingProcess(
       if (timeout) clearTimeout(timeout)
       if (startupTimeout) clearTimeout(startupTimeout)
       if (forceKill) clearTimeout(forceKill)
+      removeSignalHandlers()
       log.end(
         [
           "",

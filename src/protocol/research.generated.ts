@@ -58,12 +58,10 @@ export const researchCampaignStatusSchema = z.enum([
   "paused",
   "archived",
 ])
-export const researchLaneStatusSchema = z.enum([
+export const researchHypothesisStatusSchema = z.enum([
   "active",
-  "claimed",
-  "stale",
-  "lost",
-  "completed",
+  "paused",
+  "retired",
 ])
 export const researchSessionStatusSchema = z.enum([
   "running",
@@ -75,7 +73,7 @@ export const researchSessionStatusSchema = z.enum([
 export const researchSummaryKindSchema = z.enum([
   "campaign_brief",
   "session_brief",
-  "lane_summary",
+  "hypothesis_summary",
   "transfer_brief",
   "setup_notes",
 ])
@@ -287,9 +285,9 @@ export const researchSetupValidationFileSchema = z.object({
   summary: z.string().trim().max(4000).nullable().default(null),
 })
 
-export const researchLanePlanSchema = z.object({
+export const researchHypothesisPlanSchema = z.object({
   focus: z.string().trim().min(1).max(1000),
-  hypothesis: z.string().trim().min(1).max(2000),
+  statement: z.string().trim().min(1).max(2000),
   startingPoints: z.array(z.string().trim().min(1).max(500)).default([]),
   avoidList: z.array(z.string().trim().min(1).max(500)).default([]),
   successSignals: z.array(z.string().trim().min(1).max(500)).default([]),
@@ -405,7 +403,7 @@ export const researchCampaignExperimentSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
   sessionId: z.uuid().nullable(),
-  laneId: z.uuid().nullable(),
+  hypothesisId: z.uuid().nullable(),
   workerId: z.uuid().nullable(),
   name: z.string().min(1),
   description: z.string().nullable(),
@@ -446,7 +444,7 @@ export const researchExperimentLinkSchema = z.object({
 export const createResearchCampaignExperimentRequestSchema = z
   .object({
     sessionId: z.uuid().optional(),
-    laneId: z.uuid().optional(),
+    hypothesisId: z.uuid().optional(),
     workerId: z.uuid().optional(),
     name: z.string().trim().min(1).max(160),
     description: z.string().trim().max(2000).optional(),
@@ -491,6 +489,14 @@ export const createResearchCampaignExperimentRequestSchema = z
       path: ["primaryMetricValue"],
       error:
         'primaryMetricValue is required when status is "succeeded" or "accepted"',
+    }
+  )
+  .refine(
+    (value) =>
+      !(value.sessionId || value.workerId) || Boolean(value.hypothesisId),
+    {
+      path: ["hypothesisId"],
+      error: "hypothesisId is required for worker or session experiments",
     }
   )
 
@@ -542,47 +548,48 @@ export const researchSessionSchema = z.object({
 export const createResearchSessionRequestSchema = z.object({
   name: z.string().trim().min(1).max(160),
   workerTarget: z.number().int().positive().max(500).optional(),
-  lanePlans: z.array(researchLanePlanSchema).max(500).optional(),
+  hypotheses: z.array(researchHypothesisPlanSchema).max(500).optional(),
   metadata: metadataSchema.default({}),
 })
 
-export const researchLaneSchema = z.object({
+export const createResearchHypothesisRequestSchema = z.object({
+  name: z.string().trim().min(1).max(160).optional(),
+  description: z.string().trim().min(1).max(2000).optional(),
+  plan: researchHypothesisPlanSchema,
+  baseCommitSha: gitShaSchema.optional(),
+  metadata: metadataSchema.default({}),
+})
+
+export const updateResearchHypothesisRequestSchema = z.object({
+  name: z.string().trim().min(1).max(160).optional(),
+  description: z.string().trim().max(2000).nullable().optional(),
+  status: researchHypothesisStatusSchema.optional(),
+  plan: researchHypothesisPlanSchema.optional(),
+  metadata: metadataSchema.optional(),
+})
+
+export const researchHypothesisSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
-  sessionId: z.uuid().nullable(),
+  createdBySessionId: z.uuid().nullable(),
   name: z.string().min(1),
   description: z.string().nullable(),
-  status: researchLaneStatusSchema,
-  branchRef: z.string().min(1),
+  status: researchHypothesisStatusSchema,
   baseCommitSha: z.string().min(1),
-  currentCommitSha: z.string().nullable(),
   bestExperimentId: z.uuid().nullable(),
   bestMetricValue: z.number().finite().nullable(),
-  currentWorkerId: z.uuid().nullable(),
-  plan: researchLanePlanSchema,
-  claimedAt: z.iso.datetime().nullable(),
-  lastHeartbeatAt: z.iso.datetime().nullable(),
+  lastWorkedAt: z.iso.datetime().nullable(),
+  plan: researchHypothesisPlanSchema,
   metadata: metadataSchema,
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
-})
-
-export const claimResearchLaneRequestSchema = z.object({
-  workerId: z.uuid(),
-})
-
-export const researchLaneHeartbeatRequestSchema = z.object({
-  workerId: z.uuid(),
-  status: z.enum(["active", "claimed", "completed", "lost"]).optional(),
-  currentCommitSha: gitShaSchema.nullable().optional(),
-  metadata: metadataSchema.default({}),
 })
 
 export const researchSummarySchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
   sessionId: z.uuid().nullable(),
-  laneId: z.uuid().nullable(),
+  hypothesisId: z.uuid().nullable(),
   authoredByWorkerId: z.uuid().nullable(),
   summaryKind: researchSummaryKindSchema,
   title: z.string().min(1),
@@ -597,7 +604,7 @@ export const researchKnowledgeSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
   sessionId: z.uuid().nullable(),
-  laneId: z.uuid().nullable(),
+  hypothesisId: z.uuid().nullable(),
   authoredByWorkerId: z.uuid().nullable(),
   experimentId: z.uuid().nullable(),
   kind: researchKnowledgeKindSchema,
@@ -611,7 +618,7 @@ export const researchKnowledgeSchema = z.object({
 
 export const createResearchKnowledgeRequestSchema = z.object({
   sessionId: z.uuid().optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
   authoredByWorkerId: z.uuid().optional(),
   experimentId: z.uuid().optional(),
   kind: researchKnowledgeKindSchema,
@@ -623,7 +630,7 @@ export const createResearchKnowledgeRequestSchema = z.object({
 
 export const upsertResearchSummaryRequestSchema = z.object({
   sessionId: z.uuid().optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
   authoredByWorkerId: z.uuid().optional(),
   summaryKind: researchSummaryKindSchema,
   title: z.string().trim().min(1).max(200),
@@ -636,7 +643,7 @@ export const researchWorkerSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
   sessionId: z.uuid().nullable(),
-  laneId: z.uuid().nullable(),
+  hypothesisId: z.uuid(),
   workerName: z.string().min(1),
   agentKind: z.string().min(1),
   runtime: researchWorkerRuntimeSchema,
@@ -654,7 +661,7 @@ export const researchWorkerSchema = z.object({
 
 export const registerResearchWorkerRequestSchema = z.object({
   sessionId: z.uuid().optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid(),
   workerName: z.string().trim().min(1).max(160),
   agentKind: z.string().trim().min(1).max(80).default("codex"),
   runtime: researchWorkerRuntimeSchema.default("local"),
@@ -666,7 +673,7 @@ export const researchWorkerHeartbeatSchema = z.object({
   workerId: z.uuid(),
   campaignId: z.uuid(),
   sessionId: z.uuid().nullable(),
-  laneId: z.uuid().nullable(),
+  hypothesisId: z.uuid(),
   experimentId: z.uuid().nullable(),
   status: researchWorkerStatusSchema,
   phase: z.string().nullable(),
@@ -681,7 +688,7 @@ export const researchWorkerHeartbeatSchema = z.object({
 export const researchWorkerHeartbeatRequestSchema = z.object({
   status: researchWorkerStatusSchema.default("running"),
   sessionId: z.uuid().optional(),
-  laneId: z.uuid().nullable().optional(),
+  hypothesisId: z.uuid().optional(),
   experimentId: z.uuid().nullable().optional(),
   phase: z.string().trim().max(120).nullable().optional(),
   event: z.string().trim().max(160).nullable().optional(),
@@ -734,7 +741,7 @@ export const researchCampaignExperimentSummarySchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
   sessionId: z.uuid().nullable(),
-  laneId: z.uuid().nullable(),
+  hypothesisId: z.uuid().nullable(),
   workerId: z.uuid().nullable(),
   name: z.string().min(1),
   description: z.string().nullable(),
@@ -760,12 +767,12 @@ export const researchCampaignOverviewResponseSchema = z.object({
     bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
     latestExperiments: z.array(researchCampaignExperimentSummarySchema),
     workers: z.array(researchWorkerSchema),
-    lanes: z.array(researchLaneSchema),
+    hypotheses: z.array(researchHypothesisSchema),
     summaries: z.array(researchSummarySchema),
     knowledge: z.array(researchKnowledgeSchema),
     counts: z.object({
       experiments: z.number().int().nonnegative(),
-      activeLanes: z.number().int().nonnegative(),
+      hypothesisCount: z.number().int().nonnegative(),
       activeWorkers: z.number().int().nonnegative(),
     }),
   }),
@@ -807,7 +814,7 @@ export const researchCampaignTimelineResponseSchema = z.object({
 export const listResearchCampaignExperimentsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   cursor: z.string().trim().min(1).optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
   status: researchExperimentStatusSchema.optional(),
   order: z.enum(["asc", "desc"]).default("desc"),
 })
@@ -841,7 +848,7 @@ export const researchMetricSeriesPointSchema = z.object({
   id: z.uuid(),
   runRef: z.string().min(1),
   name: z.string().min(1),
-  laneId: z.uuid().nullable(),
+  hypothesisId: z.uuid().nullable(),
   createdAt: z.iso.datetime(),
   resultCommitSha: z.string().min(1),
   status: researchExperimentStatusSchema,
@@ -909,7 +916,7 @@ export const researchProjectGraphResponseSchema = z.object({
 export const researchProjectOutlineCampaignSchema =
   researchCampaignSchema.extend({
     latestExperiments: z.array(researchCampaignExperimentSummarySchema),
-    activeLaneCount: z.number().int().nonnegative(),
+    hypothesisCount: z.number().int().nonnegative(),
     activeWorkerCount: z.number().int().nonnegative(),
   })
 
@@ -926,7 +933,7 @@ export const researchSessionStateResponseSchema = z.object({
     campaign: researchCampaignSchema,
     latestExperiments: z.array(researchCampaignExperimentSummarySchema),
     bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
-    lanes: z.array(researchLaneSchema),
+    hypotheses: z.array(researchHypothesisSchema),
     workers: z.array(researchWorkerSchema),
     summaries: z.array(researchSummarySchema),
     knowledge: z.array(researchKnowledgeSchema),
@@ -937,7 +944,23 @@ export const researchSessionStateResponseSchema = z.object({
 export const createResearchSessionResponseSchema = z.object({
   data: z.object({
     session: researchSessionSchema,
-    lanes: z.array(researchLaneSchema),
+    hypotheses: z.array(researchHypothesisSchema),
+  }),
+})
+
+export const createResearchHypothesisResponseSchema = z.object({
+  data: z.object({
+    hypothesis: researchHypothesisSchema,
+  }),
+})
+
+export const listResearchHypothesesResponseSchema = z.object({
+  data: z.array(researchHypothesisSchema),
+})
+
+export const updateResearchHypothesisResponseSchema = z.object({
+  data: z.object({
+    hypothesis: researchHypothesisSchema,
   }),
 })
 
@@ -956,16 +979,6 @@ export const researchWorkerHeartbeatResponseSchema = z.object({
   }),
 })
 
-export const claimResearchLaneResponseSchema = z.object({
-  data: z.object({
-    lane: researchLaneSchema,
-  }),
-})
-
-export const researchLaneHeartbeatResponseSchema = z.object({
-  data: researchLaneSchema,
-})
-
 export const upsertResearchSummaryResponseSchema = z.object({
   data: researchSummarySchema,
 })
@@ -974,7 +987,7 @@ export const researchBriefSchema = z.object({
   campaign: researchCampaignSchema,
   bestExperiment: researchCampaignExperimentSchema.nullable(),
   recentExperiments: z.array(researchCampaignExperimentSchema),
-  lanes: z.array(researchLaneSchema),
+  hypotheses: z.array(researchHypothesisSchema),
   workers: z.array(researchWorkerSchema),
   summaries: z.array(researchSummarySchema),
   knowledge: z.array(researchKnowledgeSchema),
@@ -1070,7 +1083,7 @@ export const researchCampaignExperimentCodeResponseSchema = z.object({
 
 export const researchCampaignGraphNodeSchema = z.object({
   id: z.string().min(1),
-  type: z.enum(["campaign", "experiment", "lane", "worker"]),
+  type: z.enum(["campaign", "experiment", "hypothesis", "worker"]),
   label: z.string().min(1),
   status: z.string().nullable(),
   metricValue: z.number().finite().nullable(),
@@ -1103,7 +1116,7 @@ export const researchCampaignGraphResponseSchema = z.object({
 export const reconcileResearchCampaignResponseSchema = z.object({
   data: z.object({
     campaign: researchCampaignSchema,
-    lanes: z.array(researchLaneSchema),
+    hypotheses: z.array(researchHypothesisSchema),
     workers: z.array(researchWorkerSchema),
     experimentsUpdated: z.number().int().nonnegative(),
   }),
@@ -1179,7 +1192,9 @@ export type ResolveResearchProjectResponse = z.infer<
 export type ResearchCampaignStatus = z.infer<
   typeof researchCampaignStatusSchema
 >
-export type ResearchLaneStatus = z.infer<typeof researchLaneStatusSchema>
+export type ResearchHypothesisStatus = z.infer<
+  typeof researchHypothesisStatusSchema
+>
 export type ResearchSummaryKind = z.infer<typeof researchSummaryKindSchema>
 export type ResearchWorkerRuntime = z.infer<typeof researchWorkerRuntimeSchema>
 export type ResearchWorkerStatus = z.infer<typeof researchWorkerStatusSchema>
@@ -1198,7 +1213,9 @@ export type ResearchSetupValidationFile = z.infer<
 export type ResearchSetupValidationModuleResult = z.infer<
   typeof researchSetupValidationModuleResultSchema
 >
-export type ResearchLanePlan = z.infer<typeof researchLanePlanSchema>
+export type ResearchHypothesisPlan = z.infer<
+  typeof researchHypothesisPlanSchema
+>
 export type ResearchCampaign = z.infer<typeof researchCampaignSchema>
 export type CreateResearchCampaignRequest = z.infer<
   typeof createResearchCampaignRequestSchema
@@ -1277,6 +1294,21 @@ export type CreateResearchSessionRequest = z.infer<
 export type CreateResearchSessionResponse = z.infer<
   typeof createResearchSessionResponseSchema
 >
+export type CreateResearchHypothesisRequest = z.infer<
+  typeof createResearchHypothesisRequestSchema
+>
+export type CreateResearchHypothesisResponse = z.infer<
+  typeof createResearchHypothesisResponseSchema
+>
+export type ListResearchHypothesesResponse = z.infer<
+  typeof listResearchHypothesesResponseSchema
+>
+export type UpdateResearchHypothesisRequest = z.infer<
+  typeof updateResearchHypothesisRequestSchema
+>
+export type UpdateResearchHypothesisResponse = z.infer<
+  typeof updateResearchHypothesisResponseSchema
+>
 export type ResearchSessionStateResponse = z.infer<
   typeof researchSessionStateResponseSchema
 >
@@ -1286,19 +1318,7 @@ export type StopResearchSessionRequest = z.infer<
 export type StopResearchSessionResponse = z.infer<
   typeof stopResearchSessionResponseSchema
 >
-export type ResearchLane = z.infer<typeof researchLaneSchema>
-export type ClaimResearchLaneRequest = z.infer<
-  typeof claimResearchLaneRequestSchema
->
-export type ClaimResearchLaneResponse = z.infer<
-  typeof claimResearchLaneResponseSchema
->
-export type ResearchLaneHeartbeatRequest = z.infer<
-  typeof researchLaneHeartbeatRequestSchema
->
-export type ResearchLaneHeartbeatResponse = z.infer<
-  typeof researchLaneHeartbeatResponseSchema
->
+export type ResearchHypothesis = z.infer<typeof researchHypothesisSchema>
 export type ResearchSummary = z.infer<typeof researchSummarySchema>
 export type ResearchKnowledge = z.infer<typeof researchKnowledgeSchema>
 export type CreateResearchKnowledgeRequest = z.infer<
@@ -1406,12 +1426,12 @@ export const researchCampaignExperimentDeletedEventSchema = z.object({
   }),
 })
 
-export const researchLaneUpsertedEventSchema = z.object({
-  type: z.literal("research.lane.upserted"),
+export const researchHypothesisUpsertedEventSchema = z.object({
+  type: z.literal("research.hypothesis.upserted"),
   data: z.object({
     projectId: z.uuid(),
     campaignId: z.uuid(),
-    lane: researchLaneSchema,
+    hypothesis: researchHypothesisSchema,
   }),
 })
 
@@ -1457,7 +1477,7 @@ export const researchEventSchema = z.discriminatedUnion("type", [
   researchCampaignDeletedEventSchema,
   researchCampaignExperimentUpsertedEventSchema,
   researchCampaignExperimentDeletedEventSchema,
-  researchLaneUpsertedEventSchema,
+  researchHypothesisUpsertedEventSchema,
   researchSummaryUpsertedEventSchema,
   researchKnowledgeUpsertedEventSchema,
   researchWorkerUpsertedEventSchema,
@@ -1479,8 +1499,8 @@ export type ResearchCampaignExperimentUpsertedEvent = z.infer<
 export type ResearchCampaignExperimentDeletedEvent = z.infer<
   typeof researchCampaignExperimentDeletedEventSchema
 >
-export type ResearchLaneUpsertedEvent = z.infer<
-  typeof researchLaneUpsertedEventSchema
+export type ResearchHypothesisUpsertedEvent = z.infer<
+  typeof researchHypothesisUpsertedEventSchema
 >
 export type ResearchSummaryUpsertedEvent = z.infer<
   typeof researchSummaryUpsertedEventSchema

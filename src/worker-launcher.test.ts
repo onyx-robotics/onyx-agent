@@ -115,6 +115,7 @@ describe("worker launchers", () => {
 
     expect(claude.command).toBe("claude")
     expect(claude.args).toEqual([
+      "--verbose",
       "--print",
       "--input-format",
       "text",
@@ -236,8 +237,8 @@ describe("worker launchers", () => {
       logPath: join(root, "worker.log"),
       manifestPath,
       sessionId: "session",
-      laneId: "lane",
-      laneName: "lane-one",
+      hypothesisId: "hypothesis",
+      hypothesisName: "hypothesis-one",
       workerId: "worker",
       version: null,
       startedAt: "2026-06-20T00:00:00.000Z",

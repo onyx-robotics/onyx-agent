@@ -1,26 +1,29 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
-import { researchLanePlanSchema } from "../protocol"
-import type { Args } from "../lib/args"
+import {
+  researchHypothesisPlanSchema,
+  type ResearchHypothesisPlan,
+} from "../protocol"
+import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
-  claimCampaignLane,
+  createCampaignHypothesis,
   createCampaignSession,
   getCampaignBrief,
   getCampaignOverview,
   getResearchSessionState,
-  heartbeatCampaignLane,
   heartbeatWorker,
   createCampaignKnowledge,
   listCampaignKnowledge,
   listProjectCampaigns,
   registerCampaignWorker,
+  reconcileCampaign,
   stopCampaignSession,
   resolveProject,
   upsertCampaignSummary,
   type ApiCampaign,
-  type ApiLane,
+  type ApiHypothesis,
 } from "../lib/api"
 import {
   readSetupFile,
@@ -59,15 +62,11 @@ import {
   type WorkerLaunchManifest,
   type WorkerOnyxShim,
 } from "../lib/worker-launcher"
-import { renderLaneWorkerPrompt } from "../lib/worker-prompt"
+import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
 
 const MAX_WORKER_SHUTDOWN_CUSHION_MS = 90_000
 const MIN_WORKER_SHUTDOWN_CUSHION_MS = 15_000
 const MAX_WORKER_HARD_STOP_GRACE_MS = 30_000
-
-function branchName(ref: string) {
-  return ref.replace(/^refs\/heads\//, "")
-}
 
 function positiveIntegerOption(args: Args, name: string, fallback: number) {
   const raw = args.options[name]
@@ -116,14 +115,63 @@ function workerHardStopGraceMs(shutdownCushionMs: number) {
   )
 }
 
-async function lanePlansOption(args: Args) {
-  const path = args.options["lane-plans"]
+async function hypothesisPlansOption(args: Args) {
+  const path = args.options["hypotheses"]
   if (!path) return undefined
   const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
   if (!Array.isArray(parsed)) {
-    throw new Error("--lane-plans must point to a JSON array")
+    throw new Error("--hypotheses must point to a JSON array")
   }
-  return parsed.map((plan) => researchLanePlanSchema.parse(plan))
+  return parsed.map((plan) => researchHypothesisPlanSchema.parse(plan))
+}
+
+const INLINE_HYPOTHESIS_PLAN_OPTIONS = [
+  "focus",
+  "hypothesis",
+  "starting-point",
+  "avoid",
+  "success",
+  "give-up",
+]
+
+function hasInlineHypothesisPlanOptions(args: Args) {
+  return INLINE_HYPOTHESIS_PLAN_OPTIONS.some((option) => args.options[option])
+}
+
+async function hypothesisPlanOption(
+  args: Args
+): Promise<ResearchHypothesisPlan> {
+  const planPath = args.options.plan
+  const hasInline = hasInlineHypothesisPlanOptions(args)
+  if (planPath && hasInline) {
+    throw new Error(
+      "Use either --plan <json-file> or inline plan flags, not both."
+    )
+  }
+  if (planPath) {
+    const parsed: unknown = JSON.parse(await readFile(planPath, "utf8"))
+    if (Array.isArray(parsed)) {
+      throw new Error(
+        "--plan must point to one hypothesis-plan JSON object, not an array."
+      )
+    }
+    return researchHypothesisPlanSchema.parse(parsed)
+  }
+  const focus = args.options.focus
+  const hypothesis = args.options.hypothesis
+  if (!focus || !hypothesis) {
+    throw new Error(
+      "Pass --plan <json-file>, or pass --focus <text> and --hypothesis <text>."
+    )
+  }
+  return researchHypothesisPlanSchema.parse({
+    focus,
+    statement: hypothesis,
+    startingPoints: optionValues(args, "starting-point"),
+    avoidList: optionValues(args, "avoid"),
+    successSignals: optionValues(args, "success"),
+    giveUpSignals: optionValues(args, "give-up"),
+  })
 }
 
 function sleep(ms: number) {
@@ -343,19 +391,19 @@ async function writeBrief({
   root,
   campaignId,
   sessionId,
-  lane,
+  hypothesis,
   args,
 }: {
   root: string
   campaignId: string
   sessionId: string
-  lane: ApiLane
+  hypothesis: ApiHypothesis
   args: Args
 }) {
   const brief = await getCampaignBrief(campaignId, args)
   const dir = join(await onyxStateDir(root), "briefs", sessionId)
   await mkdir(dir, { recursive: true })
-  const path = join(dir, `${lane.name}.md`)
+  const path = join(dir, `${hypothesis.name}.md`)
   await writeFile(path, `${brief.markdown}\n`, "utf8")
   return path
 }
@@ -363,17 +411,17 @@ async function writeBrief({
 async function writeSessionState({
   root,
   sessionId,
-  lane,
+  hypothesis,
   args,
 }: {
   root: string
   sessionId: string
-  lane: ApiLane
+  hypothesis: ApiHypothesis
   args: Args
 }) {
   const dir = join(await onyxStateDir(root), "session-state", sessionId)
   await mkdir(dir, { recursive: true })
-  const path = join(dir, `${lane.id}.json`)
+  const path = join(dir, `${hypothesis.id}.json`)
   const state = await getResearchSessionState(sessionId, args)
   await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, "utf8")
   return path
@@ -381,56 +429,72 @@ async function writeSessionState({
 
 async function ensureWorktree({
   root,
-  lane,
+  hypothesis,
   sessionId,
+  workerId,
 }: {
   root: string
-  lane: ApiLane
+  hypothesis: ApiHypothesis
   sessionId: string
+  workerId: string
 }) {
+  const branch = workerBranchName({ sessionId, hypothesis, workerId })
   const dir = join(
     await onyxStateDir(root),
     "worktrees",
-    `${sessionId}-${lane.name}`
+    `${sessionId}-${hypothesis.name}-${workerId.slice(0, 8)}`
   )
   if (!(await pathExists(dir))) {
     await mkdir(join(await onyxStateDir(root), "worktrees"), {
       recursive: true,
     })
     await git(
-      [
-        "worktree",
-        "add",
-        "-B",
-        branchName(lane.branchRef),
-        dir,
-        lane.currentCommitSha ?? lane.baseCommitSha,
-      ],
+      ["worktree", "add", "-B", branch, dir, hypothesis.baseCommitSha],
       root
     )
   }
-  return dir
+  return { dir, branch }
 }
 
-async function commitIfNeeded(worktree: string, lane: ApiLane) {
+function workerBranchName({
+  sessionId,
+  hypothesis,
+  workerId,
+}: {
+  sessionId: string
+  hypothesis: ApiHypothesis
+  workerId: string
+}) {
+  return [
+    "onyx",
+    safeBranchSegment(sessionId).slice(0, 12),
+    safeBranchSegment(hypothesis.name),
+    safeBranchSegment(workerId).slice(0, 12),
+  ].join("/")
+}
+
+async function commitIfNeeded(worktree: string, hypothesis: ApiHypothesis) {
   const status = await git(["status", "--porcelain"], worktree)
   if (!status.trim()) {
     return { commitSha: await currentCommit(worktree), changed: false }
   }
   await git(["add", "-A"], worktree)
-  await git(["commit", "-m", `onyx: ${lane.name} research attempt`], worktree)
+  await git(
+    ["commit", "-m", `onyx: ${hypothesis.name} research attempt`],
+    worktree
+  )
   return { commitSha: await currentCommit(worktree), changed: true }
 }
 
 async function hasLocalExperimentFor({
   root,
   campaignName,
-  laneId,
+  hypothesisId,
   resultCommitSha,
 }: {
   root: string
   campaignName: string
-  laneId: string
+  hypothesisId: string
   resultCommitSha: string
 }) {
   const [outbox, history] = await Promise.all([
@@ -442,13 +506,13 @@ async function hasLocalExperimentFor({
       (record) =>
         record.type === "campaign_experiment_logged" &&
         record.campaignName === campaignName &&
-        record.laneId === laneId &&
+        record.hypothesisId === hypothesisId &&
         record.resultCommitSha === resultCommitSha
     ) ||
     history.records.some(
       (record) =>
         record.campaignName === campaignName &&
-        record.laneId === laneId &&
+        record.hypothesisId === hypothesisId &&
         record.resultCommitSha === resultCommitSha
     )
   )
@@ -464,22 +528,24 @@ async function withoutProcessExitCode<T>(fn: () => Promise<T>) {
   }
 }
 
-async function finalizeLaneAttempt({
+async function finalizeHypothesisAttempt({
   root,
   worktree,
   campaign,
-  lane,
+  hypothesis,
   sessionId,
   workerId,
+  workerBranch,
   args,
   workerFailed,
 }: {
   root: string
   worktree: string
   campaign: ApiCampaign
-  lane: ApiLane
+  hypothesis: ApiHypothesis
   sessionId: string
   workerId: string
+  workerBranch: string
   args: Args
   workerFailed: boolean
 }): Promise<WorkerFinalizationManifest> {
@@ -488,7 +554,7 @@ async function finalizeLaneAttempt({
     salvaged: workerFailed,
     commitSha: null,
     experimentLogged: false,
-    lanePushStatus: "not_attempted",
+    workerBranchPushStatus: "not_attempted",
     error: null,
   }
 
@@ -497,18 +563,18 @@ async function finalizeLaneAttempt({
     const dirty = (await git(["status", "--porcelain"], worktree)).trim()
     const hasResult =
       (Boolean(dirty) && dirty.length > 0) ||
-      headBefore !== (lane.currentCommitSha ?? lane.baseCommitSha)
+      headBefore !== hypothesis.baseCommitSha
     if (!hasResult) return manifest
 
     manifest.attempted = true
-    const commit = await commitIfNeeded(worktree, lane)
+    const commit = await commitIfNeeded(worktree, hypothesis)
     manifest.commitSha = commit.commitSha
 
     if (
       !(await hasLocalExperimentFor({
         root,
         campaignName: campaign.name,
-        laneId: lane.id,
+        hypothesisId: hypothesis.id,
         resultCommitSha: commit.commitSha,
       }))
     ) {
@@ -520,7 +586,7 @@ async function finalizeLaneAttempt({
             ...args.options,
             cwd: worktree,
             campaign: campaign.name,
-            base: lane.baseCommitSha,
+            base: hypothesis.baseCommitSha,
             timeout: "120",
             "checks-timeout": "120",
           },
@@ -536,22 +602,22 @@ async function finalizeLaneAttempt({
             ...args.options,
             cwd: worktree,
             campaign: campaign.name,
-            base: lane.baseCommitSha,
-            lane: lane.id,
+            base: hypothesis.baseCommitSha,
+            hypothesis: hypothesis.id,
             session: sessionId,
             worker: workerId,
             ...(measurementError
               ? { status: "failed", "allow-unmeasured": "true" }
               : {}),
-            name: `${lane.name}-final-${commit.commitSha.slice(0, 7)}`,
+            name: `${hypothesis.name}-final-${commit.commitSha.slice(0, 7)}`,
             description: workerFailed
-              ? `Best-effort salvage from ${lane.name} after worker process failure.`
-              : `Final ${lane.name} worker result.`,
+              ? `Best-effort salvage from ${hypothesis.name} after worker process failure.`
+              : `Final ${hypothesis.name} worker result.`,
             "agent-notes": JSON.stringify({
               finalizedBy: "onyx worker harness",
               workerFailed,
               measurementError,
-              lane: lane.name,
+              hypothesis: hypothesis.name,
             }),
           },
         })
@@ -569,16 +635,18 @@ async function finalizeLaneAttempt({
         })
     }
 
-    const lanePush = await gitResult(
-      ["push", "origin", `HEAD:${lane.branchRef}`],
+    const workerBranchPush = await gitResult(
+      ["push", "origin", `HEAD:refs/heads/${workerBranch}`],
       worktree
     )
-    if (lanePush.code === 0 && !lanePush.timedOut) {
-      manifest.lanePushStatus = "pushed"
+    if (workerBranchPush.code === 0 && !workerBranchPush.timedOut) {
+      manifest.workerBranchPushStatus = "pushed"
     } else {
-      manifest.lanePushStatus = "failed"
+      manifest.workerBranchPushStatus = "failed"
       manifest.error =
-        lanePush.stderr.trim() || lanePush.stdout.trim() || "lane push failed"
+        workerBranchPush.stderr.trim() ||
+        workerBranchPush.stdout.trim() ||
+        "worker branch push failed"
     }
 
     return manifest
@@ -594,7 +662,8 @@ async function writeWorkerPrompt({
   campaign,
   setup,
   sessionId,
-  lane,
+  hypothesis,
+  workerBranch,
   briefPath,
   sessionStatePath,
   maxIterations,
@@ -605,7 +674,8 @@ async function writeWorkerPrompt({
   campaign: ApiCampaign
   setup: ResearchSetupFile
   sessionId: string
-  lane: ApiLane
+  hypothesis: ApiHypothesis
+  workerBranch: string
   briefPath: string
   sessionStatePath: string | null
   maxIterations: number
@@ -613,7 +683,7 @@ async function writeWorkerPrompt({
 }) {
   const dir = join(await onyxStateDir(root), "worker-prompts", sessionId)
   await mkdir(dir, { recursive: true })
-  const path = join(dir, `${lane.name}.md`)
+  const path = join(dir, `${hypothesis.name}.md`)
   const protectedPaths = await protectedToolPaths(root, projectPath)
   const nowMs = Date.now()
   const budgetRemainingMs = Math.max(0, endTimeMs - nowMs)
@@ -621,14 +691,13 @@ async function writeWorkerPrompt({
   const researchDeadlineMs = Math.max(nowMs, endTimeMs - shutdownCushionMs)
   const shutdownDeadlineMs = Math.max(nowMs, endTimeMs)
   const minutesRemaining = Math.max(0, Math.ceil(budgetRemainingMs / 60_000))
-  const markdown = renderLaneWorkerPrompt({
+  const markdown = renderHypothesisWorkerPrompt({
     briefPath,
     campaignName: campaign.name,
     goal: setup.goal ?? campaign.description ?? "not specified",
-    laneBranch: lane.branchRef,
-    laneId: lane.id,
-    laneName: lane.name,
-    lanePlan: lane.plan,
+    hypothesisId: hypothesis.id,
+    hypothesisName: hypothesis.name,
+    hypothesisPlan: hypothesis.plan,
     maxIterations,
     metricLabel: `${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
     minutesRemaining,
@@ -643,6 +712,7 @@ async function writeWorkerPrompt({
       : "onyx/onyx.md",
     sessionId,
     sessionStatePath,
+    workerBranch,
   })
 
   await writeFile(path, `${markdown}\n`, "utf8")
@@ -669,7 +739,7 @@ function processFailure(
 async function withWorkerHeartbeat<T>({
   workerId,
   sessionId,
-  laneId,
+  hypothesisId,
   args,
   phase,
   progressMessage,
@@ -678,7 +748,7 @@ async function withWorkerHeartbeat<T>({
 }: {
   workerId: string
   sessionId: string
-  laneId: string
+  hypothesisId: string
   args: Args
   phase: string
   progressMessage: string | (() => string)
@@ -691,7 +761,7 @@ async function withWorkerHeartbeat<T>({
       {
         status: "running",
         sessionId,
-        laneId,
+        hypothesisId,
         phase,
         event: "heartbeat",
         progressMessage:
@@ -716,18 +786,18 @@ function errorMessage(error: unknown) {
 }
 
 function workerProgress({
-  laneName,
+  hypothesisName,
   logPath,
   lastOutputAt,
 }: {
-  laneName: string
+  hypothesisName: string
   logPath: string
   lastOutputAt: string | null
 }) {
   const output = lastOutputAt
     ? `last output ${formatAge(lastOutputAt, Date.now())} ago`
     : "no output yet"
-  return `${laneName} worker running; ${output}; log ${logPath}`
+  return `${hypothesisName} worker running; ${output}; log ${logPath}`
 }
 
 function workerMetadata({
@@ -749,21 +819,21 @@ function workerMetadata({
   }
 }
 
-type LaneRunResult = {
-  lane: ApiLane
+type HypothesisRunResult = {
+  hypothesis: ApiHypothesis
   workerId?: string
   resultCommitSha?: string
   status: "completed" | "failed"
   error?: string
 }
 
-async function runLaneOnce({
+async function runHypothesisOnce({
   root,
   projectPath,
   campaign,
   setup,
   sessionId,
-  lane,
+  hypothesis,
   workerCommand,
   agentKind,
   maxIterations,
@@ -779,7 +849,7 @@ async function runLaneOnce({
   campaign: ApiCampaign
   setup: ResearchSetupFile
   sessionId: string
-  lane: ApiLane
+  hypothesis: ApiHypothesis
   workerCommand?: string
   agentKind: string
   maxIterations: number
@@ -789,9 +859,8 @@ async function runLaneOnce({
   startupTimeoutMs: number
   syncSupervisor: ReturnType<typeof createSyncSupervisor>
   args: Args
-}): Promise<LaneRunResult> {
+}): Promise<HypothesisRunResult> {
   let workerId: string | undefined
-  let claimed: ApiLane | null = null
   let resultCommitSha: string | undefined
   let launchManifest: WorkerLaunchManifest | null = null
   let workerShim: WorkerOnyxShim | null = null
@@ -801,38 +870,41 @@ async function runLaneOnce({
       campaign.id,
       {
         sessionId,
-        laneId: lane.id,
-        workerName: `${lane.name}-${agentKind}`,
+        hypothesisId: hypothesis.id,
+        workerName: `${hypothesis.name}-${agentKind}`,
         agentKind,
         runtime: "local",
       },
       args
     )
     workerId = worker.id
-    claimed = (await claimCampaignLane(lane.id, { workerId: worker.id }, args))
-      .lane
     await heartbeatWorker(
       worker.id,
       {
         status: "running",
         sessionId,
-        laneId: claimed.id,
+        hypothesisId: hypothesis.id,
         phase: "research",
-        event: "lane_claimed",
-        progressMessage: `Running ${claimed.name}`,
+        event: "hypothesis_started",
+        progressMessage: `Running ${hypothesis.name}`,
       },
       args
     )
 
-    const worktree = await ensureWorktree({ root, lane: claimed, sessionId })
+    const { dir: worktree, branch: workerBranch } = await ensureWorktree({
+      root,
+      hypothesis,
+      sessionId,
+      workerId: worker.id,
+    })
     await emitEvent(root, {
-      type: "lane_claimed",
+      type: "hypothesis_started",
       campaignName: campaign.name,
       campaignId: campaign.id,
       sessionId,
       workerId: worker.id,
-      laneId: lane.id,
-      message: lane.name,
+      hypothesisId: hypothesis.id,
+      message: hypothesis.name,
     })
 
     const [briefPath, sessionStatePath] = await Promise.all([
@@ -840,10 +912,10 @@ async function runLaneOnce({
         root,
         campaignId: campaign.id,
         sessionId,
-        lane: claimed,
+        hypothesis,
         args,
       }),
-      writeSessionState({ root, sessionId, lane: claimed, args }).catch(
+      writeSessionState({ root, sessionId, hypothesis, args }).catch(
         () => null
       ),
     ])
@@ -853,7 +925,8 @@ async function runLaneOnce({
       campaign,
       setup,
       sessionId,
-      lane: claimed,
+      hypothesis,
+      workerBranch,
       briefPath,
       sessionStatePath,
       maxIterations,
@@ -869,9 +942,9 @@ async function runLaneOnce({
       ONYX_CAMPAIGN_ID: campaign.id,
       ONYX_CAMPAIGN_NAME: campaign.name,
       ONYX_SESSION_ID: sessionId,
-      ONYX_LANE_ID: lane.id,
-      ONYX_LANE_NAME: lane.name,
-      ONYX_LANE_BRANCH: lane.branchRef,
+      ONYX_HYPOTHESIS_ID: hypothesis.id,
+      ONYX_HYPOTHESIS_NAME: hypothesis.name,
+      ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
       ONYX_BRIEF_FILE: briefPath,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
@@ -909,8 +982,8 @@ async function runLaneOnce({
     const launchPaths = await workerLaunchPaths({
       root,
       sessionId,
-      laneId: lane.id,
-      laneName: lane.name,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
     })
     launchManifest = {
       schemaVersion: 1,
@@ -924,8 +997,8 @@ async function runLaneOnce({
       logPath: launchPaths.logPath,
       manifestPath: launchPaths.manifestPath,
       sessionId,
-      laneId: lane.id,
-      laneName: lane.name,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
       workerId: worker.id,
       version: preflight.version,
       startedAt: new Date().toISOString(),
@@ -944,12 +1017,12 @@ async function runLaneOnce({
     const workerResult = await withWorkerHeartbeat({
       workerId: worker.id,
       sessionId,
-      laneId: lane.id,
+      hypothesisId: hypothesis.id,
       args,
       phase: "research",
       progressMessage: () =>
         workerProgress({
-          laneName: claimed?.name ?? lane.name,
+          hypothesisName: hypothesis.name,
           logPath: launchManifest?.logPath ?? launchPaths.logPath,
           lastOutputAt: launchManifest?.lastOutputAt ?? null,
         }),
@@ -971,7 +1044,7 @@ async function runLaneOnce({
             `# agent: ${invocation.agentKind}`,
             `# prompt: ${prompt.path}`,
             `# worker: ${worker.id}`,
-            `# lane: ${lane.id}`,
+            `# hypothesis: ${hypothesis.id}`,
           ].join("\n"),
           stdin: invocation.stdin,
           env: workerRunEnv,
@@ -1001,15 +1074,16 @@ async function runLaneOnce({
     }
     const workerFailure = processFailure(
       workerResult,
-      `Worker process for ${lane.name}`
+      `Worker process for ${hypothesis.name}`
     )
-    const finalization = await finalizeLaneAttempt({
+    const finalization = await finalizeHypothesisAttempt({
       root,
       worktree,
       campaign,
-      lane,
+      hypothesis,
       sessionId,
       workerId: worker.id,
+      workerBranch,
       args,
       workerFailed: Boolean(workerFailure),
     })
@@ -1033,27 +1107,15 @@ async function runLaneOnce({
       )
     }
 
-    await heartbeatCampaignLane(
-      lane.id,
-      {
-        workerId: worker.id,
-        currentCommitSha: resultCommitSha,
-        status: "completed",
-        metadata: {
-          finalization,
-        },
-      },
-      args
-    )
     await heartbeatWorker(
       worker.id,
       {
         status: "stopped",
         sessionId,
-        laneId: null,
+        hypothesisId: hypothesis.id,
         phase: "completed",
-        event: "lane_completed",
-        progressMessage: `${lane.name} completed`,
+        event: "hypothesis_completed",
+        progressMessage: `${hypothesis.name} completed`,
         gitLabel: resultCommitSha,
       },
       args
@@ -1062,10 +1124,10 @@ async function runLaneOnce({
       campaign.id,
       {
         sessionId,
-        laneId: lane.id,
+        hypothesisId: hypothesis.id,
         authoredByWorkerId: worker.id,
-        summaryKind: "lane_summary",
-        title: `${lane.name} completed`,
+        summaryKind: "hypothesis_summary",
+        title: `${hypothesis.name} completed`,
         body: [
           `Worker process exited successfully.`,
           `Latest commit: ${resultCommitSha ?? "n/a"}`,
@@ -1076,8 +1138,8 @@ async function runLaneOnce({
                 : "attempted"
               : "no result changes"
           }`,
-          finalization.lanePushStatus === "failed"
-            ? `Lane push failed: ${finalization.error ?? "unknown error"}`
+          finalization.workerBranchPushStatus === "failed"
+            ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
             : "",
           `Worker log: ${launchManifest?.logPath ?? "n/a"}`,
           workerResult.stdout.trim()
@@ -1089,7 +1151,12 @@ async function runLaneOnce({
       },
       args
     )
-    return { lane, workerId: worker.id, resultCommitSha, status: "completed" }
+    return {
+      hypothesis,
+      workerId: worker.id,
+      resultCommitSha,
+      status: "completed",
+    }
   } catch (error) {
     const message = errorMessage(error)
     if (launchManifest) {
@@ -1107,9 +1174,9 @@ async function runLaneOnce({
         {
           status: "stopped",
           sessionId,
-          laneId: null,
+          hypothesisId: hypothesis.id,
           phase: "failed",
-          event: "lane_failed",
+          event: "worker_failed",
           progressMessage: message.slice(0, 1000),
           gitLabel: resultCommitSha ?? null,
           metadata: launchManifest
@@ -1124,38 +1191,27 @@ async function runLaneOnce({
         args
       ).catch(() => {})
     }
-    if (workerId && claimed) {
-      await heartbeatCampaignLane(
-        lane.id,
-        {
-          workerId,
-          status: "lost",
-          currentCommitSha: resultCommitSha,
-          metadata: {
-            error: message,
-            workerLogPath: launchManifest?.logPath,
-            lastOutputAt: launchManifest?.lastOutputAt,
-            finalization: launchManifest?.finalization,
-          },
-        },
-        args
-      ).catch(() => {})
-    }
     await upsertCampaignSummary(
       campaign.id,
       {
         sessionId,
-        laneId: lane.id,
+        hypothesisId: hypothesis.id,
         authoredByWorkerId: workerId,
-        summaryKind: "lane_summary",
-        title: `${lane.name} failed`,
+        summaryKind: "hypothesis_summary",
+        title: `${hypothesis.name} failed`,
         body: launchManifest
           ? `${message}\n\nWorker log: ${launchManifest.logPath}`
           : message,
       },
       args
     ).catch(() => {})
-    return { lane, workerId, resultCommitSha, status: "failed", error: message }
+    return {
+      hypothesis,
+      workerId,
+      resultCommitSha,
+      status: "failed",
+      error: message,
+    }
   }
 }
 
@@ -1170,13 +1226,14 @@ export async function commandResearchStart(args: Args) {
     requireBaseMatchesHead: true,
   })
 
-  const workerTarget = positiveIntegerOption(
-    args,
-    "agents",
-    Number(args.options.workers ?? 1)
-  )
+  const workerTargetOption = args.options.workers ?? args.options.agents
   const maxIterations = positiveIntegerOption(args, "max-iterations", 10)
   const maxMinutes = positiveNumberOption(args, "max-minutes", 120)
+  const hypotheses = await hypothesisPlansOption(args)
+  const workerTarget =
+    workerTargetOption === undefined && hypotheses
+      ? hypotheses.length
+      : positiveIntegerOption(args, "workers", Number(workerTargetOption ?? 1))
   const launchAgent = args.options.agent
   if (
     launchAgent !== undefined &&
@@ -1186,17 +1243,17 @@ export async function commandResearchStart(args: Args) {
     throw new Error("--agent must be codex or claude")
   }
   const endTimeMs = Date.now() + maxMinutes * 60_000
-  const lanePlans = await lanePlansOption(args)
   const result = await createCampaignSession(
     campaign.id,
     {
       name: args.options.name ?? `research-${new Date().toISOString()}`,
-      workerTarget: lanePlans?.length ?? workerTarget,
-      lanePlans,
+      workerTarget,
+      hypotheses,
       metadata: {
         startedBy: "onyx-research",
         maxIterations,
         maxMinutes,
+        agentKind: launchAgent ?? "codex",
       },
     },
     args
@@ -1223,23 +1280,23 @@ export async function commandResearchStart(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     sessionId: result.session.id,
-    message: `${result.lanes.length} lane(s)`,
+    message: `${workerTarget} worker slot(s), ${result.hypotheses.length} hypothesis(s)`,
   })
 
   await Promise.all(
-    result.lanes.map(async (lane) => {
+    result.hypotheses.map(async (hypothesis) => {
       const [briefPath, sessionStatePath] = await Promise.all([
         writeBrief({
           root,
           campaignId: campaign.id,
           sessionId: result.session.id,
-          lane,
+          hypothesis,
           args,
         }),
         writeSessionState({
           root,
           sessionId: result.session.id,
-          lane,
+          hypothesis,
           args,
         }).catch(() => null),
       ])
@@ -1249,7 +1306,8 @@ export async function commandResearchStart(args: Args) {
         campaign,
         setup,
         sessionId: result.session.id,
-        lane,
+        hypothesis,
+        workerBranch: "assigned when worker starts",
         briefPath,
         sessionStatePath,
         maxIterations,
@@ -1260,19 +1318,153 @@ export async function commandResearchStart(args: Args) {
 
   console.log(`Research session: ${result.session.id}`)
   console.log(`Campaign: ${campaign.name}`)
-  console.log(`Lanes: ${result.lanes.length}`)
-  for (const lane of result.lanes) {
-    const agentOption = launchAgent ? ` --agent ${launchAgent}` : ""
+  console.log(`Workers: 0/${workerTarget}`)
+  console.log(`Hypotheses: ${result.hypotheses.length}`)
+  const agentOption = launchAgent ? ` --agent ${launchAgent}` : ""
+  if (result.hypotheses.length === 0) {
     console.log(
-      `- ${lane.name}: ${lane.plan.focus}\n  onyx worker run --session ${result.session.id} --lane ${lane.id}${agentOption}`
+      "No hypotheses were created. Add one with `onyx research hypothesis add --session " +
+        `${result.session.id} --focus <focus> --hypothesis <statement>` +
+        "` before launching workers."
     )
+  } else {
+    for (let index = 0; index < workerTarget; index += 1) {
+      const hypothesis = result.hypotheses[index % result.hypotheses.length]
+      if (!hypothesis) continue
+      console.log(
+        `- worker ${index + 1}: ${hypothesis.name}: ${hypothesis.plan.focus}\n  onyx worker run --session ${result.session.id} --hypothesis ${hypothesis.id}${agentOption}`
+      )
+    }
   }
   console.log("Use `onyx listen` or `onyx research status` to supervise.")
 }
 
+export async function commandResearchHypothesisAdd(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const sessionId =
+    args.options.session ??
+    activeSessionIdFromState({
+      state,
+      projectPath,
+      campaignName: args.options.campaign,
+    })
+  if (!sessionId && !args.options.campaign) {
+    throw new Error(
+      "Pass --session <id> or --campaign <name>, or start a research session first."
+    )
+  }
+
+  const plan = await hypothesisPlanOption(args)
+  const before = sessionId
+    ? await getResearchSessionState(sessionId, args)
+    : null
+  const campaign =
+    before?.campaign ?? (await campaignForName(root, args)).campaign
+  const { setup } = await assertLocalSetupReady(root, projectPath)
+  const sessionMetadata = before?.session.metadata ?? {}
+  const agentKind =
+    args.options.agent ??
+    (typeof sessionMetadata.agentKind === "string"
+      ? sessionMetadata.agentKind
+      : "codex")
+  if (agentKind !== "codex" && agentKind !== "claude") {
+    throw new Error("--agent must be codex or claude")
+  }
+  const result = await createCampaignHypothesis(
+    campaign.id,
+    {
+      plan,
+      name: args.options.name,
+      description: args.options.description,
+      baseCommitSha: args.options.base,
+      metadata: {
+        createdBy: "onyx-research",
+        ...(sessionId ? { createdBySessionId: sessionId } : {}),
+      },
+    },
+    args
+  )
+
+  const maxIterations =
+    typeof sessionMetadata.maxIterations === "number"
+      ? sessionMetadata.maxIterations
+      : 10
+  const maxMinutes =
+    typeof sessionMetadata.maxMinutes === "number"
+      ? sessionMetadata.maxMinutes
+      : 120
+  const endTimeMs =
+    sessionId && state.sessions?.[sessionId]?.endTimeMs
+      ? state.sessions[sessionId].endTimeMs
+      : Date.now() + maxMinutes * 60_000
+  if (sessionId) {
+    state.sessions = state.sessions ?? {}
+    state.sessions[sessionId] = {
+      ...(state.sessions[sessionId] ?? {}),
+      campaignName: campaign.name,
+      campaignId: campaign.id,
+      endTimeMs,
+      maxIterations,
+      status: "running",
+    }
+  }
+  const key = campaignStateKey(projectPath, campaign.name)
+  state.campaigns = state.campaigns ?? {}
+  state.campaigns[key] = {
+    ...state.campaigns[key],
+    campaignId: campaign.id,
+    ...(sessionId ? { sessionId } : {}),
+  }
+  await writeState(root, state)
+
+  const hypothesis = result.hypothesis
+  if (sessionId) {
+    const [briefPath, sessionStatePath] = await Promise.all([
+      writeBrief({
+        root,
+        campaignId: campaign.id,
+        sessionId,
+        hypothesis,
+        args,
+      }),
+      writeSessionState({ root, sessionId, hypothesis, args }).catch(
+        () => null
+      ),
+    ])
+    await writeWorkerPrompt({
+      root,
+      projectPath,
+      campaign,
+      setup,
+      sessionId,
+      hypothesis,
+      workerBranch: "assigned when worker starts",
+      briefPath,
+      sessionStatePath,
+      maxIterations,
+      endTimeMs,
+    })
+  }
+
+  console.log(`Research hypothesis: ${hypothesis.id}`)
+  if (sessionId) console.log(`Session: ${sessionId}`)
+  console.log(`Hypothesis: ${hypothesis.name}: ${hypothesis.plan.focus}`)
+  if (sessionId) {
+    console.log(
+      `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}`
+    )
+  } else {
+    console.log("Start or choose a research session before launching a worker.")
+  }
+}
+
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
-  const { campaign, overview } = await campaignForName(root, args)
+  const { campaign } = await campaignForName(root, args)
+  await reconcileCampaign(campaign.id, args).catch(() => {})
+  const overview = await getCampaignOverview(campaign.id, args)
   const state = await readState(root)
   const projectPath = await resolveProjectPath(root, args)
   console.log(`campaign: ${campaign.name}`)
@@ -1285,10 +1477,7 @@ export async function commandResearchStatus(args: Args) {
     )
   }
   const scopeAll = args.options["all-sessions"] === "true"
-  const lanes =
-    activeSessionId && !scopeAll
-      ? overview.lanes.filter((lane) => lane.sessionId === activeSessionId)
-      : overview.lanes
+  const hypotheses = overview.hypotheses
   const workers =
     activeSessionId && !scopeAll
       ? overview.workers.filter(
@@ -1301,38 +1490,36 @@ export async function commandResearchStatus(args: Args) {
   const manifestByWorker = new Map(
     manifests.map((manifest) => [manifest.workerId, manifest])
   )
-  const manifestByLane = new Map(
-    manifests.map((manifest) => [manifest.laneId, manifest])
-  )
 
-  console.log(`lanes: ${lanes.length}${scopeAll ? " (all sessions)" : ""}`)
-  for (const lane of lanes) {
-    const manifest = manifestByLane.get(lane.id)
-    const manifestError =
-      manifest?.error?.replace(/\s+/g, " ").slice(0, 160) ?? null
-    const finalization = manifest?.finalization
+  if (activeSessionId) {
+    const sessionState = await getResearchSessionState(
+      activeSessionId,
+      args
+    ).catch(() => null)
+    const activeWorkers = workers.filter((worker) =>
+      ["idle", "running", "stale"].includes(worker.status)
+    ).length
+    const target = sessionState?.session.workerTarget ?? "?"
+    console.log(`worker slots: ${activeWorkers}/${target}`)
+  }
+  console.log(
+    `hypotheses: ${hypotheses.length}${scopeAll ? " (all sessions)" : ""}`
+  )
+  for (const hypothesis of hypotheses) {
+    const relatedWorkers = workers.filter(
+      (worker) => worker.hypothesisId === hypothesis.id
+    )
+    const activeWorkerCount = relatedWorkers.filter((worker) =>
+      ["idle", "running", "stale"].includes(worker.status)
+    ).length
     console.log(
       [
-        `  ${lane.name}: ${lane.status}`,
-        `branch=${lane.branchRef}`,
-        `best=${lane.bestMetricValue ?? "-"}`,
-        manifest ? `workerStatus=${manifest.status}` : null,
-        manifest?.timedOut ? "timeout=true" : null,
-        manifest
-          ? `lastOutput=${formatAge(manifest.lastOutputAt, Date.now())}`
+        `  ${hypothesis.name}: ${hypothesis.status}`,
+        `workers=${activeWorkerCount}/${relatedWorkers.length}`,
+        hypothesis.lastWorkedAt
+          ? `lastWorked=${formatAge(hypothesis.lastWorkedAt, Date.now())}`
           : null,
-        manifest?.logPath ? `log=${manifest.logPath}` : null,
-        manifestError ? `error="${manifestError}"` : null,
-        finalization
-          ? `finalized=${
-              finalization.experimentLogged
-                ? "logged"
-                : finalization.attempted
-                  ? "attempted"
-                  : "none"
-            }`
-          : null,
-        finalization?.lanePushStatus === "failed" ? "lanePush=failed" : null,
+        `best=${hypothesis.bestMetricValue ?? "-"}`,
       ]
         .filter(Boolean)
         .join(" ")
@@ -1363,52 +1550,75 @@ export async function commandResearchStatus(args: Args) {
   }
 }
 
-export async function commandResearchLanePlans(args: Args) {
+export async function commandResearchHypotheses(args: Args) {
   if (args.options.example !== "true") {
-    throw new Error("Pass --example to print a lane-plans JSON template.")
+    throw new Error("Pass --example to print a hypotheses JSON template.")
   }
+  const root = await repoRoot(args.options.cwd).catch(() => null)
+  const projectPath = root
+    ? await resolveProjectPath(root, args).catch(() => "")
+    : ""
+  const setup = root
+    ? await readSetupFile(root, projectPath).catch(() => null)
+    : null
+  const metricName = setup?.metric.name ?? "target_metric"
+  const direction =
+    setup?.metric.direction === "maximize"
+      ? "increase"
+      : setup?.metric.direction === "minimize"
+        ? "decrease"
+        : "improve"
+  const scope = setup?.editableScope.length
+    ? setup.editableScope
+    : [setup?.projectPath || projectPath || "."]
+  const protectedPaths = setup?.protectedPaths.length
+    ? setup.protectedPaths
+    : [
+        "onyx/setup.json",
+        "onyx/validation.json",
+        "onyx/onyx.md",
+        "onyx/eval.sh",
+        "onyx/checks.sh",
+        "onyx/tools/*",
+      ]
+  const constraints = setup?.constraints.length
+    ? setup.constraints
+    : ["Preserve the declared eval path and protected setup files."]
   const example = [
     {
-      focus: "Conservative controller tuning",
-      hypothesis:
-        "Small proportional and derivative gain adjustments can reduce controller error without introducing instability.",
+      focus: `Independent search to ${direction} ${metricName}`,
+      statement:
+        "A deliberately scoped exploration can improve the target metric while preserving the configured setup surface.",
       startingPoints: [
-        "Inspect the current controller gains and error metric implementation.",
-        "Try bounded gain sweeps with one parameter family at a time.",
+        ...scope,
+        "Inspect recent experiments and shared knowledge before editing.",
       ],
-      avoidList: [
-        "Do not change protected Onyx setup files.",
-        "Do not disable safety checks or clamp physical limits.",
-      ],
+      avoidList: protectedPaths,
       successSignals: [
-        "METRIC controller_error decreases versus the base commit.",
-        "checks.sh passes without warnings about physical limits.",
+        `METRIC ${metricName} moves in the desired direction.`,
+        "Required setup validation and runtime checks remain passing.",
       ],
-      giveUpSignals: [
-        "Repeated changes increase controller_error.",
-        "The candidate requires broad simulator rewrites outside the editable scope.",
-      ],
+      giveUpSignals: constraints,
     },
     {
-      focus: "Alternative damping strategy",
-      hypothesis:
-        "Adding damping or smoothing around the control signal can lower overshoot-driven error.",
+      focus: `Follow-up hypothesis for ${metricName}`,
+      statement:
+        "A focused follow-up based on previous hypothesis results can test a different mechanism or exploit a promising partial result.",
       startingPoints: [
-        "Trace where the control signal is computed and applied.",
-        "Experiment with minimal smoothing or anti-windup changes.",
+        "Review hypothesis summaries, experiment notes, and current best metric before choosing edits.",
+        ...scope,
       ],
-      avoidList: [
-        "Avoid root scratch files; keep artifacts under normal source paths.",
-      ],
+      avoidList: protectedPaths,
       successSignals: [
-        "The eval prints an improved METRIC controller_error value.",
+        `The eval prints an improved METRIC ${metricName} value.`,
         "The final diff is small enough for a human to review quickly.",
       ],
       giveUpSignals: [
-        "The best candidate depends on uncommitted generated artifacts.",
+        "The hypothesis requires edits outside the declared scope.",
+        "Repeated measured attempts fail to move the primary metric.",
       ],
     },
-  ].map((plan) => researchLanePlanSchema.parse(plan))
+  ].map((plan) => researchHypothesisPlanSchema.parse(plan))
 
   console.log(JSON.stringify(example, null, 2))
 }
@@ -1535,6 +1745,7 @@ export async function commandResearchStop(args: Args) {
   await writeState(root, state)
 
   if (campaignId) {
+    await reconcileCampaign(campaignId, args).catch(() => {})
     await stopCampaignSession(
       sessionId,
       {
@@ -1566,8 +1777,10 @@ function safeBranchSegment(value: string) {
 
 export async function commandResearchFinish(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign, overview } = await campaignForName(root, args)
+  const { campaign } = await campaignForName(root, args)
+  await reconcileCampaign(campaign.id, args).catch(() => {})
   await flushOutbox(root, args, { quiet: true }).catch(() => {})
+  const overview = await getCampaignOverview(campaign.id, args)
 
   const branches: string[] = []
   const campaignSegment = safeBranchSegment(campaign.name)
@@ -1593,7 +1806,7 @@ export async function commandResearchFinish(args: Args) {
     `Finalized campaign ${campaign.name}.`,
     `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
     `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
-    "Lane refs are not promoted from mutable lane heads; use verified experiment best projections for curated outputs.",
+    "Hypothesis refs are not promoted from mutable hypothesis heads; use verified experiment best projections for curated outputs.",
     "",
     "Local branches:",
     ...(branches.length > 0
@@ -1636,16 +1849,16 @@ export async function commandResearchFinish(args: Args) {
 export async function commandSummaryUpsert(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const { campaign } = await campaignForName(root, args)
-  const kind = args.options.kind ?? "lane_summary"
+  const kind = args.options.kind ?? "hypothesis_summary"
   if (
     kind !== "campaign_brief" &&
     kind !== "session_brief" &&
-    kind !== "lane_summary" &&
+    kind !== "hypothesis_summary" &&
     kind !== "transfer_brief" &&
     kind !== "setup_notes"
   ) {
     throw new Error(
-      "--kind must be campaign_brief, session_brief, lane_summary, transfer_brief, or setup_notes"
+      "--kind must be campaign_brief, session_brief, hypothesis_summary, transfer_brief, or setup_notes"
     )
   }
   const title = args.options.title ?? `${kind} ${new Date().toISOString()}`
@@ -1655,7 +1868,7 @@ export async function commandSummaryUpsert(args: Args) {
     campaign.id,
     {
       sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-      laneId: args.options.lane ?? process.env.ONYX_LANE_ID,
+      hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
       authoredByWorkerId:
         args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
       summaryKind: kind,
@@ -1691,7 +1904,7 @@ export async function commandKnowledgeAdd(args: Args) {
     campaign.id,
     {
       sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-      laneId: args.options.lane ?? process.env.ONYX_LANE_ID,
+      hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
       authoredByWorkerId:
         args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
       kind,
@@ -1731,7 +1944,7 @@ export async function commandKnowledgeList(args: Args) {
       item.confidence === null ? "" : ` confidence=${item.confidence}`
     const scope = [
       item.sessionId ? `session=${item.sessionId}` : null,
-      item.laneId ? `lane=${item.laneId}` : null,
+      item.hypothesisId ? `hypothesis=${item.hypothesisId}` : null,
     ]
       .filter(Boolean)
       .join(" ")
@@ -1748,6 +1961,11 @@ export async function commandKnowledgeList(args: Args) {
 }
 
 export async function commandWorkerRun(args: Args) {
+  if (args.options.lane) {
+    throw new Error(
+      "Use --hypothesis <id>; lanes have been replaced by hypotheses."
+    )
+  }
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
@@ -1764,32 +1982,33 @@ export async function commandWorkerRun(args: Args) {
   }
 
   const sessionState = await getResearchSessionState(sessionId, args)
+  if (sessionState.session.status !== "running") {
+    throw new Error(
+      `Research session ${sessionId} is ${sessionState.session.status}; cannot start a new worker.`
+    )
+  }
   const campaign = sessionState.campaign
   const { setup } = await assertLocalSetupReady(root, projectPath)
 
-  const requestedLaneId = args.options.lane ?? process.env.ONYX_LANE_ID
-  const terminalWorkerIds = new Set(
-    sessionState.workers
-      .filter(
-        (worker) => worker.status === "stopped" || worker.status === "lost"
-      )
-      .map((worker) => worker.id)
-  )
-  const lane =
-    (requestedLaneId
-      ? sessionState.lanes.find((item) => item.id === requestedLaneId)
-      : sessionState.lanes.find(
-          (item) =>
-            ["active", "stale", "lost"].includes(item.status) ||
-            (item.status === "claimed" &&
-              item.currentWorkerId !== null &&
-              terminalWorkerIds.has(item.currentWorkerId))
-        )) ?? null
-  if (!lane) {
+  const requestedHypothesisId =
+    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID
+  const hypothesis =
+    (requestedHypothesisId
+      ? sessionState.hypotheses.find(
+          (item) => item.id === requestedHypothesisId
+        )
+      : sessionState.hypotheses.find((item) => item.status === "active")) ??
+    null
+  if (!hypothesis) {
     throw new Error(
-      requestedLaneId
-        ? `Lane ${requestedLaneId} was not found in session ${sessionId}.`
-        : `No available lane found in session ${sessionId}.`
+      requestedHypothesisId
+        ? `Hypothesis ${requestedHypothesisId} was not found in campaign ${campaign.name}.`
+        : `No available hypothesis found in session ${sessionId}.`
+    )
+  }
+  if (hypothesis.status !== "active") {
+    throw new Error(
+      `Hypothesis ${hypothesis.name} is ${hypothesis.status}; only active hypotheses can receive new workers.`
     )
   }
 
@@ -1828,13 +2047,13 @@ export async function commandWorkerRun(args: Args) {
     intervalMs: syncIntervalMs,
   })
 
-  const result = await runLaneOnce({
+  const result = await runHypothesisOnce({
     root,
     projectPath,
     campaign,
     setup,
     sessionId,
-    lane,
+    hypothesis,
     workerCommand: args.options["worker-command"],
     agentKind: args.options.agent ?? "codex",
     maxIterations,
@@ -1848,10 +2067,10 @@ export async function commandWorkerRun(args: Args) {
   const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
   if (result.status === "failed") {
     throw new Error(
-      `Worker failed for ${lane.name}: ${result.error ?? "unknown error"}`
+      `Worker failed for ${hypothesis.name}: ${result.error ?? "unknown error"}`
     )
   }
   console.log(
-    `Worker completed ${lane.name} at ${result.resultCommitSha ?? "unknown"}; ${pending} sync record(s) pending.`
+    `Worker completed ${hypothesis.name} at ${result.resultCommitSha ?? "unknown"}; ${pending} sync record(s) pending.`
   )
 }

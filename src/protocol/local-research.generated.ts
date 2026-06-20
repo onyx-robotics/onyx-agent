@@ -31,7 +31,7 @@ export const localResearchSyncMetadataSchema = z.object({
   campaignId: z.uuid().optional(),
   experimentId: z.uuid().optional(),
   workerId: z.uuid().optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
   sessionId: z.uuid().optional(),
   syncedAt: z.iso.datetime().optional(),
 })
@@ -84,7 +84,7 @@ export const localResearchCampaignExperimentLoggedRecordSchema = z.object({
   outputSummary: z.string().trim().max(4000).nullable().optional(),
   sessionId: z.uuid().optional(),
   workerId: z.uuid().optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
   sync: localResearchSyncMetadataSchema.optional(),
 })
 
@@ -126,7 +126,7 @@ export const localResearchHistoryRecordSchema = z.object({
   campaignId: z.uuid().optional(),
   sessionId: z.uuid().optional(),
   workerId: z.uuid().optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
 })
 
 export const localResearchEventTypeSchema = z.enum([
@@ -137,10 +137,10 @@ export const localResearchEventTypeSchema = z.enum([
   "setup_validation_failed",
   "session_started",
   "session_stopped",
-  "lane_created",
-  "lane_claimed",
-  "lane_heartbeat",
-  "lane_completed",
+  "hypothesis_created",
+  "hypothesis_started",
+  "hypothesis_heartbeat",
+  "hypothesis_completed",
   "worker_started",
   "worker_heartbeat",
   "worker_stopped",
@@ -166,7 +166,7 @@ export const localResearchEventSchema = z.object({
   campaignId: z.uuid().optional(),
   sessionId: z.uuid().optional(),
   workerId: z.uuid().optional(),
-  laneId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
   runRef: z.string().trim().max(240).optional(),
   commitSha: gitShaSchema.optional(),
   resultRef: z.string().trim().max(300).optional(),

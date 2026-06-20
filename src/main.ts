@@ -14,7 +14,8 @@ import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
 import {
   commandResearchFinish,
-  commandResearchLanePlans,
+  commandResearchHypothesisAdd,
+  commandResearchHypotheses,
   commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
@@ -63,10 +64,11 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> [--agents <n>] [--agent codex|claude] [--lane-plans <json>] [--max-iterations <n>] [--max-minutes <n>]
+  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json>] [--max-iterations <n>] [--max-minutes <n>]
       (creates an async research session and prints worker launch commands)
-  onyx research lane-plans --example
-  onyx worker run --session <id> [--lane <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
+  onyx research hypotheses --example
+  onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]
+  onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>]
@@ -142,8 +144,19 @@ export async function main(argv = process.argv.slice(2)) {
       return commandCampaignDelete(args)
     if (command === "research" && sub === "start")
       return commandResearchStart(args)
-    if (command === "research" && sub === "lane-plans")
-      return commandResearchLanePlans(args)
+    if (command === "research" && sub === "hypotheses")
+      return commandResearchHypotheses(args)
+    if (command === "research" && sub === "lane") {
+      throw new Error(
+        "Lanes have been replaced by hypotheses. Use `onyx research hypothesis add`."
+      )
+    }
+    if (
+      command === "research" &&
+      sub === "hypothesis" &&
+      args.positional[2] === "add"
+    )
+      return commandResearchHypothesisAdd(args)
     if (command === "research" && sub === "should-stop")
       return commandResearchShouldStop(args)
     if (command === "research" && sub === "stop")

@@ -1,7 +1,7 @@
 import type {
   CreateResearchCampaignExperimentRequest,
   CreateResearchCampaignRequest,
-  ResearchLanePlan,
+  ResearchHypothesisPlan,
   ResearchSetupCompliance,
 } from "../protocol"
 
@@ -38,7 +38,7 @@ export type ApiCampaignExperiment = {
   id: string
   campaignId: string
   sessionId: string | null
-  laneId: string | null
+  hypothesisId: string | null
   workerId: string | null
   runRef: string
   name: string
@@ -80,7 +80,7 @@ export type ApiWorker = {
   id: string
   campaignId: string
   sessionId: string | null
-  laneId: string | null
+  hypothesisId: string
   workerName: string
   status: "idle" | "running" | "stale" | "lost" | "stopped"
   currentExperimentId: string | null
@@ -90,33 +90,33 @@ export type ApiWorker = {
   lastSeenAt: string
 }
 
-export type ApiLane = {
+export type ApiHypothesis = {
   id: string
   campaignId: string
-  sessionId: string | null
+  createdBySessionId: string | null
   name: string
   description: string | null
-  status: "active" | "claimed" | "stale" | "lost" | "completed"
-  branchRef: string
+  status: "active" | "paused" | "retired"
   baseCommitSha: string
-  currentCommitSha: string | null
   bestExperimentId: string | null
   bestMetricValue: number | null
-  currentWorkerId: string | null
-  plan: ResearchLanePlan
+  lastWorkedAt: string | null
+  plan: ResearchHypothesisPlan
   metadata: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
 }
 
 export type ApiSummary = {
   id: string
   campaignId: string
   sessionId: string | null
-  laneId: string | null
+  hypothesisId: string | null
   authoredByWorkerId: string | null
   summaryKind:
     | "campaign_brief"
     | "session_brief"
-    | "lane_summary"
+    | "hypothesis_summary"
     | "transfer_brief"
     | "setup_notes"
   title: string
@@ -128,7 +128,7 @@ export type ApiKnowledge = {
   id: string
   campaignId: string
   sessionId: string | null
-  laneId: string | null
+  hypothesisId: string | null
   authoredByWorkerId: string | null
   experimentId: string | null
   kind:
@@ -148,7 +148,7 @@ export type ApiKnowledge = {
 export type ApiCampaignTimeline = {
   campaign: ApiCampaign
   workers: ApiWorker[]
-  lanes: ApiLane[]
+  hypotheses: ApiHypothesis[]
   summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
 }
@@ -158,7 +158,7 @@ export type ApiCampaignOverview = ApiCampaignTimeline & {
   latestExperiments: ApiCampaignExperiment[]
   counts: {
     experiments: number
-    activeLanes: number
+    hypothesisCount: number
     activeWorkers: number
   }
 }
@@ -168,7 +168,7 @@ export type ApiSessionState = {
   campaign: ApiCampaign
   latestExperiments: ApiCampaignExperiment[]
   bestExperiment: ApiCampaignExperiment | null
-  lanes: ApiLane[]
+  hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
   summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
@@ -184,7 +184,7 @@ export type ApiBrief = {
   campaign: ApiCampaign
   bestExperiment: ApiCampaignExperiment | null
   recentExperiments: ApiCampaignExperiment[]
-  lanes: ApiLane[]
+  hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
   summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
@@ -411,15 +411,70 @@ export async function createCampaignSession(
   body: {
     name: string
     workerTarget?: number
-    lanePlans?: ResearchLanePlan[]
+    hypotheses?: ResearchHypothesisPlan[]
     metadata?: Record<string, unknown>
   },
   args?: Args
-): Promise<{ session: ApiSession; lanes: ApiLane[] }> {
-  return apiData<{ session: ApiSession; lanes: ApiLane[] }>(
+): Promise<{ session: ApiSession; hypotheses: ApiHypothesis[] }> {
+  return apiData<{ session: ApiSession; hypotheses: ApiHypothesis[] }>(
     await callApi(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/sessions`,
+      body,
+      args
+    )
+  )
+}
+
+export async function listCampaignHypotheses(
+  campaignId: string,
+  args?: Args
+): Promise<ApiHypothesis[]> {
+  return apiData<ApiHypothesis[]>(
+    await callApi(
+      "GET",
+      `/api/v1/research/campaigns/${campaignId}/hypotheses`,
+      undefined,
+      args
+    )
+  )
+}
+
+export async function createCampaignHypothesis(
+  campaignId: string,
+  body: {
+    plan: ResearchHypothesisPlan
+    name?: string
+    description?: string
+    baseCommitSha?: string
+    metadata?: Record<string, unknown>
+  },
+  args?: Args
+): Promise<{ hypothesis: ApiHypothesis }> {
+  return apiData<{ hypothesis: ApiHypothesis }>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/hypotheses`,
+      body,
+      args
+    )
+  )
+}
+
+export async function updateCampaignHypothesis(
+  hypothesisId: string,
+  body: {
+    status?: ApiHypothesis["status"]
+    plan?: ResearchHypothesisPlan
+    description?: string | null
+    metadata?: Record<string, unknown>
+  },
+  args?: Args
+): Promise<{ hypothesis: ApiHypothesis }> {
+  return apiData<{ hypothesis: ApiHypothesis }>(
+    await callApi(
+      "PATCH",
+      `/api/v1/research/hypotheses/${hypothesisId}`,
       body,
       args
     )
@@ -460,11 +515,23 @@ export async function getResearchSessionState(
   )
 }
 
+export async function reconcileCampaign(
+  campaignId: string,
+  args?: Args
+): Promise<void> {
+  await callApi(
+    "POST",
+    `/api/v1/research/campaigns/${campaignId}/reconcile`,
+    {},
+    args
+  )
+}
+
 export async function registerCampaignWorker(
   campaignId: string,
   body: {
     sessionId?: string
-    laneId?: string
+    hypothesisId: string
     workerName: string
     agentKind?: string
     runtime?: "local" | "hosted"
@@ -487,7 +554,7 @@ export async function heartbeatWorker(
   body: {
     status?: "idle" | "running" | "stale" | "lost" | "stopped"
     sessionId?: string
-    laneId?: string | null
+    hypothesisId?: string
     experimentId?: string | null
     phase?: string | null
     event?: string | null
@@ -508,46 +575,16 @@ export async function heartbeatWorker(
   )
 }
 
-export async function claimCampaignLane(
-  laneId: string,
-  body: { workerId: string },
-  args?: Args
-): Promise<{ lane: ApiLane }> {
-  return apiData<{ lane: ApiLane }>(
-    await callApi("POST", `/api/v1/research/lanes/${laneId}/claim`, body, args)
-  )
-}
-
-export async function heartbeatCampaignLane(
-  laneId: string,
-  body: {
-    workerId: string
-    status?: "active" | "claimed" | "completed" | "lost"
-    currentCommitSha?: string | null
-    metadata?: Record<string, unknown>
-  },
-  args?: Args
-): Promise<ApiLane> {
-  return apiData<ApiLane>(
-    await callApi(
-      "POST",
-      `/api/v1/research/lanes/${laneId}/heartbeat`,
-      body,
-      args
-    )
-  )
-}
-
 export async function upsertCampaignSummary(
   campaignId: string,
   body: {
     sessionId?: string
-    laneId?: string
+    hypothesisId?: string
     authoredByWorkerId?: string
     summaryKind:
       | "campaign_brief"
       | "session_brief"
-      | "lane_summary"
+      | "hypothesis_summary"
       | "transfer_brief"
       | "setup_notes"
     title: string
@@ -571,7 +608,7 @@ export async function createCampaignKnowledge(
   campaignId: string,
   body: {
     sessionId?: string
-    laneId?: string
+    hypothesisId?: string
     authoredByWorkerId?: string
     experimentId?: string
     kind: ApiKnowledge["kind"]

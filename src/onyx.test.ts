@@ -8,27 +8,39 @@ import type { LocalResearchHistoryRecord } from "./protocol"
 import {
   appendOutbox,
   assertSetupCommitted,
+  campaignStateKey,
   clientRunRef,
+  commandExpRun,
   commandExpList,
+  commandResearchHypothesisAdd,
+  commandResearchHypotheses,
   commandSetupInit,
   commandSetupModules,
   commandSetupRequire,
   commandSetupValidate,
+  lastRunPath,
   localResearchRecordSchema,
   mergeHistory,
   main,
   normalizeProjectPath,
   normalizeSetupFile,
+  normalizeValidationFile,
   onyxStateDir,
+  parseArgs,
   parseMetricLines,
   readOutbox,
   readSetupFile,
+  readLastRun,
   readValidationFile,
   renderExperimentTable,
   runToolCommand,
   requiredSetupModules,
   setupModuleRequirement,
   USAGE,
+  writeLastRun,
+  writeSetupFile,
+  writeState,
+  writeValidationFile,
 } from "./onyx"
 import { runProcess } from "./lib/process"
 
@@ -49,6 +61,151 @@ async function commitAll(root: string, message: string) {
   )
 }
 
+async function writeResearchSmokeRepo() {
+  const root = await mkdtemp(join(tmpdir(), "onyx-research-smoke-"))
+  await runProcess("git", ["init"], { cwd: root })
+  await writeFile(join(root, "README.md"), "test\n", "utf8")
+  await mkdir(join(root, "onyx"), { recursive: true })
+  await writeFile(
+    join(root, "onyx", "onyx.md"),
+    "Use the configured eval command and keep changes small.\n",
+    "utf8"
+  )
+  await writeSetupFile(
+    root,
+    "",
+    normalizeSetupFile({
+      schemaVersion: 1,
+      goal: "Improve score.",
+      metric: { name: "score", unit: null, direction: "maximize" },
+      projectPath: "",
+      editableScope: ["src"],
+      protectedPaths: [
+        "onyx/setup.json",
+        "onyx/validation.json",
+        "onyx/onyx.md",
+        "onyx/eval.sh",
+        "onyx/checks.sh",
+        "onyx/tools/*",
+      ],
+      commands: {
+        evaluate: {
+          command: "printf 'METRIC score=1.25\\n'",
+          args: [],
+          shell: true,
+          cwd: "project",
+          env: {},
+          resources: [],
+          timeoutSeconds: 5,
+          leaseTimeoutSeconds: 5,
+          outputLimitBytes: 4000,
+        },
+      },
+      resources: {},
+      constraints: ["Stay inside editable scope."],
+      modules: {},
+    })
+  )
+  const now = new Date().toISOString()
+  await writeValidationFile(
+    root,
+    "",
+    normalizeValidationFile({
+      schemaVersion: 1,
+      status: "passed",
+      generatedAt: now,
+      summary: null,
+      modules: ["setup_spec", "project_scope", "agent", "evaluation"].map(
+        (moduleId) => ({
+          moduleId,
+          status: "passed",
+          required: true,
+          summary: null,
+          outputSummary: null,
+          durationMs: 1,
+          validatedAt: now,
+          evidence: {},
+        })
+      ),
+    })
+  )
+  await commitAll(root, "init")
+  const baseCommitSha = (
+    await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+  ).stdout.trim()
+  const campaignId = "11111111-1111-4111-8111-111111111111"
+  const campaignName = "smoke"
+  await writeState(root, {
+    projectPath: "",
+    activeCampaign: campaignName,
+    campaigns: {
+      [campaignStateKey("", campaignName)]: {
+        campaignId,
+        projectPath: "",
+        baseCommitSha,
+        metricName: "score",
+        metricUnit: null,
+        metricDirection: "maximize",
+        sessionId: "22222222-2222-4222-8222-222222222222",
+      },
+    },
+    sessions: {
+      "22222222-2222-4222-8222-222222222222": {
+        campaignName,
+        campaignId,
+        maxIterations: 10,
+        endTimeMs: Date.now() + 60_000,
+        status: "running",
+      },
+    },
+  })
+
+  return { root, baseCommitSha, campaignId, campaignName }
+}
+
+async function withMockResearchApi(
+  handler: (request: { method: string; path: string; body: unknown }) => {
+    status?: number
+    body: unknown
+  },
+  run: () => Promise<void>
+) {
+  const originalFetch = globalThis.fetch
+  const previousApiUrl = process.env.ONYX_API_URL
+  const previousApiKey = process.env.ONYX_API_KEY
+  process.env.ONYX_API_URL = "https://api.onyx.test"
+  process.env.ONYX_API_KEY = "test-key"
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(String(input))
+    const body = init?.body ? JSON.parse(String(init.body)) : null
+    const response = handler({
+      method: init?.method ?? "GET",
+      path: `${url.pathname}${url.search}`,
+      body,
+    })
+    return new Response(JSON.stringify(response.body), {
+      status: response.status ?? 200,
+      headers: { "content-type": "application/json" },
+    })
+  }) as typeof fetch
+
+  try {
+    await run()
+  } finally {
+    globalThis.fetch = originalFetch
+    if (previousApiUrl === undefined) {
+      delete process.env.ONYX_API_URL
+    } else {
+      process.env.ONYX_API_URL = previousApiUrl
+    }
+    if (previousApiKey === undefined) {
+      delete process.env.ONYX_API_KEY
+    } else {
+      process.env.ONYX_API_KEY = previousApiKey
+    }
+  }
+}
+
 describe("campaign CLI surface", () => {
   test("usage exposes campaigns and not legacy branch commands", () => {
     expect(USAGE).toContain("onyx campaign setup")
@@ -56,7 +213,10 @@ describe("campaign CLI surface", () => {
     expect(USAGE).toContain("onyx setup validate")
     expect(USAGE).toContain("onyx setup require")
     expect(USAGE).toContain("onyx research start --campaign")
-    expect(USAGE).toContain("onyx research lane-plans --example")
+    expect(USAGE).toContain("onyx research hypotheses --example")
+    expect(USAGE).toContain(
+      "onyx research hypothesis add (--campaign <name> | --session <id>)"
+    )
     expect(USAGE).toContain("onyx research should-stop")
     expect(USAGE).toContain("onyx research finish")
     expect(USAGE).toContain("onyx knowledge list")
@@ -67,6 +227,22 @@ describe("campaign CLI surface", () => {
 
   test("run refs are campaign scoped", () => {
     expect(clientRunRef("fast-eval")).toMatch(/^local\/fast-eval\//)
+  })
+
+  test("repeated options preserve last option while exposing all values", () => {
+    const args = parseArgs([
+      "--agent",
+      "codex",
+      "--agent",
+      "claude",
+      "--starting-point",
+      "first",
+      "--starting-point=second",
+    ])
+
+    expect(args.options.agent).toBe("claude")
+    expect(args.options["starting-point"]).toBe("second")
+    expect(args.optionLists?.["starting-point"]).toEqual(["first", "second"])
   })
 
   test("global help returns usage before subcommand dispatch", async () => {
@@ -133,7 +309,7 @@ describe("local research protocol", () => {
       ],
       { cwd: root }
     )
-    await runProcess("git", ["worktree", "add", "-b", "lane", sibling], {
+    await runProcess("git", ["worktree", "add", "-b", "hypothesis", sibling], {
       cwd: root,
     })
 
@@ -288,6 +464,430 @@ describe("metrics", () => {
     expect(parseMetricLines("METRIC score=1.25\n", "score")).toEqual({
       score: 1.25,
     })
+  })
+})
+
+describe("exp run", () => {
+  test("--no-log leaves no last-run.json when none existed", async () => {
+    const { root } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const previousExitCode = process.exitCode
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      process.exitCode = undefined
+      await commandExpRun({
+        positional: ["exp", "run"],
+        options: { "no-log": "true", timeout: "5" },
+      })
+      await expect(readFile(await lastRunPath(root), "utf8")).rejects.toThrow()
+      expect(await readLastRun(root)).toBeNull()
+    } finally {
+      process.chdir(previousCwd)
+      process.exitCode = previousExitCode
+      console.log = originalLog
+    }
+
+    expect(JSON.parse(logs.join("\n")).metrics.score).toBe(1.25)
+  })
+
+  test("--no-log does not alter an existing last-run.json", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const previousExitCode = process.exitCode
+    const originalLog = console.log
+    console.log = () => {}
+    const existing = {
+      schemaVersion: 1 as const,
+      createdAt: "2026-06-20T00:00:00.000Z",
+      runRef: "local/smoke/existing",
+      campaignName,
+      projectPath: "",
+      baseCommitSha,
+      resultCommitSha: baseCommitSha,
+      resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/existing`,
+      status: "succeeded" as const,
+      setupCompliance: {
+        status: "passed" as const,
+        protectedPathsChanged: [],
+        outOfScopePathsChanged: [],
+        setupPathsChanged: [],
+        notes: null,
+      },
+      primaryMetricName: "score",
+      primaryMetricValue: 0.5,
+      metrics: { score: 0.5 },
+      agentNotes: {},
+      checks: null,
+      durationMs: 1,
+      startedAt: "2026-06-20T00:00:00.000Z",
+      completedAt: "2026-06-20T00:00:01.000Z",
+      outputSummary: "existing",
+    }
+    await writeLastRun(root, existing)
+    const before = await readFile(await lastRunPath(root), "utf8")
+
+    try {
+      process.chdir(root)
+      process.exitCode = undefined
+      await commandExpRun({
+        positional: ["exp", "run"],
+        options: { "no-log": "true", timeout: "5" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      process.exitCode = previousExitCode
+      console.log = originalLog
+    }
+
+    expect(await readFile(await lastRunPath(root), "utf8")).toBe(before)
+    expect((await readLastRun(root))?.runRef).toBe("local/smoke/existing")
+  })
+})
+
+describe("research hypothesis add", () => {
+  test("prints setup-aware hypothesis plan examples", async () => {
+    const { root } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    try {
+      process.chdir(root)
+      await commandResearchHypotheses({
+        positional: ["research", "hypotheses"],
+        options: { example: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const plans = JSON.parse(logs.join("\n")) as Array<{
+      focus: string
+      successSignals: string[]
+      avoidList: string[]
+    }>
+    expect(plans[0]?.focus).toContain("increase score")
+    expect(plans[0]?.successSignals).toContain(
+      "METRIC score moves in the desired direction."
+    )
+    expect(plans[0]?.avoidList).toContain("onyx/setup.json")
+    expect(JSON.stringify(plans)).not.toContain("controller_error")
+  })
+
+  test("accepts inline plan fields and prints a ready worker command", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const hypothesisId = "33333333-3333-4333-8333-333333333333"
+    const campaign = {
+      id: campaignId,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
+    const session = {
+      id: sessionId,
+      campaignId,
+      name: "session",
+      status: "running",
+      workerTarget: 2,
+      metadata: { agentKind: "claude", maxIterations: 10, maxMinutes: 5 },
+    }
+    const requests: Array<{ method: string; path: string; body: unknown }> = []
+    const previousCwd = process.cwd()
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    try {
+      process.chdir(root)
+      await withMockResearchApi(
+        (request) => {
+          requests.push(request)
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/sessions/${sessionId}/state`
+          ) {
+            return {
+              body: {
+                data: {
+                  session,
+                  campaign,
+                  latestExperiments: [],
+                  bestExperiment: null,
+                  hypotheses: [],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  updatedAt: "2026-06-20T00:00:00.000Z",
+                },
+              },
+            }
+          }
+          if (
+            request.method === "POST" &&
+            request.path ===
+              `/api/v1/research/campaigns/${campaignId}/hypotheses`
+          ) {
+            return {
+              status: 201,
+              body: {
+                data: {
+                  hypothesis: {
+                    id: hypothesisId,
+                    campaignId,
+                    createdBySessionId: null,
+                    name: "hypothesis-3",
+                    description: "Try scheduler smoothing",
+                    status: "active",
+                    baseCommitSha,
+                    bestExperimentId: null,
+                    bestMetricValue: null,
+                    lastWorkedAt: null,
+                    plan: (request.body as { plan: unknown }).plan,
+                    metadata: {},
+                    createdAt: "2026-06-20T00:00:00.000Z",
+                    updatedAt: "2026-06-20T00:00:00.000Z",
+                  },
+                },
+              },
+            }
+          }
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/brief`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign,
+                  bestExperiment: null,
+                  recentExperiments: [],
+                  hypotheses: [],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  recommendedContext: [],
+                  markdown: "brief",
+                },
+              },
+            }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        () =>
+          commandResearchHypothesisAdd({
+            positional: ["research", "hypothesis", "add"],
+            options: {
+              session: sessionId,
+              focus: "Try scheduler smoothing",
+              hypothesis: "Smoothing can improve score.",
+            },
+            optionLists: {
+              "starting-point": ["src/controller.ts", "src/simulator.ts"],
+              avoid: ["onyx/setup.json"],
+              success: ["METRIC score improves"],
+              "give-up": ["Score regresses twice"],
+            },
+          })
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const createRequest = requests.find((request) =>
+      request.path.endsWith("/hypotheses")
+    )
+    expect(createRequest?.body).toMatchObject({
+      plan: {
+        focus: "Try scheduler smoothing",
+        statement: "Smoothing can improve score.",
+        startingPoints: ["src/controller.ts", "src/simulator.ts"],
+        avoidList: ["onyx/setup.json"],
+        successSignals: ["METRIC score improves"],
+        giveUpSignals: ["Score regresses twice"],
+      },
+    })
+    expect(logs).toContain(`Research hypothesis: ${hypothesisId}`)
+    expect(logs).toContain(
+      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent claude`
+    )
+  })
+
+  test("accepts a hypothesis plan file and command-line overrides", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const hypothesisId = "55555555-5555-4555-8555-555555555555"
+    const planPath = join(root, "onyx", "replacement-plan.json")
+    await writeFile(
+      planPath,
+      `${JSON.stringify({
+        focus: "Replacement search",
+        statement: "A new focus can use the opened slot.",
+        startingPoints: ["src/new.ts"],
+        avoidList: [],
+        successSignals: ["METRIC score improves"],
+        giveUpSignals: [],
+      })}\n`,
+      "utf8"
+    )
+    const campaign = {
+      id: campaignId,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
+    const session = {
+      id: sessionId,
+      campaignId,
+      name: "session",
+      status: "running",
+      workerTarget: 2,
+      metadata: { agentKind: "claude", maxIterations: 10, maxMinutes: 5 },
+    }
+    let createBody: unknown = null
+    const previousCwd = process.cwd()
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    try {
+      process.chdir(root)
+      await withMockResearchApi(
+        (request) => {
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/sessions/${sessionId}/state`
+          ) {
+            return {
+              body: {
+                data: {
+                  session,
+                  campaign,
+                  latestExperiments: [],
+                  bestExperiment: null,
+                  hypotheses: [],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  updatedAt: "2026-06-20T00:00:00.000Z",
+                },
+              },
+            }
+          }
+          if (
+            request.method === "POST" &&
+            request.path ===
+              `/api/v1/research/campaigns/${campaignId}/hypotheses`
+          ) {
+            createBody = request.body
+            return {
+              status: 201,
+              body: {
+                data: {
+                  hypothesis: {
+                    id: hypothesisId,
+                    campaignId,
+                    createdBySessionId: null,
+                    name: "replacement",
+                    description: "Replacement search",
+                    status: "active",
+                    baseCommitSha,
+                    bestExperimentId: null,
+                    bestMetricValue: null,
+                    lastWorkedAt: null,
+                    plan: (request.body as { plan: unknown }).plan,
+                    metadata: {},
+                    createdAt: "2026-06-20T00:00:00.000Z",
+                    updatedAt: "2026-06-20T00:00:00.000Z",
+                  },
+                },
+              },
+            }
+          }
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/brief`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign,
+                  bestExperiment: null,
+                  recentExperiments: [],
+                  hypotheses: [],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  recommendedContext: [],
+                  markdown: "brief",
+                },
+              },
+            }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        () =>
+          commandResearchHypothesisAdd({
+            positional: ["research", "hypothesis", "add"],
+            options: {
+              session: sessionId,
+              plan: planPath,
+              name: "replacement",
+              base: baseCommitSha,
+              agent: "codex",
+            },
+          })
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    expect(createBody).toMatchObject({
+      name: "replacement",
+      baseCommitSha,
+      plan: { focus: "Replacement search" },
+    })
+    expect(logs).toContain(
+      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent codex`
+    )
   })
 })
 
@@ -459,7 +1059,7 @@ describe("setup modules", () => {
       await expect(
         assertSetupCommitted({ root, projectPath: "" })
       ).resolves.toBeUndefined()
-      await writeFile(join(root, "onyx", "lane-plans.json"), "[]\n")
+      await writeFile(join(root, "onyx", "hypotheses.json"), "[]\n")
       await expect(
         assertSetupCommitted({ root, projectPath: "" })
       ).resolves.toBeUndefined()

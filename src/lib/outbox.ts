@@ -1,4 +1,11 @@
-import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 
@@ -28,9 +35,9 @@ export type CliState = {
       humanFeedback?: string | null
       promotionRefName?: string | null
       sessionId?: string
-      laneId?: string
-      laneName?: string
-      laneBranch?: string
+      hypothesisId?: string
+      hypothesisName?: string
+      workerBranch?: string
       workers?: Record<
         string,
         {

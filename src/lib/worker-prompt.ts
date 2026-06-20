@@ -1,13 +1,12 @@
-export type LaneWorkerPromptInput = {
+export type HypothesisWorkerPromptInput = {
   briefPath: string
   campaignName: string
   goal: string
-  laneBranch: string
-  laneId: string
-  laneName: string
-  lanePlan: {
+  hypothesisId: string
+  hypothesisName: string
+  hypothesisPlan: {
     focus: string
-    hypothesis: string
+    statement: string
     startingPoints: string[]
     avoidList: string[]
     successSignals: string[]
@@ -25,6 +24,7 @@ export type LaneWorkerPromptInput = {
   researchSpecPath: string
   sessionId: string
   sessionStatePath: string | null
+  workerBranch: string
 }
 
 function markdownList(items: string[]) {
@@ -35,10 +35,12 @@ function optionalContextLine(label: string, value: string | null) {
   return value ? `- ${label}: ${value}\n` : ""
 }
 
-export function renderLaneWorkerPrompt(input: LaneWorkerPromptInput) {
-  return `# Onyx Lane Worker: ${input.laneName}
+export function renderHypothesisWorkerPrompt(
+  input: HypothesisWorkerPromptInput
+) {
+  return `# Onyx Hypothesis Worker: ${input.hypothesisName}
 
-You are an autonomous Onyx research lane worker. Do not ask the user questions. Do not launch other agents. Keep working until the stop condition is met or \`onyx research should-stop\` says to stop.
+You are an autonomous Onyx research hypothesis worker. Do not ask the user questions. Do not launch other agents. Keep working until the stop condition is met or \`onyx research should-stop\` says to stop.
 
 ## Campaign
 
@@ -47,8 +49,8 @@ You are an autonomous Onyx research lane worker. Do not ask the user questions. 
 - Metric: ${input.metricLabel}
 - Setup: local repo files
 - Session: ${input.sessionId}
-- Lane: ${input.laneId} (${input.laneName})
-- Lane branch: ${input.laneBranch}
+- Hypothesis: ${input.hypothesisId} (${input.hypothesisName})
+- Worker branch: ${input.workerBranch}
 - Max iterations: ${input.maxIterations}
 - Time budget remaining at launch: ${input.minutesRemaining} minute(s)
 - Stop starting new research by: ${input.researchDeadlineIso}
@@ -57,18 +59,18 @@ You are an autonomous Onyx research lane worker. Do not ask the user questions. 
 ## Context Files
 
 - Campaign brief: ${input.briefPath}
-${optionalContextLine("Peer lane state", input.sessionStatePath)}- Setup file: ${input.setupFilePath}
+${optionalContextLine("Peer hypothesis state", input.sessionStatePath)}- Setup file: ${input.setupFilePath}
 - Validation report: ${input.validationFilePath}
 - Research spec: ${input.researchSpecPath}
 
-## Lane Plan
+## Hypothesis Plan
 
-- Focus: ${input.lanePlan.focus}
-- Hypothesis: ${input.lanePlan.hypothesis}
-- Starting points: ${input.lanePlan.startingPoints.join("; ") || "choose from relevant in-scope files"}
-- Avoid: ${input.lanePlan.avoidList.join("; ") || "none beyond protected paths"}
-- Success signals: ${input.lanePlan.successSignals.join("; ") || input.metricLabel}
-- Give-up signals: ${input.lanePlan.giveUpSignals.join("; ") || "lane appears exhausted"}
+- Focus: ${input.hypothesisPlan.focus}
+- Hypothesis: ${input.hypothesisPlan.statement}
+- Starting points: ${input.hypothesisPlan.startingPoints.join("; ") || "choose from relevant in-scope files"}
+- Avoid: ${input.hypothesisPlan.avoidList.join("; ") || "none beyond protected paths"}
+- Success signals: ${input.hypothesisPlan.successSignals.join("; ") || input.metricLabel}
+- Give-up signals: ${input.hypothesisPlan.giveUpSignals.join("; ") || "hypothesis appears exhausted"}
 
 ## Protected Setup Paths
 
@@ -80,18 +82,18 @@ Do not edit protected setup paths during Research. If setup/eval/tools need to c
 
 1. Read the setup file, validation report, research spec, campaign brief, peer state, recent experiments, shared knowledge, git status, and relevant source files. Use \`onyx knowledge list --campaign "$ONYX_CAMPAIGN_NAME"\` when network access is available; otherwise read \`ONYX_SESSION_STATE_FILE\`. Understand the workload before editing.
 2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, restore only in-scope files from the best commit and commit that forward; do not rewrite history.
-3. Pick a concrete research idea for this lane. Use peer progress as inspiration, but do not duplicate an already-failed idea.
+3. Pick a concrete research idea for this hypothesis. Use peer progress as inspiration, but do not duplicate an already-failed idea.
 4. Before each iteration and before any sweep that might take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n>\`. Stop cleanly if it exits 0.
 5. Edit only in-scope project files, commit the result, then run \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha>\`.
 6. Inspect the output, metric, and checks result. Record every attempt with \`onyx exp log --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
 7. Publish concise shared learnings with \`onyx knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
-8. Periodically update a concise lane summary with \`onyx summary upsert\` if available; otherwise include the summary in final output.
+8. Periodically update a concise hypothesis summary with \`onyx summary upsert\` if available; otherwise include the summary in final output.
 9. Run \`onyx sync\` or \`onyx push\` periodically when network access is available.
 
 ## Research Rules
 
 - Primary metric is king: improved results are candidates to build from; worse or equal results should send you back to the current best before trying the next idea.
-- Make one small, measured, logged attempt early. Do not spend most of the lane budget searching before the first commit.
+- Make one small, measured, logged attempt early. Do not spend most of the hypothesis budget searching before the first commit.
 - Keep local sweeps bounded to seconds, not minutes. Prefer coarse evidence, commit a promising candidate, measure it through Onyx, then refine.
 - Secondary metrics inform tradeoffs, but hard guardrails belong in checks so a primary win that violates constraints becomes \`checks_failed\`.
 - Confirm surprising wins on noisy metrics before building on them. A single lucky trial can mislead the campaign.
@@ -116,5 +118,5 @@ Do not edit protected setup paths during Research. If setup/eval/tools need to c
 - Use \`onyx exp list --limit 20\` for recent history and \`onyx exp list --grep <regex>\` before repeating an idea.
 - Use \`onyx knowledge list\` before repeating an idea, and \`onyx knowledge add\` for promising ideas, dead-end themes, risks, and transfer notes. If you keep a local backlog file, avoid protected setup paths and commit it normally.
 
-On stop: leave the worktree clean, make sure every committed attempt is logged, run \`onyx push\` or \`onyx sync\` when network access is available, and summarize best result, failed ideas, and next promising ideas. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, local experiment log, and lane-ref push.`
+On stop: leave the worktree clean, make sure every committed attempt is logged, run \`onyx push\` or \`onyx sync\` when network access is available, and summarize best result, failed ideas, and next promising ideas. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, local experiment log, and worker-branch push.`
 }

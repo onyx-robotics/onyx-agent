@@ -5,7 +5,7 @@ Open-source agent package for Onyx research workflows.
 It installs the `onyx` command and the bundled `onyx` agent skill. The command
 is terminal-only: agents make code changes in your existing git repository,
 commit measured attempts, push immutable experiment refs, and report experiment
-metadata plus setup, lane, and worker state to the Onyx app.
+metadata plus setup, hypothesis, and worker state to the Onyx app.
 
 ## Install
 
@@ -75,18 +75,20 @@ git commit -m "Add Onyx setup"
 git push origin HEAD
 onyx campaign setup --name fast-eval --description "Improve score"
 onyx tools run evaluate
-onyx research start --campaign fast-eval --agents 4
+onyx research start --campaign fast-eval --workers 4
 onyx push
 ```
 
 The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
 when connectivity and credentials are available.
+`onyx exp run --no-log` is reserved for transient checks such as worker
+preflight and does not read, write, restore, or clear `.git/onyx/last-run.json`.
 
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
 `onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
 `onyx/tools/*`, `onyx/eval.sh`, and optional `onyx/checks.sh`; validates
 required setup modules locally with static checks; then creates an async
-research session with deliberate lane plans. Required setup modules are
+research session with deliberate hypothesis plans. Required setup modules are
 `setup_spec`, `project_scope`, `agent`, and `evaluation`; optional modules are
 `safety`, `reliability`, `reset`, and `resources`. Runtime rigor remains in
 `onyx exp run`, which executes reset/eval/check commands, parses metrics, and
@@ -103,36 +105,43 @@ Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
 available to the project.
 
-Lane workers are driven by the TypeScript-rendered Markdown prompt in
+Hypothesis workers are driven by the TypeScript-rendered Markdown prompt in
 `src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the
 editor and standalone release binaries stay self-contained.
 
-To run multiple local research lanes directly from the CLI, choose a built-in
+To run multiple local research hypotheses directly from the CLI, choose a built-in
 agent launcher:
 
 ```bash
-onyx research lane-plans --example > plans.json
-onyx research start --campaign fast-eval --agents 4 --lane-plans plans.json --max-minutes 10
-onyx worker run --session <id> --lane <lane-id> --agent codex
-onyx worker run --session <id> --lane <lane-id> --agent claude
+onyx research hypotheses --example > plans.json
+onyx research start --campaign fast-eval --workers 4 --hypotheses plans.json --max-minutes 10
+onyx worker run --session <id> --hypothesis <hypothesis-id> --agent codex
+onyx worker run --session <id> --hypothesis <hypothesis-id> --agent claude
+onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
 receive the worker prompt over stdin, and write live stdout/stderr logs plus
 launch manifests under `.git/onyx/worker-logs/`.
-`onyx research status` shows active-session lanes and workers by default,
+`onyx research status` shows active-session hypotheses and workers by default,
 including log paths, last-output age, timeout state, and manifest errors when
 local manifests are available.
 
-Each lane has a branch under `refs/heads/onyx/<campaign>/lanes/*`, gets a
-generated brief and worker prompt under `.git/onyx/`, polls
-`onyx research should-stop`, runs the setup contract through `onyx exp run`,
-pushes `refs/onyx/experiments/<campaignId>/<runRef>`, and reports the
-experiment with setup/session/lane/worker context. Workers publish shared
-learning with `onyx knowledge add` and read it back with `onyx knowledge list`.
+Each worker gets its own work branch under `refs/heads/onyx/<session>/<hypothesis>/<worker>`,
+while each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
+`onyx research should-stop`, run the setup contract through `onyx exp run`,
+push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the
+experiment with setup/session/hypothesis/worker context. `onyx research hypothesis add`
+can create another campaign hypothesis at any time from a JSON plan file or inline
+focus/hypothesis flags; when a worker slot is open, it prints a
+ready `onyx worker run --session ... --hypothesis ...` command and reuses the
+session's start agent unless `--agent codex|claude` overrides it. Workers
+publish shared learning with `onyx knowledge add` and read it back with
+`onyx knowledge list`, but successor hypothesis selection remains an
+orchestrator/human decision.
 After the agent exits, the worker harness performs one final best-effort
-commit, measurement, local experiment log, and lane-ref push so useful offline
+commit, measurement, local experiment log, and worker-branch push so useful offline
 work is not lost. Use `--worker-command` only for custom harnesses.
 
 Stop and finalize campaigns explicitly:

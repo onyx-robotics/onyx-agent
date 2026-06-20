@@ -170,7 +170,7 @@ function experimentRequestFromRecord(
     completedAt: record.completedAt ?? undefined,
     sessionId: record.sessionId,
     workerId: record.workerId,
-    laneId: record.laneId,
+    hypothesisId: record.hypothesisId,
     provenance: [],
   }
 }

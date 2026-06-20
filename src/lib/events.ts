@@ -28,7 +28,7 @@ export async function emitEvent(
     campaignId?: string
     sessionId?: string
     workerId?: string
-    laneId?: string
+    hypothesisId?: string
     runRef?: string
     commitSha?: string
     resultRef?: string

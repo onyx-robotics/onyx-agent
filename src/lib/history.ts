@@ -108,7 +108,7 @@ export function experimentRecordToHistory(
     experimentId: record.sync?.experimentId,
     sessionId: record.sessionId ?? record.sync?.sessionId,
     workerId: record.workerId ?? record.sync?.workerId,
-    laneId: record.laneId ?? record.sync?.laneId,
+    hypothesisId: record.hypothesisId ?? record.sync?.hypothesisId,
   }
 }
 
@@ -158,7 +158,7 @@ export function apiExperimentToHistory(
     campaignId: campaign.id,
     sessionId: experiment.sessionId ?? undefined,
     workerId: experiment.workerId ?? undefined,
-    laneId: experiment.laneId ?? undefined,
+    hypothesisId: experiment.hypothesisId ?? undefined,
   })
   return result.success ? result.data : null
 }
