@@ -1,5 +1,3 @@
-import type { LocalResearchCampaignStartedRecord } from "../protocol"
-
 import { descriptionOption, nameOption, type Args } from "../lib/args"
 import {
   deleteCampaign,
@@ -11,13 +9,19 @@ import { emitEvent } from "../lib/events"
 import { currentCommit, repoRoot } from "../lib/git"
 import { readHistory, rewriteHistory } from "../lib/history"
 import {
-  appendOutbox,
   readOutbox,
   readState,
   rewriteOutbox,
   writeState,
 } from "../lib/outbox"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
+import {
+  createLocalCampaign,
+  getActiveLocalCampaignName,
+  listLocalExperimentHistory,
+  localCampaignByName,
+  setActiveLocalCampaign,
+} from "../lib/research-db"
 import { assertSetupCommitted } from "../lib/setup-git"
 import { flushOutbox } from "../lib/sync"
 
@@ -39,10 +43,8 @@ export async function commandCampaignCreate(args: Args) {
   const promotionRefName =
     args.options["promotion-ref"] ?? `refs/heads/onyx/${name}/best`
 
-  const record: LocalResearchCampaignStartedRecord = {
-    schemaVersion: 1,
-    type: "campaign_started",
-    createdAt: new Date().toISOString(),
+  const localCampaign = await createLocalCampaign({
+    root,
     name,
     description,
     projectPath,
@@ -53,8 +55,7 @@ export async function commandCampaignCreate(args: Args) {
     metricDirection: setup.metric.direction,
     humanFeedback,
     promotionRefName,
-  }
-  await appendOutbox(root, record)
+  })
 
   const state = await readState(root)
   const key = campaignStateKey(projectPath, name)
@@ -64,6 +65,7 @@ export async function commandCampaignCreate(args: Args) {
     ...(state.campaigns ?? {}),
     [key]: {
       ...(state.campaigns ?? {})[key],
+      campaignId: localCampaign.id,
       projectPath,
       baseCommitSha,
       description,
@@ -86,7 +88,13 @@ export async function commandCampaignCreate(args: Args) {
   console.log(`Created campaign ${name}`)
   console.log(`Base commit: ${baseCommitSha}`)
 
+  if (args.options.offline === "true") {
+    console.log("Saved locally in SQLite; sync skipped by --offline.")
+    return
+  }
+
   const syncResult = await flushOutbox(root, args).catch((error) => {
+    if (args.options["require-online"] === "true") throw error
     console.warn(
       `Campaign sync skipped: ${
         error instanceof Error ? error.message : String(error)
@@ -108,6 +116,7 @@ export async function commandCampaignUse(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const name = nameOption(args)
+  await setActiveLocalCampaign({ root, projectPath, campaignName: name })
   const state = await readState(root)
   state.projectPath = projectPath
   state.activeCampaign = name
@@ -123,17 +132,28 @@ export async function commandCampaignStatus(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const name = args.options.name ?? state.activeCampaign
+  const name =
+    args.options.name ??
+    state.activeCampaign ??
+    (await getActiveLocalCampaignName(root)) ??
+    undefined
   if (!name) {
     console.log("campaign: none")
     return
   }
-  const campaign = state.campaigns?.[campaignStateKey(projectPath, name)]
+  const localCampaign = await localCampaignByName({ root, projectPath, name })
+  const stateCampaign = state.campaigns?.[campaignStateKey(projectPath, name)]
   console.log(`campaign: ${name}`)
-  console.log(`id: ${campaign?.campaignId ?? "(not synced)"}`)
-  console.log(`metric: ${campaign?.metricName ?? "(unknown)"}`)
-  console.log(`base: ${campaign?.baseCommitSha ?? "(unknown)"}`)
-  console.log(`session: ${campaign?.sessionId ?? "(none)"}`)
+  console.log(
+    `id: ${localCampaign?.id ?? stateCampaign?.campaignId ?? "(not synced)"}`
+  )
+  console.log(
+    `metric: ${localCampaign?.metricName ?? stateCampaign?.metricName ?? "(unknown)"}`
+  )
+  console.log(
+    `base: ${localCampaign?.baseCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`
+  )
+  console.log(`session: ${stateCampaign?.sessionId ?? "(none)"}`)
 }
 
 export async function commandCampaignDelete(args: Args) {
@@ -163,9 +183,14 @@ export async function commandCampaignDelete(args: Args) {
     })
   )
   const history = await readHistory(root)
+  const sqliteHistory = await listLocalExperimentHistory(root).catch(() => [])
   await rewriteHistory(
     root,
-    history.records.filter((record) => record.campaignName !== name)
+    history.records
+      .filter((record) => record.campaignName !== name)
+      .concat(
+        sqliteHistory.filter((record) => record.campaignName !== name) as typeof history.records
+      )
   )
 
   state.campaigns = state.campaigns ?? {}

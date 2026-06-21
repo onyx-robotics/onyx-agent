@@ -53,7 +53,7 @@ Usage:
   onyx profile use <name>
   onyx profile delete <name>
   onyx profile set-api-key-env <name> <ENV_VAR>
-  onyx campaign setup --name <name> [--description <text>] [--project-path <path>]
+  onyx campaign setup --name <name> [--description <text>] [--project-path <path>] [--offline] [--require-online]
       (creates a campaign and draft setup; each measured experiment is pushed
       as an immutable refs/onyx/experiments/* ref; setup comes from onyx/setup.json)
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
@@ -84,17 +84,20 @@ Usage:
   onyx listen
   onyx status
   onyx push
-  onyx sync [--watch] [--interval <seconds>] [--project <id>] [--repository-url <url>] [--project-path <path>]
+  onyx sync [--watch] [--interval <seconds>] [--project <id>] [--repository-url <url>] [--project-path <path>] [--offline] [--require-online]
 
-Results are logged locally first in .git/onyx/outbox.d/pending/*.json. \`onyx push\`,
-\`onyx sync\`, \`onyx sync --watch\`, and \`onyx research start\` flush the queue
-and push immutable experiment refs. \`onyx sync\` also refreshes the local history cache
-(.git/onyx/history.jsonl) that \`onyx exp list\` searches offline; \`onyx listen\`
-is a live read-only view of the current repo's research session.
+Results and research control-plane state are logged locally first in
+.git/onyx/research.db. \`onyx push\`, \`onyx sync\`, \`onyx sync --watch\`, and
+workers push immutable experiment refs and flush SQLite sync events. Pass
+\`--offline\` to suppress network attempts, or \`--require-online\` when a command
+must fail unless the app acknowledges the local events. \`onyx exp list\`
+searches the local SQLite projection offline; \`onyx listen\` is a live
+read-only view of the current repo's research session.
 
 Env:
   ONYX_API_KEY   overrides the selected profile API key
   ONYX_API_URL   overrides the selected profile API URL
+  ONYX_RESEARCH_DB overrides the local SQLite research ledger path
   Profiles may store a key locally or read it from apiKeyEnv
 `
 

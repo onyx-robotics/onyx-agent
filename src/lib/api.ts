@@ -214,6 +214,31 @@ export type ApiProjectDeletions = {
   }>
 }
 
+export type ApiResearchSyncEvent = {
+  eventId: string
+  sequence: number
+  type: string
+  entityType: string
+  entityId: string
+  payload: Record<string, unknown>
+  createdAt: string
+}
+
+export type ApiResearchSyncResponse = {
+  accepted: number
+  duplicate: number
+  conflicts: number
+  invalid: number
+  acknowledgements: Array<{
+    eventId: string
+    sequence: number
+    status: "acked" | "duplicate" | "conflict" | "invalid"
+    entityType: string
+    entityId: string | null
+    message: string | null
+  }>
+}
+
 export async function callApi(
   method: string,
   path: string,
@@ -691,6 +716,20 @@ export async function getProjectDeletions(
       undefined,
       args
     )
+  )
+}
+
+export async function syncResearchEvents(
+  body: {
+    siteId: string
+    repositoryUrl: string
+    projectPath: string
+    events: ApiResearchSyncEvent[]
+  },
+  args?: Args
+): Promise<ApiResearchSyncResponse> {
+  return apiData<ApiResearchSyncResponse>(
+    await callApi("POST", "/api/v1/research/sync", body, args)
   )
 }
 

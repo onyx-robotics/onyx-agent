@@ -11,6 +11,7 @@ import { repoRoot } from "../lib/git"
 import { hydrateHistoryFromApi } from "../lib/history"
 import { readLastRuns, readOutbox, readState } from "../lib/outbox"
 import { resolveProjectPath } from "../lib/project"
+import { pendingResearchSyncCount } from "../lib/research-db"
 import { flushOutbox } from "../lib/sync"
 
 function positiveNumberOption(args: Args, name: string, fallback: number) {
@@ -92,6 +93,7 @@ export async function commandStatus(args: Args) {
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
   const { records, corrupt } = await readOutbox(root)
+  const sqlitePending = await pendingResearchSyncCount(root).catch(() => 0)
   const lastRuns = await readLastRuns(root)
   const experiments = records.filter(
     (record) => record.type === "campaign_experiment_logged"
@@ -117,7 +119,10 @@ export async function commandStatus(args: Args) {
   console.log(`campaign: ${state.activeCampaign ?? "(none)"}`)
   console.log(`projectPath: ${projectPath || "(repo root)"}`)
   console.log(
-    `outbox: ${experiments} experiment(s), ${campaigns} campaign(s) pending${
+    `ledger: ${sqlitePending} SQLite sync event(s) pending`
+  )
+  console.log(
+    `legacy outbox: ${experiments} experiment(s), ${campaigns} campaign(s) pending${
       corrupt ? `, ${corrupt} unreadable` : ""
     }`
   )

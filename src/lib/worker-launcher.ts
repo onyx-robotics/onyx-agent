@@ -448,14 +448,22 @@ export async function workerLaunchPaths({
   sessionId,
   hypothesisId,
   hypothesisName,
+  workerId,
 }: {
   root: string
   sessionId: string
   hypothesisId: string
   hypothesisName: string
+  workerId?: string
 }) {
   const dir = join(await onyxStateDir(root), "worker-logs", sessionId)
-  const base = `${safeSegment(hypothesisName)}-${safeSegment(hypothesisId).slice(0, 8)}`
+  const base = [
+    safeSegment(hypothesisName),
+    safeSegment(hypothesisId).slice(0, 8),
+    workerId ? safeSegment(workerId).slice(0, 12) : null,
+  ]
+    .filter(Boolean)
+    .join("-")
   return {
     dir,
     logPath: join(dir, `${base}.log`),

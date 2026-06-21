@@ -19,14 +19,12 @@ import {
   summarizeOutput,
 } from "../lib/metrics"
 import {
-  appendOutbox,
   clearLastRun,
   clientRunRef,
   readOutbox,
   readLastRun,
   readLastRuns,
   readState,
-  withOnyxLock,
   writeLastRun,
   writeState,
   type LastRunSelector,
@@ -34,6 +32,12 @@ import {
 } from "../lib/outbox"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import { pathExists } from "../lib/process"
+import {
+  cacheLocalCampaign,
+  listLocalExperimentHistory,
+  localCampaignByName,
+  logLocalExperiment,
+} from "../lib/research-db"
 import { renderExperimentTable } from "../lib/tui"
 import {
   hasToolCommand,
@@ -74,17 +78,6 @@ function validateStatus(value: string): ExperimentStatus {
   throw new Error(
     "--status must be queued, running, succeeded, failed, checks_failed, setup_violation, accepted, or rejected"
   )
-}
-
-function comparableExperimentRecord(
-  record: LocalResearchCampaignExperimentLoggedRecord
-) {
-  const comparable: Partial<LocalResearchCampaignExperimentLoggedRecord> = {
-    ...record,
-  }
-  delete comparable.createdAt
-  delete comparable.sync
-  return JSON.stringify(comparable)
 }
 
 function parseAgentNotes(value?: string): Record<string, unknown> {
@@ -280,10 +273,60 @@ async function ensureCampaignMetadata({
   projectPath: string
   campaignName: string
 }) {
+  const localCampaign = await localCampaignByName({
+    root,
+    projectPath,
+    name: campaignName,
+  })
+  if (localCampaign) {
+    const state = await readState(root)
+    const key = campaignStateKey(projectPath, campaignName)
+    state.projectPath = projectPath
+    state.activeCampaign = campaignName
+    state.campaigns = state.campaigns ?? {}
+    state.campaigns[key] = {
+      ...state.campaigns[key],
+      campaignId: localCampaign.id,
+      projectPath,
+      baseCommitSha: localCampaign.baseCommitSha,
+      description: localCampaign.description,
+      metricName: localCampaign.metricName,
+      metricUnit: localCampaign.metricUnit,
+      metricDirection: localCampaign.metricDirection,
+      promotionRefName: localCampaign.promotionRefName,
+    }
+    await writeState(root, state)
+    return {
+      campaignId: localCampaign.id,
+      hypothesisId: state.campaigns[key]?.hypothesisId,
+      metricName: localCampaign.metricName,
+      baseCommitSha: localCampaign.baseCommitSha,
+    }
+  }
+
   const state = await readState(root)
   const key = campaignStateKey(projectPath, campaignName)
   const cached = state.campaigns?.[key]
   if (cached?.campaignId && cached.metricName && cached.baseCommitSha) {
+    await cacheLocalCampaign({
+      root,
+      projectPath,
+      setup: cached.setup ?? {},
+      campaign: {
+        id: cached.campaignId,
+        projectId: state.projectId ?? "local",
+        name: campaignName,
+        description: cached.description ?? null,
+        baseCommitSha: cached.baseCommitSha,
+        metricName: cached.metricName,
+        metricUnit: cached.metricUnit ?? null,
+        metricDirection: cached.metricDirection ?? "maximize",
+        bestMetricValue: null,
+        bestCommitSha: null,
+        experimentCount: 0,
+        promotionRefName: cached.promotionRefName ?? null,
+      },
+    }).catch(() => null)
     return {
       campaignId: cached.campaignId,
       hypothesisId: cached.hypothesisId,
@@ -319,6 +362,12 @@ async function ensureCampaignMetadata({
     promotionRefName: campaign.promotionRefName,
   }
   await writeState(root, state)
+  await cacheLocalCampaign({
+    root,
+    campaign,
+    projectPath,
+    setup: state.campaigns[key]?.setup ?? {},
+  }).catch(() => null)
 
   return {
     campaignId: campaign.id,
@@ -613,6 +662,18 @@ export async function commandExpLog(args: Args) {
       ? lastRun
       : null
   if (args.options["run-ref"] && !usableLastRun) {
+    const localHistory = await listLocalExperimentHistory(root).catch(() => [])
+    const logged = localHistory.find(
+      (record) =>
+        record.runRef === args.options["run-ref"] &&
+        record.campaignName === campaignName
+    )
+    if (logged) {
+      console.log(
+        `Experiment ${args.options["run-ref"]} is already recorded for campaign ${campaignName}`
+      )
+      return
+    }
     const { records } = await readOutbox(root)
     const queued = records.find(
       (record) =>
@@ -741,33 +802,12 @@ export async function commandExpLog(args: Args) {
     workerId,
     hypothesisId,
   }
-  let duplicateQueued = false
-  await withOnyxLock(root, "outbox", async () => {
-    const { records } = await readOutbox(root)
-    const existing = records.find(
-      (queued): queued is LocalResearchCampaignExperimentLoggedRecord =>
-        queued.type === "campaign_experiment_logged" &&
-        queued.runRef === record.runRef
-    )
-    if (existing) {
-      if (comparableExperimentRecord(existing) === comparableExperimentRecord(record)) {
-        duplicateQueued = true
-        return
-      }
-      throw new Error(
-        `Experiment runRef ${record.runRef} is already queued with different content. Use a new runRef for a distinct experiment.`
-      )
-    }
-    await appendOutbox(root, record)
-  })
-  if (duplicateQueued) {
-    if (usableLastRun) await clearLastRun(root, { runRef: usableLastRun.runRef })
-    console.log(
-      `Experiment ${record.runRef} is already queued for campaign ${campaignName}`
-    )
-    return
+  await logLocalExperiment({ root, record })
+  if (args.options.offline !== "true") {
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+    })
   }
-  await flushOutbox(root, args, { quiet: true }).catch(() => {})
   await appendHistory(root, experimentRecordToHistory(record)).catch(() => {})
   await emitEvent(root, {
     type: "exp_logged",
@@ -786,12 +826,18 @@ export async function commandExpLog(args: Args) {
 
 export async function commandExpList(args: Args) {
   const root = await repoRoot()
+  const sqliteRows = await listLocalExperimentHistory(root).catch(() => [])
   const { records, corrupt } = await readHistory(root)
   if (corrupt > 0) {
     console.warn(`Skipped ${corrupt} unreadable history record(s).`)
   }
 
-  const rows: LocalResearchHistoryRecord[] = [...records]
+  const rows: LocalResearchHistoryRecord[] = [...sqliteRows]
+  const sqliteRunRefs = new Set(sqliteRows.map((row) => row.runRef))
+  for (const record of records) {
+    if (sqliteRunRefs.has(record.runRef)) continue
+    rows.push(record)
+  }
   const seenRunRefs = new Set(rows.map((row) => row.runRef))
   const { records: pendingOutbox, corrupt: corruptOutbox } =
     await readOutbox(root)

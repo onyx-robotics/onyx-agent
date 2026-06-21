@@ -51,6 +51,7 @@ import {
   writeState,
   writeValidationFile,
 } from "./onyx"
+import { listLocalExperimentHistory } from "./lib/research-db"
 import { runProcess } from "./lib/process"
 
 async function commitAll(root: string, message: string) {
@@ -661,12 +662,8 @@ describe("exp log", () => {
       console.log = originalLog
     }
 
-    const { records } = await readOutbox(root)
-    const logged = records.find(
-      (record) =>
-        record.type === "campaign_experiment_logged" &&
-        record.runRef === workerTwo.runRef
-    )
+    const records = await listLocalExperimentHistory(root)
+    const logged = records.find((record) => record.runRef === workerTwo.runRef)
     expect(logged).toMatchObject({
       name: "worker-two-result",
       description: "logged the second worker",
@@ -676,11 +673,7 @@ describe("exp log", () => {
       outputSummary: `worker ${workerTwoId}`,
     })
     expect(
-      records.filter(
-        (record) =>
-          record.type === "campaign_experiment_logged" &&
-          record.runRef === workerTwo.runRef
-      )
+      records.filter((record) => record.runRef === workerTwo.runRef)
     ).toHaveLength(1)
     const remainingRuns = await readLastRuns(root)
     expect(remainingRuns.map((run) => run.runRef)).toEqual([workerOne.runRef])
@@ -736,7 +729,6 @@ describe("research start", () => {
       successSignals: ["METRIC score improves"],
       giveUpSignals: ["No movement"],
     }
-    let sessionBody: unknown = null
     const logs: string[] = []
     const previousCwd = process.cwd()
     const originalLog = console.log
@@ -776,7 +768,6 @@ describe("research start", () => {
             request.path ===
               `/api/v1/research/campaigns/${campaignId}/sessions`
           ) {
-            sessionBody = request.body
             return {
               status: 201,
               body: {
@@ -880,18 +871,19 @@ describe("research start", () => {
       console.log = originalLog
     }
 
-    expect(sessionBody).toMatchObject({
-      workerTarget: 1,
-      hypotheses: [plan],
-      metadata: {
-        maxIterations: 3,
-        maxMinutes: 10,
-        agentKind: "claude",
-      },
-    })
-    expect(logs).toContain(`Research session: ${sessionId}`)
-    expect(logs).toContain(
-      `- worker 1: inline: Inline search\n  onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent claude --max-iterations 3 --max-minutes 10`
+    const sessionLine = logs.find((line) =>
+      line.startsWith("Research session: ")
+    )
+    expect(sessionLine).toMatch(/^Research session: [0-9a-f-]{36}$/)
+    const generatedSessionId = sessionLine?.replace("Research session: ", "")
+    const workerLine = logs.find((line) =>
+      line.startsWith("- worker 1: hypothesis-1: Inline search")
+    )
+    expect(workerLine).toContain(
+      `onyx worker run --session ${generatedSessionId} --hypothesis `
+    )
+    expect(workerLine).toContain(
+      "--agent claude --max-iterations 3 --max-minutes 10"
     )
   })
 
@@ -1412,19 +1404,18 @@ describe("research hypothesis add", () => {
     const createRequest = requests.find((request) =>
       request.path.endsWith("/hypotheses")
     )
-    expect(createRequest?.body).toMatchObject({
-      plan: {
-        focus: "Try scheduler smoothing",
-        statement: "Smoothing can improve score.",
-        startingPoints: ["src/controller.ts", "src/simulator.ts"],
-        avoidList: ["onyx/setup.json"],
-        successSignals: ["METRIC score improves"],
-        giveUpSignals: ["Score regresses twice"],
-      },
-    })
-    expect(logs).toContain(`Research hypothesis: ${hypothesisId}`)
+    expect(createRequest).toBeUndefined()
+    const hypothesisLine = logs.find((line) =>
+      line.startsWith("Research hypothesis: ")
+    )
+    expect(hypothesisLine).toMatch(/^Research hypothesis: [0-9a-f-]{36}$/)
+    const generatedHypothesisId = hypothesisLine?.replace(
+      "Research hypothesis: ",
+      ""
+    )
+    expect(logs).toContain("Hypothesis: Try scheduler smoothing: Try scheduler smoothing")
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent claude --max-iterations 10 --max-minutes 5`
+      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent claude --max-iterations 10 --max-minutes 5`
     )
   })
 
@@ -1571,13 +1562,18 @@ describe("research hypothesis add", () => {
       console.log = originalLog
     }
 
-    expect(createBody).toMatchObject({
-      name: "replacement",
-      baseCommitSha,
-      plan: { focus: "Replacement search" },
-    })
+    expect(createBody).toBeNull()
+    const hypothesisLine = logs.find((line) =>
+      line.startsWith("Research hypothesis: ")
+    )
+    expect(hypothesisLine).toMatch(/^Research hypothesis: [0-9a-f-]{36}$/)
+    const generatedHypothesisId = hypothesisLine?.replace(
+      "Research hypothesis: ",
+      ""
+    )
+    expect(logs).toContain("Hypothesis: replacement: Replacement search")
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${hypothesisId} --agent codex --max-iterations 10 --max-minutes 5`
+      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent codex --max-iterations 10 --max-minutes 5`
     )
   })
 })

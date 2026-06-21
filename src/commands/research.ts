@@ -8,20 +8,13 @@ import {
 import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
-  createCampaignHypothesis,
-  createCampaignSession,
   getCampaignBrief,
   getCampaignOverview,
   getResearchSessionState,
-  heartbeatWorker,
-  createCampaignKnowledge,
-  listCampaignKnowledge,
   listProjectCampaigns,
-  registerCampaignWorker,
   reconcileCampaign,
   stopCampaignSession,
   resolveProject,
-  upsertCampaignSummary,
   type ApiCampaign,
   type ApiHypothesis,
   type ApiSummary,
@@ -51,6 +44,23 @@ import {
   type ProcessResult,
   type StreamingProcessResult,
 } from "../lib/process"
+import {
+  cacheLocalCampaign,
+  createLocalHypothesis,
+  createLocalKnowledge,
+  createLocalSession,
+  getActiveLocalCampaignName,
+  getLocalSessionState,
+  listLocalKnowledge,
+  listLocalSummaries,
+  localBriefMarkdown,
+  localCampaignByName,
+  recordLocalWorkerHeartbeat,
+  registerLocalWorker,
+  researchDbPath,
+  stopLocalSession,
+  upsertLocalSummary,
+} from "../lib/research-db"
 import { assertSetupCommitted } from "../lib/setup-git"
 import { flushOutbox } from "../lib/sync"
 import { protectedToolPaths } from "../lib/tools"
@@ -381,7 +391,10 @@ async function campaignForName(root: string, args: Args) {
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
   const campaignName =
-    args.options.campaign ?? state.activeCampaign ?? args.options.name
+    args.options.campaign ??
+    state.activeCampaign ??
+    (await getActiveLocalCampaignName(root)) ??
+    args.options.name
   if (!campaignName) {
     throw new Error(
       "Pass --campaign <name> or run `onyx campaign use --name <name>`."
@@ -389,6 +402,41 @@ async function campaignForName(root: string, args: Args) {
   }
 
   const key = campaignStateKey(projectPath, campaignName)
+  const localCampaign = await localCampaignByName({
+    root,
+    projectPath,
+    name: campaignName,
+  })
+  if (localCampaign) {
+    state.projectPath = projectPath
+    state.activeCampaign = localCampaign.name
+    state.campaigns = state.campaigns ?? {}
+    state.campaigns[key] = {
+      ...state.campaigns[key],
+      campaignId: localCampaign.id,
+      projectPath,
+      baseCommitSha: localCampaign.baseCommitSha,
+      description: localCampaign.description,
+      metricName: localCampaign.metricName,
+      metricUnit: localCampaign.metricUnit,
+      metricDirection: localCampaign.metricDirection,
+      promotionRefName: localCampaign.promotionRefName,
+    }
+    await writeState(root, state)
+    return {
+      projectPath,
+      campaign: localCampaign,
+      overview: {
+        campaign: localCampaign,
+        summaries: await listLocalSummaries(root, localCampaign.id),
+        knowledge: await listLocalKnowledge(root, localCampaign.id),
+        latestExperiments: [],
+        workers: [],
+        hypotheses: [],
+      },
+    }
+  }
+
   const cached = state.campaigns?.[key]
   if (cached?.campaignId) {
     try {
@@ -409,6 +457,12 @@ async function campaignForName(root: string, args: Args) {
         promotionRefName: campaign.promotionRefName,
       }
       await writeState(root, state)
+      await cacheLocalCampaign({
+        root,
+        campaign,
+        projectPath,
+        setup: state.campaigns[key]?.setup ?? {},
+      }).catch(() => null)
       return { projectPath, campaign, overview }
     } catch {
       // Fall back to repository/project resolution; the cached campaign may
@@ -449,6 +503,12 @@ async function campaignForName(root: string, args: Args) {
     promotionRefName: campaign.promotionRefName,
   }
   await writeState(root, state)
+  await cacheLocalCampaign({
+    root,
+    campaign: overview.campaign,
+    projectPath,
+    setup: state.campaigns[key]?.setup ?? {},
+  }).catch(() => null)
 
   return { projectPath, campaign: overview.campaign, overview }
 }
@@ -533,19 +593,31 @@ async function writeBrief({
   campaignId,
   sessionId,
   hypothesis,
+  workerId,
   args,
 }: {
   root: string
   campaignId: string
   sessionId: string
   hypothesis: ApiHypothesis
+  workerId?: string
   args: Args
 }) {
-  const brief = await getCampaignBrief(campaignId, args)
+  const markdown =
+    (await localBriefMarkdown({
+      root,
+      campaignId,
+      sessionId,
+      hypothesisId: hypothesis.id,
+    }).catch(() => null)) ??
+    (await getCampaignBrief(campaignId, args).then((brief) => brief.markdown))
   const dir = join(await onyxStateDir(root), "briefs", sessionId)
   await mkdir(dir, { recursive: true })
-  const path = join(dir, `${hypothesis.name}.md`)
-  await writeFile(path, `${brief.markdown}\n`, "utf8")
+  const suffix = workerId
+    ? `${safeFileSegment(workerId).slice(0, 12)}`
+    : safeFileSegment(hypothesis.id).slice(0, 12)
+  const path = join(dir, `${safeFileSegment(hypothesis.name)}-${suffix}.md`)
+  await writeFile(path, `${markdown}\n`, "utf8")
   return path
 }
 
@@ -563,7 +635,9 @@ async function writeSessionState({
   const dir = join(await onyxStateDir(root), "session-state", sessionId)
   await mkdir(dir, { recursive: true })
   const path = join(dir, `${hypothesis.id}.json`)
-  const state = await getResearchSessionState(sessionId, args)
+  const state = await getLocalSessionState(root, sessionId).catch(() =>
+    getResearchSessionState(sessionId, args)
+  )
   await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, "utf8")
   return path
 }
@@ -830,6 +904,7 @@ async function writeWorkerPrompt({
   setup,
   sessionId,
   hypothesis,
+  workerId,
   workerBranch,
   briefPath,
   sessionStatePath,
@@ -843,6 +918,7 @@ async function writeWorkerPrompt({
   setup: ResearchSetupFile
   sessionId: string
   hypothesis: ApiHypothesis
+  workerId: string
   workerBranch: string
   briefPath: string
   sessionStatePath: string | null
@@ -851,7 +927,10 @@ async function writeWorkerPrompt({
 }) {
   const dir = join(await onyxStateDir(root), "worker-prompts", sessionId)
   await mkdir(dir, { recursive: true })
-  const path = join(dir, `${hypothesis.name}.md`)
+  const path = join(
+    dir,
+    `${safeFileSegment(hypothesis.name)}-${safeFileSegment(workerId).slice(0, 12)}.md`
+  )
   const protectedPaths = await protectedToolPaths(root, projectPath)
   const nowMs = Date.now()
   const budgetRemainingMs = Math.max(0, endTimeMs - nowMs)
@@ -905,41 +984,40 @@ function processFailure(
 }
 
 async function withWorkerHeartbeat<T>({
+  root,
   workerId,
   sessionId,
   hypothesisId,
-  args,
   phase,
   progressMessage,
   metadata,
   run,
 }: {
+  root: string
   workerId: string
   sessionId: string
   hypothesisId: string
-  args: Args
   phase: string
   progressMessage: string | (() => string)
   metadata?: () => Record<string, unknown>
   run: () => Promise<T>
 }): Promise<T> {
   const timer = setInterval(() => {
-    void heartbeatWorker(
+    const heartbeat = {
+      root,
       workerId,
-      {
-        status: "running",
-        sessionId,
-        hypothesisId,
-        phase,
-        event: "heartbeat",
-        progressMessage:
-          typeof progressMessage === "function"
-            ? progressMessage()
-            : progressMessage,
-        metadata: metadata?.(),
-      },
-      args
-    ).catch(() => {})
+      status: "running" as const,
+      sessionId,
+      hypothesisId,
+      phase,
+      event: "heartbeat",
+      progressMessage:
+        typeof progressMessage === "function"
+          ? progressMessage()
+          : progressMessage,
+      metadata: metadata?.(),
+    }
+    void recordLocalWorkerHeartbeat(heartbeat).catch(() => {})
   }, 10_000)
 
   try {
@@ -1052,30 +1130,26 @@ async function runHypothesisOnce({
   }
 
   try {
-    const worker = await registerCampaignWorker(
-      campaign.id,
-      {
-        sessionId,
-        hypothesisId: hypothesis.id,
-        workerName: `${hypothesis.name}-${agentKind}`,
-        agentKind,
-        runtime: "local",
-      },
-      args
-    )
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      workerName: `${hypothesis.name}-${agentKind}`,
+      agentKind,
+      runtime: "local",
+    })
     workerId = worker.id
-    await heartbeatWorker(
-      worker.id,
-      {
-        status: "running",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "research",
-        event: "hypothesis_started",
-        progressMessage: `Running ${hypothesis.name}`,
-      },
-      args
-    )
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "running",
+      sessionId,
+      hypothesisId: hypothesis.id,
+      phase: "research",
+      event: "hypothesis_started",
+      progressMessage: `Running ${hypothesis.name}`,
+    })
 
     const { dir: worktree, branch: workerBranch } = await ensureWorktree({
       root,
@@ -1099,6 +1173,7 @@ async function runHypothesisOnce({
         campaignId: campaign.id,
         sessionId,
         hypothesis,
+        workerId: worker.id,
         args,
       }),
       writeSessionState({ root, sessionId, hypothesis, args }).catch(
@@ -1113,6 +1188,7 @@ async function runHypothesisOnce({
       setup,
       sessionId,
       hypothesis,
+      workerId: worker.id,
       workerBranch,
       briefPath,
       sessionStatePath,
@@ -1138,6 +1214,7 @@ async function runHypothesisOnce({
       ONYX_HYPOTHESIS_NAME: hypothesis.name,
       ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
+      ONYX_RESEARCH_DB: await researchDbPath(root),
       ONYX_BRIEF_FILE: briefPath,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
@@ -1182,6 +1259,7 @@ async function runHypothesisOnce({
       sessionId,
       hypothesisId: hypothesis.id,
       hypothesisName: hypothesis.name,
+      workerId: worker.id,
     })
     launchManifest = {
       schemaVersion: 1,
@@ -1213,10 +1291,10 @@ async function runHypothesisOnce({
     }
     await writeWorkerLaunchManifest(launchManifest)
     const workerResult = await withWorkerHeartbeat({
+      root,
       workerId: worker.id,
       sessionId,
       hypothesisId: hypothesis.id,
-      args,
       phase: "research",
       progressMessage: () =>
         workerProgress({
@@ -1311,29 +1389,27 @@ async function runHypothesisOnce({
       )
     }
 
-    await heartbeatWorker(
-      worker.id,
-      {
-        status: "completed",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "completed",
-        event: "hypothesis_completed",
-        progressMessage: `${hypothesis.name} completed`,
-        gitLabel: resultCommitSha,
-      },
-      args
-    )
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "completed",
+      sessionId,
+      hypothesisId: hypothesis.id,
+      phase: "completed",
+      event: "hypothesis_completed",
+      progressMessage: `${hypothesis.name} completed`,
+      gitLabel: resultCommitSha,
+    })
     const workerOutputSummary = summarizeWorkerOutput(workerResult)
-    await upsertCampaignSummary(
-      campaign.id,
-      {
-        sessionId,
-        hypothesisId: hypothesis.id,
-        authoredByWorkerId: worker.id,
-        summaryKind: "hypothesis_summary",
-        title: `${hypothesis.name} completed`,
-        body: [
+    await upsertLocalSummary({
+      root,
+      campaignId: campaign.id,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      authoredByWorkerId: worker.id,
+      summaryKind: "hypothesis_summary",
+      title: `${hypothesis.name} completed`,
+      body: [
           `Worker process exited successfully.`,
           `Latest commit: ${resultCommitSha ?? "n/a"}`,
           `Finalization: ${
@@ -1351,9 +1427,7 @@ async function runHypothesisOnce({
         ]
           .filter(Boolean)
           .join("\n"),
-      },
-      args
-    )
+    })
     await cleanupWorkerTempDir()
     return {
       hypothesis,
@@ -1373,42 +1447,39 @@ async function runHypothesisOnce({
       await writeWorkerLaunchManifest(launchManifest).catch(() => {})
     }
     if (workerId) {
-      await heartbeatWorker(
+      const metadata = launchManifest
+        ? {
+            workerLogPath: launchManifest.logPath,
+            workerPromptPath: launchManifest.promptPath,
+            lastOutputAt: launchManifest.lastOutputAt,
+            launcher: launchManifest.agentKind,
+          }
+        : undefined
+      await recordLocalWorkerHeartbeat({
+        root,
         workerId,
-        {
-          status: "failed",
-          sessionId,
-          hypothesisId: hypothesis.id,
-          phase: "failed",
-          event: "worker_failed",
-          progressMessage: message.slice(0, 1000),
-          gitLabel: resultCommitSha ?? null,
-          metadata: launchManifest
-            ? {
-                workerLogPath: launchManifest.logPath,
-                workerPromptPath: launchManifest.promptPath,
-                lastOutputAt: launchManifest.lastOutputAt,
-                launcher: launchManifest.agentKind,
-              }
-            : undefined,
-        },
-        args
-      ).catch(() => {})
-    }
-    await upsertCampaignSummary(
-      campaign.id,
-      {
+        status: "failed",
         sessionId,
         hypothesisId: hypothesis.id,
-        authoredByWorkerId: workerId,
-        summaryKind: "hypothesis_summary",
-        title: `${hypothesis.name} failed`,
-        body: launchManifest
-          ? `${message}\n\nWorker log: ${launchManifest.logPath}`
-          : message,
-      },
-      args
-    ).catch(() => {})
+        phase: "failed",
+        event: "worker_failed",
+        progressMessage: message.slice(0, 1000),
+        gitLabel: resultCommitSha ?? null,
+        metadata,
+      }).catch(() => {})
+    }
+    await upsertLocalSummary({
+      root,
+      campaignId: campaign.id,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      authoredByWorkerId: workerId,
+      summaryKind: "hypothesis_summary",
+      title: `${hypothesis.name} failed`,
+      body: launchManifest
+        ? `${message}\n\nWorker log: ${launchManifest.logPath}`
+        : message,
+    }).catch(() => {})
     await cleanupWorkerTempDir()
     return {
       hypothesis,
@@ -1448,21 +1519,21 @@ export async function commandResearchStart(args: Args) {
     throw new Error("--agent must be codex or claude")
   }
   const endTimeMs = Date.now() + maxMinutes * 60_000
-  const result = await createCampaignSession(
-    campaign.id,
-    {
-      name: args.options.name ?? `research-${new Date().toISOString()}`,
-      workerTarget,
-      hypotheses,
-      metadata: {
-        startedBy: "onyx-research",
-        maxIterations,
-        maxMinutes,
-        agentKind: launchAgent ?? "codex",
-      },
+  const result = await createLocalSession({
+    root,
+    campaignId: campaign.id,
+    name: args.options.name ?? `research-${new Date().toISOString()}`,
+    workerTarget,
+    hypotheses,
+    maxIterations,
+    endTimeMs,
+    metadata: {
+      startedBy: "onyx-research",
+      maxIterations,
+      maxMinutes,
+      agentKind: launchAgent ?? "codex",
     },
-    args
-  )
+  })
   const state = await readState(root)
   const key = campaignStateKey(projectPath, campaign.name)
   state.campaigns = state.campaigns ?? {}
@@ -1487,6 +1558,11 @@ export async function commandResearchStart(args: Args) {
     sessionId: result.session.id,
     message: `${workerTarget} worker slot(s), ${result.hypotheses.length} hypothesis(s)`,
   })
+  if (args.options.offline !== "true") {
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+    })
+  }
 
   await Promise.all(
     result.hypotheses.map(async (hypothesis) => {
@@ -1551,10 +1627,21 @@ export async function commandResearchHypothesisAdd(args: Args) {
 
   const plan = await hypothesisPlanOption(args)
   const before = sessionId
-    ? await getResearchSessionState(sessionId, args)
+    ? await getLocalSessionState(root, sessionId).catch(() =>
+        getResearchSessionState(sessionId, args)
+      )
     : null
   const campaign =
     before?.campaign ?? (await campaignForName(root, args)).campaign
+  if (before?.campaign) {
+    const key = campaignStateKey(projectPath, before.campaign.name)
+    await cacheLocalCampaign({
+      root,
+      campaign: before.campaign,
+      projectPath,
+      setup: state.campaigns?.[key]?.setup ?? {},
+    }).catch(() => null)
+  }
   await assertLocalSetupReady(root, projectPath)
   const sessionMetadata = before?.session.metadata ?? {}
   const agentKind =
@@ -1565,20 +1652,19 @@ export async function commandResearchHypothesisAdd(args: Args) {
   if (agentKind !== "codex" && agentKind !== "claude") {
     throw new Error("--agent must be codex or claude")
   }
-  const result = await createCampaignHypothesis(
-    campaign.id,
-    {
-      plan,
-      name: args.options.name,
-      description: args.options.description,
-      baseCommitSha: args.options.base,
-      metadata: {
-        createdBy: "onyx-research",
-        ...(sessionId ? { createdBySessionId: sessionId } : {}),
-      },
+  const createdHypothesis = await createLocalHypothesis({
+    root,
+    campaignId: campaign.id,
+    createdBySessionId: sessionId ?? null,
+    plan,
+    name: args.options.name,
+    description: args.options.description,
+    baseCommitSha: args.options.base,
+    metadata: {
+      createdBy: "onyx-research",
+      ...(sessionId ? { createdBySessionId: sessionId } : {}),
     },
-    args
-  )
+  })
 
   const maxIterations =
     typeof sessionMetadata.maxIterations === "number"
@@ -1603,6 +1689,11 @@ export async function commandResearchHypothesisAdd(args: Args) {
       status: "running",
     }
   }
+  if (args.options.offline !== "true") {
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+    })
+  }
   const key = campaignStateKey(projectPath, campaign.name)
   state.campaigns = state.campaigns ?? {}
   state.campaigns[key] = {
@@ -1612,7 +1703,7 @@ export async function commandResearchHypothesisAdd(args: Args) {
   }
   await writeState(root, state)
 
-  const hypothesis = result.hypothesis
+  const hypothesis = createdHypothesis
   if (sessionId) {
     await Promise.all([
       writeBrief({
@@ -1999,6 +2090,12 @@ export async function commandResearchStop(args: Args) {
   await writeState(root, state)
 
   if (campaignId) {
+    await stopLocalSession({
+      root,
+      sessionId,
+      status: "stop_requested",
+      reason: args.options.reason ?? "stop requested",
+    }).catch(() => {})
     await reconcileCampaign(campaignId, args).catch(() => {})
     await stopCampaignSession(
       sessionId,
@@ -2031,10 +2128,20 @@ function safeBranchSegment(value: string) {
 
 export async function commandResearchFinish(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
-  await reconcileCampaign(campaign.id, args).catch(() => {})
-  await flushOutbox(root, args, { quiet: true }).catch(() => {})
-  const overview = await getCampaignOverview(campaign.id, args)
+  const campaignInfo = await campaignForName(root, args)
+  const { campaign } = campaignInfo
+  if (args.options.offline !== "true") {
+    await reconcileCampaign(campaign.id, args).catch(() => {})
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+    })
+  }
+  const overview =
+    args.options.offline === "true"
+      ? campaignInfo.overview
+      : await getCampaignOverview(campaign.id, args).catch(
+          () => campaignInfo.overview
+        )
 
   const branches: string[] = []
   const campaignSegment = safeBranchSegment(campaign.name)
@@ -2067,16 +2174,14 @@ export async function commandResearchFinish(args: Args) {
       ? branches.map((branch) => `- ${branch}`)
       : ["- none"]),
   ].join("\n")
-  await upsertCampaignSummary(
-    campaign.id,
-    {
-      sessionId,
-      summaryKind: "campaign_brief",
-      title: `${campaign.name} final results`,
-      body,
-    },
-    args
-  ).catch(() => {})
+  await upsertLocalSummary({
+    root,
+    campaignId: campaign.id,
+    sessionId,
+    summaryKind: "campaign_brief",
+    title: `${campaign.name} final results`,
+    body,
+  }).catch(() => {})
   if (sessionId) {
     state.sessions = state.sessions ?? {}
     state.sessions[sessionId] = {
@@ -2087,6 +2192,12 @@ export async function commandResearchFinish(args: Args) {
       stopRequested: false,
     }
     await writeState(root, state)
+    await stopLocalSession({
+      root,
+      sessionId,
+      status: "completed",
+      reason: "finalized",
+    }).catch(() => {})
     await stopCampaignSession(
       sessionId,
       {
@@ -2119,18 +2230,21 @@ export async function commandSummaryUpsert(args: Args) {
     args.options.worker ?? process.env.ONYX_WORKER_ID,
     "--worker"
   )
-  await upsertCampaignSummary(
-    campaign.id,
-    {
-      sessionId,
-      hypothesisId,
-      authoredByWorkerId,
-      summaryKind: kind,
-      title,
-      body,
-    },
-    args
-  )
+  await upsertLocalSummary({
+    root,
+    campaignId: campaign.id,
+    sessionId,
+    hypothesisId,
+    authoredByWorkerId,
+    summaryKind: kind,
+    title,
+    body,
+  })
+  if (args.options.offline !== "true") {
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+    })
+  }
   console.log(`Updated ${kind} for ${campaign.name}`)
 }
 
@@ -2147,12 +2261,17 @@ function summaryScope(summary: ApiSummary) {
 export async function commandSummaryList(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const { campaign } = await campaignForName(root, args)
-  const overview = await getCampaignOverview(campaign.id, args)
   const kind = args.options.kind
     ? summaryKindOption(args, "hypothesis_summary")
     : null
   const limit = positiveIntegerOption(args, "limit", 20)
-  const matchingSummaries = overview.summaries.filter(
+  let sourceSummaries = await listLocalSummaries(root, campaign.id)
+  if (sourceSummaries.length === 0 && args.options.offline !== "true") {
+    sourceSummaries = await getCampaignOverview(campaign.id, args)
+      .then((overview) => overview.summaries)
+      .catch(() => sourceSummaries)
+  }
+  const matchingSummaries = sourceSummaries.filter(
     (summary) => !kind || summary.summaryKind === kind
   )
   const summaries = matchingSummaries.slice(0, limit)
@@ -2211,23 +2330,26 @@ export async function commandKnowledgeAdd(args: Args) {
   if (!title) throw new Error("Pass --title <text>.")
   if (!body) throw new Error("Pass --body <text>.")
 
-  await createCampaignKnowledge(
-    campaign.id,
-    {
-      sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-      hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
-      authoredByWorkerId:
-        args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
-      kind,
-      title,
-      body,
-      confidence:
-        args.options.confidence === undefined
-          ? undefined
-          : Number(args.options.confidence),
-    },
-    args
-  )
+  await createLocalKnowledge({
+    root,
+    campaignId: campaign.id,
+    sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
+    hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
+    authoredByWorkerId:
+      args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+    kind,
+    title,
+    body,
+    confidence:
+      args.options.confidence === undefined
+        ? undefined
+        : Number(args.options.confidence),
+  })
+  if (args.options.offline !== "true") {
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+    })
+  }
   console.log(`Added ${kind} knowledge for ${campaign.name}`)
 }
 
@@ -2235,10 +2357,7 @@ export async function commandKnowledgeList(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const { campaign } = await campaignForName(root, args)
   const limit = positiveIntegerOption(args, "limit", 50)
-  const knowledge = (await listCampaignKnowledge(campaign.id, args)).slice(
-    0,
-    limit
-  )
+  const knowledge = (await listLocalKnowledge(root, campaign.id)).slice(0, limit)
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(knowledge, null, 2))
@@ -2292,7 +2411,9 @@ export async function commandWorkerRun(args: Args) {
     throw new Error("Pass --session <id> or start a research session first.")
   }
 
-  const sessionState = await getResearchSessionState(sessionId, args)
+  const sessionState = await getLocalSessionState(root, sessionId).catch(() =>
+    getResearchSessionState(sessionId, args)
+  )
   if (sessionState.session.status !== "running") {
     throw new Error(
       `Research session ${sessionId} is ${sessionState.session.status}; cannot start a new worker.`

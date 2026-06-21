@@ -700,6 +700,55 @@ export const researchWorkerHeartbeatRequestSchema = z.object({
   metadata: metadataSchema.default({}),
 })
 
+export const researchSyncEventTypeSchema = z.enum([
+  "campaign.upserted",
+  "session.started",
+  "session.stopped",
+  "hypothesis.upserted",
+  "worker.registered",
+  "worker.heartbeat",
+  "experiment.logged",
+  "summary.upserted",
+  "knowledge.created",
+  "entity.deleted",
+])
+
+export const researchSyncEventSchema = z.object({
+  eventId: z.string().trim().min(1).max(240),
+  sequence: z.number().int().positive(),
+  type: researchSyncEventTypeSchema,
+  entityType: z.string().trim().min(1).max(80),
+  entityId: z.uuid(),
+  payload: metadataSchema,
+  createdAt: z.iso.datetime(),
+})
+
+export const syncResearchRequestSchema = z.object({
+  siteId: z.uuid(),
+  repositoryUrl: z.string().trim().min(1).max(2000),
+  projectPath: projectPathSchema.default(""),
+  events: z.array(researchSyncEventSchema).min(1).max(500),
+})
+
+export const researchSyncEventAckSchema = z.object({
+  eventId: z.string().min(1),
+  sequence: z.number().int().positive(),
+  status: z.enum(["acked", "duplicate", "conflict", "invalid"]),
+  entityType: z.string().min(1),
+  entityId: z.uuid().nullable(),
+  message: z.string().nullable(),
+})
+
+export const syncResearchResponseSchema = z.object({
+  data: z.object({
+    accepted: z.number().int().nonnegative(),
+    duplicate: z.number().int().nonnegative(),
+    conflicts: z.number().int().nonnegative(),
+    invalid: z.number().int().nonnegative(),
+    acknowledgements: z.array(researchSyncEventAckSchema),
+  }),
+})
+
 export const stopResearchSessionRequestSchema = z.object({
   campaignId: z.uuid(),
   status: z
@@ -1356,6 +1405,11 @@ export type ResearchWorkerHeartbeatRequest = z.infer<
 export type ResearchWorkerHeartbeatResponse = z.infer<
   typeof researchWorkerHeartbeatResponseSchema
 >
+export type ResearchSyncEventType = z.infer<typeof researchSyncEventTypeSchema>
+export type ResearchSyncEvent = z.infer<typeof researchSyncEventSchema>
+export type SyncResearchRequest = z.infer<typeof syncResearchRequestSchema>
+export type ResearchSyncEventAck = z.infer<typeof researchSyncEventAckSchema>
+export type SyncResearchResponse = z.infer<typeof syncResearchResponseSchema>
 export type ResearchCampaignFileTreeResponse = z.infer<
   typeof researchCampaignFileTreeResponseSchema
 >

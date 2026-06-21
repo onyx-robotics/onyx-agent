@@ -11,6 +11,7 @@ import {
   listProjectCampaigns,
   reportCampaignExperimentsBatch,
   resolveProject,
+  syncResearchEvents,
   upsertCampaign,
   type ApiProject,
   type ApiProjectDeletions,
@@ -21,6 +22,15 @@ import { emitEvent } from "./events"
 import { pushRefs, repositoryUrl } from "./git"
 import { applyHistorySyncUpdates, type HistorySyncUpdate } from "./history"
 import { campaignStateKey, normalizeProjectPath } from "./project"
+import { resolveProjectPath } from "./project"
+import {
+  getResearchSiteId,
+  markResearchSyncAcked,
+  markResearchSyncConflict,
+  markResearchSyncError,
+  pendingResearchSyncCount,
+  pendingResearchSyncEvents,
+} from "./research-db"
 import {
   quarantineOutboxRecord,
   readOutbox,
@@ -37,6 +47,158 @@ export type FlushResult = {
   offline: boolean
   skippedDeleted: number
   conflicts: number
+}
+
+function eventExperimentRef(event: {
+  type: string
+  payload: Record<string, unknown>
+}) {
+  if (event.type !== "experiment.logged") return null
+  const experiment = event.payload.experiment
+  if (!experiment || typeof experiment !== "object") return null
+  const record = experiment as Record<string, unknown>
+  const commitSha = record.resultCommitSha
+  const ref = record.resultRef
+  if (typeof commitSha !== "string" || typeof ref !== "string") return null
+  return { commitSha, ref }
+}
+
+async function flushResearchDbEvents(
+  root: string,
+  args: Args,
+  options: { quiet?: boolean } = {}
+): Promise<FlushResult> {
+  const pendingCount = await pendingResearchSyncCount(root)
+  if (pendingCount === 0) {
+    return {
+      flushed: 0,
+      pending: 0,
+      offline: false,
+      skippedDeleted: 0,
+      conflicts: 0,
+    }
+  }
+
+  if (args.options.offline === "true") {
+    if (args.options["require-online"] === "true") {
+      throw new Error("--offline and --require-online cannot be used together.")
+    }
+    if (!options.quiet) {
+      console.log(
+        `SQLite ledger has ${pendingCount} pending sync event(s); sync skipped by --offline.`
+      )
+    }
+    return {
+      flushed: 0,
+      pending: pendingCount,
+      offline: true,
+      skippedDeleted: 0,
+      conflicts: 0,
+    }
+  }
+
+  const events = await pendingResearchSyncEvents(root, 500)
+  const eventIds = events.map((event) => event.eventId)
+  try {
+    const refs = events.map(eventExperimentRef).filter(Boolean) as Array<{
+      commitSha: string
+      ref: string
+    }>
+    for (let index = 0; index < refs.length; index += 20) {
+      await pushRefs(root, refs.slice(index, index + 20))
+    }
+
+    const response = await syncResearchEvents(
+      {
+        siteId: await getResearchSiteId(root),
+        repositoryUrl: await repositoryUrl(
+          root,
+          args.options["repository-url"]
+        ),
+        projectPath: await resolveProjectPath(root, args),
+        events: events.map((event) => ({
+          eventId: event.eventId,
+          sequence: event.sequence,
+          type: event.type,
+          entityType: event.entityType,
+          entityId: event.entityId,
+          payload: event.payload,
+          createdAt: event.createdAt,
+        })),
+      },
+      args
+    )
+
+    let flushed = 0
+    let conflicts = 0
+    for (const acknowledgement of response.acknowledgements) {
+      if (
+        acknowledgement.status === "acked" ||
+        acknowledgement.status === "duplicate"
+      ) {
+        await markResearchSyncAcked({
+          root,
+          eventId: acknowledgement.eventId,
+          serverStatus: acknowledgement.status,
+          serverEntityId: acknowledgement.entityId,
+          details: {
+            message: acknowledgement.message,
+            sequence: acknowledgement.sequence,
+          },
+        })
+        flushed += 1
+        continue
+      }
+      if (acknowledgement.status === "conflict") {
+        conflicts += 1
+        await markResearchSyncConflict({
+          root,
+          eventId: acknowledgement.eventId,
+          message: acknowledgement.message ?? "sync conflict",
+        })
+        continue
+      }
+      await markResearchSyncError({
+        root,
+        eventIds: [acknowledgement.eventId],
+        message: acknowledgement.message ?? "sync event was invalid",
+      })
+    }
+
+    const remaining = await pendingResearchSyncCount(root)
+    if (!options.quiet) {
+      const target = await apiTarget(args)
+      console.log(
+        `Synced ${flushed} SQLite event(s)${target ? ` to ${target.url}` : ""}; ${remaining} pending.`
+      )
+      if (conflicts > 0) {
+        console.log(`${conflicts} SQLite sync event(s) need conflict resolution.`)
+      }
+    }
+    return {
+      flushed,
+      pending: remaining,
+      offline: false,
+      skippedDeleted: 0,
+      conflicts,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    await markResearchSyncError({ root, eventIds, message }).catch(() => {})
+    if (args.options["require-online"] === "true") {
+      throw error
+    }
+    if (!options.quiet) {
+      console.warn(`SQLite sync skipped: ${message}`)
+    }
+    return {
+      flushed: 0,
+      pending: await pendingResearchSyncCount(root),
+      offline: true,
+      skippedDeleted: 0,
+      conflicts: 0,
+    }
+  }
 }
 
 function campaignSecondaryMetrics(
@@ -348,17 +510,21 @@ async function flushOutboxUnlocked(
   args: Args,
   options: { quiet?: boolean } = {}
 ): Promise<FlushResult> {
+  const sqliteResult = await flushResearchDbEvents(root, args, options)
+  if (sqliteResult.offline && args.options["require-online"] === "true") {
+    throw new Error("Sync failed while --require-online was set.")
+  }
   const { records, corrupt } = await readOutbox(root)
   if (corrupt > 0 && !options.quiet) {
     console.warn(`Skipped ${corrupt} unreadable outbox record(s).`)
   }
   if (records.length === 0) {
     return {
-      flushed: 0,
-      pending: 0,
-      offline: false,
+      flushed: sqliteResult.flushed,
+      pending: sqliteResult.pending,
+      offline: sqliteResult.offline,
       skippedDeleted: 0,
-      conflicts: 0,
+      conflicts: sqliteResult.conflicts,
     }
   }
 
@@ -512,10 +678,10 @@ async function flushOutboxUnlocked(
   }
 
   return {
-    flushed,
-    pending: remaining.length,
+    flushed: flushed + sqliteResult.flushed,
+    pending: remaining.length + sqliteResult.pending,
     offline: false,
     skippedDeleted,
-    conflicts: conflictCount,
+    conflicts: conflictCount + sqliteResult.conflicts,
   }
 }

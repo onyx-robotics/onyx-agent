@@ -95,6 +95,13 @@ research session with deliberate hypothesis plans. Required setup modules are
 `onyx exp run`, which executes reset/eval/check commands, parses metrics, and
 records setup compliance.
 
+Local research state is SQLite-first. The agent stores campaigns, sessions,
+hypotheses, workers, experiments, summaries, knowledge, resource leases, and
+pending sync events in `.git/onyx/research.db`. Commands write this ledger
+before attempting network sync, so setup, research execution, experiment
+logging, summaries, and knowledge publishing work offline and can be uploaded
+later with `onyx sync`.
+
 `onyx campaign setup` and `onyx research start` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
@@ -163,10 +170,9 @@ onyx campaign delete --name fast-eval
 ```
 
 Deletion requires connectivity (it is never queued). The server tombstones
-every deleted experiment's `runRef`, so an offline agent that still has them
-queued skips them on its next sync instead of resurrecting them. Recreating a
-campaign with the same name later is fine because tombstones only match records
-created before the deletion.
+deleted campaigns and experiments so stale SQLite sync events cannot resurrect
+them. Recreating a campaign with the same name later is fine because tombstones
+only match records created before the deletion.
 
 ## Development
 

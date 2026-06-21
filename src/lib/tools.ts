@@ -1,13 +1,13 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
-import { join, resolve } from "node:path"
+import { readFile } from "node:fs/promises"
+import { resolve } from "node:path"
 
 import { z } from "zod"
 
 import type { Args } from "./args"
 import { readSetupFile, setupPath, validationPath } from "./contract"
-import { onyxStateDir } from "./outbox"
 import { onyxPath, resolveProjectPath, scopedRoot } from "./project"
 import { pathExists, runProcess, type ProcessResult } from "./process"
+import { acquireLocalResourceLease } from "./research-db"
 
 export const TOOL_API_FILE = "tool-api.json"
 
@@ -41,14 +41,6 @@ export type ToolApi = z.infer<typeof toolApiSchema>
 export type ToolRunResult = ProcessResult & {
   commandName: string
   outputSummary: string | null
-}
-
-function sleep(ms: number) {
-  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
-}
-
-function safeSegment(value: string) {
-  return value.replace(/[^A-Za-z0-9._-]+/g, "-")
 }
 
 function quoteShellArg(value: string) {
@@ -205,46 +197,23 @@ async function acquireResourceSlot({
   resourceName,
   slots,
   timeoutMs,
+  leaseMs,
 }: {
   root: string
   resourceName: string
   slots: number
   timeoutMs: number
+  leaseMs: number
 }) {
-  const started = Date.now()
-  const dir = join(await onyxStateDir(root), "tool-locks", safeSegment(resourceName))
-  await mkdir(dir, { recursive: true })
-
-  while (Date.now() - started < timeoutMs) {
-    for (let slot = 1; slot <= slots; slot += 1) {
-      const lockPath = join(dir, String(slot))
-      try {
-        await mkdir(lockPath)
-        await writeFile(
-          join(lockPath, "owner.json"),
-          `${JSON.stringify(
-            {
-              resourceName,
-              slot,
-              pid: process.pid,
-              acquiredAt: new Date().toISOString(),
-            },
-            null,
-            2
-          )}\n`,
-          "utf8"
-        )
-        return async () => {
-          await rm(lockPath, { recursive: true, force: true })
-        }
-      } catch {
-        // Slot is held by another worker.
-      }
-    }
-    await sleep(250)
-  }
-
-  throw new Error(`Timed out waiting for tool resource ${resourceName}`)
+  return acquireLocalResourceLease({
+    root,
+    resourceName,
+    slots,
+    timeoutMs,
+    leaseMs,
+    ownerId: `${process.pid}:${Date.now()}:${Math.random()}`,
+    metadata: { pid: process.pid },
+  })
 }
 
 async function acquireResources({
@@ -266,6 +235,7 @@ async function acquireResources({
           resourceName,
           slots: resource?.slots ?? 1,
           timeoutMs: command.leaseTimeoutSeconds * 1000,
+          leaseMs: command.leaseTimeoutSeconds * 1000,
         })
       )
     }
