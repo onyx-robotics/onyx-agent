@@ -17,6 +17,7 @@ import type {
   ApiCampaignExperiment,
   ApiHypothesis,
   ApiKnowledge,
+  ApiProjectDeletions,
   ApiResearchSyncResponse,
   ApiSession,
   ApiSessionState,
@@ -72,6 +73,15 @@ type Row = Record<string, unknown>
 
 type LocalSummaryKind = ApiSummary["summaryKind"]
 type LocalKnowledgeKind = ApiKnowledge["kind"]
+type LocalTombstoneInput = {
+  entityType: string
+  entityId: string
+  campaignId: string | null
+  name: string | null
+  runRef: string | null
+  reason: string | null
+  deletedAt: string
+}
 
 const dbCache = new Map<string, Database>()
 const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 1
@@ -533,15 +543,24 @@ function nextSequence(db: Db) {
 
 async function openDb(root: string) {
   const path = await researchDbPath(root)
-  await mkdir(dirname(path), { recursive: true })
   const cached = dbCache.get(path)
   if (cached) return cached
-  const db = new Database(path, { create: true })
-  configureDb(db)
-  applyMigrations(db)
-  ensureSiteId(db)
-  dbCache.set(path, db)
-  return db
+  let db: Database | null = null
+  try {
+    await mkdir(dirname(path), { recursive: true })
+    db = new Database(path, { create: true })
+    configureDb(db)
+    applyMigrations(db)
+    ensureSiteId(db)
+    dbCache.set(path, db)
+    return db
+  } catch (error) {
+    db?.close()
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `Unable to open local research ledger at ${path}. Ensure the git directory is writable or set ONYX_RESEARCH_DB to a writable SQLite path. ${message}`
+    )
+  }
 }
 
 export async function getResearchSiteId(root: string) {
@@ -902,26 +921,29 @@ export async function localCampaignByName({
   projectPath: string
   name: string
 }) {
-  const row = (await openDb(root))
+  const db = await openDb(root)
+  const row = db
     .query("SELECT * FROM campaigns WHERE project_path = ? AND name = ?")
     .get(projectPath, name) as Row | null
-  return row ? campaignFromRow(row) : null
+  return row ? campaignFromRowForDb(db, row) : null
 }
 
 export async function localCampaignById(root: string, campaignId: string) {
-  const row = (await openDb(root))
+  const db = await openDb(root)
+  const row = db
     .query("SELECT * FROM campaigns WHERE id = ?")
     .get(campaignId) as Row | null
-  return row ? campaignFromRow(row) : null
+  return row ? campaignFromRowForDb(db, row) : null
 }
 
 export async function listLocalCampaigns(root: string) {
-  const rows = (await openDb(root))
+  const db = await openDb(root)
+  const rows = db
     .query(
       "SELECT * FROM campaigns WHERE status != 'deleted' ORDER BY updated_at DESC"
     )
     .all() as Row[]
-  return rows.map(campaignFromRow)
+  return rows.map((row) => campaignFromRowForDb(db, row))
 }
 
 export async function deleteLocalCampaignWithTombstone({
@@ -1184,15 +1206,20 @@ export async function getLocalSessionState(
     .get(sessionId) as Row | null
   if (!sessionRow)
     throw new Error(`Local research session ${sessionId} not found`)
-  const campaign = await localCampaignById(
-    root,
+  const campaignRow = db
+    .query("SELECT * FROM campaigns WHERE id = ?")
+    .get(sessionRow.campaign_id as string) as Row | null
+  if (!campaignRow) throw new Error("Local campaign not found")
+  const visibleExperiments = listLocalExperimentsForDb(
+    db,
     sessionRow.campaign_id as string
   )
-  if (!campaign) throw new Error("Local campaign not found")
-  const latest = listLocalExperimentsForDb(db, campaign.id, 20)
-  const best =
-    latest.find((experiment) => experiment.id === campaign.bestExperimentId) ??
-    null
+  const campaign = campaignWithVisibleProjection(
+    campaignFromRow(campaignRow),
+    visibleExperiments
+  )
+  const latest = visibleExperiments.slice(0, 20)
+  const best = bestVisibleExperimentForCampaign(campaign, visibleExperiments)
   const hypotheses = (
     db
       .query(
@@ -1506,6 +1533,68 @@ function isBetter(
   return direction === "maximize" ? next > current : next < current
 }
 
+function visibleExperimentPredicateSql() {
+  return `
+    NOT EXISTS (
+      SELECT 1
+      FROM tombstones t
+      WHERE
+        (
+          t.entity_type = 'experiment'
+          AND (t.entity_id = e.id OR t.run_ref = e.run_ref)
+        )
+        OR (
+          t.entity_type = 'campaign'
+          AND (
+            t.entity_id = e.campaign_id
+            OR t.campaign_id = e.campaign_id
+            OR t.name = c.name
+          )
+          AND e.created_at < t.created_at
+        )
+    )
+  `
+}
+
+function bestVisibleExperimentForCampaign(
+  campaign: Pick<LocalCampaign, "metricDirection">,
+  experiments: ApiCampaignExperiment[]
+) {
+  return experiments.reduce<ApiCampaignExperiment | null>((current, next) => {
+    if (!isBestEligible(next) || next.primaryMetricValue === null) return current
+    return isBetter(
+      campaign.metricDirection,
+      current?.primaryMetricValue ?? null,
+      next.primaryMetricValue
+    )
+      ? next
+      : current
+  }, null)
+}
+
+function campaignWithVisibleProjection(
+  campaign: LocalCampaign,
+  experiments: ApiCampaignExperiment[]
+) {
+  const best = bestVisibleExperimentForCampaign(campaign, experiments)
+  return {
+    ...campaign,
+    bestExperimentId: best?.id ?? null,
+    bestMetricValue: best?.primaryMetricValue ?? null,
+    bestCommitSha: best?.resultCommitSha ?? null,
+    experimentCount: experiments.length,
+  }
+}
+
+function campaignFromRowForDb(db: Db, row: Row) {
+  const campaign = campaignFromRow(row)
+  if (campaign.status === "deleted") return campaign
+  return campaignWithVisibleProjection(
+    campaign,
+    listLocalExperimentsForDb(db, campaign.id)
+  )
+}
+
 export async function logLocalExperiment({
   root,
   record,
@@ -1732,14 +1821,25 @@ export async function logLocalExperiment({
   return tx()
 }
 
-function listLocalExperimentsForDb(db: Db, campaignId: string, limit: number) {
-  return (
-    db
-      .query(
-        "SELECT * FROM experiments WHERE campaign_id = ? ORDER BY created_at DESC LIMIT ?"
-      )
-      .all(campaignId, limit) as Row[]
-  ).map(experimentFromRow)
+function listLocalExperimentsForDb(
+  db: Db,
+  campaignId: string,
+  limit?: number
+) {
+  const sql = `
+    SELECT e.*
+    FROM experiments e
+    INNER JOIN campaigns c ON c.id = e.campaign_id
+    WHERE e.campaign_id = ?
+      AND ${visibleExperimentPredicateSql()}
+    ORDER BY e.created_at DESC
+    ${limit === undefined ? "" : "LIMIT ?"}
+  `
+  const rows =
+    limit === undefined
+      ? (db.query(sql).all(campaignId) as Row[])
+      : (db.query(sql).all(campaignId, limit) as Row[])
+  return rows.map(experimentFromRow)
 }
 
 export async function listLocalExperimentHistory(root: string) {
@@ -1750,6 +1850,7 @@ export async function listLocalExperimentHistory(root: string) {
         SELECT e.*, c.name AS campaign_name
         FROM experiments e
         INNER JOIN campaigns c ON c.id = e.campaign_id
+        WHERE ${visibleExperimentPredicateSql()}
         ORDER BY e.created_at DESC
       `
     )
@@ -2157,6 +2258,59 @@ export async function applyRemoteTombstones({
   root: string
   tombstones: ApiResearchSyncResponse["tombstones"]
 }) {
+  await insertLocalTombstones({
+    root,
+    tombstones: tombstones.map((tombstone) => ({
+      entityType: tombstone.entityType,
+      entityId: tombstone.entityId,
+      campaignId: tombstone.campaignId,
+      name: tombstone.name,
+      runRef: tombstone.runRef,
+      reason: tombstone.reason,
+      deletedAt: tombstone.deletedAt,
+    })),
+  })
+}
+
+export async function applyProjectDeletions({
+  root,
+  deletions,
+}: {
+  root: string
+  deletions: ApiProjectDeletions
+}) {
+  await insertLocalTombstones({
+    root,
+    tombstones: [
+      ...deletions.campaigns.map((tombstone) => ({
+        entityType: "campaign" as const,
+        entityId: tombstone.campaignId,
+        campaignId: tombstone.campaignId,
+        name: tombstone.name,
+        runRef: null,
+        reason: null,
+        deletedAt: tombstone.deletedAt,
+      })),
+      ...deletions.experiments.map((tombstone) => ({
+        entityType: "experiment" as const,
+        entityId: tombstone.experimentId,
+        campaignId: tombstone.campaignId,
+        name: tombstone.campaignName,
+        runRef: tombstone.runRef,
+        reason: null,
+        deletedAt: tombstone.deletedAt,
+      })),
+    ],
+  })
+}
+
+async function insertLocalTombstones({
+  root,
+  tombstones,
+}: {
+  root: string
+  tombstones: LocalTombstoneInput[]
+}) {
   if (tombstones.length === 0) return
   const db = await openDb(root)
   const insert = db.query(
@@ -2439,16 +2593,20 @@ export async function localBriefMarkdown({
   sessionId?: string
   hypothesisId?: string
 }) {
-  const campaign = await localCampaignById(root, campaignId)
-  if (!campaign) throw new Error("Local campaign not found")
+  const db = await openDb(root)
+  const campaignRow = db
+    .query("SELECT * FROM campaigns WHERE id = ?")
+    .get(campaignId) as Row | null
+  if (!campaignRow) throw new Error("Local campaign not found")
+  const visibleExperiments = listLocalExperimentsForDb(db, campaignId)
+  const campaign = campaignWithVisibleProjection(
+    campaignFromRow(campaignRow),
+    visibleExperiments
+  )
   const state = sessionId
     ? await getLocalSessionState(root, sessionId)
     : {
-        latestExperiments: listLocalExperimentsForDb(
-          await openDb(root),
-          campaignId,
-          20
-        ),
+        latestExperiments: visibleExperiments.slice(0, 20),
         hypotheses: [],
         workers: [],
         summaries: await listLocalSummaries(root, campaignId),

@@ -9,6 +9,7 @@ import { normalizeSetupFile } from "./lib/contract"
 import { runProcess } from "./lib/process"
 import {
   acquireLocalResourceLease,
+  applyProjectDeletions,
   createLocalCampaign,
   createLocalSession,
   clearLocalAttempt,
@@ -20,6 +21,8 @@ import {
   listLocalCampaigns,
   listLocalExperimentHistory,
   listResearchSyncConflicts,
+  localBriefMarkdown,
+  localCampaignByName,
   logLocalExperiment,
   markResearchSyncConflict,
   pendingResearchSyncCount,
@@ -32,6 +35,7 @@ import {
   retryResearchSyncConflicts,
   writeLocalAttempt,
 } from "./lib/research-db"
+import { researchSyncEventSchema } from "./protocol"
 
 async function fixtureRepo() {
   const root = await mkdtemp(join(tmpdir(), "onyx-research-db-"))
@@ -73,6 +77,55 @@ function setup() {
     riskModel: { risks: [], antiGamingChecks: [] },
     measurement: { trials: 1, aggregation: "single", notes: null },
   })
+}
+
+function experimentRecord({
+  campaignName,
+  campaignId,
+  runRef,
+  name,
+  value,
+  createdAt,
+  sessionId,
+  hypothesisId,
+}: {
+  campaignName: string
+  campaignId: string
+  runRef: string
+  name: string
+  value: number
+  createdAt: string
+  sessionId?: string
+  hypothesisId?: string
+}) {
+  return {
+    schemaVersion: 1 as const,
+    type: "campaign_experiment_logged" as const,
+    createdAt,
+    runRef,
+    campaignName,
+    name,
+    description: null,
+    projectPath: "",
+    baseCommitSha: "abcdef1",
+    resultCommitSha: `${name}-commit`,
+    resultRef: `refs/onyx/experiments/${campaignId}/${runRef}`,
+    status: "succeeded" as const,
+    setupCompliance: {
+      status: "passed" as const,
+      protectedPathsChanged: [],
+      outOfScopePathsChanged: [],
+      setupPathsChanged: [],
+      notes: null,
+    },
+    primaryMetricName: "score",
+    primaryMetricValue: value,
+    metrics: { score: value },
+    agentNotes: {},
+    checks: null,
+    sessionId,
+    hypothesisId,
+  }
 }
 
 describe("SQLite research ledger", () => {
@@ -230,6 +283,227 @@ describe("SQLite research ledger", () => {
     expect(history).toHaveLength(1)
     expect(history[0]?.runRef).toBe("local/experiments/1")
     expect(history[0]?.primaryMetricValue).toBe(2)
+  })
+
+  test("filters tombstoned experiments from offline history and read models", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "tombstone-filter",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "controller",
+          statement: "Try a scoped controller change.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    const first = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/tombstone-filter/deleted",
+        name: "deleted-best",
+        value: 10,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        sessionId: session.session.id,
+        hypothesisId: hypothesis.id,
+      }),
+    })
+    const second = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/tombstone-filter/live",
+        name: "surviving",
+        value: 2,
+        createdAt: "2026-01-02T00:00:00.000Z",
+        sessionId: session.session.id,
+        hypothesisId: hypothesis.id,
+      }),
+    })
+
+    await applyProjectDeletions({
+      root,
+      deletions: {
+        campaigns: [],
+        experiments: [
+          {
+            experimentId: first.id,
+            runRef: first.runRef,
+            campaignId: campaign.id,
+            campaignName: campaign.name,
+            deletedAt: "2026-01-03T00:00:00.000Z",
+          },
+        ],
+      },
+    })
+
+    const history = await listLocalExperimentHistory(root)
+    expect(history.map((item) => item.runRef)).toEqual([second.runRef])
+
+    const projectedCampaign = await localCampaignByName({
+      root,
+      projectPath: "",
+      name: campaign.name,
+    })
+    expect(projectedCampaign?.experimentCount).toBe(1)
+    expect(projectedCampaign?.bestExperimentId).toBe(second.id)
+    expect(projectedCampaign?.bestMetricValue).toBe(2)
+
+    const sessionState = await getLocalSessionState(root, session.session.id)
+    expect(sessionState.latestExperiments.map((item) => item.runRef)).toEqual([
+      second.runRef,
+    ])
+    expect(sessionState.bestExperiment?.id).toBe(second.id)
+
+    const brief = await localBriefMarkdown({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+    })
+    expect(brief).toContain("surviving")
+    expect(brief).not.toContain("deleted-best")
+  })
+
+  test("filters experiments that predate a campaign tombstone", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "deleted-campaign",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/deleted-campaign/old",
+        name: "old-run",
+        value: 3,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    })
+
+    await applyProjectDeletions({
+      root,
+      deletions: {
+        campaigns: [
+          {
+            campaignId: campaign.id,
+            name: campaign.name,
+            deletedAt: "2026-01-02T00:00:00.000Z",
+          },
+        ],
+        experiments: [],
+      },
+    })
+
+    expect(await listLocalExperimentHistory(root)).toEqual([])
+    expect(
+      (await localCampaignByName({ root, projectPath: "", name: campaign.name }))
+        ?.experimentCount
+    ).toBe(0)
+  })
+
+  test("emitted SQLite sync events satisfy the generated protocol contract", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "contract",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "controller",
+          statement: "Try a scoped controller change.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      workerName: "worker-1",
+      agentKind: "codex",
+    })
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "completed",
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      event: "completed",
+      progressMessage: "done",
+      gitLabel: "abcdef2",
+    })
+    await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/contract/1",
+        name: "contract-run",
+        value: 4,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        sessionId: session.session.id,
+        hypothesisId: hypothesis.id,
+      }),
+    })
+
+    for (const event of await pendingResearchSyncEvents(root)) {
+      expect(() =>
+        researchSyncEventSchema.parse({
+          eventId: event.eventId,
+          sequence: event.sequence,
+          type: event.type,
+          entityType: event.entityType,
+          entityId: event.entityId,
+          payload: event.payload,
+          createdAt: event.createdAt,
+        })
+      ).not.toThrow()
+    }
   })
 
   test("stores measured attempts in SQLite and clears them after logging", async () => {

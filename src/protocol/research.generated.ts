@@ -788,6 +788,9 @@ const researchSyncHypothesisPayloadSchema = syncPayloadBaseSchema
         description: true,
         status: true,
         baseCommitSha: true,
+        bestExperimentId: true,
+        bestMetricValue: true,
+        lastWorkedAt: true,
         plan: true,
         metadata: true,
         createdAt: true,
@@ -811,6 +814,10 @@ const researchSyncWorkerPayloadSchema = syncPayloadBaseSchema
         status: true,
         startedAt: true,
         lastSeenAt: true,
+        currentExperimentId: true,
+        phase: true,
+        progressMessage: true,
+        gitLabel: true,
         metadata: true,
         createdAt: true,
         updatedAt: true,
@@ -889,6 +896,7 @@ const researchSyncExperimentPayloadSchema = syncPayloadBaseSchema
 const researchSyncSummaryPayloadSchema = syncPayloadBaseSchema
   .extend({
     summary: researchSummarySchema.strict(),
+    metadata: metadataSchema.optional(),
   })
   .strict()
 

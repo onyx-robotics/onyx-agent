@@ -1,10 +1,11 @@
 import type { Args } from "./args"
-import { syncResearchEvents } from "./api"
+import { getProjectDeletions, resolveProject, syncResearchEvents } from "./api"
 import { apiTarget } from "./config"
 import { pushRefs, repositoryUrl } from "./git"
 import { resolveProjectPath } from "./project"
 import {
   getResearchSiteId,
+  applyProjectDeletions,
   applyRemoteTombstones,
   markResearchSyncAcked,
   markResearchSyncConflict,
@@ -12,7 +13,7 @@ import {
   pendingResearchSyncCount,
   pendingResearchSyncEvents,
 } from "./research-db"
-import { withOnyxLock } from "./outbox"
+import { readState, withOnyxLock } from "./outbox"
 
 export type FlushResult = {
   flushed: number
@@ -36,26 +37,29 @@ function eventExperimentRef(event: {
   return { commitSha, ref }
 }
 
+async function resolveProjectIdForDeletionFeed(root: string, args: Args) {
+  if (args.options.project) return args.options.project
+  const state = await readState(root)
+  if (state.projectId) return state.projectId
+  return (await resolveProject(root, args)).id
+}
+
+async function fetchAndApplyRemoteDeletions(root: string, args: Args) {
+  const projectId = await resolveProjectIdForDeletionFeed(root, args)
+  const deletions = await getProjectDeletions(projectId, args)
+  await applyProjectDeletions({ root, deletions })
+}
+
 async function flushResearchDbEvents(
   root: string,
   args: Args,
   options: { quiet?: boolean } = {}
 ): Promise<FlushResult> {
-  const pendingCount = await pendingResearchSyncCount(root)
-  if (pendingCount === 0) {
-    return {
-      flushed: 0,
-      pending: 0,
-      offline: false,
-      skippedDeleted: 0,
-      conflicts: 0,
-    }
-  }
-
   if (args.options.offline === "true") {
     if (args.options["require-online"] === "true") {
       throw new Error("--offline and --require-online cannot be used together.")
     }
+    const pendingCount = await pendingResearchSyncCount(root)
     if (!options.quiet) {
       console.log(
         `SQLite ledger has ${pendingCount} pending sync event(s); sync skipped by --offline.`
@@ -67,6 +71,33 @@ async function flushResearchDbEvents(
       offline: true,
       skippedDeleted: 0,
       conflicts: 0,
+    }
+  }
+
+  const pendingCount = await pendingResearchSyncCount(root)
+  if (pendingCount === 0) {
+    try {
+      await fetchAndApplyRemoteDeletions(root, args)
+      return {
+        flushed: 0,
+        pending: 0,
+        offline: false,
+        skippedDeleted: 0,
+        conflicts: 0,
+      }
+    } catch (error) {
+      if (args.options["require-online"] === "true") throw error
+      if (!options.quiet) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn(`SQLite tombstone refresh skipped: ${message}`)
+      }
+      return {
+        flushed: 0,
+        pending: 0,
+        offline: true,
+        skippedDeleted: 0,
+        conflicts: 0,
+      }
     }
   }
 

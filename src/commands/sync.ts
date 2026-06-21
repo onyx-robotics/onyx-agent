@@ -37,6 +37,10 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
+
 export async function commandPush(args: Args) {
   const root = await repoRoot()
   const result = await flushOutbox(root, args)
@@ -124,9 +128,17 @@ export async function commandStatus(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const sqlitePending = await pendingResearchSyncCount(root).catch(() => 0)
-  const sqliteConflicts = await researchSyncConflictCount(root).catch(() => 0)
-  const lastRuns = await listLocalAttempts(root)
+  let ledgerLine: string
+  try {
+    const [sqlitePending, sqliteConflicts] = await Promise.all([
+      pendingResearchSyncCount(root),
+      researchSyncConflictCount(root),
+    ])
+    ledgerLine = `ledger: ${sqlitePending} SQLite sync event(s) pending, ${sqliteConflicts} conflict(s)`
+  } catch (error) {
+    ledgerLine = `ledger: unavailable (${errorMessage(error)})`
+  }
+  const lastRuns = await listLocalAttempts(root).catch(() => [])
 
   const config = await readConfig()
   const profileName = profileNameFromArgs(args, config)
@@ -144,9 +156,7 @@ export async function commandStatus(args: Args) {
   )
   console.log(`campaign: ${state.activeCampaign ?? "(none)"}`)
   console.log(`projectPath: ${projectPath || "(repo root)"}`)
-  console.log(
-    `ledger: ${sqlitePending} SQLite sync event(s) pending, ${sqliteConflicts} conflict(s)`
-  )
+  console.log(ledgerLine)
   if (lastRuns.length > 0) {
     const lastRun = lastRuns[0]!
     console.log(
