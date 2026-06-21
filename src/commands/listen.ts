@@ -1,23 +1,16 @@
 import { watch, type FSWatcher } from "node:fs"
-import { stat } from "node:fs/promises"
 import { basename } from "node:path"
 
-import type {
-  LocalResearchEvent,
-  LocalResearchHistoryRecord,
-} from "../protocol"
-
-import { readEvents } from "../lib/events"
 import { gitResult, repoRoot } from "../lib/git"
-import { historyPath, readHistory } from "../lib/history"
-import {
-  onyxStateDir,
-  readOutboxConflictCount,
-  readLastRuns,
-  readOutbox,
-  readState,
-} from "../lib/outbox"
+import { onyxStateDir, readState } from "../lib/outbox"
 import { campaignStateKey } from "../lib/project"
+import {
+  getActiveLocalCampaignName,
+  listLocalAttempts,
+  listLocalExperimentHistory,
+  pendingResearchSyncCount,
+  researchSyncConflictCount,
+} from "../lib/research-db"
 import { formatAge, renderFrame, type ListenModel } from "../lib/tui"
 
 const CSI = "\x1b["
@@ -25,67 +18,11 @@ const RENDER_INTERVAL_MS = 500
 const RENDER_MIN_GAP_MS = 100
 // Matches the spinner's frame duration in lib/tui.ts.
 const SPINNER_REDRAW_MS = 120
-// The session counts as live for 2 minutes after the last event/commit, or
-// for the whole eval window while a run is in flight (default timeout 600s).
+// The session counts as live for 2 minutes after the latest git activity.
 const ACTIVE_WINDOW_MS = 2 * 60_000
-const EVAL_ACTIVE_WINDOW_MS = 10 * 60_000
 // While idle, rebuild the model every Nth interval tick (2s instead of 500ms)
 // to keep git spawns and file reads minimal on constrained hardware.
 const IDLE_REBUILD_EVERY = 4
-
-// history.jsonl is re-read (and Zod-parsed) only when its mtime/size changes;
-// the parse of a long history is the most expensive part of a rebuild.
-let historyCache: {
-  key: string
-  records: LocalResearchHistoryRecord[]
-} | null = null
-
-async function readHistoryCached(
-  root: string
-): Promise<LocalResearchHistoryRecord[]> {
-  let key: string
-  try {
-    const stats = await stat(await historyPath(root))
-    key = `${stats.mtimeMs}:${stats.size}`
-  } catch {
-    historyCache = null
-    return []
-  }
-  if (historyCache?.key === key) return historyCache.records
-  const { records } = await readHistory(root)
-  historyCache = { key, records }
-  return records
-}
-
-function describeEvent(event: LocalResearchEvent, nowMs: number) {
-  const sha = event.commitSha ? event.commitSha.slice(0, 7) : null
-  const labels: Record<LocalResearchEvent["type"], string> = {
-    campaign_created: "campaign created",
-    campaign_deleted: "campaign deleted",
-    setup_created: "setup created",
-    setup_validated: "setup validated",
-    setup_validation_failed: "setup validation failed",
-    session_started: "session started",
-    session_stopped: "session stopped",
-    hypothesis_created: "hypothesis created",
-    hypothesis_started: "hypothesis started",
-    hypothesis_heartbeat: "hypothesis heartbeat",
-    hypothesis_completed: "hypothesis completed",
-    worker_started: "worker started",
-    worker_heartbeat: "worker heartbeat",
-    worker_stopped: "worker stopped",
-    research_started: "research started",
-    exp_run_started: "running eval",
-    eval_finished: "eval finished",
-    checks_finished: "checks",
-    run_finished: "measured",
-    exp_logged: "logged",
-    flush_finished: "sync",
-    pushed: "pushed",
-  }
-  const parts = [labels[event.type], sha, event.message].filter(Boolean)
-  return `${parts.join(" · ")} · ${formatAge(event.ts, nowMs)}`
-}
 
 /** Latest commit on HEAD as a live-activity candidate. */
 async function headCommitInfo(root: string) {
@@ -101,9 +38,10 @@ async function headCommitInfo(root: string) {
 
 async function buildModel(root: string): Promise<ListenModel> {
   const state = await readState(root)
-  const campaignName = state.activeCampaign ?? null
+  const campaignName =
+    state.activeCampaign ?? (await getActiveLocalCampaignName(root)) ?? null
 
-  const records = await readHistoryCached(root)
+  const records = await listLocalExperimentHistory(root)
   // Ascending — the most recent experiment renders at the bottom of the
   // table. Copy before sorting/pushing so the cached array stays untouched.
   const rows = (
@@ -115,7 +53,7 @@ async function buildModel(root: string): Promise<ListenModel> {
   )
 
   // Surface measured-but-unlogged runs at the bottom of the table.
-  for (const lastRun of await readLastRuns(root)) {
+  for (const lastRun of await listLocalAttempts(root)) {
     if (
       rows.some((row) => row.runRef === lastRun.runRef) ||
       (campaignName && lastRun.campaignName !== campaignName)
@@ -130,12 +68,25 @@ async function buildModel(root: string): Promise<ListenModel> {
       baseCommitSha: lastRun.baseCommitSha,
       resultCommitSha: lastRun.resultCommitSha,
       resultRef: lastRun.resultRef,
+      gitStatus: undefined,
       status: lastRun.status,
       name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
+      description: null,
       primaryMetricName: lastRun.primaryMetricName,
       primaryMetricValue: lastRun.primaryMetricValue,
       metrics: lastRun.metrics,
       agentNotes: lastRun.agentNotes,
+      checks: lastRun.checks
+        ? {
+            status: lastRun.checks.status,
+            durationMs: lastRun.checks.durationMs ?? null,
+            outputSummary: lastRun.checks.outputSummary ?? null,
+          }
+        : null,
+      durationMs: lastRun.durationMs ?? null,
+      outputSummary: lastRun.outputSummary ?? null,
+      campaignId: "",
+      experimentId: "",
       sessionId: lastRun.sessionId,
       workerId: lastRun.workerId,
       hypothesisId: lastRun.hypothesisId,
@@ -165,39 +116,21 @@ async function buildModel(root: string): Promise<ListenModel> {
       )
     : null
 
-  // Activity: most recent of (latest CLI event, latest commit on HEAD).
+  // Activity: latest commit on HEAD; research activity comes from SQLite rows.
   const nowMs = Date.now()
-  const [latestEvent] = (await readEvents(root, { tail: 1 })).slice(-1)
   const head = await headCommitInfo(root)
-  let activity: string | null = latestEvent
-    ? describeEvent(latestEvent, nowMs)
+  const activity = head
+    ? `committed ${head.sha.slice(0, 7)} · ${head.subject} · ${formatAge(head.committedAt, nowMs)}`
     : null
-  if (
-    head &&
-    (!latestEvent || Date.parse(head.committedAt) > Date.parse(latestEvent.ts))
-  ) {
-    activity = `committed ${head.sha.slice(0, 7)} · ${head.subject} · ${formatAge(head.committedAt, nowMs)}`
-  }
 
-  // Live while an eval is in flight (exp_run_started without a newer event,
-  // bounded by the eval timeout) or anything happened in the last 2 minutes.
-  const eventMs = latestEvent ? Date.parse(latestEvent.ts) : Number.NaN
+  // Live while git HEAD activity happened in the last 2 minutes.
   const commitMs = head ? Date.parse(head.committedAt) : Number.NaN
-  const lastActivityMs = Math.max(
-    Number.isFinite(eventMs) ? eventMs : 0,
-    Number.isFinite(commitMs) ? commitMs : 0
-  )
-  const evalInFlight =
-    latestEvent?.type === "exp_run_started" &&
-    Number.isFinite(eventMs) &&
-    nowMs - eventMs < EVAL_ACTIVE_WINDOW_MS
   const active =
-    evalInFlight ||
-    (lastActivityMs > 0 && nowMs - lastActivityMs < ACTIVE_WINDOW_MS)
+    Number.isFinite(commitMs) && nowMs - commitMs < ACTIVE_WINDOW_MS
 
-  const [{ records: outboxRecords }, conflictCount] = await Promise.all([
-    readOutbox(root),
-    readOutboxConflictCount(root),
+  const [pendingOutbox, conflictCount] = await Promise.all([
+    pendingResearchSyncCount(root),
+    researchSyncConflictCount(root),
   ])
 
   return {
@@ -210,9 +143,9 @@ async function buildModel(root: string): Promise<ListenModel> {
     activity,
     active,
     rows,
-    pendingOutbox: outboxRecords.length,
+    pendingOutbox,
     conflictOutbox: conflictCount,
-    syncedCount: records.filter((record) => record.source === "api").length,
+    syncedCount: 0,
   }
 }
 
@@ -224,8 +157,8 @@ function frameText(lines: string[], live: boolean) {
 
 /**
  * Live, read-only view of the current repo's research session: tails
- * `.git/onyx/` (events, history, last-run, outbox) and polls git for new
- * commits. With no TTY it prints a single snapshot and exits.
+ * `.git/onyx/research.db` and polls git for new commits. With no TTY it
+ * prints a single snapshot and exits.
  */
 export async function commandListen() {
   const root = await repoRoot()

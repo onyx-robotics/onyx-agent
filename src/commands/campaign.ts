@@ -1,24 +1,13 @@
 import { descriptionOption, nameOption, type Args } from "../lib/args"
-import {
-  deleteCampaign,
-  listProjectCampaigns,
-  resolveProject,
-} from "../lib/api"
 import { readSetupFile } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, repoRoot } from "../lib/git"
-import { readHistory, rewriteHistory } from "../lib/history"
-import {
-  readOutbox,
-  readState,
-  rewriteOutbox,
-  writeState,
-} from "../lib/outbox"
+import { readState, writeState } from "../lib/outbox"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import {
   createLocalCampaign,
+  deleteLocalCampaignWithTombstone,
   getActiveLocalCampaignName,
-  listLocalExperimentHistory,
   localCampaignByName,
   setActiveLocalCampaign,
 } from "../lib/research-db"
@@ -160,38 +149,14 @@ export async function commandCampaignDelete(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const name = nameOption(args)
-  await flushOutbox(root, args, { quiet: true }).catch(() => {})
   const state = await readState(root)
   const key = campaignStateKey(projectPath, name)
-  let campaignId = state.campaigns?.[key]?.campaignId
-  if (!campaignId) {
-    const project = await resolveProject(root, args)
-    const campaigns = await listProjectCampaigns(project.id, args)
-    campaignId = campaigns.find((campaign) => campaign.name === name)?.id
-  }
-  if (!campaignId) {
-    throw new Error(`Campaign ${name} is not synced or does not exist.`)
-  }
-
-  const result = await deleteCampaign(campaignId, args)
-  const outbox = await readOutbox(root)
-  await rewriteOutbox(
+  const result = await deleteLocalCampaignWithTombstone({
     root,
-    outbox.records.filter((record) => {
-      if (record.type === "campaign_started") return record.name !== name
-      return record.campaignName !== name
-    })
-  )
-  const history = await readHistory(root)
-  const sqliteHistory = await listLocalExperimentHistory(root).catch(() => [])
-  await rewriteHistory(
-    root,
-    history.records
-      .filter((record) => record.campaignName !== name)
-      .concat(
-        sqliteHistory.filter((record) => record.campaignName !== name) as typeof history.records
-      )
-  )
+    projectPath,
+    name,
+    reason: args.options.reason ?? "campaign deleted locally",
+  })
 
   state.campaigns = state.campaigns ?? {}
   delete state.campaigns[key]
@@ -200,8 +165,18 @@ export async function commandCampaignDelete(args: Args) {
   await emitEvent(root, {
     type: "campaign_deleted",
     campaignName: name,
-    campaignId,
+    campaignId: result.campaignId,
     message: `${result.deletedExperimentCount} experiment(s)`,
   })
+  if (args.options.offline !== "true") {
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+      console.warn(
+        `Campaign delete sync skipped: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    })
+  }
   console.log(`Deleted campaign ${name}`)
 }

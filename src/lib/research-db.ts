@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { dirname, join } from "node:path"
 
@@ -17,13 +17,18 @@ import type {
   ApiCampaignExperiment,
   ApiHypothesis,
   ApiKnowledge,
+  ApiResearchSyncResponse,
   ApiSession,
   ApiSessionState,
   ApiSummary,
   ApiWorker,
 } from "./api"
 import { currentCommit } from "./git"
-import { onyxStateDir } from "./outbox"
+import {
+  onyxStateDir,
+  type LastRunRecord,
+  type LastRunSelector,
+} from "./outbox"
 
 type Db = Database
 
@@ -69,6 +74,7 @@ type LocalSummaryKind = ApiSummary["summaryKind"]
 type LocalKnowledgeKind = ApiKnowledge["kind"]
 
 const dbCache = new Map<string, Database>()
+const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 1
 
 function nowIso() {
   return new Date().toISOString()
@@ -108,6 +114,65 @@ function numericRecord(value: Record<string, unknown>) {
   )
 }
 
+function sortedJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(sortedJson).join(",")}]`
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${sortedJson(item)}`)
+      .join(",")}}`
+  }
+  return JSON.stringify(value)
+}
+
+function experimentFingerprint(experiment: ApiCampaignExperiment) {
+  return createHash("sha256")
+    .update(
+      sortedJson({
+        runRef: experiment.runRef,
+        campaignId: experiment.campaignId,
+        sessionId: experiment.sessionId,
+        hypothesisId: experiment.hypothesisId,
+        workerId: experiment.workerId,
+        baseCommitSha: experiment.baseCommitSha,
+        resultCommitSha: experiment.resultCommitSha,
+        resultRef: experiment.resultRef,
+        status: experiment.status,
+        setupCompliance: experiment.setupCompliance,
+        primaryMetricName: experiment.primaryMetricName,
+        primaryMetricValue: experiment.primaryMetricValue,
+        secondaryMetrics: experiment.secondaryMetrics,
+        artifactRefs: experiment.artifactRefs,
+        agentNotes: experiment.agentNotes,
+        checks: experiment.checks,
+        durationMs: experiment.durationMs,
+        outputSummary: experiment.outputSummary,
+        startedAt: experiment.startedAt,
+        completedAt: experiment.completedAt,
+        createdAt: experiment.createdAt,
+      })
+    )
+    .digest("hex")
+}
+
+function syncCampaignPayload(row: Row) {
+  return {
+    id: row.id as string,
+    projectId:
+      (row.server_project_id as string | null) ??
+      "00000000-0000-0000-0000-000000000000",
+    name: row.name as string,
+    description: nullableString(row.description),
+    baseCommitSha: row.base_commit_sha as string,
+    metricName: row.metric_name as string,
+    metricUnit: nullableString(row.metric_unit),
+    metricDirection: row.metric_direction as "maximize" | "minimize",
+    promotionRefName: nullableString(row.promotion_ref_name),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  }
+}
+
 export async function researchDbPath(root: string) {
   if (process.env.ONYX_RESEARCH_DB) return process.env.ONYX_RESEARCH_DB
   return join(await onyxStateDir(root), "research.db")
@@ -123,6 +188,24 @@ function configureDb(db: Db) {
 
 function applyMigrations(db: Db) {
   db.run(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    )
+  `)
+  const row = db
+    .query("SELECT MAX(version) AS version FROM schema_migrations")
+    .get() as { version: number | null } | null
+  const currentVersion = Number(row?.version ?? 0)
+  if (currentVersion > CURRENT_RESEARCH_DB_SCHEMA_VERSION) {
+    throw new Error(
+      `Local research DB schema version ${currentVersion} is newer than this Onyx CLI supports (${CURRENT_RESEARCH_DB_SCHEMA_VERSION}).`
+    )
+  }
+  if (currentVersion >= CURRENT_RESEARCH_DB_SCHEMA_VERSION) return
+
+  db.transaction(() => {
+    db.run(`
     CREATE TABLE IF NOT EXISTS local_settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
@@ -130,7 +213,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS campaigns (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -157,7 +240,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -174,7 +257,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS hypotheses (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -194,7 +277,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS workers (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -216,7 +299,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS worker_heartbeats (
       id TEXT PRIMARY KEY,
       worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
@@ -235,7 +318,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS experiments (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -270,7 +353,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS summaries (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -287,7 +370,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS knowledge (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -305,7 +388,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS resource_leases (
       resource_name TEXT NOT NULL,
       slot INTEGER NOT NULL,
@@ -317,7 +400,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS tombstones (
       id TEXT PRIMARY KEY,
       entity_type TEXT NOT NULL,
@@ -331,7 +414,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS sync_events (
       event_id TEXT PRIMARY KEY,
       sequence INTEGER NOT NULL UNIQUE,
@@ -348,7 +431,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS sync_acks (
       event_id TEXT PRIMARY KEY,
       server_status TEXT NOT NULL,
@@ -358,7 +441,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(`
+    db.run(`
     CREATE TABLE IF NOT EXISTS server_mappings (
       local_entity_type TEXT NOT NULL,
       local_entity_id TEXT NOT NULL,
@@ -369,24 +452,49 @@ function applyMigrations(db: Db) {
     )
   `)
 
-  db.run(
-    "CREATE INDEX IF NOT EXISTS sync_events_pending_idx ON sync_events(status, sequence)"
-  )
-  db.run(
-    "CREATE INDEX IF NOT EXISTS experiments_campaign_created_idx ON experiments(campaign_id, created_at DESC)"
-  )
-  db.run(
-    "CREATE INDEX IF NOT EXISTS workers_campaign_seen_idx ON workers(campaign_id, status, last_seen_at DESC)"
-  )
-  db.run(
-    "CREATE INDEX IF NOT EXISTS hypotheses_campaign_status_idx ON hypotheses(campaign_id, status, last_worked_at DESC)"
-  )
-  db.run(
-    "CREATE INDEX IF NOT EXISTS summaries_campaign_kind_idx ON summaries(campaign_id, summary_kind, is_current)"
-  )
-  db.run(
-    "CREATE INDEX IF NOT EXISTS knowledge_campaign_created_idx ON knowledge(campaign_id, created_at DESC)"
-  )
+    db.run(`
+    CREATE TABLE IF NOT EXISTS local_attempts (
+      run_ref TEXT PRIMARY KEY,
+      campaign_id TEXT,
+      campaign_name TEXT NOT NULL,
+      project_path TEXT NOT NULL DEFAULT '',
+      session_id TEXT,
+      worker_id TEXT,
+      hypothesis_id TEXT,
+      result_commit_sha TEXT NOT NULL,
+      status TEXT NOT NULL,
+      record_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `)
+
+    db.run(
+      "CREATE INDEX IF NOT EXISTS sync_events_pending_idx ON sync_events(status, sequence)"
+    )
+    db.run(
+      "CREATE INDEX IF NOT EXISTS experiments_campaign_created_idx ON experiments(campaign_id, created_at DESC)"
+    )
+    db.run(
+      "CREATE INDEX IF NOT EXISTS workers_campaign_seen_idx ON workers(campaign_id, status, last_seen_at DESC)"
+    )
+    db.run(
+      "CREATE INDEX IF NOT EXISTS hypotheses_campaign_status_idx ON hypotheses(campaign_id, status, last_worked_at DESC)"
+    )
+    db.run(
+      "CREATE INDEX IF NOT EXISTS summaries_campaign_kind_idx ON summaries(campaign_id, summary_kind, is_current)"
+    )
+    db.run(
+      "CREATE INDEX IF NOT EXISTS knowledge_campaign_created_idx ON knowledge(campaign_id, created_at DESC)"
+    )
+    db.run(
+      "CREATE INDEX IF NOT EXISTS local_attempts_context_idx ON local_attempts(campaign_name, project_path, session_id, worker_id, hypothesis_id, updated_at DESC)"
+    )
+    db.query(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
+    ).run(CURRENT_RESEARCH_DB_SCHEMA_VERSION, nowIso())
+    db.run(`PRAGMA user_version = ${CURRENT_RESEARCH_DB_SCHEMA_VERSION}`)
+  })()
 }
 
 function setting(db: Db, key: string) {
@@ -546,12 +654,18 @@ function workerFromRow(row: Row): ApiWorker {
     sessionId: nullableString(row.session_id),
     hypothesisId: row.hypothesis_id as string,
     workerName: row.worker_name as string,
+    agentKind: row.agent_kind as string,
+    runtime: row.runtime as ApiWorker["runtime"],
     status: row.status as ApiWorker["status"],
     currentExperimentId: nullableString(row.current_experiment_id),
     phase: nullableString(row.phase),
     progressMessage: nullableString(row.progress_message),
     gitLabel: nullableString(row.git_label),
     lastSeenAt: row.last_seen_at as string,
+    startedAt: row.started_at as string,
+    metadata: parseJson(row.metadata_json, {}),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
   }
 }
 
@@ -576,6 +690,7 @@ function experimentFromRow(row: Row): ApiCampaignExperiment {
     primaryMetricName: row.primary_metric_name as string,
     primaryMetricValue: numberOrNull(row.primary_metric_value),
     secondaryMetrics: parseJson(row.secondary_metrics_json, {}),
+    artifactRefs: parseJson(row.artifact_refs_json, {}),
     agentNotes: parseJson(row.agent_notes_json, {}),
     checks: parseJson(row.checks_json, null),
     durationMs:
@@ -584,6 +699,7 @@ function experimentFromRow(row: Row): ApiCampaignExperiment {
     startedAt: nullableString(row.started_at),
     completedAt: nullableString(row.completed_at),
     createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
   }
 }
 
@@ -598,6 +714,9 @@ function summaryFromRow(row: Row): ApiSummary {
     title: row.title as string,
     body: row.body as string,
     isCurrent: bool(row.is_current),
+    metadata: parseJson(row.metadata_json, {}),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
   }
 }
 
@@ -709,7 +828,7 @@ export async function createLocalCampaign({
       type: "campaign.upserted",
       entityType: "campaign",
       entityId: campaign.id as string,
-      payload: campaignFromRow(campaign) as unknown as Record<string, unknown>,
+      payload: { campaign: syncCampaignPayload(campaign) },
     })
     setSetting(db, "active_project_path", projectPath)
     setSetting(db, "active_campaign", name)
@@ -798,9 +917,90 @@ export async function localCampaignById(root: string, campaignId: string) {
 
 export async function listLocalCampaigns(root: string) {
   const rows = (await openDb(root))
-    .query("SELECT * FROM campaigns WHERE status != 'deleted' ORDER BY updated_at DESC")
+    .query(
+      "SELECT * FROM campaigns WHERE status != 'deleted' ORDER BY updated_at DESC"
+    )
     .all() as Row[]
   return rows.map(campaignFromRow)
+}
+
+export async function deleteLocalCampaignWithTombstone({
+  root,
+  projectPath,
+  name,
+  reason = null,
+}: {
+  root: string
+  projectPath: string
+  name: string
+  reason?: string | null
+}) {
+  const db = await openDb(root)
+  const at = nowIso()
+  const tx = db.transaction(() => {
+    const campaign = db
+      .query("SELECT * FROM campaigns WHERE project_path = ? AND name = ?")
+      .get(projectPath, name) as Row | null
+    if (!campaign) throw new Error(`Local campaign ${name} not found`)
+    const campaignId = campaign.id as string
+    const experiments = db
+      .query("SELECT id, run_ref FROM experiments WHERE campaign_id = ?")
+      .all(campaignId) as Row[]
+    const insertTombstone = db.query(
+      `
+        INSERT INTO tombstones (
+          id, entity_type, entity_id, campaign_id, name, run_ref, reason, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+          campaign_id = excluded.campaign_id,
+          name = excluded.name,
+          run_ref = excluded.run_ref,
+          reason = excluded.reason,
+          created_at = excluded.created_at
+      `
+    )
+    for (const experiment of experiments) {
+      insertTombstone.run(
+        `experiment:${experiment.id as string}`,
+        "experiment",
+        experiment.id as string,
+        campaignId,
+        name,
+        experiment.run_ref as string,
+        reason,
+        at
+      )
+    }
+    insertTombstone.run(
+      `campaign:${campaignId}`,
+      "campaign",
+      campaignId,
+      campaignId,
+      name,
+      null,
+      reason,
+      at
+    )
+    enqueueSyncEvent({
+      db,
+      type: "entity.deleted",
+      entityType: "campaign",
+      entityId: campaignId,
+      payload: {
+        entityType: "campaign",
+        entityId: campaignId,
+        campaignId,
+        name,
+        runRef: null,
+        deletedAt: at,
+        reason,
+      },
+    })
+    db.query("DELETE FROM campaigns WHERE id = ?").run(campaignId)
+    return { campaignId, deletedExperimentCount: experiments.length }
+  })
+  return tx()
 }
 
 function defaultHypothesisName(index: number) {
@@ -982,32 +1182,44 @@ export async function getLocalSessionState(
   const sessionRow = db
     .query("SELECT * FROM sessions WHERE id = ?")
     .get(sessionId) as Row | null
-  if (!sessionRow) throw new Error(`Local research session ${sessionId} not found`)
-  const campaign = await localCampaignById(root, sessionRow.campaign_id as string)
+  if (!sessionRow)
+    throw new Error(`Local research session ${sessionId} not found`)
+  const campaign = await localCampaignById(
+    root,
+    sessionRow.campaign_id as string
+  )
   if (!campaign) throw new Error("Local campaign not found")
   const latest = listLocalExperimentsForDb(db, campaign.id, 20)
   const best =
     latest.find((experiment) => experiment.id === campaign.bestExperimentId) ??
     null
   const hypotheses = (
-    db.query(
-      "SELECT * FROM hypotheses WHERE campaign_id = ? ORDER BY created_at ASC"
-    ).all(campaign.id) as Row[]
+    db
+      .query(
+        "SELECT * FROM hypotheses WHERE campaign_id = ? ORDER BY created_at ASC"
+      )
+      .all(campaign.id) as Row[]
   ).map(hypothesisFromRow)
   const workers = (
-    db.query("SELECT * FROM workers WHERE campaign_id = ? ORDER BY last_seen_at DESC").all(
-      campaign.id
-    ) as Row[]
+    db
+      .query(
+        "SELECT * FROM workers WHERE campaign_id = ? ORDER BY last_seen_at DESC"
+      )
+      .all(campaign.id) as Row[]
   ).map(workerFromRow)
   const summaries = (
-    db.query(
-      "SELECT * FROM summaries WHERE campaign_id = ? ORDER BY updated_at DESC LIMIT 50"
-    ).all(campaign.id) as Row[]
+    db
+      .query(
+        "SELECT * FROM summaries WHERE campaign_id = ? ORDER BY updated_at DESC LIMIT 50"
+      )
+      .all(campaign.id) as Row[]
   ).map(summaryFromRow)
   const knowledge = (
-    db.query(
-      "SELECT * FROM knowledge WHERE campaign_id = ? ORDER BY created_at DESC LIMIT 50"
-    ).all(campaign.id) as Row[]
+    db
+      .query(
+        "SELECT * FROM knowledge WHERE campaign_id = ? ORDER BY created_at DESC LIMIT 50"
+      )
+      .all(campaign.id) as Row[]
   ).map(knowledgeFromRow)
   return {
     session: sessionFromRow(sessionRow),
@@ -1174,7 +1386,7 @@ export async function recordLocalWorkerHeartbeat({
     )
 
     const shouldStoreHeartbeat =
-      event !== undefined && event !== "heartbeat" ||
+      (event !== undefined && event !== "heartbeat") ||
       status === "completed" ||
       status === "failed" ||
       status === "stopped"
@@ -1278,11 +1490,11 @@ export async function stopLocalSession({
 
 function isBestEligible(experiment: ApiCampaignExperiment) {
   return (
-    experiment.gitStatus === "verified" ||
-    experiment.gitStatus === "pending"
-  ) &&
+    (experiment.gitStatus === "verified" ||
+      experiment.gitStatus === "pending") &&
     experiment.primaryMetricValue !== null &&
     (experiment.status === "succeeded" || experiment.status === "accepted")
+  )
 }
 
 function isBetter(
@@ -1310,7 +1522,8 @@ export async function logLocalExperiment({
         "SELECT * FROM campaigns WHERE project_path = ? AND name = ? AND status != 'deleted'"
       )
       .get(record.projectPath ?? "", record.campaignName) as Row | null
-    if (!campaign) throw new Error(`Local campaign ${record.campaignName} not found`)
+    if (!campaign)
+      throw new Error(`Local campaign ${record.campaignName} not found`)
     const campaignId = campaign.id as string
     let sessionId = record.sessionId ?? null
     let hypothesisId = record.hypothesisId ?? null
@@ -1511,6 +1724,7 @@ export async function logLocalExperiment({
         experiment,
         campaignName: record.campaignName,
         projectPath: record.projectPath ?? "",
+        fingerprint: experimentFingerprint(experiment),
       },
     })
     return experiment
@@ -1520,9 +1734,11 @@ export async function logLocalExperiment({
 
 function listLocalExperimentsForDb(db: Db, campaignId: string, limit: number) {
   return (
-    db.query(
-      "SELECT * FROM experiments WHERE campaign_id = ? ORDER BY created_at DESC LIMIT ?"
-    ).all(campaignId, limit) as Row[]
+    db
+      .query(
+        "SELECT * FROM experiments WHERE campaign_id = ? ORDER BY created_at DESC LIMIT ?"
+      )
+      .all(campaignId, limit) as Row[]
   ).map(experimentFromRow)
 }
 
@@ -1577,6 +1793,137 @@ export async function listLocalExperimentHistory(root: string) {
   })
 }
 
+function attemptFromRow(row: Row): LastRunRecord {
+  return parseJson<LastRunRecord>(row.record_json, {
+    schemaVersion: 1,
+    createdAt: row.created_at as string,
+    runRef: row.run_ref as string,
+    campaignName: row.campaign_name as string,
+    projectPath: row.project_path as string,
+    baseCommitSha: "",
+    resultCommitSha: row.result_commit_sha as string,
+    resultRef: "",
+    status: row.status as LastRunRecord["status"],
+    setupCompliance: {
+      status: "passed",
+      protectedPathsChanged: [],
+      outOfScopePathsChanged: [],
+      setupPathsChanged: [],
+      notes: null,
+    },
+    primaryMetricName: "score",
+    primaryMetricValue: null,
+    metrics: {},
+    agentNotes: {},
+    checks: null,
+    durationMs: 0,
+    startedAt: null,
+    completedAt: null,
+    outputSummary: null,
+  })
+}
+
+export async function writeLocalAttempt({
+  root,
+  record,
+}: {
+  root: string
+  record: LastRunRecord
+}) {
+  const db = await openDb(root)
+  const at = nowIso()
+  db.query(
+    `
+      INSERT INTO local_attempts (
+        run_ref, campaign_id, campaign_name, project_path, session_id, worker_id,
+        hypothesis_id, result_commit_sha, status, record_json, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_ref) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        campaign_name = excluded.campaign_name,
+        project_path = excluded.project_path,
+        session_id = excluded.session_id,
+        worker_id = excluded.worker_id,
+        hypothesis_id = excluded.hypothesis_id,
+        result_commit_sha = excluded.result_commit_sha,
+        status = excluded.status,
+        record_json = excluded.record_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    record.runRef,
+    null,
+    record.campaignName,
+    record.projectPath ?? "",
+    record.sessionId ?? null,
+    record.workerId ?? null,
+    record.hypothesisId ?? null,
+    record.resultCommitSha,
+    record.status,
+    json(record),
+    record.createdAt,
+    at
+  )
+}
+
+export async function readLocalAttempt(
+  root: string,
+  selector: LastRunSelector
+) {
+  const db = await openDb(root)
+  if (selector.runRef) {
+    const row = db
+      .query("SELECT * FROM local_attempts WHERE run_ref = ?")
+      .get(selector.runRef) as Row | null
+    return row ? attemptFromRow(row) : null
+  }
+
+  const rows = db
+    .query(
+      `
+        SELECT * FROM local_attempts
+        WHERE campaign_name = ? AND project_path = ?
+        ORDER BY updated_at DESC
+      `
+    )
+    .all(selector.campaignName ?? "", selector.projectPath ?? "") as Row[]
+  const match = rows.find((row) => {
+    if (selector.sessionId && row.session_id !== selector.sessionId)
+      return false
+    if (selector.workerId && row.worker_id !== selector.workerId) return false
+    if (selector.hypothesisId && row.hypothesis_id !== selector.hypothesisId) {
+      return false
+    }
+    return true
+  })
+  return match ? attemptFromRow(match) : null
+}
+
+export async function listLocalAttempts(root: string) {
+  const rows = (await openDb(root))
+    .query("SELECT * FROM local_attempts ORDER BY updated_at DESC")
+    .all() as Row[]
+  return rows.map(attemptFromRow)
+}
+
+export async function clearLocalAttempt(
+  root: string,
+  selector: LastRunSelector
+) {
+  const db = await openDb(root)
+  if (selector.runRef) {
+    db.query("DELETE FROM local_attempts WHERE run_ref = ?").run(
+      selector.runRef
+    )
+    return
+  }
+  const attempt = await readLocalAttempt(root, selector)
+  if (attempt) {
+    db.query("DELETE FROM local_attempts WHERE run_ref = ?").run(attempt.runRef)
+  }
+}
+
 export async function upsertLocalSummary({
   root,
   campaignId,
@@ -1613,7 +1960,13 @@ export async function upsertLocalSummary({
             AND COALESCE(session_id, '') = COALESCE(?, '')
             AND COALESCE(hypothesis_id, '') = COALESCE(?, '')
         `
-      ).run(at, campaignId, summaryKind, sessionId ?? null, hypothesisId ?? null)
+      ).run(
+        at,
+        campaignId,
+        summaryKind,
+        sessionId ?? null,
+        hypothesisId ?? null
+      )
     }
     db.query(
       `
@@ -1797,6 +2150,45 @@ export async function markResearchSyncAcked({
   })()
 }
 
+export async function applyRemoteTombstones({
+  root,
+  tombstones,
+}: {
+  root: string
+  tombstones: ApiResearchSyncResponse["tombstones"]
+}) {
+  if (tombstones.length === 0) return
+  const db = await openDb(root)
+  const insert = db.query(
+    `
+      INSERT INTO tombstones (
+        id, entity_type, entity_id, campaign_id, name, run_ref, reason, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        name = excluded.name,
+        run_ref = excluded.run_ref,
+        reason = excluded.reason,
+        created_at = excluded.created_at
+    `
+  )
+  db.transaction(() => {
+    for (const tombstone of tombstones) {
+      insert.run(
+        `${tombstone.entityType}:${tombstone.entityId}`,
+        tombstone.entityType,
+        tombstone.entityId,
+        tombstone.campaignId,
+        tombstone.name,
+        tombstone.runRef,
+        tombstone.reason,
+        tombstone.deletedAt
+      )
+    }
+  })()
+}
+
 export async function markResearchSyncError({
   root,
   eventIds,
@@ -1841,6 +2233,95 @@ export async function pendingResearchSyncCount(root: string) {
     .query("SELECT COUNT(*) AS count FROM sync_events WHERE status = 'pending'")
     .get() as { count: number }
   return Number(row.count ?? 0)
+}
+
+export async function researchSyncConflictCount(root: string) {
+  const row = (await openDb(root))
+    .query(
+      "SELECT COUNT(*) AS count FROM sync_events WHERE status = 'conflict'"
+    )
+    .get() as { count: number }
+  return Number(row.count ?? 0)
+}
+
+export async function listResearchSyncConflicts(root: string) {
+  const rows = (await openDb(root))
+    .query(
+      `
+        SELECT * FROM sync_events
+        WHERE status = 'conflict'
+        ORDER BY sequence ASC
+      `
+    )
+    .all() as Row[]
+  return rows.map((row) => ({
+    eventId: row.event_id as string,
+    sequence: Number(row.sequence),
+    type: row.type as ResearchSyncEvent["type"],
+    entityType: row.entity_type as string,
+    entityId: row.entity_id as string,
+    payload: parseJson(row.payload_json, {}),
+    status: row.status as ResearchSyncEventStatus,
+    attempts: Number(row.attempts ?? 0),
+    lastError: nullableString(row.last_error),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  }))
+}
+
+export async function retryResearchSyncConflicts(root: string) {
+  const db = await openDb(root)
+  const result = db
+    .query(
+      `
+        UPDATE sync_events
+        SET status = 'pending', updated_at = ?, last_error = NULL
+        WHERE status = 'conflict'
+      `
+    )
+    .run(nowIso())
+  return result.changes
+}
+
+export async function researchSyncStatus(root: string) {
+  const db = await openDb(root)
+  const rows = db
+    .query(
+      `
+        SELECT status, COUNT(*) AS count
+        FROM sync_events
+        GROUP BY status
+      `
+    )
+    .all() as Array<{ status: string; count: number }>
+  const counts = Object.fromEntries(
+    rows.map((row) => [row.status, Number(row.count)])
+  )
+  const version = db
+    .query("SELECT MAX(version) AS version FROM schema_migrations")
+    .get() as { version: number | null } | null
+  return {
+    schemaVersion: Number(version?.version ?? 0),
+    pending: counts.pending ?? 0,
+    acked: counts.acked ?? 0,
+    duplicate: counts.duplicate ?? 0,
+    conflict: counts.conflict ?? 0,
+    invalid: counts.invalid ?? 0,
+  }
+}
+
+export async function researchDbDoctor(root: string) {
+  const db = await openDb(root)
+  const integrity = db.query("PRAGMA integrity_check").get() as
+    | { integrity_check: string }
+    | undefined
+  const status = await researchSyncStatus(root)
+  db.query("PRAGMA wal_checkpoint(TRUNCATE)").all()
+  return {
+    ok: integrity?.integrity_check === "ok",
+    integrity: integrity?.integrity_check ?? "unknown",
+    ...status,
+  }
 }
 
 export async function acquireLocalResourceLease({
@@ -1901,6 +2382,52 @@ export async function acquireLocalResourceLease({
   throw new Error(`Timed out waiting for tool resource ${resourceName}`)
 }
 
+export async function renewLocalResourceLease({
+  root,
+  resourceName,
+  ownerId,
+  leaseMs,
+}: {
+  root: string
+  resourceName: string
+  ownerId: string
+  leaseMs: number
+}) {
+  const expiresAt = new Date(Date.now() + leaseMs).toISOString()
+  const result = (await openDb(root))
+    .query(
+      `
+        UPDATE resource_leases
+        SET expires_at = ?
+        WHERE resource_name = ? AND owner_id = ?
+      `
+    )
+    .run(expiresAt, resourceName, ownerId)
+  return result.changes
+}
+
+export async function cleanupExpiredResourceLeases(root: string) {
+  const result = (await openDb(root))
+    .query("DELETE FROM resource_leases WHERE expires_at <= ?")
+    .run(nowIso())
+  return result.changes
+}
+
+export async function listLocalResourceLeases(root: string) {
+  await cleanupExpiredResourceLeases(root)
+  const rows = (await openDb(root))
+    .query("SELECT * FROM resource_leases ORDER BY resource_name, slot")
+    .all() as Row[]
+  return rows.map((row) => ({
+    resourceName: row.resource_name as string,
+    slot: Number(row.slot),
+    ownerId: row.owner_id as string,
+    acquiredAt: row.acquired_at as string,
+    expiresAt: row.expires_at as string,
+    metadata: parseJson(row.metadata_json, {}),
+  }))
+}
+
 export async function localBriefMarkdown({
   root,
   campaignId,
@@ -1941,23 +2468,30 @@ export async function localBriefMarkdown({
     hypothesis ? `Statement: ${hypothesis.plan.statement}` : null,
     "",
     "## Recent Experiments",
-    ...state.latestExperiments.slice(0, 10).map(
-      (experiment) =>
-        `- ${experiment.name}: ${experiment.primaryMetricName}=${experiment.primaryMetricValue ?? "null"} (${experiment.status}) ${experiment.resultCommitSha.slice(0, 7)}`
-    ),
+    ...state.latestExperiments
+      .slice(0, 10)
+      .map(
+        (experiment) =>
+          `- ${experiment.name}: ${experiment.primaryMetricName}=${experiment.primaryMetricValue ?? "null"} (${experiment.status}) ${experiment.resultCommitSha.slice(0, 7)}`
+      ),
     state.latestExperiments.length === 0 ? "- none yet" : null,
     "",
     "## Shared Knowledge",
-    ...state.knowledge.slice(0, 20).map(
-      (item) => `- ${item.kind}: ${item.title} - ${item.body.slice(0, 240)}`
-    ),
+    ...state.knowledge
+      .slice(0, 20)
+      .map(
+        (item) => `- ${item.kind}: ${item.title} - ${item.body.slice(0, 240)}`
+      ),
     state.knowledge.length === 0 ? "- none yet" : null,
     "",
     "## Current Summaries",
     ...state.summaries
       .filter((summary) => summary.isCurrent)
       .slice(0, 10)
-      .map((summary) => `- ${summary.summaryKind}: ${summary.title}\n${summary.body}`),
+      .map(
+        (summary) =>
+          `- ${summary.summaryKind}: ${summary.title}\n${summary.body}`
+      ),
   ]
     .filter((line) => line !== null)
     .join("\n")

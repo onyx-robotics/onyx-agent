@@ -1,5 +1,5 @@
 import type { Args } from "../lib/args"
-import { requestProjectSync, resolveProject } from "../lib/api"
+import { resolveProject } from "../lib/api"
 import {
   apiTarget,
   describeApiTarget,
@@ -8,10 +8,19 @@ import {
 } from "../lib/config"
 import { emitEvent } from "../lib/events"
 import { repoRoot } from "../lib/git"
-import { hydrateHistoryFromApi } from "../lib/history"
-import { readLastRuns, readOutbox, readState } from "../lib/outbox"
+import { readState } from "../lib/outbox"
 import { resolveProjectPath } from "../lib/project"
-import { pendingResearchSyncCount } from "../lib/research-db"
+import {
+  listLocalCampaigns,
+  listLocalAttempts,
+  listLocalExperimentHistory,
+  listResearchSyncConflicts,
+  pendingResearchSyncCount,
+  researchDbDoctor,
+  researchSyncConflictCount,
+  researchSyncStatus,
+  retryResearchSyncConflicts,
+} from "../lib/research-db"
 import { flushOutbox } from "../lib/sync"
 
 function positiveNumberOption(args: Args, name: string, fallback: number) {
@@ -39,9 +48,62 @@ export async function commandPush(args: Args) {
 
 export async function commandSync(args: Args) {
   const root = await repoRoot()
+  const sub = args.positional[1]
+  if (sub === "status") {
+    console.log(JSON.stringify(await researchSyncStatus(root), null, 2))
+    return
+  }
+  if (sub === "conflicts") {
+    const conflicts = await listResearchSyncConflicts(root)
+    if (args.options.json === "true") {
+      console.log(JSON.stringify(conflicts, null, 2))
+      return
+    }
+    if (conflicts.length === 0) {
+      console.log("No SQLite sync conflicts.")
+      return
+    }
+    for (const conflict of conflicts) {
+      const payloadSummary = JSON.stringify(conflict.payload).slice(0, 240)
+      console.log(
+        [
+          `${conflict.sequence} ${conflict.eventId}`,
+          conflict.type,
+          `${conflict.entityType}:${conflict.entityId}`,
+          conflict.lastError ? `error=${conflict.lastError}` : null,
+          `payload=${payloadSummary}`,
+        ]
+          .filter(Boolean)
+          .join(" ")
+      )
+    }
+    return
+  }
+  if (sub === "retry") {
+    const retried = await retryResearchSyncConflicts(root)
+    console.log(`Retried ${retried} conflict event(s).`)
+    return
+  }
+  if (sub === "doctor") {
+    console.log(JSON.stringify(await researchDbDoctor(root), null, 2))
+    return
+  }
+  if (sub === "export") {
+    const campaignName = args.options.campaign
+    const campaigns = (await listLocalCampaigns(root)).filter(
+      (campaign) => !campaignName || campaign.name === campaignName
+    )
+    const campaignNames = new Set(campaigns.map((campaign) => campaign.name))
+    const experiments = (await listLocalExperimentHistory(root)).filter(
+      (experiment) => campaignNames.has(experiment.campaignName)
+    )
+    console.log(JSON.stringify({ campaigns, experiments }, null, 2))
+    return
+  }
+
   if (args.options.watch === "true") {
     const intervalMs = positiveNumberOption(args, "interval", 5) * 1000
-    console.log(`Watching outbox; syncing every ${intervalMs / 1000}s.`)
+    console.log(`Watching SQLite ledger; syncing every ${intervalMs / 1000}s.`)
     while (true) {
       await flushOutbox(root, args).catch((error) => {
         console.warn(
@@ -56,51 +118,15 @@ export async function commandSync(args: Args) {
 
   const result = await flushOutbox(root, args)
   if (result.offline) return
-
-  // Refresh the local history cache to the canonical API state. Runs even
-  // when the outbox was empty so fresh clones pick up cross-branch history.
-  try {
-    const hydrated = await hydrateHistoryFromApi(root, args)
-    console.log(
-      `history: ${hydrated.experiments} experiment(s) across ${hydrated.campaigns} campaign(s)${
-        hydrated.pendingLocal ? `, ${hydrated.pendingLocal} pending local` : ""
-      }`
-    )
-  } catch (error) {
-    console.warn(
-      `History refresh skipped: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-  }
-
-  // Refresh repository metadata so file/diff views see the latest GitHub head.
-  try {
-    const project = await resolveProject(root, args)
-    await requestProjectSync(project.id, args)
-    console.log(`Requested repository sync for project ${project.id}`)
-  } catch (error) {
-    console.warn(
-      `Repository sync skipped: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-  }
 }
 
 export async function commandStatus(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const { records, corrupt } = await readOutbox(root)
   const sqlitePending = await pendingResearchSyncCount(root).catch(() => 0)
-  const lastRuns = await readLastRuns(root)
-  const experiments = records.filter(
-    (record) => record.type === "campaign_experiment_logged"
-  ).length
-  const campaigns = records.filter(
-    (record) => record.type === "campaign_started"
-  ).length
+  const sqliteConflicts = await researchSyncConflictCount(root).catch(() => 0)
+  const lastRuns = await listLocalAttempts(root)
 
   const config = await readConfig()
   const profileName = profileNameFromArgs(args, config)
@@ -119,12 +145,7 @@ export async function commandStatus(args: Args) {
   console.log(`campaign: ${state.activeCampaign ?? "(none)"}`)
   console.log(`projectPath: ${projectPath || "(repo root)"}`)
   console.log(
-    `ledger: ${sqlitePending} SQLite sync event(s) pending`
-  )
-  console.log(
-    `legacy outbox: ${experiments} experiment(s), ${campaigns} campaign(s) pending${
-      corrupt ? `, ${corrupt} unreadable` : ""
-    }`
+    `ledger: ${sqlitePending} SQLite sync event(s) pending, ${sqliteConflicts} conflict(s)`
   )
   if (lastRuns.length > 0) {
     const lastRun = lastRuns[0]!

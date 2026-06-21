@@ -29,14 +29,7 @@ import {
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
-import { readHistory } from "../lib/history"
-import {
-  onyxStateDir,
-  readOutbox,
-  readOutboxConflictCount,
-  readState,
-  writeState,
-} from "../lib/outbox"
+import { onyxStateDir, readState, writeState } from "../lib/outbox"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
   pathExists,
@@ -51,10 +44,14 @@ import {
   createLocalSession,
   getActiveLocalCampaignName,
   getLocalSessionState,
+  listLocalAttempts,
+  listLocalExperimentHistory,
   listLocalKnowledge,
   listLocalSummaries,
   localBriefMarkdown,
   localCampaignByName,
+  pendingResearchSyncCount,
+  researchSyncConflictCount,
   recordLocalWorkerHeartbeat,
   registerLocalWorker,
   researchDbPath,
@@ -373,12 +370,11 @@ function createSyncSupervisor({
       const deadline = Date.now() + timeoutMs
       do {
         await run()
-        const { records } = await readOutbox(root)
-        if (records.length === 0) return 0
+        const pending = await pendingResearchSyncCount(root)
+        if (pending === 0) return 0
         await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
       } while (Date.now() < deadline)
-      const { records } = await readOutbox(root)
-      return records.length
+      return pendingResearchSyncCount(root)
     },
     stop() {
       stopped = true
@@ -712,19 +708,18 @@ async function hasLocalExperimentFor({
   hypothesisId: string
   resultCommitSha: string
 }) {
-  const [outbox, history] = await Promise.all([
-    readOutbox(root).catch(() => ({ records: [], corrupt: 0 })),
-    readHistory(root).catch(() => ({ records: [], corrupt: 0 })),
+  const [experiments, attempts] = await Promise.all([
+    listLocalExperimentHistory(root).catch(() => []),
+    listLocalAttempts(root).catch(() => []),
   ])
   return (
-    outbox.records.some(
+    experiments.some(
       (record) =>
-        record.type === "campaign_experiment_logged" &&
         record.campaignName === campaignName &&
         record.hypothesisId === hypothesisId &&
         record.resultCommitSha === resultCommitSha
     ) ||
-    history.records.some(
+    attempts.some(
       (record) =>
         record.campaignName === campaignName &&
         record.hypothesisId === hypothesisId &&
@@ -1410,23 +1405,23 @@ async function runHypothesisOnce({
       summaryKind: "hypothesis_summary",
       title: `${hypothesis.name} completed`,
       body: [
-          `Worker process exited successfully.`,
-          `Latest commit: ${resultCommitSha ?? "n/a"}`,
-          `Finalization: ${
-            finalization.attempted
-              ? finalization.experimentLogged
-                ? "experiment logged"
-                : "attempted"
-              : "no result changes"
-          }`,
-          finalization.workerBranchPushStatus === "failed"
-            ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-            : "",
-          `Worker log: ${launchManifest?.logPath ?? "n/a"}`,
-          workerOutputSummary ? `\nWorker output:\n${workerOutputSummary}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
+        `Worker process exited successfully.`,
+        `Latest commit: ${resultCommitSha ?? "n/a"}`,
+        `Finalization: ${
+          finalization.attempted
+            ? finalization.experimentLogged
+              ? "experiment logged"
+              : "attempted"
+            : "no result changes"
+        }`,
+        finalization.workerBranchPushStatus === "failed"
+          ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
+          : "",
+        `Worker log: ${launchManifest?.logPath ?? "n/a"}`,
+        workerOutputSummary ? `\nWorker output:\n${workerOutputSummary}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
     })
     await cleanupWorkerTempDir()
     return {
@@ -1734,16 +1729,28 @@ export async function commandResearchHypothesisAdd(args: Args) {
 
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
-  const { campaign } = await campaignForName(root, args)
+  const campaignInfo = await campaignForName(root, args)
+  const { campaign } = campaignInfo
   if (args.options.reconcile === "true") {
     await reconcileCampaign(campaign.id, args).catch(() => {})
   }
-  const overview = await getCampaignOverview(campaign.id, args)
   const state = await readState(root)
   const projectPath = await resolveProjectPath(root, args)
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   const scopeAll = args.options["all-sessions"] === "true"
+  const localSessionState = activeSessionId
+    ? await getLocalSessionState(root, activeSessionId).catch(() => null)
+    : null
+  const overview = localSessionState
+    ? {
+        campaign: localSessionState.campaign,
+        hypotheses: localSessionState.hypotheses,
+        workers: localSessionState.workers,
+        summaries: localSessionState.summaries,
+        knowledge: localSessionState.knowledge,
+      }
+    : campaignInfo.overview
   const hypotheses = overview.hypotheses
   const workers =
     activeSessionId && !scopeAll
@@ -1757,9 +1764,7 @@ export async function commandResearchStatus(args: Args) {
   const manifestByWorker = new Map(
     manifests.map((manifest) => [manifest.workerId, manifest])
   )
-  const sessionState = activeSessionId
-    ? await getResearchSessionState(activeSessionId, args).catch(() => null)
-    : null
+  const sessionState = localSessionState
   const activeWorkers = workers.filter((worker) =>
     ["idle", "running", "stale"].includes(worker.status)
   ).length
@@ -1775,14 +1780,8 @@ export async function commandResearchStatus(args: Args) {
     (activeSessionId
       ? Boolean(state.sessions?.[activeSessionId]?.stopRequested)
       : false)
-  const { records, corrupt } = await readOutbox(root)
-  const conflicts = await readOutboxConflictCount(root)
-  const pendingExperiments = records.filter(
-    (record) => record.type === "campaign_experiment_logged"
-  ).length
-  const pendingCampaigns = records.filter(
-    (record) => record.type === "campaign_started"
-  ).length
+  const pendingSync = await pendingResearchSyncCount(root).catch(() => 0)
+  const conflicts = await researchSyncConflictCount(root).catch(() => 0)
   const launchSuggestions =
     activeSessionId && openSlots && openSlots > 0 && !stopping
       ? hypotheses
@@ -1811,10 +1810,8 @@ export async function commandResearchStatus(args: Args) {
             : null,
           hypotheses,
           workers,
-          outbox: {
-            pendingExperiments,
-            pendingCampaigns,
-            corrupt,
+          sync: {
+            pendingSync,
             conflicts,
           },
           launchSuggestions,
@@ -1832,9 +1829,9 @@ export async function commandResearchStatus(args: Args) {
     console.log(`session: ${activeSessionId} ${sessionStatus ?? ""}`.trim())
   }
   console.log(
-    `outbox: ${pendingExperiments} experiment(s), ${pendingCampaigns} campaign(s) pending${
-      corrupt ? `, ${corrupt} unreadable` : ""
-    }${conflicts ? `, ${conflicts} conflict(s)` : ""}`
+    `sync: ${pendingSync} SQLite event(s) pending${
+      conflicts ? `, ${conflicts} conflict(s)` : ""
+    }`
   )
 
   if (activeSessionId) {
@@ -2012,6 +2009,16 @@ export async function commandResearchShouldStop(args: Args) {
     args.options.iteration === undefined ? null : Number(args.options.iteration)
   const reasons: string[] = []
   if (localSession?.stopRequested) reasons.push("stop requested")
+  const localDbSession = await getLocalSessionState(root, sessionId).catch(
+    () => null
+  )
+  if (
+    localDbSession &&
+    localDbSession.session.status !== "running" &&
+    !reasons.includes(`local session ${localDbSession.session.status}`)
+  ) {
+    reasons.push(`local session ${localDbSession.session.status}`)
+  }
   const workerResearchDeadline = process.env.ONYX_RESEARCH_DEADLINE_AT
     ? Date.parse(process.env.ONYX_RESEARCH_DEADLINE_AT)
     : Number.NaN
@@ -2096,22 +2103,25 @@ export async function commandResearchStop(args: Args) {
       status: "stop_requested",
       reason: args.options.reason ?? "stop requested",
     }).catch(() => {})
-    await reconcileCampaign(campaignId, args).catch(() => {})
-    await stopCampaignSession(
-      sessionId,
-      {
-        campaignId,
-        status: "stop_requested",
-        reason: args.options.reason ?? "stop requested",
-      },
-      args
-    ).catch((error) => {
-      console.warn(
-        `Remote stop request skipped: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      )
-    })
+    if (args.options.offline !== "true") {
+      await flushOutbox(root, args, { quiet: true }).catch(() => {})
+      await reconcileCampaign(campaignId, args).catch(() => {})
+      await stopCampaignSession(
+        sessionId,
+        {
+          campaignId,
+          status: "stop_requested",
+          reason: args.options.reason ?? "stop requested",
+        },
+        args
+      ).catch((error) => {
+        console.warn(
+          `Remote stop request skipped: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      })
+    }
   }
   await emitEvent(root, {
     type: "session_stopped",
@@ -2357,7 +2367,10 @@ export async function commandKnowledgeList(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const { campaign } = await campaignForName(root, args)
   const limit = positiveIntegerOption(args, "limit", 50)
-  const knowledge = (await listLocalKnowledge(root, campaign.id)).slice(0, limit)
+  const knowledge = (await listLocalKnowledge(root, campaign.id)).slice(
+    0,
+    limit
+  )
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(knowledge, null, 2))

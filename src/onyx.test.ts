@@ -37,7 +37,6 @@ import {
   readState,
   readSetupFile,
   readLastRun,
-  readLastRuns,
   readValidationFile,
   renderExperimentTable,
   runToolCommand,
@@ -51,7 +50,11 @@ import {
   writeState,
   writeValidationFile,
 } from "./onyx"
-import { listLocalExperimentHistory } from "./lib/research-db"
+import {
+  listLocalAttempts,
+  listLocalExperimentHistory,
+  writeLocalAttempt,
+} from "./lib/research-db"
 import { runProcess } from "./lib/process"
 
 async function commitAll(root: string, message: string) {
@@ -419,33 +422,40 @@ describe("history helpers", () => {
     expect(mergeHistory([api], [local])).toEqual([api])
   })
 
-  test("exp list includes pending local outbox experiments", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-exp-list-outbox-"))
+  test("exp list includes unlogged local SQLite attempts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-exp-list-attempt-"))
     await runProcess("git", ["init"], { cwd: root })
     await writeFile(join(root, "README.md"), "test\n", "utf8")
     await commitAll(root, "init")
-    await appendOutbox(root, {
-      schemaVersion: 1,
-      type: "campaign_experiment_logged",
-      createdAt: "2026-06-17T12:00:00.000Z",
-      runRef: "local/fast-eval/outbox-only",
-      campaignName: "fast-eval",
-      name: "outbox-only",
-      baseCommitSha: "abcdef1",
-      resultCommitSha: "1234567",
-      resultRef: "refs/onyx/experiments/campaign/local/fast-eval/outbox-only",
-      status: "succeeded",
-      setupCompliance: {
-        status: "passed",
-        protectedPathsChanged: [],
-        outOfScopePathsChanged: [],
-        setupPathsChanged: [],
-        notes: null,
+    await writeLocalAttempt({
+      root,
+      record: {
+        schemaVersion: 1,
+        createdAt: "2026-06-17T12:00:00.000Z",
+        runRef: "local/fast-eval/unlogged",
+        campaignName: "fast-eval",
+        projectPath: "",
+        baseCommitSha: "abcdef1",
+        resultCommitSha: "1234567",
+        resultRef: "refs/onyx/experiments/campaign/local/fast-eval/unlogged",
+        status: "succeeded",
+        setupCompliance: {
+          status: "passed",
+          protectedPathsChanged: [],
+          outOfScopePathsChanged: [],
+          setupPathsChanged: [],
+          notes: null,
+        },
+        primaryMetricName: "score",
+        primaryMetricValue: 1,
+        metrics: { score: 1 },
+        agentNotes: {},
+        checks: null,
+        durationMs: null,
+        startedAt: null,
+        completedAt: null,
+        outputSummary: null,
       },
-      primaryMetricName: "score",
-      primaryMetricValue: 1,
-      metrics: { score: 1 },
-      agentNotes: {},
     })
 
     const previousCwd = process.cwd()
@@ -467,7 +477,7 @@ describe("history helpers", () => {
 
     const rows = JSON.parse(logs.join("\n")) as LocalResearchHistoryRecord[]
     expect(rows).toHaveLength(1)
-    expect(rows[0]?.runRef).toBe("local/fast-eval/outbox-only")
+    expect(rows[0]?.runRef).toBe("local/fast-eval/unlogged")
   })
 })
 
@@ -593,7 +603,11 @@ describe("exp log", () => {
     const workerTwoId = "77777777-7777-4777-8777-777777777772"
     const hypothesisOneId = "88888888-8888-4888-8888-888888888881"
     const hypothesisTwoId = "88888888-8888-4888-8888-888888888882"
-    const makeRun = (workerId: string, hypothesisId: string, value: number) => ({
+    const makeRun = (
+      workerId: string,
+      hypothesisId: string,
+      value: number
+    ) => ({
       schemaVersion: 1 as const,
       createdAt: `2026-06-20T00:00:0${value}.000Z`,
       runRef: `local/smoke/${workerId}`,
@@ -625,8 +639,8 @@ describe("exp log", () => {
     })
     const workerOne = makeRun(workerOneId, hypothesisOneId, 1)
     const workerTwo = makeRun(workerTwoId, hypothesisTwoId, 2)
-    await writeLastRun(root, workerOne)
-    await writeLastRun(root, workerTwo)
+    await writeLocalAttempt({ root, record: workerOne })
+    await writeLocalAttempt({ root, record: workerTwo })
 
     const previousCwd = process.cwd()
     const originalLog = console.log
@@ -675,7 +689,7 @@ describe("exp log", () => {
     expect(
       records.filter((record) => record.runRef === workerTwo.runRef)
     ).toHaveLength(1)
-    const remainingRuns = await readLastRuns(root)
+    const remainingRuns = await listLocalAttempts(root)
     expect(remainingRuns.map((run) => run.runRef)).toEqual([workerOne.runRef])
   })
 
@@ -765,8 +779,7 @@ describe("research start", () => {
           }
           if (
             request.method === "POST" &&
-            request.path ===
-              `/api/v1/research/campaigns/${campaignId}/sessions`
+            request.path === `/api/v1/research/campaigns/${campaignId}/sessions`
           ) {
             return {
               status: 201,
@@ -1413,7 +1426,9 @@ describe("research hypothesis add", () => {
       "Research hypothesis: ",
       ""
     )
-    expect(logs).toContain("Hypothesis: Try scheduler smoothing: Try scheduler smoothing")
+    expect(logs).toContain(
+      "Hypothesis: Try scheduler smoothing: Try scheduler smoothing"
+    )
     expect(logs).toContain(
       `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent claude --max-iterations 10 --max-minutes 5`
     )

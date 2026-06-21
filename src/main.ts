@@ -85,6 +85,11 @@ Usage:
   onyx status
   onyx push
   onyx sync [--watch] [--interval <seconds>] [--project <id>] [--repository-url <url>] [--project-path <path>] [--offline] [--require-online]
+  onyx sync status
+  onyx sync conflicts [--json]
+  onyx sync retry
+  onyx sync export [--campaign <name>]
+  onyx sync doctor
 
 Results and research control-plane state are logged locally first in
 .git/onyx/research.db. \`onyx push\`, \`onyx sync\`, \`onyx sync --watch\`, and
@@ -172,8 +177,7 @@ export async function main(argv = process.argv.slice(2)) {
       return commandResearchStatus(args)
     if (command === "summary" && sub === "upsert")
       return commandSummaryUpsert(args)
-    if (command === "summary" && sub === "list")
-      return commandSummaryList(args)
+    if (command === "summary" && sub === "list") return commandSummaryList(args)
     if (command === "knowledge" && sub === "add")
       return commandKnowledgeAdd(args)
     if (command === "knowledge" && sub === "list")

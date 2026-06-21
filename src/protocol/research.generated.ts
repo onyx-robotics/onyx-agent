@@ -713,15 +713,327 @@ export const researchSyncEventTypeSchema = z.enum([
   "entity.deleted",
 ])
 
-export const researchSyncEventSchema = z.object({
-  eventId: z.string().trim().min(1).max(240),
-  sequence: z.number().int().positive(),
-  type: researchSyncEventTypeSchema,
-  entityType: z.string().trim().min(1).max(80),
-  entityId: z.uuid(),
-  payload: metadataSchema,
-  createdAt: z.iso.datetime(),
+const syncOriginSchema = z
+  .object({
+    siteId: z.uuid(),
+    sequence: z.number().int().positive(),
+    eventId: z.string().trim().min(1).max(240),
+  })
+  .strict()
+
+const syncPayloadBaseSchema = z.object({
+  origin: syncOriginSchema.optional(),
 })
+
+const researchSyncCampaignPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    campaign: researchCampaignSchema
+      .pick({
+        id: true,
+        projectId: true,
+        name: true,
+        description: true,
+        baseCommitSha: true,
+        metricName: true,
+        metricUnit: true,
+        metricDirection: true,
+        promotionRefName: true,
+        createdAt: true,
+        updatedAt: true,
+      })
+      .extend({
+        projectId: z
+          .uuid()
+          .optional()
+          .default("00000000-0000-0000-0000-000000000000"),
+      })
+      .strict(),
+  })
+  .strict()
+
+const researchSyncSessionPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    session: researchSessionSchema
+      .pick({
+        id: true,
+        campaignId: true,
+        name: true,
+        status: true,
+        workerTarget: true,
+        metadata: true,
+        startedAt: true,
+        completedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      })
+      .partial({
+        startedAt: true,
+        completedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      })
+      .strict(),
+    reason: z.string().trim().max(1000).nullable().optional(),
+  })
+  .strict()
+
+const researchSyncHypothesisPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    hypothesis: researchHypothesisSchema
+      .pick({
+        id: true,
+        campaignId: true,
+        createdBySessionId: true,
+        name: true,
+        description: true,
+        status: true,
+        baseCommitSha: true,
+        plan: true,
+        metadata: true,
+        createdAt: true,
+        updatedAt: true,
+      })
+      .strict(),
+  })
+  .strict()
+
+const researchSyncWorkerPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    worker: researchWorkerSchema
+      .pick({
+        id: true,
+        campaignId: true,
+        sessionId: true,
+        hypothesisId: true,
+        workerName: true,
+        agentKind: true,
+        runtime: true,
+        status: true,
+        startedAt: true,
+        lastSeenAt: true,
+        metadata: true,
+        createdAt: true,
+        updatedAt: true,
+      })
+      .partial({
+        startedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      })
+      .strict(),
+  })
+  .strict()
+
+const researchSyncWorkerHeartbeatPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    workerId: z.uuid(),
+    heartbeatId: z.uuid(),
+    campaignId: z.uuid(),
+    sessionId: z.uuid().nullable(),
+    hypothesisId: z.uuid(),
+    experimentId: z.uuid().nullable(),
+    status: researchWorkerStatusSchema,
+    phase: z.string().trim().max(120).nullable(),
+    event: z.string().trim().max(160).nullable(),
+    progressMessage: z.string().trim().max(1000).nullable(),
+    gitLabel: z.string().trim().max(240).nullable(),
+    resourceStats: metadataSchema,
+    metadata: metadataSchema,
+    createdAt: z.iso.datetime(),
+  })
+  .strict()
+
+const researchSyncExperimentPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    experiment: researchCampaignExperimentSchema
+      .pick({
+        id: true,
+        campaignId: true,
+        sessionId: true,
+        hypothesisId: true,
+        workerId: true,
+        runRef: true,
+        name: true,
+        description: true,
+        baseCommitSha: true,
+        resultCommitSha: true,
+        resultRef: true,
+        status: true,
+        setupCompliance: true,
+        gitStatus: true,
+        gitVerifiedAt: true,
+        gitStatusReason: true,
+        primaryMetricName: true,
+        primaryMetricValue: true,
+        secondaryMetrics: true,
+        artifactRefs: true,
+        agentNotes: true,
+        checks: true,
+        durationMs: true,
+        outputSummary: true,
+        startedAt: true,
+        completedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      })
+      .partial({
+        updatedAt: true,
+      })
+      .strict(),
+    campaignName: z.string().trim().min(1).max(120),
+    projectPath: projectPathSchema.default(""),
+    fingerprint: z.string().trim().min(32).max(128),
+  })
+  .strict()
+
+const researchSyncSummaryPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    summary: researchSummarySchema.strict(),
+  })
+  .strict()
+
+const researchSyncKnowledgePayloadSchema = syncPayloadBaseSchema
+  .extend({
+    knowledge: researchKnowledgeSchema.strict(),
+  })
+  .strict()
+
+const researchSyncDeletedPayloadSchema = syncPayloadBaseSchema
+  .extend({
+    entityType: z.enum([
+      "campaign",
+      "experiment",
+      "hypothesis",
+      "summary",
+      "knowledge",
+    ]),
+    entityId: z.uuid(),
+    campaignId: z.uuid().nullable().default(null),
+    name: z.string().trim().min(1).max(240).nullable().default(null),
+    runRef: z.string().trim().min(1).max(240).nullable().default(null),
+    deletedAt: z.iso.datetime(),
+    reason: z.string().trim().max(1000).nullable().default(null),
+  })
+  .strict()
+
+export const researchSyncEventSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("campaign.upserted"),
+      entityType: z.literal("campaign"),
+      entityId: z.uuid(),
+      payload: researchSyncCampaignPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("session.started"),
+      entityType: z.literal("session"),
+      entityId: z.uuid(),
+      payload: researchSyncSessionPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("session.stopped"),
+      entityType: z.literal("session"),
+      entityId: z.uuid(),
+      payload: researchSyncSessionPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("hypothesis.upserted"),
+      entityType: z.literal("hypothesis"),
+      entityId: z.uuid(),
+      payload: researchSyncHypothesisPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("worker.registered"),
+      entityType: z.literal("worker"),
+      entityId: z.uuid(),
+      payload: researchSyncWorkerPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("worker.heartbeat"),
+      entityType: z.literal("worker"),
+      entityId: z.uuid(),
+      payload: researchSyncWorkerHeartbeatPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("experiment.logged"),
+      entityType: z.literal("experiment"),
+      entityId: z.uuid(),
+      payload: researchSyncExperimentPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("summary.upserted"),
+      entityType: z.literal("summary"),
+      entityId: z.uuid(),
+      payload: researchSyncSummaryPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("knowledge.created"),
+      entityType: z.literal("knowledge"),
+      entityId: z.uuid(),
+      payload: researchSyncKnowledgePayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+  z
+    .object({
+      eventId: z.string().trim().min(1).max(240),
+      sequence: z.number().int().positive(),
+      type: z.literal("entity.deleted"),
+      entityType: z.enum([
+        "campaign",
+        "experiment",
+        "hypothesis",
+        "summary",
+        "knowledge",
+      ]),
+      entityId: z.uuid(),
+      payload: researchSyncDeletedPayloadSchema,
+      createdAt: z.iso.datetime(),
+    })
+    .strict(),
+])
 
 export const syncResearchRequestSchema = z.object({
   siteId: z.uuid(),
@@ -734,9 +1046,11 @@ export const researchSyncEventAckSchema = z.object({
   eventId: z.string().min(1),
   sequence: z.number().int().positive(),
   status: z.enum(["acked", "duplicate", "conflict", "invalid"]),
+  code: z.string().trim().min(1),
   entityType: z.string().min(1),
   entityId: z.uuid().nullable(),
   message: z.string().nullable(),
+  details: metadataSchema.default({}),
 })
 
 export const syncResearchResponseSchema = z.object({
@@ -746,6 +1060,40 @@ export const syncResearchResponseSchema = z.object({
     conflicts: z.number().int().nonnegative(),
     invalid: z.number().int().nonnegative(),
     acknowledgements: z.array(researchSyncEventAckSchema),
+    tombstones: z
+      .array(
+        z
+          .object({
+            entityType: z.string().min(1),
+            entityId: z.uuid(),
+            campaignId: z.uuid().nullable(),
+            name: z.string().nullable(),
+            runRef: z.string().nullable(),
+            deletedAt: z.iso.datetime(),
+            reason: z.string().nullable(),
+          })
+          .strict()
+      )
+      .default([]),
+    projectionDeltas: z
+      .object({
+        campaigns: z.array(researchCampaignSchema).default([]),
+        sessions: z.array(researchSessionSchema).default([]),
+        hypotheses: z.array(researchHypothesisSchema).default([]),
+        workers: z.array(researchWorkerSchema).default([]),
+        experiments: z.array(researchCampaignExperimentSchema).default([]),
+        summaries: z.array(researchSummarySchema).default([]),
+        knowledge: z.array(researchKnowledgeSchema).default([]),
+      })
+      .default({
+        campaigns: [],
+        sessions: [],
+        hypotheses: [],
+        workers: [],
+        experiments: [],
+        summaries: [],
+        knowledge: [],
+      }),
   }),
 })
 

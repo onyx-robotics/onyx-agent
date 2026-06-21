@@ -79,11 +79,11 @@ onyx research start --campaign fast-eval --workers 4
 onyx push
 ```
 
-The CLI stores local retry state under `.git/onyx/` and flushes it to `/api/v1`
-when connectivity and credentials are available.
+The CLI stores local research state and retry events in `.git/onyx/research.db`
+and flushes them to `/api/v1` when connectivity and credentials are available.
 `onyx exp run --no-log` is reserved for transient checks such as worker
-preflight and does not read, write, restore, or clear `.git/onyx/last-run.json`
-or scoped worker records under `.git/onyx/last-runs/`.
+preflight and does not read, write, restore, or clear measured-attempt or sync
+state.
 
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
 `onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
@@ -101,6 +101,9 @@ pending sync events in `.git/onyx/research.db`. Commands write this ledger
 before attempting network sync, so setup, research execution, experiment
 logging, summaries, and knowledge publishing work offline and can be uploaded
 later with `onyx sync`.
+Use `onyx sync status`, `onyx sync conflicts`, `onyx sync retry`,
+`onyx sync export`, and `onyx sync doctor` to inspect and repair the local
+ledger.
 
 `onyx campaign setup` and `onyx research start` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
@@ -169,10 +172,11 @@ experiments and matching local cache rows:
 onyx campaign delete --name fast-eval
 ```
 
-Deletion requires connectivity (it is never queued). The server tombstones
-deleted campaigns and experiments so stale SQLite sync events cannot resurrect
-them. Recreating a campaign with the same name later is fine because tombstones
-only match records created before the deletion.
+Deletion writes a local tombstone and sync event first, so it can be queued
+offline and replayed safely. The server also tombstones deleted campaigns and
+experiments so stale SQLite sync events cannot resurrect them. Recreating a
+campaign with the same name later is fine because tombstones only match records
+created before the deletion.
 
 ## Development
 

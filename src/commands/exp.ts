@@ -9,23 +9,13 @@ import { readSetupFile, type ResearchSetupFile } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, repoRoot } from "../lib/git"
 import {
-  appendHistory,
-  experimentRecordToHistory,
-  readHistory,
-} from "../lib/history"
-import {
   parseMetricLines,
   primaryMetric,
   summarizeOutput,
 } from "../lib/metrics"
 import {
-  clearLastRun,
   clientRunRef,
-  readOutbox,
-  readLastRun,
-  readLastRuns,
   readState,
-  writeLastRun,
   writeState,
   type LastRunSelector,
   type LastRunRecord,
@@ -34,9 +24,13 @@ import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import { pathExists } from "../lib/process"
 import {
   cacheLocalCampaign,
+  clearLocalAttempt,
+  listLocalAttempts,
   listLocalExperimentHistory,
   localCampaignByName,
   logLocalExperiment,
+  readLocalAttempt,
+  writeLocalAttempt,
 } from "../lib/research-db"
 import { renderExperimentTable } from "../lib/tui"
 import {
@@ -414,7 +408,9 @@ export async function commandExpRun(args: Args) {
     workerId,
     hypothesisId,
   })
-  const existingAttempt = noLog ? null : await readLastRun(root, lastRunSelector)
+  const existingAttempt = noLog
+    ? null
+    : await readLocalAttempt(root, lastRunSelector)
   const reusableAttempt =
     existingAttempt?.campaignName === campaignName &&
     existingAttempt.projectPath === projectPath &&
@@ -456,7 +452,7 @@ export async function commandExpRun(args: Args) {
     workerId,
     hypothesisId,
   }
-  if (!noLog) await writeLastRun(root, initialRun)
+  if (!noLog) await writeLocalAttempt({ root, record: initialRun })
 
   await emitEvent(root, {
     type: "exp_run_started",
@@ -475,32 +471,35 @@ export async function commandExpRun(args: Args) {
     })
     if (reset.code !== 0 || reset.timedOut) {
       if (!noLog) {
-        await writeLastRun(root, {
-          schemaVersion: 1,
-          createdAt: new Date().toISOString(),
-          runRef,
-          campaignName,
-          projectPath,
-          baseCommitSha,
-          resultCommitSha,
-          resultRef,
-          status: "failed",
-          setupCompliance: initialRun.setupCompliance,
-          primaryMetricName: campaign.metricName,
-          primaryMetricValue: null,
-          metrics: {},
-          agentNotes: {},
-          checks: null,
-          durationMs: 0,
-          startedAt: started.toISOString(),
-          completedAt: new Date().toISOString(),
-          outputSummary:
-            reset.outputSummary ??
-            summarizeOutput(reset.stdout, reset.stderr) ??
-            "Environment reset failed.",
-          sessionId,
-          workerId,
-          hypothesisId,
+        await writeLocalAttempt({
+          root,
+          record: {
+            schemaVersion: 1,
+            createdAt: new Date().toISOString(),
+            runRef,
+            campaignName,
+            projectPath,
+            baseCommitSha,
+            resultCommitSha,
+            resultRef,
+            status: "failed",
+            setupCompliance: initialRun.setupCompliance,
+            primaryMetricName: campaign.metricName,
+            primaryMetricValue: null,
+            metrics: {},
+            agentNotes: {},
+            checks: null,
+            durationMs: 0,
+            startedAt: started.toISOString(),
+            completedAt: new Date().toISOString(),
+            outputSummary:
+              reset.outputSummary ??
+              summarizeOutput(reset.stdout, reset.stderr) ??
+              "Environment reset failed.",
+            sessionId,
+            workerId,
+            hypothesisId,
+          },
         })
       }
       throw new Error("Environment reset failed before evaluation.")
@@ -597,7 +596,7 @@ export async function commandExpRun(args: Args) {
     workerId,
     hypothesisId,
   }
-  await writeLastRun(root, record)
+  await writeLocalAttempt({ root, record })
   await emitEvent(root, {
     type: "run_finished",
     campaignName,
@@ -645,7 +644,7 @@ export async function commandExpLog(args: Args) {
   const contextWorkerId = args.options.worker ?? process.env.ONYX_WORKER_ID
   const contextHypothesisId =
     args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID
-  const lastRun = await readLastRun(
+  const lastRun = await readLocalAttempt(
     root,
     lastRunSelectorForContext({
       campaignName,
@@ -671,19 +670,6 @@ export async function commandExpLog(args: Args) {
     if (logged) {
       console.log(
         `Experiment ${args.options["run-ref"]} is already recorded for campaign ${campaignName}`
-      )
-      return
-    }
-    const { records } = await readOutbox(root)
-    const queued = records.find(
-      (record) =>
-        record.type === "campaign_experiment_logged" &&
-        record.runRef === args.options["run-ref"] &&
-        record.campaignName === campaignName
-    )
-    if (queued) {
-      console.log(
-        `Experiment ${args.options["run-ref"]} is already queued for campaign ${campaignName}`
       )
       return
     }
@@ -808,7 +794,6 @@ export async function commandExpLog(args: Args) {
       if (args.options["require-online"] === "true") throw error
     })
   }
-  await appendHistory(root, experimentRecordToHistory(record)).catch(() => {})
   await emitEvent(root, {
     type: "exp_logged",
     campaignName,
@@ -821,39 +806,16 @@ export async function commandExpLog(args: Args) {
   console.log(
     `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}`
   )
-  if (usableLastRun) await clearLastRun(root, { runRef: usableLastRun.runRef })
+  if (usableLastRun)
+    await clearLocalAttempt(root, { runRef: usableLastRun.runRef })
 }
 
 export async function commandExpList(args: Args) {
   const root = await repoRoot()
   const sqliteRows = await listLocalExperimentHistory(root).catch(() => [])
-  const { records, corrupt } = await readHistory(root)
-  if (corrupt > 0) {
-    console.warn(`Skipped ${corrupt} unreadable history record(s).`)
-  }
-
   const rows: LocalResearchHistoryRecord[] = [...sqliteRows]
-  const sqliteRunRefs = new Set(sqliteRows.map((row) => row.runRef))
-  for (const record of records) {
-    if (sqliteRunRefs.has(record.runRef)) continue
-    rows.push(record)
-  }
   const seenRunRefs = new Set(rows.map((row) => row.runRef))
-  const { records: pendingOutbox, corrupt: corruptOutbox } =
-    await readOutbox(root)
-  if (corruptOutbox > 0) {
-    console.warn(
-      `Skipped ${corruptOutbox} unreadable pending outbox record(s).`
-    )
-  }
-  for (const record of pendingOutbox) {
-    if (record.type !== "campaign_experiment_logged") continue
-    if (seenRunRefs.has(record.runRef)) continue
-    rows.push(experimentRecordToHistory(record))
-    seenRunRefs.add(record.runRef)
-  }
-
-  const lastRuns = await readLastRuns(root)
+  const lastRuns = await listLocalAttempts(root)
   for (const lastRun of lastRuns) {
     if (seenRunRefs.has(lastRun.runRef)) continue
     rows.push({

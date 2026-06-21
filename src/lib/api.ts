@@ -54,6 +54,7 @@ export type ApiCampaignExperiment = {
   primaryMetricName: string
   primaryMetricValue: number | null
   secondaryMetrics: Record<string, unknown>
+  artifactRefs: Record<string, unknown>
   agentNotes: Record<string, unknown>
   checks: {
     status: "passed" | "failed" | "timed_out"
@@ -65,6 +66,7 @@ export type ApiCampaignExperiment = {
   startedAt: string | null
   completedAt: string | null
   createdAt: string
+  updatedAt: string
 }
 
 export type ApiSession = {
@@ -82,6 +84,8 @@ export type ApiWorker = {
   sessionId: string | null
   hypothesisId: string
   workerName: string
+  agentKind: string
+  runtime: "local" | "hosted"
   status:
     | "idle"
     | "running"
@@ -95,6 +99,10 @@ export type ApiWorker = {
   progressMessage: string | null
   gitLabel: string | null
   lastSeenAt: string
+  startedAt: string
+  metadata: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
 }
 
 export type ApiHypothesis = {
@@ -129,6 +137,9 @@ export type ApiSummary = {
   title: string
   body: string
   isCurrent: boolean
+  metadata: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
 }
 
 export type ApiKnowledge = {
@@ -233,10 +244,30 @@ export type ApiResearchSyncResponse = {
     eventId: string
     sequence: number
     status: "acked" | "duplicate" | "conflict" | "invalid"
+    code: string
     entityType: string
     entityId: string | null
     message: string | null
+    details: Record<string, unknown>
   }>
+  tombstones: Array<{
+    entityType: string
+    entityId: string
+    campaignId: string | null
+    name: string | null
+    runRef: string | null
+    deletedAt: string
+    reason: string | null
+  }>
+  projectionDeltas: {
+    campaigns: ApiCampaign[]
+    sessions: ApiSession[]
+    hypotheses: ApiHypothesis[]
+    workers: ApiWorker[]
+    experiments: ApiCampaignExperiment[]
+    summaries: ApiSummary[]
+    knowledge: ApiKnowledge[]
+  }
 }
 
 export async function callApi(
