@@ -10,6 +10,7 @@ import { runProcess } from "./lib/process"
 import {
   acquireLocalResourceLease,
   applyProjectDeletions,
+  cacheLocalCampaign,
   createLocalCampaign,
   createLocalSession,
   clearLocalAttempt,
@@ -235,6 +236,37 @@ describe("SQLite research ledger", () => {
     expect(state.workers[0]?.status).toBe("completed")
   })
 
+  test("caches server project ids with campaigns", async () => {
+    const root = await fixtureRepo()
+    const campaign = await cacheLocalCampaign({
+      root,
+      projectPath: "",
+      setup: setup(),
+      campaign: {
+        id: "11111111-1111-4111-8111-111111111111",
+        projectId: "22222222-2222-4222-8222-222222222222",
+        name: "synced",
+        description: "Synced campaign.",
+        baseCommitSha: "abcdef1",
+        metricName: "score",
+        metricUnit: null,
+        metricDirection: "maximize",
+        bestMetricValue: null,
+        bestCommitSha: null,
+        experimentCount: 0,
+        promotionRefName: null,
+      },
+    })
+
+    expect(campaign?.projectId).toBe("22222222-2222-4222-8222-222222222222")
+    const byName = await localCampaignByName({
+      root,
+      projectPath: "",
+      name: "synced",
+    })
+    expect(byName?.projectId).toBe("22222222-2222-4222-8222-222222222222")
+  })
+
   test("logs experiments into SQLite and exposes offline history", async () => {
     const root = await fixtureRepo()
     const campaign = await createLocalCampaign({
@@ -424,8 +456,13 @@ describe("SQLite research ledger", () => {
 
     expect(await listLocalExperimentHistory(root)).toEqual([])
     expect(
-      (await localCampaignByName({ root, projectPath: "", name: campaign.name }))
-        ?.experimentCount
+      (
+        await localCampaignByName({
+          root,
+          projectPath: "",
+          name: campaign.name,
+        })
+      )?.experimentCount
     ).toBe(0)
   })
 

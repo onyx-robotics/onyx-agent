@@ -730,6 +730,7 @@ const researchSyncCampaignPayloadSchema = syncPayloadBaseSchema
         name: true,
         description: true,
         baseCommitSha: true,
+        status: true,
         metricName: true,
         metricUnit: true,
         metricDirection: true,
@@ -1521,6 +1522,7 @@ export const reconcileResearchCampaignResponseSchema = z.object({
     campaign: researchCampaignSchema,
     hypotheses: z.array(researchHypothesisSchema),
     workers: z.array(researchWorkerSchema),
+    experiments: z.array(researchCampaignExperimentSchema),
     experimentsUpdated: z.number().int().nonnegative(),
   }),
 })

@@ -23,7 +23,7 @@ import {
 } from "../lib/skill"
 
 export const DEVELOPER_USAGE = `Usage:
-  onyx developer status
+  onyx developer status [--json]
   onyx developer link [path]
   onyx developer use dev [--skill-dir <path>] [--quiet]
   onyx developer use release [--skill-dir <path>] [--quiet]
@@ -243,9 +243,28 @@ export async function commandDeveloper(args: Args) {
 
   if (sub === "status") {
     const current = await readDeveloperConfig()
+    const target = await apiTarget(args)
+    const skillTarget = skillInstallTarget(defaultSkillInstallRoot())
+    if (args.options.json === "true") {
+      console.log(
+        JSON.stringify(
+          {
+            mode: current.mode,
+            apiTarget: target ? describeApiTarget(target) : null,
+            skillTarget,
+            checkout: current.checkout ?? null,
+          },
+          null,
+          2
+        )
+      )
+      return
+    }
     console.log(`Mode: ${current.mode}`)
-    console.log(`API target: ${await apiTargetLine(args)}`)
-    console.log(`Skill target: ${skillInstallTarget(defaultSkillInstallRoot())}`)
+    console.log(
+      `API target: ${target ? describeApiTarget(target) : "not configured (run `onyx login`)"}`
+    )
+    console.log(`Skill target: ${skillTarget}`)
     if (current.checkout) {
       console.log(`Developer checkout: ${current.checkout.root}`)
       console.log(`Developer CLI: ${current.checkout.binPath}`)

@@ -143,12 +143,52 @@ export async function commandStatus(args: Args) {
   const config = await readConfig()
   const profileName = profileNameFromArgs(args, config)
   const profile = profileName ? config.profiles[profileName] : undefined
+  const target = await apiTarget(args)
+  let project:
+    | Awaited<ReturnType<typeof resolveProject>>
+    | null = null
+  let projectError: string | null = null
+  try {
+    project = await resolveProject(root, args)
+  } catch (error) {
+    projectError = errorMessage(error)
+  }
+  if (args.options.json === "true") {
+    const [sqlitePending, sqliteConflicts] = await Promise.all([
+      pendingResearchSyncCount(root).catch(() => null),
+      researchSyncConflictCount(root).catch(() => null),
+    ])
+    console.log(
+      JSON.stringify(
+        {
+          profile: profileName
+            ? {
+                name: profileName,
+                teamName: profile?.teamName ?? null,
+              }
+            : null,
+          apiTarget: target ? describeApiTarget(target) : null,
+          activeCampaign: state.activeCampaign ?? null,
+          projectPath,
+          ledger: {
+            pending: sqlitePending,
+            conflicts: sqliteConflicts,
+          },
+          lastRun: lastRuns[0] ?? null,
+          project,
+          projectError,
+        },
+        null,
+        2
+      )
+    )
+    return
+  }
   console.log(
     profile
       ? `profile: ${profileName} (${profile.teamName})`
       : "profile: (none)"
   )
-  const target = await apiTarget(args)
   console.log(
     target
       ? `api: ${describeApiTarget(target)}`
@@ -166,10 +206,9 @@ export async function commandStatus(args: Args) {
     )
   }
 
-  try {
-    const project = await resolveProject(root, args)
+  if (project) {
     console.log(`project: ${project.name} (${project.id})`)
-  } catch {
+  } else {
     console.log("project: not provisioned / offline")
   }
 }

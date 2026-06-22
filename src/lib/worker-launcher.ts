@@ -367,24 +367,39 @@ export async function preflightWorkerInvocation(
     return result
   }
 
-  const onyxHelp = await runCheck("onyx surface", "onyx", ["--help"])
-  const help = onyxHelp.stdout
-  for (const required of [
-    "onyx research should-stop",
-    "onyx knowledge add",
-    "onyx knowledge list",
-    "onyx summary upsert",
-    "onyx exp run [--campaign",
+  await runCheck("onyx developer status", "onyx", [
+    "developer",
+    "status",
+    "--json",
+  ])
+  await runCheck("onyx status", "onyx", ["status", "--json"])
+  for (const probe of [
+    {
+      name: "onyx exp run help",
+      args: ["exp", "run", "--help"],
+    },
+    {
+      name: "onyx worker run help",
+      args: ["worker", "run", "--help"],
+    },
+    {
+      name: "onyx research should-stop help",
+      args: ["research", "should-stop", "--help"],
+    },
+    {
+      name: "onyx knowledge add help",
+      args: ["knowledge", "add", "--help"],
+    },
+    {
+      name: "onyx knowledge list help",
+      args: ["knowledge", "list", "--help"],
+    },
+    {
+      name: "onyx summary upsert help",
+      args: ["summary", "upsert", "--help"],
+    },
   ]) {
-    if (!help.includes(required)) {
-      const output = `Onyx CLI surface is missing ${required}. The worker is likely resolving a stale bundled CLI instead of the orchestrator's CLI.`
-      checks.push({
-        name: `onyx capability ${required}`,
-        status: "failed",
-        output,
-      })
-      throw new Error(output)
-    }
+    await runCheck(probe.name, "onyx", probe.args)
   }
   checks.push({
     name: "onyx capability surface",
@@ -417,7 +432,7 @@ export async function preflightWorkerInvocation(
         "0",
         "--json",
       ],
-      { allowExitCodes: [0, 1] }
+      { allowExitCodes: [0] }
     )
   }
 

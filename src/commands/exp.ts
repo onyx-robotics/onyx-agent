@@ -459,30 +459,41 @@ async function writeWorkflowStepLog({
   return path
 }
 
-function parseStrictMetricLine(stdout: string, metricName: string) {
+export function parseWorkflowMetricLines(stdout: string, metricName: string) {
   const metricLines = stdout
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.startsWith("METRIC "))
-  if (metricLines.length !== 1) {
+  if (metricLines.length === 0) {
     return {
       metrics: {},
-      error: `Expected exactly one METRIC line for ${metricName}; found ${metricLines.length}.`,
+      error: `Expected one primary METRIC ${metricName}=<number> line; found none.`,
     }
   }
-  const match = metricLines[0]!.match(
-    /^METRIC\s+([A-Za-z0-9_.:-]+)=(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i
-  )
-  if (!match) {
-    return { metrics: {}, error: `Invalid METRIC line: ${metricLines[0]}` }
+  const metrics: Record<string, number> = {}
+  for (const line of metricLines) {
+    const match = line.match(
+      /^METRIC\s+([A-Za-z0-9_.:-]+)=(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i
+    )
+    if (!match) {
+      return { metrics: {}, error: `Invalid METRIC line: ${line}` }
+    }
+    const name = match[1]!
+    if (Object.hasOwn(metrics, name)) {
+      return {
+        metrics: {},
+        error: `Duplicate METRIC ${name}=<number> line.`,
+      }
+    }
+    metrics[name] = Number(match[2])
   }
-  if (match[1] !== metricName) {
+  if (!Object.hasOwn(metrics, metricName)) {
     return {
       metrics: {},
-      error: `Expected METRIC ${metricName}=<number>, got ${match[1]}.`,
+      error: `Expected one primary METRIC ${metricName}=<number> line; found ${metricLines.length} metric line(s) without the primary metric.`,
     }
   }
-  return { metrics: { [metricName]: Number(match[2]) }, error: null }
+  return { metrics, error: null }
 }
 
 function checksRecordForSteps(
@@ -867,7 +878,7 @@ async function executeWorkflow({
     let stepMetrics: Record<string, number> = {}
     let metricError: string | null = null
     if (step.metric) {
-      const parsed = parseStrictMetricLine(result.stdout, setup.metric.name)
+      const parsed = parseWorkflowMetricLines(result.stdout, setup.metric.name)
       stepMetrics = parsed.metrics
       metricError = parsed.error
     }

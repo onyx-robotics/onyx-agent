@@ -13,6 +13,7 @@ import {
   commandExpLog,
   commandExpRun,
   commandExpList,
+  commandResearchFinish,
   commandResearchStart,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
@@ -31,6 +32,7 @@ import {
   onyxStateDir,
   parseArgs,
   parseMetricLines,
+  parseWorkflowMetricLines,
   readOutbox,
   readState,
   readSetupFile,
@@ -46,6 +48,9 @@ import {
   writeValidationFile,
 } from "./onyx"
 import {
+  createLocalCampaign,
+  createLocalSession,
+  listLocalHypotheses,
   listLocalAttempts,
   listLocalExperimentHistory,
   writeLocalAttempt,
@@ -120,11 +125,7 @@ async function writeResearchSmokeRepo() {
       { id: "evaluate", run: "evaluation.run", metric: true },
     ],
   })
-  await writeSetupFile(
-    root,
-    "",
-    setup
-  )
+  await writeSetupFile(root, "", setup)
   const now = new Date().toISOString()
   await writeValidationFile(
     root,
@@ -513,6 +514,41 @@ describe("metrics", () => {
     expect(parseMetricLines("METRIC score=1.25\n", "score")).toEqual({
       score: 1.25,
     })
+  })
+
+  test("parses workflow primary and secondary metric lines", () => {
+    expect(parseWorkflowMetricLines("METRIC score=1.25\n", "score")).toEqual({
+      metrics: { score: 1.25 },
+      error: null,
+    })
+    expect(
+      parseWorkflowMetricLines(
+        "METRIC score=1.25\nMETRIC control_effort=0.4\n",
+        "score"
+      )
+    ).toEqual({
+      metrics: { score: 1.25, control_effort: 0.4 },
+      error: null,
+    })
+  })
+
+  test("rejects workflow metric output without the configured primary", () => {
+    expect(
+      parseWorkflowMetricLines("METRIC control_effort=0.4\n", "score")
+        .error
+    ).toContain("without the primary metric")
+  })
+
+  test("rejects duplicate workflow metric names", () => {
+    expect(
+      parseWorkflowMetricLines("METRIC score=1\nMETRIC score=2\n", "score")
+        .error
+    ).toContain("Duplicate METRIC score")
+  })
+
+  test("rejects invalid workflow metric values", () => {
+    expect(parseWorkflowMetricLines("METRIC score=fast\n", "score").error)
+      .toBe("Invalid METRIC line: METRIC score=fast")
   })
 })
 
@@ -1221,6 +1257,132 @@ describe("research status", () => {
       console.log = originalLog
     }
   })
+
+  test("completed sessions refresh cached state and do not suggest workers", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const setup = await readSetupFile(root, "")
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      description: "Improve score.",
+      projectPath: "",
+      baseCommitSha,
+      setup,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 2,
+      hypotheses: [
+        {
+          focus: "Try a new controller",
+          statement: "A focused controller change can improve score.",
+          startingPoints: ["src"],
+          avoidList: ["onyx/"],
+          successSignals: ["METRIC score improves"],
+          giveUpSignals: [],
+        },
+      ],
+      metadata: { agentKind: "claude", maxIterations: 10 },
+    })
+    const hypothesis = session.hypotheses[0]!
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          projectPath: "",
+          baseCommitSha,
+          metricName: "score",
+          metricUnit: null,
+          metricDirection: "maximize",
+          sessionId: session.session.id,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          maxIterations: 10,
+          endTimeMs: Date.now() + 60_000,
+          status: "running",
+        },
+      },
+    })
+
+    const sessionStateDir = join(
+      await onyxStateDir(root),
+      "session-state",
+      session.session.id
+    )
+    await mkdir(sessionStateDir, { recursive: true })
+    await writeFile(
+      join(sessionStateDir, `${hypothesis.id}.json`),
+      `${JSON.stringify(
+        {
+          session: { ...session.session, status: "running" },
+          campaign,
+          latestExperiments: [],
+          bestExperiment: null,
+          hypotheses: session.hypotheses,
+          workers: [],
+          summaries: [],
+          knowledge: [],
+          updatedAt: "2026-06-20T00:00:00.000Z",
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    )
+
+    const previousCwd = process.cwd()
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandResearchFinish({
+        positional: ["research", "finish"],
+        options: {
+          campaign: campaignName,
+          session: session.session.id,
+          offline: "true",
+        },
+      })
+
+      const cached = JSON.parse(
+        await readFile(join(sessionStateDir, `${hypothesis.id}.json`), "utf8")
+      ) as { session: { status: string } }
+      expect(cached.session.status).toBe("completed")
+
+      logs.length = 0
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const status = JSON.parse(logs.join("\n")) as {
+      campaign: { status: string }
+      session: { status: string; openSlots: number }
+      launchSuggestions: string[]
+    }
+    expect(status.campaign.status).toBe("completed")
+    expect(status.session.status).toBe("completed")
+    expect(status.session.openSlots).toBe(2)
+    expect(status.launchSuggestions).toEqual([])
+  })
 })
 
 describe("research hypothesis add", () => {
@@ -1408,6 +1570,18 @@ describe("research hypothesis add", () => {
     )
     expect(logs).toContain(
       `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent claude --max-iterations 10 --max-minutes 5`
+    )
+    const hypotheses = await listLocalHypotheses(root, campaignId)
+    const stored = hypotheses.find(
+      (hypothesis) => hypothesis.id === generatedHypothesisId
+    )
+    expect(stored?.plan.avoidList).toEqual(
+      expect.arrayContaining([
+        "onyx/setup.json",
+        "onyx/validation.json",
+        "onyx/onyx.md",
+        "onyx/tools/",
+      ])
     )
   })
 
@@ -1674,8 +1848,7 @@ describe("setup workflow", () => {
       const validation = await readValidationFile(root, "")
       expect(validation?.status).toBe("warning")
       expect(
-        validation?.checks.find((item) => item.id === "metric_capture")
-          ?.status
+        validation?.checks.find((item) => item.id === "metric_capture")?.status
       ).toBe("passed")
     } finally {
       process.chdir(previousCwd)

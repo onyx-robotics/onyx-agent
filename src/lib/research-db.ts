@@ -232,6 +232,7 @@ function syncCampaignPayload(row: Row) {
     name: row.name as string,
     description: nullableString(row.description),
     baseCommitSha: row.base_commit_sha as string,
+    status: row.status as LocalCampaign["status"],
     metricName: row.metric_name as string,
     metricUnit: nullableString(row.metric_unit),
     metricDirection: row.metric_direction as "maximize" | "minimize",
@@ -274,7 +275,7 @@ function applyMigrations(db: Db) {
 
   if (currentVersion < 1) {
     db.transaction(() => {
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS local_settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
@@ -282,7 +283,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS campaigns (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -309,7 +310,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -326,7 +327,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS hypotheses (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -346,7 +347,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS workers (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -368,7 +369,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS worker_heartbeats (
       id TEXT PRIMARY KEY,
       worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
@@ -387,7 +388,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS experiments (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -422,7 +423,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS summaries (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -439,7 +440,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS knowledge (
       id TEXT PRIMARY KEY,
       campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -457,7 +458,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS resource_leases (
       resource_name TEXT NOT NULL,
       slot INTEGER NOT NULL,
@@ -469,7 +470,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS tombstones (
       id TEXT PRIMARY KEY,
       entity_type TEXT NOT NULL,
@@ -483,7 +484,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS sync_events (
       event_id TEXT PRIMARY KEY,
       sequence INTEGER NOT NULL UNIQUE,
@@ -500,7 +501,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS sync_acks (
       event_id TEXT PRIMARY KEY,
       server_status TEXT NOT NULL,
@@ -510,7 +511,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS server_mappings (
       local_entity_type TEXT NOT NULL,
       local_entity_id TEXT NOT NULL,
@@ -521,7 +522,7 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(`
+      db.run(`
     CREATE TABLE IF NOT EXISTS local_attempts (
       run_ref TEXT PRIMARY KEY,
       campaign_id TEXT,
@@ -538,27 +539,27 @@ function applyMigrations(db: Db) {
     )
   `)
 
-    db.run(
-      "CREATE INDEX IF NOT EXISTS sync_events_pending_idx ON sync_events(status, sequence)"
-    )
-    db.run(
-      "CREATE INDEX IF NOT EXISTS experiments_campaign_created_idx ON experiments(campaign_id, created_at DESC)"
-    )
-    db.run(
-      "CREATE INDEX IF NOT EXISTS workers_campaign_seen_idx ON workers(campaign_id, status, last_seen_at DESC)"
-    )
-    db.run(
-      "CREATE INDEX IF NOT EXISTS hypotheses_campaign_status_idx ON hypotheses(campaign_id, status, last_worked_at DESC)"
-    )
-    db.run(
-      "CREATE INDEX IF NOT EXISTS summaries_campaign_kind_idx ON summaries(campaign_id, summary_kind, is_current)"
-    )
-    db.run(
-      "CREATE INDEX IF NOT EXISTS knowledge_campaign_created_idx ON knowledge(campaign_id, created_at DESC)"
-    )
-    db.run(
-      "CREATE INDEX IF NOT EXISTS local_attempts_context_idx ON local_attempts(campaign_name, project_path, session_id, worker_id, hypothesis_id, updated_at DESC)"
-    )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS sync_events_pending_idx ON sync_events(status, sequence)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS experiments_campaign_created_idx ON experiments(campaign_id, created_at DESC)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS workers_campaign_seen_idx ON workers(campaign_id, status, last_seen_at DESC)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS hypotheses_campaign_status_idx ON hypotheses(campaign_id, status, last_worked_at DESC)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS summaries_campaign_kind_idx ON summaries(campaign_id, summary_kind, is_current)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS knowledge_campaign_created_idx ON knowledge(campaign_id, created_at DESC)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS local_attempts_context_idx ON local_attempts(campaign_name, project_path, session_id, worker_id, hypothesis_id, updated_at DESC)"
+      )
       db.query(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
       ).run(1, nowIso())
@@ -995,10 +996,11 @@ export async function cacheLocalCampaign({
     `
       INSERT INTO campaigns (
         id, name, description, project_path, base_commit_sha, setup_json,
-        metric_name, metric_unit, metric_direction, promotion_ref_name, status,
+        metric_name, metric_unit, metric_direction, promotion_ref_name,
+        server_project_id, status,
         best_metric_value, best_commit_sha, experiment_count, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         description = excluded.description,
@@ -1009,6 +1011,8 @@ export async function cacheLocalCampaign({
         metric_unit = excluded.metric_unit,
         metric_direction = excluded.metric_direction,
         promotion_ref_name = excluded.promotion_ref_name,
+        server_project_id = excluded.server_project_id,
+        status = excluded.status,
         best_metric_value = excluded.best_metric_value,
         best_commit_sha = excluded.best_commit_sha,
         experiment_count = excluded.experiment_count,
@@ -1025,6 +1029,8 @@ export async function cacheLocalCampaign({
     campaign.metricUnit,
     campaign.metricDirection,
     campaign.promotionRefName,
+    campaign.projectId,
+    campaign.status ?? "active",
     campaign.bestMetricValue,
     campaign.bestCommitSha,
     campaign.experimentCount,
@@ -1032,6 +1038,35 @@ export async function cacheLocalCampaign({
     at
   )
   return localCampaignById(root, campaign.id)
+}
+
+export async function completeLocalCampaign({
+  root,
+  campaignId,
+}: {
+  root: string
+  campaignId: string
+}) {
+  const db = await openDb(root)
+  const at = nowIso()
+  const tx = db.transaction(() => {
+    db.query(
+      "UPDATE campaigns SET status = 'completed', updated_at = ? WHERE id = ? AND status != 'deleted'"
+    ).run(at, campaignId)
+    const row = db
+      .query("SELECT * FROM campaigns WHERE id = ?")
+      .get(campaignId) as Row | null
+    if (!row) throw new Error("Local campaign not found")
+    enqueueSyncEvent({
+      db,
+      type: "campaign.upserted",
+      entityType: "campaign",
+      entityId: campaignId,
+      payload: { campaign: syncCampaignPayload(row) },
+    })
+    return campaignFromRow(row)
+  })
+  return tx()
 }
 
 export async function localCampaignByName({
@@ -1381,6 +1416,15 @@ export async function getLocalSessionState(
     knowledge,
     updatedAt: nowIso(),
   }
+}
+
+export async function listLocalHypotheses(root: string, campaignId: string) {
+  const rows = (await openDb(root))
+    .query(
+      "SELECT * FROM hypotheses WHERE campaign_id = ? ORDER BY created_at ASC"
+    )
+    .all(campaignId) as Row[]
+  return rows.map(hypothesisFromRow)
 }
 
 function activeWorkerStatus(status: string) {
@@ -2014,6 +2058,69 @@ export async function listLocalExperimentHistory(root: string) {
       hypothesisId: experiment.hypothesisId ?? undefined,
     } satisfies LocalResearchHistoryRecord
   })
+}
+
+export async function markExperimentRefsVerified({
+  root,
+  refs,
+}: {
+  root: string
+  refs: Array<{ runRef: string; commitSha: string; ref: string }>
+}) {
+  if (refs.length === 0) return
+  const db = await openDb(root)
+  const at = nowIso()
+  const tx = db.transaction(() => {
+    for (const ref of refs) {
+      db.query(
+        `
+          UPDATE experiments
+          SET git_status = 'verified',
+            git_verified_at = ?,
+            git_status_reason = NULL,
+            updated_at = ?
+          WHERE run_ref = ?
+            AND result_commit_sha = ?
+            AND result_ref = ?
+        `
+      ).run(at, at, ref.runRef, ref.commitSha, ref.ref)
+    }
+  })
+  tx()
+}
+
+export async function applyRemoteExperimentGitStatuses({
+  root,
+  experiments,
+}: {
+  root: string
+  experiments: ApiCampaignExperiment[]
+}) {
+  if (experiments.length === 0) return
+  const db = await openDb(root)
+  const at = nowIso()
+  const tx = db.transaction(() => {
+    for (const experiment of experiments) {
+      db.query(
+        `
+          UPDATE experiments
+          SET git_status = ?,
+            git_verified_at = ?,
+            git_status_reason = ?,
+            updated_at = ?
+          WHERE id = ? OR run_ref = ?
+        `
+      ).run(
+        experiment.gitStatus,
+        experiment.gitVerifiedAt,
+        experiment.gitStatusReason,
+        at,
+        experiment.id,
+        experiment.runRef
+      )
+    }
+  })
+  tx()
 }
 
 function attemptFromRow(row: Row): LastRunRecord {

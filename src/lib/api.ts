@@ -8,6 +8,7 @@ import type {
 import type { Args } from "./args"
 import { apiBaseUrl, apiKey } from "./config"
 import { normalizeRepositoryUrl, repositoryUrl } from "./git"
+import { readState, updateState } from "./outbox"
 import { resolveProjectPath } from "./project"
 
 export type ApiProject = {
@@ -25,6 +26,7 @@ export type ApiCampaign = {
   name: string
   description: string | null
   baseCommitSha: string
+  status?: "active" | "completed" | "deleted"
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
@@ -270,6 +272,14 @@ export type ApiResearchSyncResponse = {
   }
 }
 
+export type ApiReconcileCampaignResponse = {
+  campaign: ApiCampaign
+  hypotheses: ApiHypothesis[]
+  workers: ApiWorker[]
+  experiments: ApiCampaignExperiment[]
+  experimentsUpdated: number
+}
+
 export async function callApi(
   method: string,
   path: string,
@@ -346,9 +356,24 @@ export async function resolveProject(
   const url = normalizeRepositoryUrl(
     await repositoryUrl(root, args.options["repository-url"])
   )
+  const state = await readState(root).catch(() => null)
+  if (
+    state?.projectCache &&
+    state.projectCache.repositoryUrl === url &&
+    state.projectCache.projectPath === projectPath
+  ) {
+    return {
+      id: state.projectCache.id,
+      name: state.projectCache.name,
+      repositoryUrl: state.projectCache.repositoryUrl,
+      repositoryFullName: state.projectCache.repositoryFullName,
+      defaultBranch: state.projectCache.defaultBranch,
+      projectPath: state.projectCache.projectPath,
+    }
+  }
   const params = new URLSearchParams({ repositoryUrl: url, projectPath })
   try {
-    return apiData<ApiProject>(
+    const project = apiData<ApiProject>(
       await callApi(
         "GET",
         `/api/v1/research/projects/resolve?${params.toString()}`,
@@ -356,7 +381,38 @@ export async function resolveProject(
         args
       )
     )
-  } catch {
+    await updateState(root, (state) => {
+      state.projectId = project.id
+      state.projectPath = projectPath
+      state.projectCache = {
+        id: project.id,
+        name: project.name,
+        repositoryUrl: url,
+        repositoryFullName: project.repositoryFullName,
+        defaultBranch: project.defaultBranch,
+        projectPath,
+        resolvedAt: new Date().toISOString(),
+        lastDeletionFetchAt:
+          state.projectCache?.repositoryUrl === url &&
+          state.projectCache?.projectPath === projectPath
+            ? state.projectCache.lastDeletionFetchAt
+            : undefined,
+      }
+    }).catch(() => {})
+    return project
+  } catch (error) {
+    if (error instanceof ApiError) {
+      if (error.status === 401 || error.status === 403) {
+        throw new Error(
+          `Onyx API could not resolve this repository because authentication failed (${error.status}). Run \`onyx status\` and refresh or switch profiles.`
+        )
+      }
+      if (error.status !== 404) {
+        throw new Error(
+          `Onyx API project resolve failed (${error.status}). ${error.message}`
+        )
+      }
+    }
     throw new Error(
       "No Onyx project is tracking this repository yet. Start a campaign with `onyx campaign setup`, or grant Onyx GitHub access to this repository and sync again."
     )
@@ -581,12 +637,14 @@ export async function getResearchSessionState(
 export async function reconcileCampaign(
   campaignId: string,
   args?: Args
-): Promise<void> {
-  await callApi(
-    "POST",
-    `/api/v1/research/campaigns/${campaignId}/reconcile`,
-    {},
-    args
+): Promise<ApiReconcileCampaignResponse> {
+  return apiData<ApiReconcileCampaignResponse>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/reconcile`,
+      {},
+      args
+    )
   )
 }
 

@@ -21,6 +21,16 @@ import { gitCommonDir } from "./git"
 
 export type CliState = {
   projectId?: string
+  projectCache?: {
+    id: string
+    name: string
+    repositoryUrl: string
+    repositoryFullName: string | null
+    defaultBranch: string
+    projectPath: string
+    resolvedAt: string
+    lastDeletionFetchAt?: string
+  }
   projectPath?: string
   activeCampaign?: string
   campaigns?: Record<
@@ -321,6 +331,7 @@ export async function readState(root: string): Promise<CliState> {
     ) as Partial<CliState>
     return {
       projectId: parsed.projectId,
+      projectCache: parsed.projectCache,
       projectPath: parsed.projectPath,
       activeCampaign: parsed.activeCampaign,
       campaigns: parsed.campaigns ?? {},

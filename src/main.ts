@@ -38,7 +38,7 @@ export const USAGE = `onyx - research workflow CLI
 
 Usage:
   onyx --version
-  onyx developer status
+  onyx developer status [--json]
   onyx developer link [path]
   onyx developer use dev [--skill-dir <path>] [--quiet]
   onyx developer use release [--skill-dir <path>] [--quiet]
@@ -78,7 +78,7 @@ Usage:
   onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
-  onyx status
+  onyx status [--json]
   onyx push
   onyx sync [--watch] [--interval <seconds>] [--project <id>] [--repository-url <url>] [--project-path <path>] [--offline] [--require-online]
   onyx sync status

@@ -179,24 +179,37 @@ async function buildValidation({
     ...toolFileReferences(setup),
   ]) {
     const exists = path.endsWith("/")
-      ? await pathExists(onyxPath(root, projectPath, path.slice("onyx/".length)))
-      : await pathExists(onyxPath(root, projectPath, path.slice("onyx/".length)))
+      ? await pathExists(
+          onyxPath(root, projectPath, path.slice("onyx/".length))
+        )
+      : await pathExists(
+          onyxPath(root, projectPath, path.slice("onyx/".length))
+        )
     checks.push(
       exists
         ? check(
-            `path_${path.replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "").toLowerCase()}`,
+            `path_${path
+              .replace(/[^a-z0-9]+/gi, "_")
+              .replace(/^_|_$/g, "")
+              .toLowerCase()}`,
             "passed",
             `${path} exists.`
           )
         : check(
-            `path_${path.replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "").toLowerCase()}`,
+            `path_${path
+              .replace(/[^a-z0-9]+/gi, "_")
+              .replace(/^_|_$/g, "")
+              .toLowerCase()}`,
             "failed",
             `${path} is missing.`
           )
     )
   }
 
-  const ids = [...Object.keys(setup.tools), ...setup.workflow.map((step) => step.id)]
+  const ids = [
+    ...Object.keys(setup.tools),
+    ...setup.workflow.map((step) => step.id),
+  ]
   const hasSafety = ids.some((id) => id.includes("safety"))
   const hasReadiness = ids.some(
     (id) => id.includes("readiness") || id.includes("reset")
@@ -303,6 +316,9 @@ export async function commandSetupInit(args: Args) {
   )
   console.log(`wrote ${validationPath(root, projectPath)}`)
   console.log(`setup validation: ${validation.status}`)
+  console.log(
+    "next: configure onyx/tools/evaluation/run.sh, then run `onyx tools run evaluation.run` for a transient eval preflight."
+  )
 }
 
 export async function commandSetupValidate(args: Args) {
@@ -320,4 +336,7 @@ export async function commandSetupValidate(args: Args) {
     console.log(`${item.id}: ${item.status} - ${item.message}`)
   }
   console.log(`wrote ${validationPath(root, projectPath)}`)
+  console.log(
+    "preflight: run `onyx tools run evaluation.run` to execute the eval tool; setup validation is static."
+  )
 }

@@ -71,6 +71,10 @@ describe("hypothesis worker prompt", () => {
       'onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
     )
     expect(prompt).toContain("onyx knowledge add")
+    expect(prompt).toContain(
+      'onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json'
+    )
+    expect(prompt).toContain('"shouldStop": true')
     expect(prompt).toContain("Make one small, measured, logged attempt early")
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
     expect(prompt).toContain("Primary metric is king")

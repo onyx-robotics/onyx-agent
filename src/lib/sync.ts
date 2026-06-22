@@ -7,13 +7,16 @@ import {
   getResearchSiteId,
   applyProjectDeletions,
   applyRemoteTombstones,
+  markExperimentRefsVerified,
   markResearchSyncAcked,
   markResearchSyncConflict,
   markResearchSyncError,
   pendingResearchSyncCount,
   pendingResearchSyncEvents,
 } from "./research-db"
-import { readState, withOnyxLock } from "./outbox"
+import { readState, updateState, withOnyxLock } from "./outbox"
+
+const DELETION_REFRESH_INTERVAL_MS = 60_000
 
 export type FlushResult = {
   flushed: number
@@ -31,10 +34,17 @@ function eventExperimentRef(event: {
   const experiment = event.payload.experiment
   if (!experiment || typeof experiment !== "object") return null
   const record = experiment as Record<string, unknown>
+  const runRef = record.runRef
   const commitSha = record.resultCommitSha
   const ref = record.resultRef
-  if (typeof commitSha !== "string" || typeof ref !== "string") return null
-  return { commitSha, ref }
+  if (
+    typeof runRef !== "string" ||
+    typeof commitSha !== "string" ||
+    typeof ref !== "string"
+  ) {
+    return null
+  }
+  return { runRef, commitSha, ref }
 }
 
 async function resolveProjectIdForDeletionFeed(root: string, args: Args) {
@@ -45,9 +55,24 @@ async function resolveProjectIdForDeletionFeed(root: string, args: Args) {
 }
 
 async function fetchAndApplyRemoteDeletions(root: string, args: Args) {
+  const state = await readState(root)
+  const lastDeletionFetchAt = state.projectCache?.lastDeletionFetchAt
+    ? Date.parse(state.projectCache.lastDeletionFetchAt)
+    : Number.NaN
+  if (
+    Number.isFinite(lastDeletionFetchAt) &&
+    Date.now() - lastDeletionFetchAt < DELETION_REFRESH_INTERVAL_MS
+  ) {
+    return
+  }
   const projectId = await resolveProjectIdForDeletionFeed(root, args)
   const deletions = await getProjectDeletions(projectId, args)
   await applyProjectDeletions({ root, deletions })
+  await updateState(root, (state) => {
+    if (state.projectCache?.id === projectId) {
+      state.projectCache.lastDeletionFetchAt = new Date().toISOString()
+    }
+  }).catch(() => {})
 }
 
 async function flushResearchDbEvents(
@@ -105,12 +130,14 @@ async function flushResearchDbEvents(
   const eventIds = events.map((event) => event.eventId)
   try {
     const refs = events.map(eventExperimentRef).filter(Boolean) as Array<{
+      runRef: string
       commitSha: string
       ref: string
     }>
     for (let index = 0; index < refs.length; index += 20) {
       await pushRefs(root, refs.slice(index, index + 20))
     }
+    await markExperimentRefsVerified({ root, refs })
 
     const response = await syncResearchEvents(
       {

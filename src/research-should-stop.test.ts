@@ -13,6 +13,49 @@ afterEach(() => {
 })
 
 describe("research should-stop", () => {
+  test("continues with a successful JSON response when no stop reason exists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: "smoke",
+      sessions: {
+        session_123: {
+          campaignName: "smoke",
+          campaignId: "campaign_123",
+          endTimeMs: Date.now() + 60_000,
+          maxIterations: 10,
+          status: "running",
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const lines: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandResearchShouldStop({
+        positional: ["research", "should-stop"],
+        options: { session: "session_123", iteration: "1", json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const payload = JSON.parse(lines.join("\n")) as {
+      shouldStop: boolean
+      reasons: string[]
+    }
+    expect(process.exitCode).toBeUndefined()
+    expect(payload.shouldStop).toBe(false)
+    expect(payload.reasons).toEqual([])
+  })
+
   test("stops when worker shutdown cushion deadline is reached", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
     await runProcess("git", ["init"], { cwd: root })
@@ -60,7 +103,7 @@ describe("research should-stop", () => {
       shouldStop: boolean
       reasons: string[]
     }
-    expect(process.exitCode).toBe(0)
+    expect(process.exitCode).toBeUndefined()
     expect(payload.shouldStop).toBe(true)
     expect(payload.reasons).toContain("worker shutdown cushion reached")
   })

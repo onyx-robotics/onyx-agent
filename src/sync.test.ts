@@ -60,6 +60,111 @@ function setup() {
 }
 
 describe("SQLite sync", () => {
+  test("marks experiment refs verified after a successful push", async () => {
+    const root = await fixtureRepo()
+    const remote = await mkdtemp(join(tmpdir(), "onyx-sync-remote-"))
+    await runProcess("git", ["init", "--bare"], { cwd: remote })
+    await runProcess("git", ["remote", "add", "origin", remote], {
+      cwd: root,
+    })
+    const head = (
+      await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+    ).stdout.trim()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "push-verify",
+      projectPath: "",
+      baseCommitSha: head,
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const experiment = await logLocalExperiment({
+      root,
+      record: {
+        schemaVersion: 1,
+        type: "campaign_experiment_logged",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runRef: "local/push-verify/run",
+        campaignName: campaign.name,
+        name: "pushed",
+        description: null,
+        projectPath: "",
+        baseCommitSha: head,
+        resultCommitSha: head,
+        resultRef: `refs/onyx/experiments/${campaign.id}/push-verify`,
+        status: "succeeded",
+        setupCompliance: {
+          status: "passed",
+          protectedPathsChanged: [],
+          outOfScopePathsChanged: [],
+          setupPathsChanged: [],
+          notes: null,
+        },
+        primaryMetricName: "score",
+        primaryMetricValue: 1,
+        metrics: { score: 1 },
+        agentNotes: {},
+        checks: null,
+      },
+    })
+
+    const originalFetch = globalThis.fetch
+    const previousApiUrl = process.env.ONYX_API_URL
+    const previousApiKey = process.env.ONYX_API_KEY
+    process.env.ONYX_API_URL = "https://api.onyx.test"
+    process.env.ONYX_API_KEY = "test-key"
+    globalThis.fetch = (async (_input, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        events: Array<{ eventId: string; sequence: number; entityType: string; entityId: string }>
+      }
+      return Response.json({
+        data: {
+          accepted: body.events.length,
+          duplicate: 0,
+          conflicts: 0,
+          invalid: 0,
+          acknowledgements: body.events.map((event) => ({
+            eventId: event.eventId,
+            sequence: event.sequence,
+            status: "acked",
+            code: "accepted",
+            entityType: event.entityType,
+            entityId: event.entityId,
+            message: null,
+            details: {},
+          })),
+          tombstones: [],
+          projectionDeltas: {
+            campaigns: [],
+            sessions: [],
+            hypotheses: [],
+            workers: [],
+            experiments: [],
+            summaries: [],
+            knowledge: [],
+          },
+        },
+      })
+    }) as typeof fetch
+
+    try {
+      const result = await flushOutbox(root, parseArgs(["sync"]))
+      expect(result.offline).toBe(false)
+    } finally {
+      globalThis.fetch = originalFetch
+      if (previousApiUrl === undefined) delete process.env.ONYX_API_URL
+      else process.env.ONYX_API_URL = previousApiUrl
+      if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
+      else process.env.ONYX_API_KEY = previousApiKey
+    }
+
+    const history = await listLocalExperimentHistory(root)
+    const pushed = history.find((record) => record.runRef === experiment.runRef)
+    expect(pushed?.gitStatus).toBe("verified")
+  })
+
   test("fetches remote tombstones even when no local events are pending", async () => {
     const root = await fixtureRepo()
     const projectId = "11111111-1111-4111-8111-111111111111"
@@ -105,6 +210,15 @@ describe("SQLite sync", () => {
 
     await updateState(root, (state) => {
       state.projectId = projectId
+      state.projectCache = {
+        id: projectId,
+        name: "zero-pending",
+        repositoryUrl: "",
+        repositoryFullName: null,
+        defaultBranch: "main",
+        projectPath: "",
+        resolvedAt: "2026-01-01T00:00:00.000Z",
+      }
       state.projectPath = ""
     })
     for (const event of await pendingResearchSyncEvents(root)) {
@@ -146,6 +260,9 @@ describe("SQLite sync", () => {
     try {
       const result = await flushOutbox(root, parseArgs(["sync"]))
       expect(result).toMatchObject({ flushed: 0, pending: 0, offline: false })
+      expect(paths).toEqual([`/api/v1/research/projects/${projectId}/deletions`])
+      const second = await flushOutbox(root, parseArgs(["sync"]))
+      expect(second).toMatchObject({ flushed: 0, pending: 0, offline: false })
       expect(paths).toEqual([`/api/v1/research/projects/${projectId}/deletions`])
     } finally {
       globalThis.fetch = originalFetch

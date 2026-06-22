@@ -118,7 +118,12 @@ export {
   commandCampaignStatus,
   commandCampaignUse,
 } from "./commands/campaign"
-export { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
+export {
+  commandExpList,
+  commandExpLog,
+  commandExpRun,
+  parseWorkflowMetricLines,
+} from "./commands/exp"
 export { commandListen } from "./commands/listen"
 export { commandPush, commandStatus, commandSync } from "./commands/sync"
 export { commandToolsRun } from "./commands/tools"

@@ -39,6 +39,8 @@ import {
 } from "../lib/process"
 import {
   cacheLocalCampaign,
+  applyRemoteExperimentGitStatuses,
+  completeLocalCampaign,
   createLocalHypothesis,
   createLocalKnowledge,
   createLocalSession,
@@ -161,8 +163,56 @@ function hasInlineHypothesisPlanOptions(args: Args) {
   return INLINE_HYPOTHESIS_PLAN_OPTIONS.some((option) => args.options[option])
 }
 
+function uniqueStrings(values: string[]) {
+  return [...new Set(values.filter(Boolean))]
+}
+
+function setupAwareHypothesisDefaults({
+  setup,
+  projectPath,
+}: {
+  setup: ResearchSetupFile | null
+  projectPath: string
+}) {
+  const metricName = setup?.metric.name ?? "target_metric"
+  const direction =
+    setup?.metric.direction === "maximize"
+      ? "increase"
+      : setup?.metric.direction === "minimize"
+        ? "decrease"
+        : "improve"
+  const scope = setup?.scope.editable.length
+    ? setup.scope.editable
+    : [setup?.projectPath || projectPath || "."]
+  const protectedPaths = setup?.scope.protected.length
+    ? setup.scope.protected
+    : ["onyx/setup.json", "onyx/validation.json", "onyx/onyx.md", "onyx/tools/"]
+  return {
+    metricName,
+    direction,
+    scope,
+    protectedPaths,
+    startingPoints: uniqueStrings([
+      "Review recent experiments, hypothesis summaries, and shared knowledge before editing.",
+      ...scope,
+    ]),
+    successSignals: [
+      `METRIC ${metricName} moves in the desired direction.`,
+      "Required setup validation and runtime checks remain passing.",
+    ],
+    giveUpSignals: [
+      "The hypothesis requires edits outside the declared scope.",
+      `Repeated measured attempts fail to ${direction} ${metricName}.`,
+    ],
+  }
+}
+
 async function hypothesisPlanOption(
-  args: Args
+  args: Args,
+  context?: {
+    setup: ResearchSetupFile | null
+    projectPath: string
+  }
 ): Promise<ResearchHypothesisPlan> {
   const planPath = args.options.plan
   const hasInline = hasInlineHypothesisPlanOptions(args)
@@ -187,13 +237,24 @@ async function hypothesisPlanOption(
       "Pass --plan <json-file>, or pass --focus <text> and --hypothesis <text>."
     )
   }
+  const defaults = setupAwareHypothesisDefaults({
+    setup: context?.setup ?? null,
+    projectPath: context?.projectPath ?? "",
+  })
+  const startingPoints = optionValues(args, "starting-point")
+  const avoidList = optionValues(args, "avoid")
+  const successSignals = optionValues(args, "success")
+  const giveUpSignals = optionValues(args, "give-up")
   return researchHypothesisPlanSchema.parse({
     focus,
     statement: hypothesis,
-    startingPoints: optionValues(args, "starting-point"),
-    avoidList: optionValues(args, "avoid"),
-    successSignals: optionValues(args, "success"),
-    giveUpSignals: optionValues(args, "give-up"),
+    startingPoints:
+      startingPoints.length > 0 ? startingPoints : defaults.startingPoints,
+    avoidList: uniqueStrings([...avoidList, ...defaults.protectedPaths]),
+    successSignals:
+      successSignals.length > 0 ? successSignals : defaults.successSignals,
+    giveUpSignals:
+      giveUpSignals.length > 0 ? giveUpSignals : defaults.giveUpSignals,
   })
 }
 
@@ -629,6 +690,31 @@ async function writeSessionState({
   )
   await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, "utf8")
   return path
+}
+
+async function refreshSessionStateFiles({
+  root,
+  sessionId,
+  args,
+}: {
+  root: string
+  sessionId: string
+  args: Args
+}) {
+  const state = await getLocalSessionState(root, sessionId).catch(() =>
+    getResearchSessionState(sessionId, args)
+  )
+  const dir = join(await onyxStateDir(root), "session-state", sessionId)
+  await mkdir(dir, { recursive: true })
+  await Promise.all(
+    state.hypotheses.map((hypothesis) =>
+      writeFile(
+        join(dir, `${hypothesis.id}.json`),
+        `${JSON.stringify(state, null, 2)}\n`,
+        "utf8"
+      )
+    )
+  )
 }
 
 async function ensureWorktree({
@@ -1388,7 +1474,6 @@ async function runHypothesisOnce({
       progressMessage: `${hypothesis.name} completed`,
       gitLabel: resultCommitSha,
     })
-    const workerOutputSummary = summarizeWorkerOutput(workerResult)
     await upsertLocalSummary({
       root,
       campaignId: campaign.id,
@@ -1396,9 +1481,9 @@ async function runHypothesisOnce({
       hypothesisId: hypothesis.id,
       authoredByWorkerId: worker.id,
       summaryKind: "hypothesis_summary",
-      title: `${hypothesis.name} completed`,
+      title: `${hypothesis.name} worker finalization`,
       body: [
-        `Worker process exited successfully.`,
+        `Outcome: completed`,
         `Latest commit: ${resultCommitSha ?? "n/a"}`,
         `Finalization: ${
           finalization.attempted
@@ -1409,12 +1494,20 @@ async function runHypothesisOnce({
         }`,
         finalization.workerBranchPushStatus === "failed"
           ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-          : "",
+          : `Worker branch push: ${finalization.workerBranchPushStatus}`,
+        finalization.error ? `Finalization note: ${finalization.error}` : "",
+        `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
         `Worker log: ${launchManifest?.logPath ?? "n/a"}`,
-        workerOutputSummary ? `\nWorker output:\n${workerOutputSummary}` : "",
       ]
         .filter(Boolean)
         .join("\n"),
+      isCurrent: false,
+      metadata: {
+        authoredBy: "worker-harness",
+        outcome: "completed",
+        resultCommitSha: resultCommitSha ?? null,
+        finalization,
+      },
     })
     await cleanupWorkerTempDir()
     return {
@@ -1463,11 +1556,25 @@ async function runHypothesisOnce({
       hypothesisId: hypothesis.id,
       authoredByWorkerId: workerId,
       summaryKind: "hypothesis_summary",
-      title: `${hypothesis.name} failed`,
-      body: launchManifest
-        ? `${message}\n\nWorker log: ${launchManifest.logPath}`
-        : message,
-    }).catch(() => {})
+      title: `${hypothesis.name} worker finalization failed`,
+      body: [
+        `Outcome: failed`,
+        `Error: ${message}`,
+        resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
+        launchManifest?.manifestPath
+          ? `Worker manifest: ${launchManifest.manifestPath}`
+          : "",
+        launchManifest?.logPath ? `Worker log: ${launchManifest.logPath}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      isCurrent: false,
+      metadata: {
+        authoredBy: "worker-harness",
+        outcome: "failed",
+        resultCommitSha: resultCommitSha ?? null,
+      },
+    })
     await cleanupWorkerTempDir()
     return {
       hypothesis,
@@ -1613,7 +1720,11 @@ export async function commandResearchHypothesisAdd(args: Args) {
     )
   }
 
-  const plan = await hypothesisPlanOption(args)
+  const setupForPlan = await readSetupFile(root, projectPath).catch(() => null)
+  const plan = await hypothesisPlanOption(args, {
+    setup: setupForPlan,
+    projectPath,
+  })
   const before = sessionId
     ? await getLocalSessionState(root, sessionId).catch(() =>
         getResearchSessionState(sessionId, args)
@@ -1724,11 +1835,16 @@ export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
   const campaignInfo = await campaignForName(root, args)
   const { campaign } = campaignInfo
+  const projectPath = await resolveProjectPath(root, args)
   if (args.options.reconcile === "true") {
-    await reconcileCampaign(campaign.id, args).catch(() => {})
+    await reconcileCampaignIntoLocalState({
+      root,
+      campaignId: campaign.id,
+      projectPath,
+      args,
+    }).catch(() => {})
   }
   const state = await readState(root)
-  const projectPath = await resolveProjectPath(root, args)
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   const scopeAll = args.options["all-sessions"] === "true"
@@ -1776,7 +1892,11 @@ export async function commandResearchStatus(args: Args) {
   const pendingSync = await pendingResearchSyncCount(root).catch(() => 0)
   const conflicts = await researchSyncConflictCount(root).catch(() => 0)
   const launchSuggestions =
-    activeSessionId && openSlots && openSlots > 0 && !stopping
+    activeSessionId &&
+    sessionStatus === "running" &&
+    openSlots &&
+    openSlots > 0 &&
+    !stopping
       ? hypotheses
           .filter((hypothesis) => hypothesis.status === "active")
           .slice(0, openSlots)
@@ -1896,24 +2016,14 @@ export async function commandResearchHypotheses(args: Args) {
   const setup = root
     ? await readSetupFile(root, projectPath).catch(() => null)
     : null
-  const metricName = setup?.metric.name ?? "target_metric"
-  const direction =
-    setup?.metric.direction === "maximize"
-      ? "increase"
-      : setup?.metric.direction === "minimize"
-        ? "decrease"
-        : "improve"
-  const scope = setup?.scope.editable.length
-    ? setup.scope.editable
-    : [setup?.projectPath || projectPath || "."]
-  const protectedPaths = setup?.scope.protected.length
-    ? setup.scope.protected
-    : [
-        "onyx/setup.json",
-        "onyx/validation.json",
-        "onyx/onyx.md",
-        "onyx/tools/",
-      ]
+  const {
+    metricName,
+    direction,
+    scope,
+    protectedPaths,
+    successSignals,
+    giveUpSignals,
+  } = setupAwareHypothesisDefaults({ setup, projectPath })
   const constraints = [
     "Preserve the declared workflow, tools, and protected setup files.",
   ]
@@ -1927,10 +2037,7 @@ export async function commandResearchHypotheses(args: Args) {
         "Inspect recent experiments and shared knowledge before editing.",
       ],
       avoidList: protectedPaths,
-      successSignals: [
-        `METRIC ${metricName} moves in the desired direction.`,
-        "Required setup validation and runtime checks remain passing.",
-      ],
+      successSignals,
       giveUpSignals: constraints,
     },
     {
@@ -1946,10 +2053,7 @@ export async function commandResearchHypotheses(args: Args) {
         `The eval prints an improved METRIC ${metricName} value.`,
         "The final diff is small enough for a human to review quickly.",
       ],
-      giveUpSignals: [
-        "The hypothesis requires edits outside the declared scope.",
-        "Repeated measured attempts fail to move the primary metric.",
-      ],
+      giveUpSignals,
     },
   ].map((plan) => researchHypothesisPlanSchema.parse(plan))
 
@@ -1977,6 +2081,33 @@ function activeSessionIdFromState({
   return undefined
 }
 
+async function reconcileCampaignIntoLocalState({
+  root,
+  campaignId,
+  projectPath,
+  args,
+}: {
+  root: string
+  campaignId: string
+  projectPath: string
+  args: Args
+}) {
+  const response = await reconcileCampaign(campaignId, args)
+  const state = await readState(root).catch(() => null)
+  const key = campaignStateKey(projectPath, response.campaign.name)
+  await cacheLocalCampaign({
+    root,
+    campaign: response.campaign,
+    projectPath,
+    setup: state?.campaigns?.[key]?.setup ?? {},
+  }).catch(() => {})
+  await applyRemoteExperimentGitStatuses({
+    root,
+    experiments: response.experiments,
+  }).catch(() => {})
+  return response
+}
+
 export async function commandResearchShouldStop(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
@@ -1991,7 +2122,6 @@ export async function commandResearchShouldStop(args: Args) {
     })
   if (!sessionId) {
     console.log("continue: no active session")
-    process.exitCode = 1
     return
   }
 
@@ -2055,7 +2185,6 @@ export async function commandResearchShouldStop(args: Args) {
         : `continue: session ${sessionId}`
     )
   }
-  process.exitCode = shouldStop ? 0 : 1
 }
 
 export async function commandResearchStop(args: Args) {
@@ -2094,9 +2223,15 @@ export async function commandResearchStop(args: Args) {
       status: "stop_requested",
       reason: args.options.reason ?? "stop requested",
     }).catch(() => {})
+    await refreshSessionStateFiles({ root, sessionId, args }).catch(() => {})
     if (args.options.offline !== "true") {
       await flushOutbox(root, args, { quiet: true }).catch(() => {})
-      await reconcileCampaign(campaignId, args).catch(() => {})
+      await reconcileCampaignIntoLocalState({
+        root,
+        campaignId,
+        projectPath,
+        args,
+      }).catch(() => {})
       await stopCampaignSession(
         sessionId,
         {
@@ -2132,7 +2267,12 @@ export async function commandResearchFinish(args: Args) {
   const campaignInfo = await campaignForName(root, args)
   const { campaign } = campaignInfo
   if (args.options.offline !== "true") {
-    await reconcileCampaign(campaign.id, args).catch(() => {})
+    await reconcileCampaignIntoLocalState({
+      root,
+      campaignId: campaign.id,
+      projectPath: campaignInfo.projectPath,
+      args,
+    }).catch(() => {})
     await flushOutbox(root, args, { quiet: true }).catch((error) => {
       if (args.options["require-online"] === "true") throw error
     })
@@ -2183,6 +2323,10 @@ export async function commandResearchFinish(args: Args) {
     title: `${campaign.name} final results`,
     body,
   }).catch(() => {})
+  await completeLocalCampaign({
+    root,
+    campaignId: campaign.id,
+  }).catch(() => {})
   if (sessionId) {
     state.sessions = state.sessions ?? {}
     state.sessions[sessionId] = {
@@ -2199,6 +2343,25 @@ export async function commandResearchFinish(args: Args) {
       status: "completed",
       reason: "finalized",
     }).catch(() => {})
+    const sessionState = await getLocalSessionState(root, sessionId).catch(
+      () => null
+    )
+    for (const worker of sessionState?.workers ?? []) {
+      if (["idle", "running", "stale", "lost"].includes(worker.status)) {
+        await recordLocalWorkerHeartbeat({
+          root,
+          workerId: worker.id,
+          status: "stopped",
+          sessionId,
+          hypothesisId: worker.hypothesisId,
+          phase: "stopped",
+          event: "campaign_finalized",
+          progressMessage: "Campaign finalized",
+          gitLabel: worker.gitLabel ?? null,
+        }).catch(() => {})
+      }
+    }
+    await refreshSessionStateFiles({ root, sessionId, args }).catch(() => {})
     await stopCampaignSession(
       sessionId,
       {
@@ -2208,6 +2371,17 @@ export async function commandResearchFinish(args: Args) {
       },
       args
     ).catch(() => {})
+  }
+  if (args.options.offline !== "true") {
+    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+      if (args.options["require-online"] === "true") throw error
+    })
+    await reconcileCampaignIntoLocalState({
+      root,
+      campaignId: campaign.id,
+      projectPath: campaignInfo.projectPath,
+      args,
+    }).catch(() => {})
   }
   console.log(body)
 }
