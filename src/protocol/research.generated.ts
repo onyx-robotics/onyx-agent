@@ -270,7 +270,9 @@ export const researchSetupValidationCheckSchema = z
 export const researchSetupValidationFileSchema = z
   .object({
     schemaVersion: z.literal(1).default(1),
-    status: z.enum(["passed", "warning", "failed", "blocked"]).default("passed"),
+    status: z
+      .enum(["passed", "warning", "failed", "blocked"])
+      .default("passed"),
     setupHash: z
       .string()
       .trim()
