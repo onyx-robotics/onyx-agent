@@ -28,13 +28,11 @@ import {
 } from "./commands/research"
 import {
   commandSetupInit,
-  commandSetupModules,
-  commandSetupOptional,
-  commandSetupRequire,
   commandSetupValidate,
 } from "./commands/setup"
 import { commandPush, commandStatus, commandSync } from "./commands/sync"
 import { commandToolsRun } from "./commands/tools"
+import { commandWorkflowStatus } from "./commands/workflow"
 
 export const USAGE = `onyx - research workflow CLI
 
@@ -58,10 +56,7 @@ Usage:
       as an immutable refs/onyx/experiments/* ref; setup comes from onyx/setup.json)
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
   onyx setup init [--project-path <path>] [--goal <text>] [--metric-name <name>] [--metric-unit <unit>] [--metric-direction maximize|minimize]
-  onyx setup validate [--project-path <path>] [--modules <ids>] [--required]
-  onyx setup modules [--project-path <path>]
-  onyx setup require <module> [--project-path <path>] [--reason <text>]
-  onyx setup optional <module> [--project-path <path>]
+  onyx setup validate [--project-path <path>]
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
@@ -78,7 +73,8 @@ Usage:
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
-  onyx exp run [--campaign <name>] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>] [--no-log]
+  onyx exp run (--campaign <name> [--base <sha>] | --resume <workflowRunId>) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
+  onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--project-path <path>] [--json]
   onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
@@ -141,12 +137,14 @@ export async function main(argv = process.argv.slice(2)) {
     if (command === "setup" && sub === "init") return commandSetupInit(args)
     if (command === "setup" && sub === "validate")
       return commandSetupValidate(args)
-    if (command === "setup" && sub === "modules")
-      return commandSetupModules(args)
-    if (command === "setup" && sub === "require")
-      return commandSetupRequire(args)
-    if (command === "setup" && sub === "optional")
-      return commandSetupOptional(args)
+    if (
+      command === "setup" &&
+      (sub === "modules" || sub === "require" || sub === "optional")
+    ) {
+      throw new Error(
+        "Setup modules were removed. Use `onyx setup validate`."
+      )
+    }
     if (command === "campaign" && sub === "use") return commandCampaignUse(args)
     if (command === "campaign" && sub === "status")
       return commandCampaignStatus(args)
@@ -186,6 +184,8 @@ export async function main(argv = process.argv.slice(2)) {
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "exp" && sub === "log") return commandExpLog(args)
     if (command === "exp" && sub === "list") return commandExpList(args)
+    if (command === "workflow" && sub === "status")
+      return commandWorkflowStatus(args)
     if (command === "listen") return commandListen()
     if (command === "status") return commandStatus(args)
     if (command === "push") return commandPush(args)

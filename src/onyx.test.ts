@@ -20,10 +20,8 @@ import {
   commandSummaryList,
   commandSummaryUpsert,
   commandSetupInit,
-  commandSetupModules,
-  commandSetupRequire,
   commandSetupValidate,
-  lastRunPath,
+  commandWorkflowStatus,
   localResearchRecordSchema,
   mergeHistory,
   main,
@@ -36,16 +34,13 @@ import {
   readOutbox,
   readState,
   readSetupFile,
-  readLastRun,
   readValidationFile,
   renderExperimentTable,
   runToolCommand,
-  requiredSetupModules,
-  setupModuleRequirement,
+  setupHash,
   summarizeWorkerOutput,
   updateState,
   USAGE,
-  writeLastRun,
   writeSetupFile,
   writeState,
   writeValidationFile,
@@ -78,51 +73,57 @@ async function writeResearchSmokeRepo() {
   const root = await mkdtemp(join(tmpdir(), "onyx-research-smoke-"))
   await runProcess("git", ["init"], { cwd: root })
   await writeFile(join(root, "README.md"), "test\n", "utf8")
-  await mkdir(join(root, "onyx"), { recursive: true })
+  await mkdir(join(root, "onyx", "tools", "evaluation"), { recursive: true })
   await writeFile(
     join(root, "onyx", "onyx.md"),
     "Use the configured eval command and keep changes small.\n",
     "utf8"
   )
   await writeFile(
-    join(root, "onyx", "eval.sh"),
+    join(root, "onyx", "tools", "evaluation", "run.sh"),
     "#!/usr/bin/env sh\nprintf 'METRIC score=1.25\\n'\n",
     "utf8"
   )
-  await writeSetupFile(
-    root,
-    "",
-    normalizeSetupFile({
-      schemaVersion: 1,
-      goal: "Improve score.",
-      metric: { name: "score", unit: null, direction: "maximize" },
-      projectPath: "",
-      editableScope: ["src"],
-      protectedPaths: [
+  const setup = normalizeSetupFile({
+    schemaVersion: 1,
+    goal: "Improve score.",
+    projectPath: "",
+    scope: {
+      editable: ["src"],
+      protected: [
         "onyx/setup.json",
         "onyx/validation.json",
         "onyx/onyx.md",
-        "onyx/eval.sh",
-        "onyx/checks.sh",
-        "onyx/tools/*",
+        "onyx/tools/",
       ],
-      commands: {
-        evaluate: {
-          command: "printf 'METRIC score=1.25\\n'",
-          args: [],
-          shell: true,
-          cwd: "project",
-          env: {},
-          resources: [],
-          timeoutSeconds: 5,
-          leaseTimeoutSeconds: 5,
-          outputLimitBytes: 4000,
-        },
+    },
+    metric: { name: "score", unit: null, direction: "maximize" },
+    resources: {},
+    tools: {
+      "evaluation.run": {
+        command: "printf 'METRIC score=1.25\\n'",
+        args: [],
+        shell: true,
+        cwd: "project",
+        env: {},
+        resources: [],
+        timeoutSeconds: 5,
+        leaseTimeoutSeconds: 5,
+        outputLimitBytes: 4000,
       },
-      resources: {},
-      constraints: ["Stay inside editable scope."],
-      modules: {},
-    })
+    },
+    workflow: [
+      {
+        id: "edit",
+        agent: "Make one scoped code change, commit it, then resume.",
+      },
+      { id: "evaluate", run: "evaluation.run", metric: true },
+    ],
+  })
+  await writeSetupFile(
+    root,
+    "",
+    setup
   )
   const now = new Date().toISOString()
   await writeValidationFile(
@@ -131,20 +132,23 @@ async function writeResearchSmokeRepo() {
     normalizeValidationFile({
       schemaVersion: 1,
       status: "passed",
+      setupHash: setupHash(setup),
       generatedAt: now,
       summary: null,
-      modules: ["setup_spec", "project_scope", "agent", "evaluation"].map(
-        (moduleId) => ({
-          moduleId,
+      checks: [
+        {
+          id: "setup_schema",
           status: "passed",
-          required: true,
-          summary: null,
-          outputSummary: null,
-          durationMs: 1,
-          validatedAt: now,
+          message: "setup ok",
           evidence: {},
-        })
-      ),
+        },
+        {
+          id: "metric_capture",
+          status: "passed",
+          message: "metric ok",
+          evidence: {},
+        },
+      ],
     })
   )
   await commitAll(root, "init")
@@ -229,7 +233,8 @@ describe("campaign CLI surface", () => {
     expect(USAGE).toContain("onyx campaign setup")
     expect(USAGE).toContain("onyx setup init")
     expect(USAGE).toContain("onyx setup validate")
-    expect(USAGE).toContain("onyx setup require")
+    expect(USAGE).not.toContain("onyx setup require")
+    expect(USAGE).toContain("onyx workflow status")
     expect(USAGE).toContain("onyx research start --campaign")
     expect(USAGE).toContain("onyx research hypotheses --example")
     expect(USAGE).toContain(
@@ -512,85 +517,57 @@ describe("metrics", () => {
 })
 
 describe("exp run", () => {
-  test("--no-log leaves no last-run.json when none existed", async () => {
+  test("--no-log points diagnostics to tools run", async () => {
     const { root } = await writeResearchSmokeRepo()
     const previousCwd = process.cwd()
-    const previousExitCode = process.exitCode
-    const logs: string[] = []
-    const originalLog = console.log
-    console.log = (...items: unknown[]) => {
-      logs.push(items.join(" "))
-    }
     try {
       process.chdir(root)
-      process.exitCode = undefined
-      await commandExpRun({
-        positional: ["exp", "run"],
-        options: { "no-log": "true", timeout: "5" },
-      })
-      await expect(readFile(await lastRunPath(root), "utf8")).rejects.toThrow()
-      expect(await readLastRun(root)).toBeNull()
+      await expect(
+        commandExpRun({
+          positional: ["exp", "run"],
+          options: { "no-log": "true", timeout: "5" },
+        })
+      ).rejects.toThrow("onyx tools run <tool-id>")
     } finally {
       process.chdir(previousCwd)
-      process.exitCode = previousExitCode
-      console.log = originalLog
     }
-
-    expect(JSON.parse(logs.join("\n")).metrics.score).toBe(1.25)
   })
 
-  test("--no-log does not alter an existing last-run.json", async () => {
-    const { root, baseCommitSha, campaignId, campaignName } =
-      await writeResearchSmokeRepo()
+  test("pauses, resumes, and writes a terminal local attempt", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
     const previousCwd = process.cwd()
     const previousExitCode = process.exitCode
     const originalLog = console.log
     console.log = () => {}
-    const existing = {
-      schemaVersion: 1 as const,
-      createdAt: "2026-06-20T00:00:00.000Z",
-      runRef: "local/smoke/existing",
-      campaignName,
-      projectPath: "",
-      baseCommitSha,
-      resultCommitSha: baseCommitSha,
-      resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/existing`,
-      status: "succeeded" as const,
-      setupCompliance: {
-        status: "passed" as const,
-        protectedPathsChanged: [],
-        outOfScopePathsChanged: [],
-        setupPathsChanged: [],
-        notes: null,
-      },
-      primaryMetricName: "score",
-      primaryMetricValue: 0.5,
-      metrics: { score: 0.5 },
-      agentNotes: {},
-      checks: null,
-      durationMs: 1,
-      startedAt: "2026-06-20T00:00:00.000Z",
-      completedAt: "2026-06-20T00:00:01.000Z",
-      outputSummary: "existing",
-    }
-    await writeLastRun(root, existing)
-    const before = await readFile(await lastRunPath(root), "utf8")
-
     try {
       process.chdir(root)
       process.exitCode = undefined
-      await commandExpRun({
+      const paused = await commandExpRun({
         positional: ["exp", "run"],
-        options: { "no-log": "true", timeout: "5" },
+        options: { campaign: "smoke", base: baseCommitSha, timeout: "5" },
       })
+      expect(paused?.status).toBe("paused")
+      if (!paused || !("id" in paused)) throw new Error("expected paused run")
+      await commandWorkflowStatus({
+        positional: ["workflow", "status"],
+        options: { run: paused!.id, json: "true" },
+      })
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate")
+      const completed = await commandExpRun({
+        positional: ["exp", "run"],
+        options: { resume: paused!.id, timeout: "5" },
+      })
+      expect(completed?.status).toBe("succeeded")
+      const attempts = await listLocalAttempts(root)
+      expect(attempts[0]?.runRef).toBe(paused?.runRef)
+      expect(attempts[0]?.primaryMetricValue).toBe(1.25)
     } finally {
       process.chdir(previousCwd)
       process.exitCode = previousExitCode
       console.log = originalLog
     }
-
-    expect(await readFile(await lastRunPath(root), "utf8")).toBe(before)
-    expect((await readLastRun(root))?.runRef).toBe("local/smoke/existing")
   })
 })
 
@@ -1593,7 +1570,7 @@ describe("research hypothesis add", () => {
   })
 })
 
-describe("setup modules", () => {
+describe("setup workflow", () => {
   test("normalizes dot project path to repo root", () => {
     expect(normalizeProjectPath(".")).toBe("")
     expect(normalizeProjectPath("./")).toBe("")
@@ -1603,43 +1580,50 @@ describe("setup modules", () => {
     )
   })
 
-  test("fundamental modules remain required and conditional modules default optional", () => {
+  test("validates the new workflow setup contract", () => {
     const setup = normalizeSetupFile({
       schemaVersion: 1,
       goal: "Improve the target metric.",
-      metric: { name: "score", unit: null, direction: "maximize" },
       projectPath: "",
-      editableScope: ["src"],
-      protectedPaths: ["onyx/setup.json", "onyx/validation.json"],
-      commands: {
-        evaluate: {
-          command: "bash",
-          args: ["onyx/eval.sh"],
+      scope: {
+        editable: ["src"],
+        protected: ["onyx/setup.json", "onyx/validation.json"],
+      },
+      metric: { name: "score", unit: null, direction: "maximize" },
+      resources: {
+        rig: { slots: 1, description: "test rig" },
+      },
+      tools: {
+        "evaluation.run": {
+          command: "printf 'METRIC score=1\\n'",
+          args: [],
           shell: false,
           cwd: "project",
           env: {},
-          resources: [],
+          resources: ["rig"],
           timeoutSeconds: 600,
           leaseTimeoutSeconds: 120,
           outputLimitBytes: 4000,
         },
       },
-      modules: {
-        setup_spec: { required: false, reason: "attempted override" },
-        hardware: { required: true, reason: "physical rig required" },
-      },
+      workflow: [
+        { id: "edit", agent: "Make one scoped code change." },
+        { id: "evaluate", run: "evaluation.run", metric: true },
+      ],
     })
 
-    expect(setupModuleRequirement(setup, "setup_spec").required).toBe(true)
-    expect(setupModuleRequirement(setup, "reliability").required).toBe(false)
-    expect(setupModuleRequirement(setup, "resources").required).toBe(true)
-    expect(requiredSetupModules(setup)).toContain("setup_spec")
-    expect(requiredSetupModules(setup)).toContain("resources")
-    expect(requiredSetupModules(setup)).toContain("evaluation")
-    expect(requiredSetupModules(setup)).toContain("agent")
+    expect(setup.workflow[0]?.agent).toBeTruthy()
+    expect(setup.workflow[1]?.metric).toBe(true)
+    expect(setup.tools["evaluation.run"]?.resources).toContain("rig")
+    expect(() =>
+      normalizeSetupFile({
+        ...setup,
+        workflow: [{ id: "evaluate", run: "evaluation.run", metric: true }],
+      })
+    ).toThrow("leading agent")
   })
 
-  test("setup commands write and print canonical module ids", async () => {
+  test("setup init writes workflow files and removed module commands fail", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-setup-"))
     const previousCwd = process.cwd()
     await runProcess("git", ["init"], { cwd: root })
@@ -1649,49 +1633,19 @@ describe("setup modules", () => {
         positional: ["setup", "init"],
         options: { goal: "Improve score", "metric-name": "score" },
       })
-      const evalSh = await readFile(join(root, "onyx", "eval.sh"), "utf8")
-      expect(evalSh).toContain("TODO: replace onyx/eval.sh")
-      expect(evalSh).toContain("METRIC score=<number>")
-      expect(evalSh).toContain("exit 1")
-      await commandSetupRequire({
-        positional: ["setup", "require", "checks"],
-        options: {},
-      })
-      await commandSetupRequire({
-        positional: ["setup", "require", "agent_handoff"],
-        options: {},
-      })
-
-      const setup = await readSetupFile(root, "")
-      expect(Object.keys(setup.modules).sort()).toEqual([
-        "agent",
-        "evaluation",
-        "project_scope",
-        "reliability",
-        "setup_spec",
-      ])
-      expect(setup.modules.reliability?.required).toBe(true)
-
-      const lines: string[] = []
-      const originalLog = console.log
-      console.log = (...items: unknown[]) => {
-        lines.push(items.join(" "))
-      }
-      try {
-        await commandSetupModules({
-          positional: ["setup", "modules"],
-          options: {},
-        })
-      } finally {
-        console.log = originalLog
-      }
-      expect(lines).toContain("agent: required; latest=not_run")
-      expect(lines).toContain("evaluation: required; latest=not_run")
-      expect(lines).toContain("reliability: required; latest=not_run")
-      expect(lines.some((line) => line.startsWith("checks:"))).toBe(false)
-      expect(lines.some((line) => line.startsWith("agent_handoff:"))).toBe(
-        false
+      const evalSh = await readFile(
+        join(root, "onyx", "tools", "evaluation", "run.sh"),
+        "utf8"
       )
+      expect(evalSh).toContain("TODO: replace onyx/tools/evaluation/run.sh")
+      expect(evalSh).toContain("METRIC score=<number>")
+      const setup = await readSetupFile(root, "")
+      expect(setup.tools["evaluation.run"]).toBeTruthy()
+      expect(setup.workflow.map((step) => step.id)).toEqual([
+        "edit",
+        "evaluate",
+      ])
+      expect(USAGE).not.toContain("onyx setup require")
     } finally {
       process.chdir(previousCwd)
     }
@@ -1708,7 +1662,7 @@ describe("setup modules", () => {
         options: { goal: "Improve score", "metric-name": "score" },
       })
       await writeFile(
-        join(root, "onyx", "eval.sh"),
+        join(root, "onyx", "tools", "evaluation", "run.sh"),
         ["#!/usr/bin/env bash", "exit 42", ""].join("\n"),
         "utf8"
       )
@@ -1718,9 +1672,9 @@ describe("setup modules", () => {
       })
 
       const validation = await readValidationFile(root, "")
-      expect(validation?.status).toBe("passed")
+      expect(validation?.status).toBe("warning")
       expect(
-        validation?.modules.find((item) => item.moduleId === "evaluation")
+        validation?.checks.find((item) => item.id === "metric_capture")
           ?.status
       ).toBe("passed")
     } finally {
@@ -1795,29 +1749,48 @@ describe("setup modules", () => {
   })
 })
 
-describe("tool api", () => {
-  test("runs manifest commands from the project root", async () => {
+describe("setup tools", () => {
+  test("runs setup tools from the project root", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-tools-"))
     await runProcess("git", ["init"], { cwd: root })
     await mkdir(join(root, "onyx"), { recursive: true })
-    await writeFile(
-      join(root, "onyx", "tool-api.json"),
-      `${JSON.stringify({
+    await writeSetupFile(
+      root,
+      "",
+      normalizeSetupFile({
         schemaVersion: 1,
-        commands: {
-          evaluate: {
+        goal: "Improve score.",
+        projectPath: "",
+        scope: {
+          editable: [],
+          protected: ["onyx/setup.json", "onyx/validation.json"],
+        },
+        metric: { name: "score", unit: null, direction: "maximize" },
+        resources: {},
+        tools: {
+          "evaluation.run": {
             command: "printf 'METRIC score=2\\n'",
+            args: [],
+            shell: true,
+            cwd: "project",
+            env: {},
+            resources: [],
             timeoutSeconds: 5,
+            leaseTimeoutSeconds: 5,
+            outputLimitBytes: 4000,
           },
         },
-      })}\n`,
-      "utf8"
+        workflow: [
+          { id: "edit", agent: "Make one scoped code change." },
+          { id: "evaluate", run: "evaluation.run", metric: true },
+        ],
+      })
     )
 
     const result = await runToolCommand({
       root,
       projectPath: "",
-      name: "evaluate",
+      name: "evaluation.run",
     })
 
     expect(result.code).toBe(0)

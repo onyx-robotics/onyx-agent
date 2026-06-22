@@ -423,18 +423,14 @@ export async function preflightWorkerInvocation(
 
   if (options.campaignName) {
     await runCheck(
-      "onyx exp run",
+      "onyx evaluation tool",
       "onyx",
       [
-        "exp",
+        "tools",
         "run",
-        "--campaign",
-        options.campaignName,
+        "evaluation.run",
         "--timeout",
         "120",
-        "--checks-timeout",
-        "120",
-        "--no-log",
       ],
       { allowExitCodes: [0, 1] }
     )

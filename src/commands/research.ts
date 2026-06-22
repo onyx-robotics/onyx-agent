@@ -22,8 +22,8 @@ import {
 import {
   readSetupFile,
   readValidationFile,
-  requiredSetupModules,
   setupPath,
+  validationMatchesSetup,
   validationPath,
   type ResearchSetupFile,
 } from "../lib/contract"
@@ -511,14 +511,14 @@ async function campaignForName(root: string, args: Args) {
 
 async function assertLocalSetupReady(root: string, projectPath: string) {
   const setup = await readSetupFile(root, projectPath)
-  const cheapFailures = await recheckCheapRequiredSetupModules({
+  const cheapFailures = await recheckCheapSetupReadiness({
     root,
     projectPath,
     setup,
   })
   if (cheapFailures.length > 0) {
     throw new Error(
-      `Required setup module(s) failed local preflight: ${cheapFailures.join("; ")}. Run \`onyx setup validate --required\`.`
+      `Setup preflight failed: ${cheapFailures.join("; ")}. Run \`onyx setup validate\`.`
     )
   }
 
@@ -528,21 +528,21 @@ async function assertLocalSetupReady(root: string, projectPath: string) {
       "Missing onyx/validation.json. Run `onyx setup validate` before starting research."
     )
   }
-  const byModule = new Map(
-    validation.modules.map((module) => [module.moduleId, module])
-  )
-  const failing = requiredSetupModules(setup).filter(
-    (moduleId) => byModule.get(moduleId)?.status !== "passed"
-  )
+  if (!validationMatchesSetup({ setup, validation })) {
+    throw new Error(
+      "onyx/validation.json is stale for the current setup. Run `onyx setup validate`."
+    )
+  }
+  const failing = validation.checks.filter((check) => check.status === "failed")
   if (failing.length > 0) {
     throw new Error(
-      `Required setup module(s) are not passing: ${failing.join(", ")}. Run \`onyx setup validate --required\`.`
+      `Setup check(s) are failing: ${failing.map((check) => check.id).join(", ")}. Run \`onyx setup validate\`.`
     )
   }
   return { setup, validation }
 }
 
-async function recheckCheapRequiredSetupModules({
+async function recheckCheapSetupReadiness({
   root,
   projectPath,
   setup,
@@ -551,33 +551,26 @@ async function recheckCheapRequiredSetupModules({
   projectPath: string
   setup: ResearchSetupFile
 }) {
-  const required = new Set(requiredSetupModules(setup))
   const failures: string[] = []
 
-  if (required.has("project_scope") && setup.projectPath !== projectPath) {
+  if (setup.projectPath !== projectPath) {
     failures.push(
-      `project_scope expected projectPath "${projectPath}" but setup has "${setup.projectPath}"`
+      `expected projectPath "${projectPath}" but setup has "${setup.projectPath}"`
     )
   }
 
-  if (required.has("evaluation")) {
-    if (setup.metric.name.trim().length === 0) {
-      failures.push("evaluation is missing a metric")
-    }
-    if (setup.commands.evaluate.command.trim().length === 0) {
-      failures.push("evaluation is missing a command")
-    }
+  const metricSteps = setup.workflow.filter((step) => step.metric)
+  if (metricSteps.length !== 1) {
+    failures.push("workflow must have exactly one metric step")
   }
 
-  if (required.has("agent")) {
-    const instructionsPath = onyxPath(root, projectPath, "onyx.md")
-    if (!(await pathExists(instructionsPath))) {
-      failures.push("agent is missing onyx/onyx.md")
-    } else {
-      const instructions = await readFile(instructionsPath, "utf8")
-      if (instructions.trim().length < 20) {
-        failures.push("agent has too little guidance in onyx/onyx.md")
-      }
+  const instructionsPath = onyxPath(root, projectPath, "onyx.md")
+  if (!(await pathExists(instructionsPath))) {
+    failures.push("missing onyx/onyx.md")
+  } else {
+    const instructions = await readFile(instructionsPath, "utf8")
+    if (instructions.trim().length < 40) {
+      failures.push("onyx/onyx.md has too little guidance")
     }
   }
 
@@ -1910,22 +1903,20 @@ export async function commandResearchHypotheses(args: Args) {
       : setup?.metric.direction === "minimize"
         ? "decrease"
         : "improve"
-  const scope = setup?.editableScope.length
-    ? setup.editableScope
+  const scope = setup?.scope.editable.length
+    ? setup.scope.editable
     : [setup?.projectPath || projectPath || "."]
-  const protectedPaths = setup?.protectedPaths.length
-    ? setup.protectedPaths
+  const protectedPaths = setup?.scope.protected.length
+    ? setup.scope.protected
     : [
         "onyx/setup.json",
         "onyx/validation.json",
         "onyx/onyx.md",
-        "onyx/eval.sh",
-        "onyx/checks.sh",
-        "onyx/tools/*",
+        "onyx/tools/",
       ]
-  const constraints = setup?.constraints.length
-    ? setup.constraints
-    : ["Preserve the declared eval path and protected setup files."]
+  const constraints = [
+    "Preserve the declared workflow, tools, and protected setup files.",
+  ]
   const example = [
     {
       focus: `Independent search to ${direction} ${metricName}`,

@@ -69,6 +69,64 @@ export type LocalCampaign = ApiCampaign & {
   updatedAt: string
 }
 
+export type LocalWorkflowRunStatus =
+  | "running"
+  | "paused"
+  | "blocked"
+  | "failed"
+  | "checks_failed"
+  | "setup_violation"
+  | "succeeded"
+
+export type LocalWorkflowStepStatus =
+  | "pending"
+  | "paused"
+  | "running"
+  | "passed"
+  | "failed"
+  | "skipped"
+
+export type LocalWorkflowRun = {
+  id: string
+  campaignId: string | null
+  campaignName: string
+  projectPath: string
+  runRef: string
+  baseCommitSha: string
+  resultCommitSha: string | null
+  resultRef: string
+  setupHash: string
+  status: LocalWorkflowRunStatus
+  currentStepIndex: number
+  metrics: Record<string, number>
+  blockReason: string | null
+  createdAt: string
+  startedAt: string
+  completedAt: string | null
+  updatedAt: string
+  sessionId?: string
+  workerId?: string
+  hypothesisId?: string
+}
+
+export type LocalWorkflowStep = {
+  runId: string
+  stepId: string
+  stepIndex: number
+  kind: "agent" | "run"
+  toolId: string | null
+  status: LocalWorkflowStepStatus
+  attempt: number
+  exitCode: number | null
+  timedOut: boolean
+  outputSummary: string | null
+  metrics: Record<string, number>
+  logPath: string | null
+  startedAt: string | null
+  completedAt: string | null
+  updatedAt: string
+}
+
 type Row = Record<string, unknown>
 
 type LocalSummaryKind = ApiSummary["summaryKind"]
@@ -84,7 +142,7 @@ type LocalTombstoneInput = {
 }
 
 const dbCache = new Map<string, Database>()
-const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 1
+const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 2
 
 function nowIso() {
   return new Date().toISOString()
@@ -214,7 +272,8 @@ function applyMigrations(db: Db) {
   }
   if (currentVersion >= CURRENT_RESEARCH_DB_SCHEMA_VERSION) return
 
-  db.transaction(() => {
+  if (currentVersion < 1) {
+    db.transaction(() => {
     db.run(`
     CREATE TABLE IF NOT EXISTS local_settings (
       key TEXT PRIMARY KEY,
@@ -500,11 +559,74 @@ function applyMigrations(db: Db) {
     db.run(
       "CREATE INDEX IF NOT EXISTS local_attempts_context_idx ON local_attempts(campaign_name, project_path, session_id, worker_id, hypothesis_id, updated_at DESC)"
     )
-    db.query(
-      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
-    ).run(CURRENT_RESEARCH_DB_SCHEMA_VERSION, nowIso())
-    db.run(`PRAGMA user_version = ${CURRENT_RESEARCH_DB_SCHEMA_VERSION}`)
-  })()
+      db.query(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
+      ).run(1, nowIso())
+      db.run("PRAGMA user_version = 1")
+    })()
+  }
+
+  if (currentVersion < 2) {
+    db.transaction(() => {
+      db.run(`
+      CREATE TABLE IF NOT EXISTS workflow_runs (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT,
+        campaign_name TEXT NOT NULL,
+        project_path TEXT NOT NULL DEFAULT '',
+        run_ref TEXT NOT NULL,
+        base_commit_sha TEXT NOT NULL,
+        result_commit_sha TEXT,
+        result_ref TEXT NOT NULL,
+        setup_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_step_index INTEGER NOT NULL DEFAULT 0,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        block_reason TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
+        session_id TEXT,
+        worker_id TEXT,
+        hypothesis_id TEXT,
+        UNIQUE(run_ref)
+      )
+    `)
+
+      db.run(`
+      CREATE TABLE IF NOT EXISTS workflow_steps (
+        run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+        step_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        tool_id TEXT,
+        status TEXT NOT NULL,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        exit_code INTEGER,
+        timed_out INTEGER NOT NULL DEFAULT 0,
+        output_summary TEXT,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        log_path TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, step_id)
+      )
+    `)
+
+      db.run(
+        "CREATE INDEX IF NOT EXISTS workflow_runs_active_idx ON workflow_runs(campaign_name, project_path, status, updated_at DESC)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS workflow_steps_run_idx ON workflow_steps(run_id, step_index)"
+      )
+      db.query(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
+      ).run(2, nowIso())
+      db.run("PRAGMA user_version = 2")
+    })()
+  }
 }
 
 function setting(db: Db, key: string) {
@@ -2023,6 +2145,201 @@ export async function clearLocalAttempt(
   if (attempt) {
     db.query("DELETE FROM local_attempts WHERE run_ref = ?").run(attempt.runRef)
   }
+}
+
+function workflowRunFromRow(row: Row): LocalWorkflowRun {
+  return {
+    id: row.id as string,
+    campaignId: nullableString(row.campaign_id),
+    campaignName: row.campaign_name as string,
+    projectPath: row.project_path as string,
+    runRef: row.run_ref as string,
+    baseCommitSha: row.base_commit_sha as string,
+    resultCommitSha: nullableString(row.result_commit_sha),
+    resultRef: row.result_ref as string,
+    setupHash: row.setup_hash as string,
+    status: row.status as LocalWorkflowRunStatus,
+    currentStepIndex: Number(row.current_step_index ?? 0),
+    metrics: numericRecord(parseJson(row.metrics_json, {})),
+    blockReason: nullableString(row.block_reason),
+    createdAt: row.created_at as string,
+    startedAt: row.started_at as string,
+    completedAt: nullableString(row.completed_at),
+    updatedAt: row.updated_at as string,
+    sessionId: nullableString(row.session_id) ?? undefined,
+    workerId: nullableString(row.worker_id) ?? undefined,
+    hypothesisId: nullableString(row.hypothesis_id) ?? undefined,
+  }
+}
+
+function workflowStepFromRow(row: Row): LocalWorkflowStep {
+  return {
+    runId: row.run_id as string,
+    stepId: row.step_id as string,
+    stepIndex: Number(row.step_index ?? 0),
+    kind: row.kind as "agent" | "run",
+    toolId: nullableString(row.tool_id),
+    status: row.status as LocalWorkflowStepStatus,
+    attempt: Number(row.attempt ?? 0),
+    exitCode:
+      typeof row.exit_code === "number" ? Number(row.exit_code) : null,
+    timedOut: bool(row.timed_out),
+    outputSummary: nullableString(row.output_summary),
+    metrics: numericRecord(parseJson(row.metrics_json, {})),
+    logPath: nullableString(row.log_path),
+    startedAt: nullableString(row.started_at),
+    completedAt: nullableString(row.completed_at),
+    updatedAt: row.updated_at as string,
+  }
+}
+
+export async function upsertWorkflowRun({
+  root,
+  run,
+}: {
+  root: string
+  run: LocalWorkflowRun
+}) {
+  const db = await openDb(root)
+  const at = nowIso()
+  db.query(
+    `
+      INSERT INTO workflow_runs (
+        id, campaign_id, campaign_name, project_path, run_ref, base_commit_sha,
+        result_commit_sha, result_ref, setup_hash, status, current_step_index,
+        metrics_json, block_reason, created_at, started_at, completed_at,
+        updated_at, session_id, worker_id, hypothesis_id
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        campaign_name = excluded.campaign_name,
+        project_path = excluded.project_path,
+        run_ref = excluded.run_ref,
+        base_commit_sha = excluded.base_commit_sha,
+        result_commit_sha = excluded.result_commit_sha,
+        result_ref = excluded.result_ref,
+        setup_hash = excluded.setup_hash,
+        status = excluded.status,
+        current_step_index = excluded.current_step_index,
+        metrics_json = excluded.metrics_json,
+        block_reason = excluded.block_reason,
+        completed_at = excluded.completed_at,
+        updated_at = excluded.updated_at,
+        session_id = excluded.session_id,
+        worker_id = excluded.worker_id,
+        hypothesis_id = excluded.hypothesis_id
+    `
+  ).run(
+    run.id,
+    run.campaignId,
+    run.campaignName,
+    run.projectPath,
+    run.runRef,
+    run.baseCommitSha,
+    run.resultCommitSha,
+    run.resultRef,
+    run.setupHash,
+    run.status,
+    run.currentStepIndex,
+    json(run.metrics),
+    run.blockReason,
+    run.createdAt,
+    run.startedAt,
+    run.completedAt,
+    at,
+    run.sessionId ?? null,
+    run.workerId ?? null,
+    run.hypothesisId ?? null
+  )
+}
+
+export async function readWorkflowRun(root: string, id: string) {
+  const row = (await openDb(root))
+    .query("SELECT * FROM workflow_runs WHERE id = ?")
+    .get(id) as Row | null
+  return row ? workflowRunFromRow(row) : null
+}
+
+export async function readLatestActiveWorkflowRun({
+  root,
+  campaignName,
+  projectPath,
+}: {
+  root: string
+  campaignName: string
+  projectPath: string
+}) {
+  const row = (await openDb(root))
+    .query(
+      `
+        SELECT * FROM workflow_runs
+        WHERE campaign_name = ? AND project_path = ?
+          AND status IN ('running', 'paused', 'blocked')
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `
+    )
+    .get(campaignName, projectPath) as Row | null
+  return row ? workflowRunFromRow(row) : null
+}
+
+export async function upsertWorkflowStep({
+  root,
+  step,
+}: {
+  root: string
+  step: LocalWorkflowStep
+}) {
+  const db = await openDb(root)
+  const at = nowIso()
+  db.query(
+    `
+      INSERT INTO workflow_steps (
+        run_id, step_id, step_index, kind, tool_id, status, attempt, exit_code,
+        timed_out, output_summary, metrics_json, log_path, started_at,
+        completed_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id, step_id) DO UPDATE SET
+        step_index = excluded.step_index,
+        kind = excluded.kind,
+        tool_id = excluded.tool_id,
+        status = excluded.status,
+        attempt = excluded.attempt,
+        exit_code = excluded.exit_code,
+        timed_out = excluded.timed_out,
+        output_summary = excluded.output_summary,
+        metrics_json = excluded.metrics_json,
+        log_path = excluded.log_path,
+        started_at = excluded.started_at,
+        completed_at = excluded.completed_at,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    step.runId,
+    step.stepId,
+    step.stepIndex,
+    step.kind,
+    step.toolId,
+    step.status,
+    step.attempt,
+    step.exitCode,
+    step.timedOut ? 1 : 0,
+    step.outputSummary,
+    json(step.metrics),
+    step.logPath,
+    step.startedAt,
+    step.completedAt,
+    at
+  )
+}
+
+export async function listWorkflowSteps(root: string, runId: string) {
+  const rows = (await openDb(root))
+    .query("SELECT * FROM workflow_steps WHERE run_id = ? ORDER BY step_index")
+    .all(runId) as Row[]
+  return rows.map(workflowStepFromRow)
 }
 
 export async function upsertLocalSummary({

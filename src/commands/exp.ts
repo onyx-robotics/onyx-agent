@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto"
+import { mkdir, writeFile } from "node:fs/promises"
+import { join } from "node:path"
+
 import type {
   LocalResearchCampaignExperimentLoggedRecord,
   LocalResearchHistoryRecord,
@@ -5,39 +9,43 @@ import type {
 
 import { listProjectCampaigns, resolveProject } from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
-import { readSetupFile, type ResearchSetupFile } from "../lib/contract"
+import {
+  normalizeSetupFile,
+  readSetupFile,
+  setupHash,
+  type ResearchSetupFile,
+  type ResearchSetupWorkflowStep,
+} from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, repoRoot } from "../lib/git"
-import {
-  parseMetricLines,
-  primaryMetric,
-  summarizeOutput,
-} from "../lib/metrics"
+import { summarizeOutput } from "../lib/metrics"
 import {
   clientRunRef,
+  onyxStateDir,
   readState,
   writeState,
   type LastRunSelector,
   type LastRunRecord,
 } from "../lib/outbox"
-import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
-import { pathExists } from "../lib/process"
+import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import {
   cacheLocalCampaign,
   clearLocalAttempt,
+  listWorkflowSteps,
   listLocalAttempts,
   listLocalExperimentHistory,
   localCampaignByName,
   logLocalExperiment,
   readLocalAttempt,
+  readWorkflowRun,
+  upsertWorkflowRun,
+  upsertWorkflowStep,
   writeLocalAttempt,
+  type LocalWorkflowRun,
+  type LocalWorkflowStep,
 } from "../lib/research-db"
 import { renderExperimentTable } from "../lib/tui"
-import {
-  hasToolCommand,
-  runToolCommand,
-  type ToolRunResult,
-} from "../lib/tools"
+import { runToolCommand, type ToolRunResult } from "../lib/tools"
 import { flushOutbox } from "../lib/sync"
 
 type ExperimentStatus = LocalResearchCampaignExperimentLoggedRecord["status"]
@@ -172,20 +180,18 @@ function setupCompliance({
     "onyx/onyx.md",
     "onyx/setup.json",
     "onyx/validation.json",
-    "onyx/eval.sh",
-    "onyx/checks.sh",
     "onyx/tools",
   ]
-  const protectedPaths = [...defaultProtected, ...setup.protectedPaths]
+  const protectedPaths = [...defaultProtected, ...setup.scope.protected]
   const protectedPathsChanged = changedPaths.filter((path) =>
     protectedPaths.some((scope) => pathMatchesScope(path, scope))
   )
   const outOfScopePathsChanged =
-    setup.editableScope.length === 0
+    setup.scope.editable.length === 0
       ? []
       : changedPaths.filter(
           (path) =>
-            !setup.editableScope.some((scope) => pathMatchesScope(path, scope))
+            !setup.scope.editable.some((scope) => pathMatchesScope(path, scope))
         )
   const setupPathsChanged = changedPaths.filter((path) =>
     defaultProtected.some((scope) => pathMatchesScope(path, scope))
@@ -201,47 +207,6 @@ function setupCompliance({
     notes: violated
       ? "Local diff changed protected or out-of-scope paths under the local setup policy."
       : null,
-  }
-}
-
-async function runChecks({
-  root,
-  projectPath,
-  timeoutMs,
-}: {
-  root: string
-  projectPath: string
-  timeoutMs: number
-}): Promise<ChecksRecord | null> {
-  const hasManifestCheck = await hasToolCommand({
-    root,
-    projectPath,
-    name: "check",
-  })
-  const checksSh = onyxPath(root, projectPath, "checks.sh")
-  if (!hasManifestCheck && !(await pathExists(checksSh))) return null
-
-  const started = Date.now()
-  const result = await runToolCommand({
-    root,
-    projectPath,
-    name: hasManifestCheck ? "check" : "checks",
-    timeoutSeconds: timeoutMs / 1000,
-  })
-  const durationMs = Date.now() - started
-  const outputSummary =
-    result.outputSummary ??
-    summarizeOutput(result.stdout, result.stderr) ??
-    null
-
-  return {
-    status: result.timedOut
-      ? "timed_out"
-      : result.code === 0
-        ? "passed"
-        : "failed",
-    durationMs,
-    outputSummary,
   }
 }
 
@@ -371,257 +336,783 @@ async function ensureCampaignMetadata({
   }
 }
 
-export async function commandExpRun(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  const projectPath = await resolveProjectPath(root, args)
-  const campaignName = await resolveCampaignName(root, args)
-  const campaign = await ensureCampaignMetadata({
-    root,
-    args,
-    projectPath,
-    campaignName,
-  })
-  const setup = await readSetupFile(root, projectPath)
-  if (setup.projectPath !== projectPath) {
-    throw new Error(
-      `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
-    )
+function workflowMode(args: Args) {
+  if (optionalFlag(args, "auto") && optionalFlag(args, "next")) {
+    throw new Error("Use only one of --auto or --next")
   }
-  const resultCommitSha = await currentCommit(root)
+  return optionalFlag(args, "next") ? "next" : "auto"
+}
 
-  const timeoutMs = numberOption(args, "timeout", 600) * 1000
-  const checksTimeoutMs = numberOption(args, "checks-timeout", 300) * 1000
-  const started = new Date()
+async function readSetupFileFromCommit({
+  root,
+  projectPath,
+  commitSha,
+}: {
+  root: string
+  projectPath: string
+  commitSha: string
+}) {
+  const path = [projectPath, "onyx", "setup.json"].filter(Boolean).join("/")
+  const text = await git(["show", `${commitSha}:${path}`], root)
+  return normalizeSetupFile(JSON.parse(text))
+}
+
+async function gitStatus(root: string) {
+  return (await git(["status", "--porcelain"], root)).trim()
+}
+
+async function commitCountBetween({
+  root,
+  baseCommitSha,
+  headCommitSha,
+}: {
+  root: string
+  baseCommitSha: string
+  headCommitSha: string
+}) {
+  return Number(
+    await git(["rev-list", "--count", `${baseCommitSha}..${headCommitSha}`], root)
+  )
+}
+
+function stepRecord({
+  run,
+  step,
+  index,
+  status,
+  attempt = 0,
+  result = null,
+  metrics = {},
+  logPath = null,
+  outputSummary = null,
+  startedAt = null,
+}: {
+  run: LocalWorkflowRun
+  step: ResearchSetupWorkflowStep
+  index: number
+  status: LocalWorkflowStep["status"]
+  attempt?: number
+  result?: ToolRunResult | null
+  metrics?: Record<string, number>
+  logPath?: string | null
+  outputSummary?: string | null
+  startedAt?: string | null
+}): LocalWorkflowStep {
+  const now = new Date().toISOString()
+  return {
+    runId: run.id,
+    stepId: step.id,
+    stepIndex: index,
+    kind: step.agent ? "agent" : "run",
+    toolId: step.run ?? null,
+    status,
+    attempt,
+    exitCode: result?.code ?? null,
+    timedOut: result?.timedOut ?? false,
+    outputSummary:
+      outputSummary ??
+      result?.outputSummary ??
+      (result ? summarizeOutput(result.stdout, result.stderr) : null),
+    metrics,
+    logPath,
+    startedAt: startedAt ?? (status === "running" ? now : null),
+    completedAt:
+      status === "passed" || status === "failed" || status === "skipped"
+        ? now
+        : null,
+    updatedAt: now,
+  }
+}
+
+async function writeWorkflowStepLog({
+  root,
+  run,
+  step,
+  result,
+}: {
+  root: string
+  run: LocalWorkflowRun
+  step: ResearchSetupWorkflowStep
+  result: ToolRunResult
+}) {
+  const dir = join(await onyxStateDir(root), "workflow-runs", run.id)
+  await mkdir(dir, { recursive: true })
+  const path = join(dir, `${encodeURIComponent(step.id)}.log`)
+  await writeFile(
+    path,
+    [
+      `# workflow run: ${run.id}`,
+      `# step: ${step.id}`,
+      `# tool: ${step.run ?? ""}`,
+      `# exitCode: ${result.code ?? "null"}`,
+      `# timedOut: ${result.timedOut}`,
+      "",
+      "## stdout",
+      result.stdout,
+      "",
+      "## stderr",
+      result.stderr,
+      "",
+    ].join("\n"),
+    "utf8"
+  )
+  return path
+}
+
+function parseStrictMetricLine(stdout: string, metricName: string) {
+  const metricLines = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("METRIC "))
+  if (metricLines.length !== 1) {
+    return {
+      metrics: {},
+      error: `Expected exactly one METRIC line for ${metricName}; found ${metricLines.length}.`,
+    }
+  }
+  const match = metricLines[0]!.match(
+    /^METRIC\s+([A-Za-z0-9_.:-]+)=(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i
+  )
+  if (!match) {
+    return { metrics: {}, error: `Invalid METRIC line: ${metricLines[0]}` }
+  }
+  if (match[1] !== metricName) {
+    return {
+      metrics: {},
+      error: `Expected METRIC ${metricName}=<number>, got ${match[1]}.`,
+    }
+  }
+  return { metrics: { [metricName]: Number(match[2]) }, error: null }
+}
+
+function checksRecordForSteps(
+  setup: ResearchSetupFile,
+  steps: LocalWorkflowStep[]
+): ChecksRecord | null {
+  const guardrailIds = new Set(
+    setup.workflow
+      .filter((step) => step.guardrail && !step.optional)
+      .map((step) => step.id)
+  )
+  const guardrailSteps = steps.filter((step) => guardrailIds.has(step.stepId))
+  if (guardrailSteps.length === 0) return null
+  const failed = guardrailSteps.find((step) => step.status === "failed")
+  if (failed) {
+    return {
+      status: failed.timedOut ? "timed_out" : "failed",
+      durationMs: null,
+      outputSummary: failed.outputSummary,
+    }
+  }
+  return {
+    status: "passed",
+    durationMs: null,
+    outputSummary: guardrailSteps
+      .map((step) => step.outputSummary)
+      .filter(Boolean)
+      .join("\n")
+      .slice(0, 4000),
+  }
+}
+
+async function setWorkflowBlocked({
+  root,
+  run,
+  reason,
+  currentStepIndex = run.currentStepIndex,
+}: {
+  root: string
+  run: LocalWorkflowRun
+  reason: string
+  currentStepIndex?: number
+}) {
+  const next = {
+    ...run,
+    status: "blocked" as const,
+    currentStepIndex,
+    blockReason: reason,
+  }
+  await upsertWorkflowRun({ root, run: next })
+  console.error(reason)
+  process.exitCode = 1
+  return next
+}
+
+async function writeTerminalAttempt({
+  root,
+  run,
+  setup,
+  status,
+  outputSummary,
+  checks,
+}: {
+  root: string
+  run: LocalWorkflowRun
+  setup: ResearchSetupFile
+  status: ExperimentStatus
+  outputSummary: string | null
+  checks: ChecksRecord | null
+}) {
+  const resultCommitSha = run.resultCommitSha
+  if (!resultCommitSha) {
+    throw new Error("Workflow cannot finish before a result commit is selected.")
+  }
+  const completed = new Date()
+  const compliance = setupCompliance({
+    setup,
+    changedPaths: await changedProjectPaths({
+      root,
+      projectPath: run.projectPath,
+      baseCommitSha: run.baseCommitSha,
+      resultCommitSha,
+    }),
+  })
+  const finalStatus =
+    compliance.status === "setup_violation" ? "setup_violation" : status
+  const record: LastRunRecord = {
+    schemaVersion: 1,
+    createdAt: completed.toISOString(),
+    runRef: run.runRef,
+    campaignName: run.campaignName,
+    projectPath: run.projectPath,
+    baseCommitSha: run.baseCommitSha,
+    resultCommitSha,
+    resultRef: run.resultRef,
+    status: finalStatus,
+    setupCompliance: compliance,
+    primaryMetricName: setup.metric.name,
+    primaryMetricValue: run.metrics[setup.metric.name] ?? null,
+    metrics: run.metrics,
+    agentNotes: {},
+    checks,
+    durationMs: completed.getTime() - new Date(run.startedAt).getTime(),
+    startedAt: run.startedAt,
+    completedAt: completed.toISOString(),
+    outputSummary,
+    sessionId: run.sessionId,
+    workerId: run.workerId,
+    hypothesisId: run.hypothesisId,
+  }
+  await writeLocalAttempt({ root, record })
+  const workflowStatus = finalStatus as LocalWorkflowRun["status"]
+  const terminalRun = {
+    ...run,
+    status: workflowStatus,
+    completedAt: completed.toISOString(),
+    blockReason: null,
+  }
+  await upsertWorkflowRun({ root, run: terminalRun })
+  await emitEvent(root, {
+    type: "run_finished",
+    campaignName: run.campaignName,
+    campaignId: run.campaignId ?? undefined,
+    runRef: run.runRef,
+    commitSha: resultCommitSha,
+    resultRef: run.resultRef,
+    message: finalStatus,
+  })
+  console.log(
+    `Workflow complete: ${finalStatus} (${setup.metric.name}=${record.primaryMetricValue ?? "null"})`
+  )
+  console.log(
+    `Run \`onyx exp log --run-ref ${run.runRef} --description <text>\` to record this result.`
+  )
+  if (finalStatus !== "succeeded") process.exitCode = 1
+  return {
+    workflowRunId: run.id,
+    runRef: run.runRef,
+    status: finalStatus,
+    metrics: run.metrics,
+    checks,
+    compliance,
+  }
+}
+
+async function createWorkflowRun({
+  root,
+  args,
+  campaignName,
+  campaign,
+  projectPath,
+  setup,
+}: {
+  root: string
+  args: Args
+  campaignName: string
+  campaign: Awaited<ReturnType<typeof ensureCampaignMetadata>>
+  projectPath: string
+  setup: ResearchSetupFile
+}) {
+  const started = new Date().toISOString()
+  const runRef = clientRunRef(campaignName)
+  const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
+  const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
   const hypothesisId =
     args.options.hypothesis ??
     process.env.ONYX_HYPOTHESIS_ID ??
     campaign.hypothesisId
-  const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
-  const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
   const baseCommitSha =
     args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
-  const noLog = optionalFlag(args, "no-log")
-  const lastRunSelector = lastRunSelectorForContext({
+  const run: LocalWorkflowRun = {
+    id: randomUUID(),
+    campaignId: campaign.campaignId,
     campaignName,
     projectPath,
-    sessionId,
-    workerId,
-    hypothesisId,
-  })
-  const existingAttempt = noLog
-    ? null
-    : await readLocalAttempt(root, lastRunSelector)
-  const reusableAttempt =
-    existingAttempt?.campaignName === campaignName &&
-    existingAttempt.projectPath === projectPath &&
-    existingAttempt.baseCommitSha === baseCommitSha &&
-    existingAttempt.resultCommitSha === resultCommitSha
-      ? existingAttempt
-      : null
-  const runRef = reusableAttempt?.runRef ?? clientRunRef(campaignName)
-  const resultRef =
-    reusableAttempt?.resultRef ??
-    `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
-  const initialRun: LastRunRecord = {
-    schemaVersion: 1,
-    createdAt: started.toISOString(),
     runRef,
-    campaignName,
-    projectPath,
     baseCommitSha,
-    resultCommitSha,
-    resultRef,
+    resultCommitSha: null,
+    resultRef: `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`,
+    setupHash: setupHash(setup),
     status: "running",
-    setupCompliance: {
-      status: "passed",
-      protectedPathsChanged: [],
-      outOfScopePathsChanged: [],
-      setupPathsChanged: [],
-      notes: null,
-    },
-    primaryMetricName: campaign.metricName,
-    primaryMetricValue: null,
+    currentStepIndex: 0,
     metrics: {},
-    agentNotes: {},
-    checks: null,
-    durationMs: 0,
-    startedAt: started.toISOString(),
+    blockReason: null,
+    createdAt: started,
+    startedAt: started,
     completedAt: null,
-    outputSummary: null,
+    updatedAt: started,
     sessionId,
     workerId,
     hypothesisId,
   }
-  if (!noLog) await writeLocalAttempt({ root, record: initialRun })
-
+  await upsertWorkflowRun({ root, run })
+  for (const [index, step] of setup.workflow.entries()) {
+    await upsertWorkflowStep({
+      root,
+      step: stepRecord({ run, step, index, status: "pending" }),
+    })
+  }
   await emitEvent(root, {
     type: "exp_run_started",
     campaignName,
     campaignId: campaign.campaignId,
     runRef,
-    commitSha: resultCommitSha,
-    resultRef,
+    commitSha: await currentCommit(root),
+    resultRef: run.resultRef,
   })
-  if (await hasToolCommand({ root, projectPath, name: "reset" })) {
-    const reset = await runToolCommand({
+  return run
+}
+
+async function executeWorkflow({
+  root,
+  projectPath,
+  setup,
+  run,
+  args,
+  mode,
+}: {
+  root: string
+  projectPath: string
+  setup: ResearchSetupFile
+  run: LocalWorkflowRun
+  args: Args
+  mode: "auto" | "next"
+}) {
+  let currentRun = run
+  let advanced = false
+  const firstCommandStepIndex = setup.workflow.findIndex((step) => Boolean(step.run))
+
+  while (currentRun.currentStepIndex < setup.workflow.length) {
+    const index = currentRun.currentStepIndex
+    const step = setup.workflow[index]!
+    const head = await currentCommit(root)
+    const dirty = await gitStatus(root)
+    const commitCount = await commitCountBetween({
       root,
-      projectPath,
-      name: "reset",
-      timeoutSeconds: numberOption(args, "reset-timeout", 120),
+      baseCommitSha: currentRun.baseCommitSha,
+      headCommitSha: head,
     })
-    if (reset.code !== 0 || reset.timedOut) {
-      if (!noLog) {
-        await writeLocalAttempt({
+
+    if (step.agent) {
+      if (dirty) {
+        return setWorkflowBlocked({
           root,
-          record: {
-            schemaVersion: 1,
-            createdAt: new Date().toISOString(),
-            runRef,
-            campaignName,
-            projectPath,
-            baseCommitSha,
-            resultCommitSha,
-            resultRef,
-            status: "failed",
-            setupCompliance: initialRun.setupCompliance,
-            primaryMetricName: campaign.metricName,
-            primaryMetricValue: null,
-            metrics: {},
-            agentNotes: {},
-            checks: null,
-            durationMs: 0,
-            startedAt: started.toISOString(),
-            completedAt: new Date().toISOString(),
-            outputSummary:
-              reset.outputSummary ??
-              summarizeOutput(reset.stdout, reset.stderr) ??
-              "Environment reset failed.",
-            sessionId,
-            workerId,
-            hypothesisId,
-          },
+          run: currentRun,
+          reason:
+            "Workflow agent step cannot complete while the git tree is dirty.",
         })
       }
-      throw new Error("Environment reset failed before evaluation.")
+      if (commitCount === 0) {
+        const paused = {
+          ...currentRun,
+          status: "paused" as const,
+          blockReason: "Paused at agent step. Make exactly one commit, then resume.",
+        }
+        await upsertWorkflowRun({ root, run: paused })
+        await upsertWorkflowStep({
+          root,
+          step: stepRecord({ run: paused, step, index, status: "paused" }),
+        })
+        console.log("Paused at agent step. Make exactly one commit, then resume.")
+        return paused
+      }
+      if (commitCount !== 1) {
+        return setWorkflowBlocked({
+          root,
+          run: currentRun,
+          reason:
+            "Workflow attempts must contain exactly one result commit over the base commit.",
+        })
+      }
+      currentRun = {
+        ...currentRun,
+        status: "running",
+        resultCommitSha: head,
+        currentStepIndex: index + 1,
+        blockReason: null,
+      }
+      await upsertWorkflowStep({
+        root,
+        step: stepRecord({ run: currentRun, step, index, status: "passed" }),
+      })
+      await upsertWorkflowRun({ root, run: currentRun })
+      advanced = true
+      if (mode === "next") return currentRun
+      continue
     }
-  }
-  const result: ToolRunResult = await runToolCommand({
-    root,
-    projectPath,
-    name: "evaluate",
-    timeoutSeconds: timeoutMs / 1000,
-  })
-  const completed = new Date()
-  const metrics = parseMetricLines(result.stdout, campaign.metricName)
-  const primary = primaryMetric(metrics, campaign.metricName)
-  const benchmarkSucceeded =
-    result.code === 0 && !result.timedOut && primary.value !== null
-  await emitEvent(root, {
-    type: "eval_finished",
-    campaignName,
-    campaignId: campaign.campaignId,
-    runRef,
-    commitSha: resultCommitSha,
-    resultRef,
-    message: `${primary.name}=${primary.value ?? "null"} (${benchmarkSucceeded ? "ok" : "failed"})`,
-  })
-  const checks = benchmarkSucceeded
-    ? await runChecks({ root, projectPath, timeoutMs: checksTimeoutMs })
-    : null
-  if (checks) {
-    await emitEvent(root, {
-      type: "checks_finished",
-      campaignName,
-      campaignId: campaign.campaignId,
-      runRef,
-      commitSha: resultCommitSha,
-      resultRef,
-      message: checks.status,
+
+    if (dirty) {
+      return setWorkflowBlocked({
+        root,
+        run: currentRun,
+        reason: "Workflow command steps require a clean git tree.",
+      })
+    }
+    if (commitCount !== 1) {
+      return setWorkflowBlocked({
+        root,
+        run: currentRun,
+        reason:
+          "Workflow command steps require exactly one result commit over the base commit.",
+      })
+    }
+    if (currentRun.resultCommitSha && currentRun.resultCommitSha !== head) {
+      currentRun = {
+        ...currentRun,
+        resultCommitSha: head,
+        currentStepIndex: index,
+        metrics: {},
+        blockReason: null,
+      }
+      await upsertWorkflowRun({ root, run: currentRun })
+      for (const [resetIndex, resetStep] of setup.workflow.entries()) {
+        if (resetIndex >= index && resetStep.run) {
+          await upsertWorkflowStep({
+            root,
+            step: stepRecord({
+              run: currentRun,
+              step: resetStep,
+              index: resetIndex,
+              status: "pending",
+            }),
+          })
+        }
+      }
+    } else if (!currentRun.resultCommitSha) {
+      currentRun = { ...currentRun, resultCommitSha: head }
+      await upsertWorkflowRun({ root, run: currentRun })
+    }
+
+    const compliance = setupCompliance({
+      setup,
+      changedPaths: await changedProjectPaths({
+        root,
+        projectPath,
+        baseCommitSha: currentRun.baseCommitSha,
+        resultCommitSha: head,
+      }),
     })
-  }
-  const measuredStatus: ExperimentStatus = !benchmarkSucceeded
-    ? "failed"
-    : checks && checks.status !== "passed"
-      ? "checks_failed"
-      : "succeeded"
-  const compliance = setupCompliance({
-    setup,
-    changedPaths: await changedProjectPaths({
+    if (compliance.status === "setup_violation") {
+      const terminalRun = {
+        ...currentRun,
+        status: "setup_violation" as const,
+        blockReason: compliance.notes,
+      }
+      await upsertWorkflowRun({ root, run: terminalRun })
+      return writeTerminalAttempt({
+        root,
+        run: terminalRun,
+        setup,
+        status: "setup_violation",
+        outputSummary: compliance.notes,
+        checks: null,
+      })
+    }
+
+    const existingSteps = await listWorkflowSteps(root, currentRun.id)
+    const existingStep = existingSteps.find((item) => item.stepId === step.id)
+    const startedStep = stepRecord({
+      run: currentRun,
+      step,
+      index,
+      status: "running",
+      attempt: (existingStep?.attempt ?? 0) + 1,
+    })
+    await upsertWorkflowStep({ root, step: startedStep })
+    const timeoutSeconds = step.metric
+      ? args.options.timeout
+        ? numberOption(args, "timeout", 600)
+        : undefined
+      : step.guardrail && args.options["checks-timeout"]
+        ? numberOption(args, "checks-timeout", 300)
+        : undefined
+    const result = await runToolCommand({
       root,
       projectPath,
-      baseCommitSha,
-      resultCommitSha,
-    }),
-  })
-  const status: ExperimentStatus =
-    compliance.status === "setup_violation" ? "setup_violation" : measuredStatus
-  const outputSummaryParts = [
-    result.timedOut ? `Eval timed out after ${timeoutMs / 1000}s.` : "",
-    result.code === 0 && primary.value === null
-      ? `No METRIC line found for ${campaign.metricName}.`
-      : "",
-    result.outputSummary ?? summarizeOutput(result.stdout, result.stderr),
-  ].filter(Boolean)
-  const outputSummary = outputSummaryParts.join("\n").slice(0, 4000) || null
+      name: step.run!,
+      timeoutSeconds,
+    })
+    const logPath = await writeWorkflowStepLog({ root, run: currentRun, step, result })
+    const failed = result.timedOut || result.code !== 0
+    let stepMetrics: Record<string, number> = {}
+    let metricError: string | null = null
+    if (step.metric) {
+      const parsed = parseStrictMetricLine(result.stdout, setup.metric.name)
+      stepMetrics = parsed.metrics
+      metricError = parsed.error
+    }
+    const outputSummaryParts = [
+      result.timedOut ? `Tool timed out.` : "",
+      metricError ?? "",
+      result.outputSummary ?? summarizeOutput(result.stdout, result.stderr),
+    ].filter(Boolean)
+    const outputSummary = outputSummaryParts.join("\n").slice(0, 4000) || null
 
-  if (noLog) {
-    console.log(
-      JSON.stringify({ metrics, status, checks, compliance }, null, 2)
+    if (failed || metricError) {
+      await upsertWorkflowStep({
+        root,
+        step: stepRecord({
+          run: currentRun,
+          step,
+          index,
+          status: "failed",
+          attempt: startedStep.attempt,
+          result,
+          metrics: stepMetrics,
+          logPath,
+          outputSummary,
+          startedAt: startedStep.startedAt,
+        }),
+      })
+      if (step.optional) {
+        currentRun = {
+          ...currentRun,
+          currentStepIndex: index + 1,
+          blockReason: null,
+        }
+        await upsertWorkflowRun({ root, run: currentRun })
+        advanced = true
+        if (mode === "next") return currentRun
+        continue
+      }
+      const terminalStatus: ExperimentStatus = step.guardrail && !step.metric
+        ? "checks_failed"
+        : "failed"
+      const failedRun = {
+        ...currentRun,
+        status: terminalStatus,
+        blockReason: outputSummary,
+      }
+      await upsertWorkflowRun({ root, run: failedRun })
+      const steps = await listWorkflowSteps(root, failedRun.id)
+      const checks: ChecksRecord | null =
+        terminalStatus === "checks_failed"
+          ? {
+              status: result.timedOut ? "timed_out" : "failed",
+              durationMs: null,
+              outputSummary,
+            }
+          : checksRecordForSteps(setup, steps)
+      return writeTerminalAttempt({
+        root,
+        run: failedRun,
+        setup,
+        status: terminalStatus,
+        outputSummary,
+        checks,
+      })
+    }
+
+    currentRun = {
+      ...currentRun,
+      currentStepIndex: index + 1,
+      metrics: { ...currentRun.metrics, ...stepMetrics },
+      blockReason: null,
+    }
+    await upsertWorkflowStep({
+      root,
+      step: stepRecord({
+        run: currentRun,
+        step,
+        index,
+        status: "passed",
+        attempt: startedStep.attempt,
+        result,
+        metrics: stepMetrics,
+        logPath,
+        outputSummary,
+        startedAt: startedStep.startedAt,
+      }),
+    })
+    await upsertWorkflowRun({ root, run: currentRun })
+    if (step.metric) {
+      await emitEvent(root, {
+        type: "eval_finished",
+        campaignName: currentRun.campaignName,
+        campaignId: currentRun.campaignId ?? undefined,
+        runRef: currentRun.runRef,
+        commitSha: head,
+        resultRef: currentRun.resultRef,
+        message: `${setup.metric.name}=${stepMetrics[setup.metric.name]}`,
+      })
+    }
+    if (step.guardrail) {
+      await emitEvent(root, {
+        type: "checks_finished",
+        campaignName: currentRun.campaignName,
+        campaignId: currentRun.campaignId ?? undefined,
+        runRef: currentRun.runRef,
+        commitSha: head,
+        resultRef: currentRun.resultRef,
+        message: "passed",
+      })
+    }
+    advanced = true
+    if (mode === "next") return currentRun
+  }
+
+  if (currentRun.currentStepIndex >= setup.workflow.length) {
+    const head = await currentCommit(root)
+    const dirty = await gitStatus(root)
+    const commitCount = await commitCountBetween({
+      root,
+      baseCommitSha: currentRun.baseCommitSha,
+      headCommitSha: head,
+    })
+    if (dirty) {
+      return setWorkflowBlocked({
+        root,
+        run: currentRun,
+        reason: "Workflow cannot finish while the git tree is dirty.",
+      })
+    }
+    if (commitCount !== 1) {
+      return setWorkflowBlocked({
+        root,
+        run: currentRun,
+        reason:
+          "Workflow cannot finish unless HEAD is exactly one result commit over the base commit.",
+      })
+    }
+    if (currentRun.resultCommitSha && currentRun.resultCommitSha !== head) {
+      const rerunFrom =
+        firstCommandStepIndex >= 0 ? firstCommandStepIndex : setup.workflow.length
+      currentRun = {
+        ...currentRun,
+        status: "running",
+        resultCommitSha: head,
+        currentStepIndex: rerunFrom,
+        metrics: {},
+        blockReason: null,
+      }
+      await upsertWorkflowRun({ root, run: currentRun })
+      for (const [resetIndex, resetStep] of setup.workflow.entries()) {
+        if (resetIndex >= rerunFrom && resetStep.run) {
+          await upsertWorkflowStep({
+            root,
+            step: stepRecord({
+              run: currentRun,
+              step: resetStep,
+              index: resetIndex,
+              status: "pending",
+            }),
+          })
+        }
+      }
+      if (mode === "next") return currentRun
+      return executeWorkflow({ root, projectPath, setup, run: currentRun, args, mode })
+    }
+  }
+
+  if (!advanced && currentRun.status !== "running") return currentRun
+  const steps = await listWorkflowSteps(root, currentRun.id)
+  return writeTerminalAttempt({
+    root,
+    run: { ...currentRun, status: "succeeded", blockReason: null },
+    setup,
+    status: "succeeded",
+    outputSummary: "Workflow completed successfully.",
+    checks: checksRecordForSteps(setup, steps),
+  })
+}
+
+export async function commandExpRun(args: Args) {
+  if (optionalFlag(args, "no-log")) {
+    throw new Error(
+      "`onyx exp run --no-log` was removed. Use `onyx tools run <tool-id>` for transient diagnostics."
     )
-    if (result.code !== 0) process.exitCode = result.code ?? 1
-    return { runRef, status, metrics, checks, compliance }
+  }
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const mode = workflowMode(args)
+
+  let run: LocalWorkflowRun
+  let setup: ResearchSetupFile
+  if (args.options.resume) {
+    const existing = await readWorkflowRun(root, args.options.resume)
+    if (!existing) {
+      throw new Error(`Workflow run ${args.options.resume} was not found.`)
+    }
+    if (existing.projectPath !== projectPath) {
+      throw new Error(
+        `Workflow run projectPath "${existing.projectPath}" does not match active project path "${projectPath}".`
+      )
+    }
+    run = existing
+    setup = await readSetupFileFromCommit({
+      root,
+      projectPath,
+      commitSha: run.baseCommitSha,
+    })
+    await ensureCampaignMetadata({
+      root,
+      args,
+      projectPath,
+      campaignName: run.campaignName,
+    })
+  } else {
+    const campaignName = await resolveCampaignName(root, args)
+    const campaign = await ensureCampaignMetadata({
+      root,
+      args,
+      projectPath,
+      campaignName,
+    })
+    const baseCommitSha =
+      args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+    setup = await readSetupFileFromCommit({
+      root,
+      projectPath,
+      commitSha: baseCommitSha,
+    }).catch(async () => readSetupFile(root, projectPath))
+    if (setup.projectPath !== projectPath) {
+      throw new Error(
+        `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
+      )
+    }
+    run = await createWorkflowRun({
+      root,
+      args: { ...args, options: { ...args.options, base: baseCommitSha } },
+      campaignName,
+      campaign,
+      projectPath,
+      setup,
+    })
   }
 
-  const record: LastRunRecord = {
-    schemaVersion: 1,
-    createdAt: completed.toISOString(),
-    runRef,
-    campaignName,
-    projectPath,
-    baseCommitSha,
-    resultCommitSha,
-    resultRef,
-    status,
-    setupCompliance: compliance,
-    primaryMetricName: primary.name,
-    primaryMetricValue: primary.value,
-    metrics,
-    agentNotes: {},
-    checks,
-    durationMs: completed.getTime() - started.getTime(),
-    startedAt: started.toISOString(),
-    completedAt: completed.toISOString(),
-    outputSummary,
-    sessionId,
-    workerId,
-    hypothesisId,
-  }
-  await writeLocalAttempt({ root, record })
-  await emitEvent(root, {
-    type: "run_finished",
-    campaignName,
-    campaignId: campaign.campaignId,
-    runRef,
-    commitSha: resultCommitSha,
-    resultRef,
-    message: status,
-  })
-  console.log(
-    `Measured ${resultCommitSha.slice(0, 7)} (${primary.name}=${primary.value ?? "null"}, ${status}); runRef ${runRef}`
-  )
-  console.log(
-    `Run \`onyx exp log --run-ref ${runRef} --description <text>\` to record this result.`
-  )
-
-  if (
-    !benchmarkSucceeded ||
-    status === "checks_failed" ||
-    status === "setup_violation"
-  ) {
-    process.exitCode = result.code && result.code !== 0 ? result.code : 1
-  }
-
-  return { runRef, status, metrics, checks, compliance }
+  console.log(`Workflow run: ${run.id}`)
+  console.log(`Run ref: ${run.runRef}`)
+  return executeWorkflow({ root, projectPath, setup, run, args, mode })
 }
 
 export async function commandExpLog(args: Args) {

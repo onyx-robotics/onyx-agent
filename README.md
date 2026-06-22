@@ -68,32 +68,29 @@ onyx agent skill-path
 
 ```bash
 onyx setup init --goal "Improve score" --metric-name score
-# edit onyx/eval.sh so it emits METRIC score=<number>
-onyx setup validate --required
+# edit onyx/setup.json, onyx/onyx.md, and onyx/tools/evaluation/run.sh
+onyx setup validate
 git add onyx
 git commit -m "Add Onyx setup"
 git push origin HEAD
 onyx campaign setup --name fast-eval --description "Improve score"
-onyx tools run evaluate
+onyx tools run evaluation.run
 onyx research start --campaign fast-eval --workers 4
 onyx push
 ```
 
 The CLI stores local research state and retry events in `.git/onyx/research.db`
 and flushes them to `/api/v1` when connectivity and credentials are available.
-`onyx exp run --no-log` is reserved for transient checks such as worker
-preflight and does not read, write, restore, or clear measured-attempt or sync
-state.
+Transient diagnostics use `onyx tools run <tool-id>`, which executes declared
+setup tools without creating workflow or measured-attempt state.
 
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
 `onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
-`onyx/tools/*`, `onyx/eval.sh`, and optional `onyx/checks.sh`; validates
-required setup modules locally with static checks; then creates an async
-research session with deliberate hypothesis plans. Required setup modules are
-`setup_spec`, `project_scope`, `agent`, and `evaluation`; optional modules are
-`safety`, `reliability`, `reset`, and `resources`. Runtime rigor remains in
-`onyx exp run`, which executes reset/eval/check commands, parses metrics, and
-records setup compliance.
+and `onyx/tools/*`; designs the linear workflow and declared tools; validates
+the setup hash and static checks; then creates an async research session with
+deliberate hypothesis plans. Runtime rigor remains in `onyx exp run`, which
+pauses for the agent edit, requires exactly one clean result commit, executes
+workflow command steps, parses the primary metric, and records setup compliance.
 
 Local research state is SQLite-first. The agent stores campaigns, sessions,
 hypotheses, workers, experiments, summaries, knowledge, resource leases, and
@@ -108,9 +105,9 @@ ledger.
 `onyx campaign setup` and `onyx research start` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
-`eval.sh`. GitHub-backed campaigns also require that base commit to be present
-on the repository remote; the CLI warns when it is missing, while the bundled
-`/onyx` skill pushes the setup base before campaign sync.
+declared workflow tools. GitHub-backed campaigns also require that base commit
+to be present on the repository remote; the CLI warns when it is missing, while
+the bundled `/onyx` skill pushes the setup base before campaign sync.
 
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
@@ -141,9 +138,10 @@ local manifests are available.
 
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<hypothesis>/<worker>`,
 while each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
-`onyx research should-stop`, run the setup contract through `onyx exp run`,
-push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the
-experiment with setup/session/hypothesis/worker context. `onyx research hypothesis add`
+`onyx research should-stop`, run the setup workflow through `onyx exp run
+--campaign <name> --base <sha> --auto` and `onyx exp run --resume <id> --auto`,
+push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment
+with setup/session/hypothesis/worker context. `onyx research hypothesis add`
 can create another campaign hypothesis at any time from a JSON plan file or inline
 focus/hypothesis flags; when a worker slot is open, it prints a
 ready `onyx worker run --session ... --hypothesis ...` command and reuses the
@@ -152,8 +150,10 @@ publish shared learning with `onyx knowledge add` and read it back with
 `onyx knowledge list`, but successor hypothesis selection remains an
 orchestrator/human decision.
 After the agent exits, the worker harness performs one final best-effort
-commit, measurement, local experiment log, and worker-branch push so useful offline
-work is not lost. Use `--worker-command` only for custom harnesses.
+commit, measurement for exactly one unlogged commit when possible, local
+experiment log, and worker-branch push so useful offline work is not lost.
+Multi-commit or dirty salvage preserves the branch without producing a
+measured experiment. Use `--worker-command` only for custom harnesses.
 
 Stop and finalize campaigns explicitly:
 

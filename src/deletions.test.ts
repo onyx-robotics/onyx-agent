@@ -13,18 +13,21 @@ const AFTER_DELETE = "2026-06-11T00:00:00.000Z"
 const setup = {
   schemaVersion: 1 as const,
   goal: "Improve score",
+  projectPath: "",
+  scope: {
+    editable: [],
+    protected: ["onyx/setup.json", "onyx/validation.json", "onyx/tools/"],
+  },
   metric: {
     name: "score",
     unit: null,
     direction: "maximize" as const,
   },
-  projectPath: "",
-  editableScope: [],
-  protectedPaths: [],
-  commands: {
-    evaluate: {
-      command: "bash",
-      args: ["onyx/eval.sh"],
+  resources: {},
+  tools: {
+    "evaluation.run": {
+      command: "printf 'METRIC score=1\\n'",
+      args: [],
       shell: false,
       cwd: "project",
       env: {},
@@ -34,21 +37,19 @@ const setup = {
       outputLimitBytes: 4000,
     },
   },
-  resources: {},
-  constraints: [],
-  riskModel: { risks: [], antiGamingChecks: [] },
-  measurement: {
-    metricLine: "METRIC",
-    trials: 1,
-    aggregation: "single" as const,
-    notes: null,
-  },
-  stopPolicy: {
-    maxIterations: null,
-    maxMinutes: null,
-    patience: null,
-  },
-  modules: {},
+  workflow: [
+    {
+      id: "edit",
+      agent: "Make one scoped code change.",
+      optional: false as const,
+    },
+    {
+      id: "evaluate",
+      run: "evaluation.run",
+      metric: true as const,
+      optional: false as const,
+    },
+  ],
 }
 
 const deletions: ApiProjectDeletions = {

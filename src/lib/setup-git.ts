@@ -9,14 +9,12 @@ export function requiredSetupRepoPaths(projectPath: string) {
     setupRepoPath(projectPath, "setup.json"),
     setupRepoPath(projectPath, "validation.json"),
     setupRepoPath(projectPath, "onyx.md"),
-    setupRepoPath(projectPath, "eval.sh"),
   ]
 }
 
 export function protectedSetupRepoPaths(projectPath: string) {
   return [
     ...requiredSetupRepoPaths(projectPath),
-    setupRepoPath(projectPath, "checks.sh"),
     setupRepoPath(projectPath, "tools"),
   ]
 }

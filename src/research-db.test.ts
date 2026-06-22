@@ -54,12 +54,12 @@ function setup() {
   return normalizeSetupFile({
     schemaVersion: 1,
     goal: "Improve score.",
-    metric: { name: "score", unit: null, direction: "maximize" },
     projectPath: "",
-    editableScope: ["src"],
-    protectedPaths: [],
-    commands: {
-      evaluate: {
+    scope: { editable: ["src"], protected: [] },
+    metric: { name: "score", unit: null, direction: "maximize" },
+    resources: {},
+    tools: {
+      "evaluation.run": {
         command: "printf 'METRIC score=1\\n'",
         args: [],
         shell: true,
@@ -71,11 +71,10 @@ function setup() {
         outputLimitBytes: 4000,
       },
     },
-    resources: {},
-    constraints: [],
-    modules: {},
-    riskModel: { risks: [], antiGamingChecks: [] },
-    measurement: { trials: 1, aggregation: "single", notes: null },
+    workflow: [
+      { id: "edit", agent: "Make one scoped code change." },
+      { id: "evaluate", run: "evaluation.run", metric: true },
+    ],
   })
 }
 
@@ -133,7 +132,7 @@ describe("SQLite research ledger", () => {
     const root = await fixtureRepo()
     const doctor = await researchDbDoctor(root)
     expect(doctor.ok).toBe(true)
-    expect(doctor.schemaVersion).toBe(1)
+    expect(doctor.schemaVersion).toBe(2)
 
     const dbPath = join(
       await mkdtemp(join(tmpdir(), "onyx-newer-db-")),

@@ -137,35 +137,27 @@ export {
   summarizeWorkerOutput,
   commandWorkerRun,
 } from "./commands/research"
-export {
-  commandSetupInit,
-  commandSetupModules,
-  commandSetupOptional,
-  commandSetupRequire,
-  commandSetupValidate,
-} from "./commands/setup"
+export { commandSetupInit, commandSetupValidate } from "./commands/setup"
+export { commandWorkflowStatus } from "./commands/workflow"
 export {
   normalizeSetupFile,
   normalizeValidationFile,
   readSetupFile,
   readValidationFile,
-  requiredSetupModules,
-  setupModuleRequirement,
+  setupHash,
   setupPath,
+  validationMatchesSetup,
   validationPath,
   writeSetupFile,
   writeValidationFile,
   type ResearchSetupFile,
-  type ResearchSetupModuleId,
+  type ResearchSetupId,
   type ResearchSetupValidationFile,
 } from "./lib/contract"
 export {
   protectedToolPaths,
-  readToolApi,
   resolveToolApiPath,
   runToolCommand,
-  toolApiPath,
-  TOOL_API_FILE,
   type ToolApi,
   type ToolCommand,
   type ToolRunResult,

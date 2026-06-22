@@ -92,23 +92,25 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, restore only in-scope files from the best commit and commit that forward; do not rewrite history.
 3. Pick a concrete research idea for this hypothesis. Use peer progress as inspiration, but do not duplicate an already-failed idea.
 4. Before each iteration and before any sweep that might take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n>\`. Stop cleanly if it exits 0.
-5. Edit only in-scope project files, commit the result, then run \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha>\`; copy the printed runRef.
-6. Inspect the output, metric, and checks result. Record every attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
-7. Publish concise shared learnings with \`onyx knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
-8. Periodically review summaries with \`onyx summary list\` and update a concise hypothesis summary with \`onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"\` if available; otherwise include the summary in final output. Do not pipe mutation commands through \`tail\`, \`head\`, or other filters that can hide failed exits.
-9. Run \`onyx sync\` or \`onyx push\` periodically when network access is available.
+5. Start a workflow with \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha> --auto\`; copy the printed workflow run id and runRef. The CLI should pause at the agent step.
+6. Edit only in-scope project files, make exactly one clean commit, then resume with \`onyx exp run --resume <workflowRunId> --auto\`. If blocked, inspect \`onyx workflow status --run <workflowRunId>\`; use \`onyx tools run <tool-id>\` only for diagnostics.
+7. Inspect the output, metric, and checks result. Record every terminal attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
+8. Publish concise shared learnings with \`onyx knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
+9. Periodically review summaries with \`onyx summary list\` and update a concise hypothesis summary with \`onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"\` if available; otherwise include the summary in final output. Do not pipe mutation commands through \`tail\`, \`head\`, or other filters that can hide failed exits.
+10. Run \`onyx sync\` or \`onyx push\` periodically when network access is available.
 
 ## Research Rules
 
 - Primary metric is king: improved results are candidates to build from; worse or equal results should send you back to the current best before trying the next idea.
 - Make one small, measured, logged attempt early. Do not spend most of the hypothesis budget searching before the first commit.
-- Keep local sweeps bounded to seconds, not minutes. Prefer coarse evidence, commit a promising candidate, measure it through Onyx, then refine.
-- Secondary metrics inform tradeoffs, but hard guardrails belong in checks so a primary win that violates constraints becomes \`checks_failed\`.
+- Keep local sweeps bounded to seconds, not minutes. Prefer coarse evidence, start a workflow, commit one promising candidate, measure it through Onyx, then refine in a new workflow.
+- Secondary metrics inform tradeoffs, but hard guardrails belong in declared guardrail steps so a primary win that violates constraints becomes \`checks_failed\`.
 - Confirm surprising wins on noisy metrics before building on them. A single lucky trial can mislead the campaign.
 - Use loop statuses from \`onyx exp run\`: \`succeeded\`, \`failed\`, \`checks_failed\`, and \`setup_violation\`. Do not mark autonomous attempts \`accepted\` or \`rejected\`; those are for human curation.
 - Never drop failed attempts. If eval crashes or emits no primary metric, log it as failed with notes about what happened.
 - Annotate every run with useful \`--agent-notes\`: what you learned, why it mattered, and what a fresh worker should avoid or try next.
 - Keep experiment names/descriptions clean and specific. Do not prefix them with iteration counters; Onyx already tracks ordering.
+- A workflow attempt is one result commit and one primary metric. If you accidentally create multiple commits, stop and summarize instead of trying to force it into a valid measured experiment.
 - Prefer simple, understandable changes. Removing complexity for equal or better metric is valuable; ugly complexity for tiny gains is usually not.
 - Stick to the user's existing interfaces and code paths. Do not invent custom tuning entry points, parameter scripts, or harnesses unless the setup explicitly requires them.
 - Do not thrash. If you keep circling the same idea, try something structurally different.

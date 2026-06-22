@@ -108,184 +108,178 @@ export const researchKnowledgeKindSchema = z.enum([
   "transfer_note",
 ])
 
-export const researchSetupModuleIdSchema = z.enum([
-  "setup_spec",
-  "project_scope",
-  "agent",
-  "evaluation",
-  "safety",
-  "reliability",
-  "reset",
-  "resources",
-])
-
-const researchSetupModuleRequirementSchema = z.object({
-  required: z.boolean().default(false),
-  reason: z.string().trim().max(1000).nullable().default(null),
-})
-
-const legacyResearchSetupModuleIds = {
-  metric: "evaluation",
-  evaluation_definition: "evaluation",
-  evaluation_run: "evaluation",
-  metric_parsing: "evaluation",
-  agent_handoff: "agent",
-  checks: "reliability",
-  repeatability: "reliability",
-  environment: "resources",
-  hardware: "resources",
-  git_remote: "resources",
-} as const
-
-function normalizeResearchSetupModuleId(value: string) {
-  return (
-    legacyResearchSetupModuleIds[
-      value as keyof typeof legacyResearchSetupModuleIds
-    ] ?? value
+export const researchSetupIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(120)
+  .regex(
+    /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/,
+    "must use lowercase path-safe namespaced segments"
   )
-}
 
-const researchSetupModuleIdInputSchema = z.preprocess(
-  (value) =>
-    typeof value === "string" ? normalizeResearchSetupModuleId(value) : value,
-  researchSetupModuleIdSchema
-)
+const researchSetupToolSchema = z
+  .object({
+    description: z.string().trim().max(1000).optional(),
+    command: z.string().trim().min(1),
+    args: z.array(z.string()).default([]),
+    shell: z.boolean().default(false),
+    cwd: z.string().trim().min(1).default("project"),
+    env: z.record(z.string(), z.string()).default({}),
+    resources: z.array(researchSetupIdSchema).default([]),
+    timeoutSeconds: z.number().positive().default(600),
+    leaseTimeoutSeconds: z.number().positive().default(120),
+    outputLimitBytes: z.number().int().positive().default(4000),
+  })
+  .strict()
 
-function normalizeResearchSetupModuleRequirements(value: unknown) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value
+const researchSetupResourceSchema = z
+  .object({
+    slots: z.number().int().positive().default(1),
+    description: z.string().trim().max(1000).optional(),
+  })
+  .strict()
 
-  const normalized: Record<string, unknown> = {}
-  for (const [key, requirement] of Object.entries(value)) {
-    const moduleId = normalizeResearchSetupModuleId(key)
-    const existing = normalized[moduleId]
-    if (
-      existing &&
-      typeof existing === "object" &&
-      !Array.isArray(existing) &&
-      requirement &&
-      typeof requirement === "object" &&
-      !Array.isArray(requirement)
-    ) {
-      normalized[moduleId] = {
-        ...existing,
-        ...requirement,
-        required:
-          Boolean((existing as { required?: unknown }).required) ||
-          Boolean((requirement as { required?: unknown }).required),
-        reason:
-          (requirement as { reason?: unknown }).reason ??
-          (existing as { reason?: unknown }).reason ??
-          null,
-      }
-    } else {
-      normalized[moduleId] = requirement
-    }
-  }
-  return normalized
-}
+const researchSetupScopeSchema = z
+  .object({
+    editable: z.array(z.string().trim().min(1).max(240)).default([]),
+    protected: z.array(z.string().trim().min(1).max(240)).default([]),
+  })
+  .strict()
 
-const researchSetupCommandSchema = z.object({
-  command: z.string().trim().min(1),
-  args: z.array(z.string()).default([]),
-  shell: z.boolean().default(true),
-  cwd: z.string().trim().min(1).default("project"),
-  env: z.record(z.string(), z.string()).default({}),
-  resources: z.array(z.string().trim().min(1)).default([]),
-  timeoutSeconds: z.number().positive().default(600),
-  leaseTimeoutSeconds: z.number().positive().default(120),
-  outputLimitBytes: z.number().int().positive().default(4000),
-})
-
-const researchSetupResourceSchema = z.object({
-  slots: z.number().int().positive().default(1),
-  description: z.string().trim().max(1000).optional(),
-})
-
-export const researchSetupFileSchema = z.object({
-  schemaVersion: z.literal(1).default(1),
-  goal: z.string().trim().min(1).max(4000),
-  metric: z.object({
-    name: z.string().trim().min(1).max(120),
+const researchSetupMetricSchema = z
+  .object({
+    name: researchSetupIdSchema,
     unit: z.string().trim().max(80).nullable().default(null),
     direction: researchMetricDirectionSchema,
-  }),
-  projectPath: projectPathSchema.default(""),
-  editableScope: z.array(z.string().trim().min(1).max(240)).default([]),
-  protectedPaths: z.array(z.string().trim().min(1).max(240)).default([]),
-  commands: z.object({
-    reset: researchSetupCommandSchema.optional(),
-    evaluate: researchSetupCommandSchema,
-    check: researchSetupCommandSchema.optional(),
-  }),
-  resources: z
-    .record(z.string().min(1), researchSetupResourceSchema)
-    .default({}),
-  constraints: z.array(z.string().trim().min(1).max(2000)).default([]),
-  riskModel: z
-    .object({
-      risks: z.array(z.string().trim().min(1).max(2000)).default([]),
-      antiGamingChecks: z.array(z.string().trim().min(1).max(2000)).default([]),
-    })
-    .default({ risks: [], antiGamingChecks: [] }),
-  measurement: z
-    .object({
-      metricLine: z.string().trim().min(1).default("METRIC"),
-      trials: z.number().int().positive().default(1),
-      aggregation: z
-        .enum(["single", "mean", "median", "min", "max"])
-        .default("single"),
-      notes: z.string().trim().max(4000).nullable().default(null),
-    })
-    .default({
-      metricLine: "METRIC",
-      trials: 1,
-      aggregation: "single",
-      notes: null,
-    }),
-  stopPolicy: z
-    .object({
-      maxIterations: z.number().int().positive().nullable().default(null),
-      maxMinutes: z.number().positive().nullable().default(null),
-      patience: z.number().int().positive().nullable().default(null),
-    })
-    .default({ maxIterations: null, maxMinutes: null, patience: null }),
-  modules: z
-    .preprocess(
-      normalizeResearchSetupModuleRequirements,
-      z.partialRecord(
-        researchSetupModuleIdSchema,
-        researchSetupModuleRequirementSchema
-      )
-    )
-    .default({}),
-})
+  })
+  .strict()
 
-export const researchSetupModuleStatusSchema = z.enum([
+const researchSetupWorkflowStepSchema = z
+  .object({
+    id: researchSetupIdSchema,
+    agent: z.string().trim().min(1).max(2000).optional(),
+    run: researchSetupIdSchema.optional(),
+    metric: z.literal(true).optional(),
+    optional: z.boolean().default(false),
+    pause: z.literal(true).optional(),
+    guardrail: z.literal(true).optional(),
+  })
+  .strict()
+  .superRefine((step, ctx) => {
+    const hasAgent = step.agent !== undefined
+    const hasRun = step.run !== undefined
+    if (hasAgent === hasRun) {
+      ctx.addIssue({
+        code: "custom",
+        message: "workflow step must have exactly one of agent or run",
+        path: ["agent"],
+      })
+    }
+    if (hasAgent && (step.metric || step.guardrail || step.optional)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "agent steps cannot be metric, guardrail, or optional steps",
+        path: ["agent"],
+      })
+    }
+  })
+
+export const researchSetupFileSchema = z
+  .object({
+    schemaVersion: z.literal(1).default(1),
+    goal: z.string().trim().min(1).max(4000),
+    projectPath: projectPathSchema.default(""),
+    scope: researchSetupScopeSchema.default({ editable: [], protected: [] }),
+    metric: researchSetupMetricSchema,
+    resources: z
+      .record(researchSetupIdSchema, researchSetupResourceSchema)
+      .default({}),
+    tools: z.record(researchSetupIdSchema, researchSetupToolSchema).default({}),
+    workflow: z.array(researchSetupWorkflowStepSchema).min(2),
+  })
+  .strict()
+  .superRefine((setup, ctx) => {
+    const stepIds = new Set<string>()
+    for (const [index, step] of setup.workflow.entries()) {
+      if (stepIds.has(step.id)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `duplicate workflow step id: ${step.id}`,
+          path: ["workflow", index, "id"],
+        })
+      }
+      stepIds.add(step.id)
+      if (step.run && !Object.hasOwn(setup.tools, step.run)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `workflow step references unknown tool: ${step.run}`,
+          path: ["workflow", index, "run"],
+        })
+      }
+    }
+
+    const agentSteps = setup.workflow.filter((step) => step.agent !== undefined)
+    if (agentSteps.length !== 1 || setup.workflow[0]?.agent === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: "workflow v1 must have exactly one leading agent step",
+        path: ["workflow"],
+      })
+    }
+
+    const metricSteps = setup.workflow.filter(
+      (step) => step.metric && !step.optional
+    )
+    if (metricSteps.length !== 1) {
+      ctx.addIssue({
+        code: "custom",
+        message: "workflow v1 must have exactly one required metric step",
+        path: ["workflow"],
+      })
+    }
+
+    for (const [toolId, tool] of Object.entries(setup.tools)) {
+      for (const [resourceIndex, resource] of tool.resources.entries()) {
+        if (!Object.hasOwn(setup.resources, resource)) {
+          ctx.addIssue({
+            code: "custom",
+            message: `tool ${toolId} references unknown resource: ${resource}`,
+            path: ["tools", toolId, "resources", resourceIndex],
+          })
+        }
+      }
+    }
+  })
+
+export const researchSetupValidationCheckStatusSchema = z.enum([
   "passed",
   "warning",
   "failed",
-  "skipped",
-  "not_run",
 ])
 
-export const researchSetupValidationModuleResultSchema = z.object({
-  moduleId: researchSetupModuleIdInputSchema,
-  status: researchSetupModuleStatusSchema,
-  required: z.boolean(),
-  summary: z.string().trim().max(1000).nullable().default(null),
-  outputSummary: z.string().trim().max(4000).nullable().default(null),
-  durationMs: z.number().int().nonnegative().nullable().default(null),
-  validatedAt: z.iso.datetime(),
-  evidence: metadataSchema.default({}),
-})
+export const researchSetupValidationCheckSchema = z
+  .object({
+    id: researchSetupIdSchema,
+    status: researchSetupValidationCheckStatusSchema,
+    message: z.string().trim().max(1000),
+    evidence: metadataSchema.default({}),
+  })
+  .strict()
 
-export const researchSetupValidationFileSchema = z.object({
-  schemaVersion: z.literal(1).default(1),
-  status: z.enum(["passed", "warning", "failed", "blocked"]).default("passed"),
-  generatedAt: z.iso.datetime(),
-  modules: z.array(researchSetupValidationModuleResultSchema).default([]),
-  summary: z.string().trim().max(4000).nullable().default(null),
-})
+export const researchSetupValidationFileSchema = z
+  .object({
+    schemaVersion: z.literal(1).default(1),
+    status: z.enum(["passed", "warning", "failed", "blocked"]).default("passed"),
+    setupHash: z
+      .string()
+      .trim()
+      .regex(/^sha256:[0-9a-f]{64}$/),
+    generatedAt: z.iso.datetime(),
+    checks: z.array(researchSetupValidationCheckSchema).default([]),
+    summary: z.string().trim().max(4000).nullable().default(null),
+  })
+  .strict()
 
 export const researchHypothesisPlanSchema = z.object({
   focus: z.string().trim().min(1).max(1000),
@@ -1612,13 +1606,17 @@ export type ResearchExperimentLinkType = z.infer<
   typeof researchExperimentLinkTypeSchema
 >
 export type ResearchKnowledgeKind = z.infer<typeof researchKnowledgeKindSchema>
-export type ResearchSetupModuleId = z.infer<typeof researchSetupModuleIdSchema>
+export type ResearchSetupId = z.infer<typeof researchSetupIdSchema>
+export type ResearchSetupTool = z.infer<typeof researchSetupToolSchema>
+export type ResearchSetupWorkflowStep = z.infer<
+  typeof researchSetupWorkflowStepSchema
+>
 export type ResearchSetupFile = z.infer<typeof researchSetupFileSchema>
+export type ResearchSetupValidationCheck = z.infer<
+  typeof researchSetupValidationCheckSchema
+>
 export type ResearchSetupValidationFile = z.infer<
   typeof researchSetupValidationFileSchema
->
-export type ResearchSetupValidationModuleResult = z.infer<
-  typeof researchSetupValidationModuleResultSchema
 >
 export type ResearchHypothesisPlan = z.infer<
   typeof researchHypothesisPlanSchema

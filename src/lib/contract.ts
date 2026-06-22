@@ -1,42 +1,27 @@
+import { createHash } from "node:crypto"
 import { readFile, writeFile } from "node:fs/promises"
 
 import {
   researchSetupFileSchema,
-  researchSetupModuleIdSchema,
   researchSetupValidationFileSchema,
   type ResearchSetupFile,
-  type ResearchSetupModuleId,
+  type ResearchSetupId,
+  type ResearchSetupTool,
   type ResearchSetupValidationFile,
-  type ResearchSetupValidationModuleResult,
+  type ResearchSetupValidationCheck,
+  type ResearchSetupWorkflowStep,
 } from "../protocol"
 
 import { onyxPath } from "./project"
 
 export type {
   ResearchSetupFile,
-  ResearchSetupModuleId,
+  ResearchSetupId,
+  ResearchSetupTool,
+  ResearchSetupValidationCheck,
   ResearchSetupValidationFile,
-  ResearchSetupValidationModuleResult,
+  ResearchSetupWorkflowStep,
 }
-
-export const FUNDAMENTAL_SETUP_MODULE_IDS = [
-  "setup_spec",
-  "project_scope",
-  "agent",
-  "evaluation",
-] as const satisfies readonly ResearchSetupModuleId[]
-
-export const CONDITIONAL_SETUP_MODULE_IDS = [
-  "safety",
-  "reliability",
-  "reset",
-  "resources",
-] as const satisfies readonly ResearchSetupModuleId[]
-
-export const SETUP_MODULE_IDS = [
-  ...FUNDAMENTAL_SETUP_MODULE_IDS,
-  ...CONDITIONAL_SETUP_MODULE_IDS,
-] as const satisfies readonly ResearchSetupModuleId[]
 
 export function setupPath(root: string, projectPath: string) {
   return onyxPath(root, projectPath, "setup.json")
@@ -56,24 +41,30 @@ export function normalizeValidationFile(
   return researchSetupValidationFileSchema.parse(value)
 }
 
-export function parseSetupModuleId(value: string): ResearchSetupModuleId {
-  return researchSetupModuleIdSchema.parse(normalizeSetupModuleId(value))
+function sortedJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(sortedJson).join(",")}]`
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${sortedJson(item)}`)
+      .join(",")}}`
+  }
+  return JSON.stringify(value)
 }
 
-export function normalizeSetupModuleId(value: string) {
-  const legacy: Record<string, ResearchSetupModuleId> = {
-    metric: "evaluation",
-    evaluation_definition: "evaluation",
-    evaluation_run: "evaluation",
-    metric_parsing: "evaluation",
-    agent_handoff: "agent",
-    checks: "reliability",
-    repeatability: "reliability",
-    environment: "resources",
-    hardware: "resources",
-    git_remote: "resources",
-  }
-  return legacy[value] ?? value
+export function setupHash(setup: ResearchSetupFile) {
+  const normalized = normalizeSetupFile(setup)
+  return `sha256:${createHash("sha256").update(sortedJson(normalized)).digest("hex")}`
+}
+
+export function validationMatchesSetup({
+  setup,
+  validation,
+}: {
+  setup: ResearchSetupFile
+  validation: ResearchSetupValidationFile | null
+}) {
+  return validation?.setupHash === setupHash(setup)
 }
 
 export async function readSetupFile(
@@ -131,30 +122,5 @@ export async function writeValidationFile(
     validationPath(root, projectPath),
     `${JSON.stringify(normalized, null, 2)}\n`,
     "utf8"
-  )
-}
-
-export function isFundamentalSetupModule(id: ResearchSetupModuleId) {
-  return FUNDAMENTAL_SETUP_MODULE_IDS.includes(
-    id as (typeof FUNDAMENTAL_SETUP_MODULE_IDS)[number]
-  )
-}
-
-export function setupModuleRequirement(
-  setup: ResearchSetupFile,
-  id: ResearchSetupModuleId
-) {
-  if (isFundamentalSetupModule(id)) {
-    return {
-      required: true,
-      reason: "Required for Onyx auto research.",
-    }
-  }
-  return setup.modules[id] ?? { required: false, reason: null }
-}
-
-export function requiredSetupModules(setup: ResearchSetupFile) {
-  return SETUP_MODULE_IDS.filter(
-    (id) => setupModuleRequirement(setup, id).required
   )
 }
