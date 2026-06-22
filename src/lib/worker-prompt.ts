@@ -89,10 +89,10 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 ## Loop
 
 1. Read the setup file, validation report, research spec, campaign brief, peer state, recent experiments, shared knowledge, git status, and relevant source files. Use \`onyx knowledge list --campaign "$ONYX_CAMPAIGN_NAME"\` when network access is available; otherwise read \`ONYX_SESSION_STATE_FILE\`. Understand the workload before editing.
-2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, restore only in-scope files from the best commit and commit that forward; do not rewrite history.
+2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, plan the restore as a normal measured workflow attempt; do not create an unmeasured restore-forward commit outside \`onyx exp run\`.
 3. Pick a concrete research idea for this hypothesis. Use peer progress as inspiration, but do not duplicate an already-failed idea.
 4. Before each iteration and before any sweep that might take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json\`. Treat the configured iteration value as a maximum cap, not a target count. Stop cleanly when the JSON output contains \`"shouldStop": true\`; a nonzero exit means the stop check itself failed.
-5. Start a workflow with \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha> --auto\`; copy the printed workflow run id and runRef. The CLI should pause at the agent step.
+5. Start the first measured workflow early, before any broad sweep or multi-minute search. Use \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha> --auto\`; copy the printed workflow run id and runRef. The CLI should pause at the agent step.
 6. Edit only in-scope project files, make exactly one clean commit, then resume with \`onyx exp run --resume <workflowRunId> --auto\`. If blocked, inspect \`onyx workflow status --run <workflowRunId>\`; use \`onyx tools run <tool-id>\` only for diagnostics.
 7. Inspect the output, metric, and checks result. Record every terminal attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
 8. Publish concise shared learnings with \`onyx knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
@@ -102,8 +102,8 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 ## Research Rules
 
 - Primary metric is king: improved results are candidates to build from; worse or equal results should send you back to the current best before trying the next idea.
-- Make one small, measured, logged attempt early. Do not spend most of the hypothesis budget searching before the first commit.
-- Keep local sweeps bounded to seconds, not minutes. Prefer coarse evidence, start a workflow, commit one promising candidate, measure it through Onyx, then refine in a new workflow.
+- Make one small, measured, logged attempt early. Do not spend more than a quick orientation pass before the first \`onyx exp run\`.
+- Keep local sweeps bounded to seconds, not minutes. Before the first workflow, use at most one tiny sanity check; then start a workflow, commit one promising candidate, measure it through Onyx, and refine in a new workflow.
 - Secondary metrics inform tradeoffs, but hard guardrails belong in declared guardrail steps so a primary win that violates constraints becomes \`checks_failed\`.
 - Confirm surprising wins on noisy metrics before building on them. A single lucky trial can mislead the campaign.
 - Use loop statuses from \`onyx exp run\`: \`succeeded\`, \`failed\`, \`checks_failed\`, and \`setup_violation\`. Do not mark autonomous attempts \`accepted\` or \`rejected\`; those are for human curation.
@@ -116,14 +116,14 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 - Do not thrash. If you keep circling the same idea, try something structurally different.
 - Crashes: fix trivial issues, otherwise log what failed and move on.
 - When stuck, slow down: re-read source, inspect eval output, search history with \`onyx exp list --grep\`, study profiling or papers if useful, and reason from evidence instead of random variation.
-- Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: commit or restore the best scoped files, run/log any final measurement, sync/push when possible, summarize, and exit before ${input.shutdownDeadlineIso}. Do not start new exploration after ${input.researchDeadlineIso}.
+- Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: finish/log the current one-commit workflow if possible, sync/push when possible, summarize, and exit before ${input.shutdownDeadlineIso}. Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow. Do not start new exploration after ${input.researchDeadlineIso}.
 - Keep going only while useful work remains and the iteration cap has not been reached. Stop when the hypothesis is exhausted, the budget is no longer useful, or \`onyx research should-stop --json\` reports \`shouldStop: true\`. Do not ask whether to continue.
 
 ## Git And State Rules
 
 - Keep the tree clean before measuring. The result is attributed to HEAD.
 - Do not use \`git reset --hard\`, force-push, or rewrite reported experiment history.
-- Restoring an earlier best with \`git checkout <best-sha> -- <scoped files>\` is allowed only as a new forward commit.
+- Restoring an earlier best with \`git checkout <best-sha> -- <scoped files>\` is allowed only inside a normal \`onyx exp run\` attempt that produces exactly one measured forward commit.
 - Do not delete campaigns or experiments. Deletion/tombstones are human/orchestrator actions.
 - Use \`onyx exp list --limit 20\` for recent history and \`onyx exp list --grep <regex>\` before repeating an idea.
 - Use \`onyx knowledge list\` before repeating an idea, and \`onyx knowledge add\` for promising ideas, dead-end themes, risks, and transfer notes. If you keep a local backlog file, avoid protected setup paths and commit it normally.

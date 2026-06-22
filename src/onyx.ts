@@ -139,6 +139,7 @@ export {
   commandKnowledgeList,
   commandSummaryList,
   commandSummaryUpsert,
+  finalizeHypothesisAttempt,
   summarizeWorkerOutput,
   commandWorkerRun,
 } from "./commands/research"

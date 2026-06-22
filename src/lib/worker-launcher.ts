@@ -49,11 +49,20 @@ export type WorkerOnyxShim = {
   target: string
 }
 
+export type WorkerFinalizationStatus =
+  | "none"
+  | "already_logged"
+  | "measured_and_logged"
+  | "salvaged_unmeasured"
+  | "failed"
+
 export type WorkerFinalizationManifest = {
   attempted: boolean
   salvaged: boolean
+  finalizationStatus: WorkerFinalizationStatus
   commitSha: string | null
-  experimentLogged: boolean
+  measurementBaseCommitSha: string | null
+  unloggedCommitCount: number
   workerBranchPushStatus: "not_attempted" | "pushed" | "failed"
   rootDriftStatus: "not_checked" | "clean" | "dirty"
   error: string | null

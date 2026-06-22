@@ -78,6 +78,13 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain('"shouldStop": true')
     expect(prompt).toContain("maximum cap, not a target count")
     expect(prompt).toContain("Make one small, measured, logged attempt early")
+    expect(prompt).toContain("Start the first measured workflow early")
+    expect(prompt).toContain(
+      "do not create an unmeasured restore-forward commit outside `onyx exp run`"
+    )
+    expect(prompt).toContain(
+      "allowed only inside a normal `onyx exp run` attempt"
+    )
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
     expect(prompt).toContain("Primary metric is king")
     expect(prompt).toContain("Do not ask whether to continue")

@@ -33,6 +33,12 @@ function shellQuote(value: string) {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
+function markdownList(items: string[], empty: string) {
+  return items.length > 0
+    ? items.map((item) => `- ${item}`).join("\n")
+    : `- ${empty}`
+}
+
 function check(
   id: string,
   status: ResearchSetupValidationCheck["status"],
@@ -138,6 +144,74 @@ function defaultEvalScript(setup: ResearchSetupFile, args: Args) {
   ].join("\n")
 }
 
+function defaultInstructions(setup: ResearchSetupFile, args: Args) {
+  const metric = `${setup.metric.name}${setup.metric.unit ? ` (${setup.metric.unit})` : ""}`
+  const evalCommand =
+    args.options["eval-command"] ??
+    "onyx/tools/evaluation/run.sh currently exits nonzero until you replace it with the real eval."
+  const editable = setup.scope.editable.length
+    ? setup.scope.editable
+    : ["No editable scope was provided. Add one before real research."]
+  const toolIds = Object.keys(setup.tools).sort()
+  const workflow = setup.workflow.map((step) => {
+    if (step.agent) return `- ${step.id}: agent step - ${step.agent}`
+    if (step.run) {
+      return `- ${step.id}: run ${step.run}${step.metric ? ` and capture METRIC ${setup.metric.name}=<number>` : ""}`
+    }
+    return `- ${step.id}: ${JSON.stringify(step)}`
+  })
+
+  return [
+    "# Onyx Worker Instructions",
+    "",
+    "## Goal",
+    "",
+    setup.goal,
+    "",
+    "## Primary Metric",
+    "",
+    `- Name: ${metric}`,
+    `- Direction: ${setup.metric.direction}`,
+    "- Required output: the evaluation workflow must emit exactly one primary metric line shaped as `METRIC " +
+      `${setup.metric.name}=<number>\`.`,
+    "",
+    "## Editable Scope",
+    "",
+    markdownList(editable, "No editable scope configured yet."),
+    "",
+    "Workers may edit only the scoped project files above. They must not edit protected setup files during Research.",
+    "",
+    "## Protected Setup Surface",
+    "",
+    markdownList(setup.scope.protected, "onyx/setup.json, onyx/validation.json, onyx/onyx.md, and onyx/tools/"),
+    "",
+    "## Evaluation",
+    "",
+    `- Canonical tool: evaluation.run`,
+    `- Command configured from setup init: ${evalCommand}`,
+    "- Preflight before committing setup: `onyx tools run evaluation.run`",
+    "",
+    "## Workflow Contract",
+    "",
+    workflow.join("\n"),
+    "",
+    "Every experiment attempt should start with `onyx exp run`, pause at the agent step, make exactly one clean result commit, resume the workflow, then log the terminal attempt with `onyx exp log`.",
+    "",
+    "## Tools",
+    "",
+    markdownList(toolIds, "No tools configured."),
+    "",
+    "## First-Run Checklist",
+    "",
+    "- Confirm the editable scope is complete and narrow.",
+    "- Replace the evaluation tool if the scaffolded script is still a TODO.",
+    "- Run `onyx setup validate` and fix failed checks.",
+    "- Run `onyx tools run evaluation.run` and confirm it emits the primary metric.",
+    "- Commit `onyx/setup.json`, `onyx/validation.json`, `onyx/onyx.md`, and `onyx/tools/*` before campaign setup or research start.",
+    "",
+  ].join("\n")
+}
+
 async function buildValidation({
   root,
   projectPath,
@@ -167,11 +241,30 @@ async function buildValidation({
     checks.push(check("agent_context", "failed", "onyx/onyx.md is missing."))
   } else {
     const text = await readFile(instructionsPath, "utf8")
+    const hasContext = text.trim().length >= 40
     checks.push(
-      text.trim().length >= 40
+      hasContext
         ? check("agent_context", "passed", "onyx/onyx.md contains context.")
         : check("agent_context", "failed", "onyx/onyx.md is too sparse.")
     )
+    if (hasContext) {
+      const missingHints = [
+        text.includes(setup.metric.name) ? null : setup.metric.name,
+        text.includes("onyx exp run") ? null : "onyx exp run",
+        text.includes("editable") || text.includes("Editable")
+          ? null
+          : "editable scope",
+      ].filter(Boolean)
+      if (missingHints.length > 0) {
+        checks.push(
+          check(
+            "agent_context_quality",
+            "warning",
+            `onyx/onyx.md is present but should mention ${missingHints.join(", ")} for first-run workers.`
+          )
+        )
+      }
+    }
   }
 
   const metricStep = setup.workflow.find((step) => step.metric)
@@ -300,15 +393,7 @@ export async function commandSetupInit(args: Args) {
   )
   const wroteInstructions = await writeIfMissing(
     onyxPath(root, projectPath, "onyx.md"),
-    [
-      "# Onyx Worker Instructions",
-      "",
-      "Before validation and research, the orchestrator should edit onyx/setup.json, onyx/onyx.md, and onyx/tools/* for this repository.",
-      "Read onyx/setup.json and onyx/validation.json before starting work.",
-      "Use onyx exp run to pause, resume, and measure exactly one committed experiment attempt.",
-      "Do not edit protected setup files during research.",
-      "",
-    ].join("\n")
+    defaultInstructions(setupFile, args)
   )
   const wroteEval = await writeIfMissing(
     onyxPath(root, projectPath, "tools", "evaluation", "run.sh"),
@@ -343,8 +428,17 @@ export async function commandSetupValidate(args: Args) {
   const validation = await validateAndWrite(root, projectPath)
 
   console.log(`setup validation: ${validation.status}`)
-  for (const item of validation.checks) {
-    console.log(`${item.id}: ${item.status} - ${item.message}`)
+  const groups = [
+    ["blocking", validation.checks.filter((item) => item.status === "failed")],
+    ["warnings", validation.checks.filter((item) => item.status === "warning")],
+    ["passed", validation.checks.filter((item) => item.status === "passed")],
+  ] as const
+  for (const [label, items] of groups) {
+    if (items.length === 0) continue
+    console.log(`${label}:`)
+    for (const item of items) {
+      console.log(`- ${item.id}: ${item.status} - ${item.message}`)
+    }
   }
   console.log(`wrote ${validationPath(root, projectPath)}`)
   console.log(

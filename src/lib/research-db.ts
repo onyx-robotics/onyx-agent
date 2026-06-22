@@ -73,6 +73,8 @@ export type LocalWorkflowRunStatus =
   | "running"
   | "paused"
   | "blocked"
+  | "abandoned"
+  | "superseded"
   | "failed"
   | "checks_failed"
   | "setup_violation"
@@ -2446,13 +2448,63 @@ export async function readLatestActiveWorkflowRun({
       `
         SELECT * FROM workflow_runs
         WHERE campaign_name = ? AND project_path = ?
-          AND status IN ('running', 'paused', 'blocked')
+          AND status IN ('running', 'paused')
         ORDER BY updated_at DESC
         LIMIT 1
       `
     )
     .get(campaignName, projectPath) as Row | null
   return row ? workflowRunFromRow(row) : null
+}
+
+export async function readLatestBlockedWorkflowRun({
+  root,
+  campaignName,
+  projectPath,
+}: {
+  root: string
+  campaignName: string
+  projectPath: string
+}) {
+  const row = (await openDb(root))
+    .query(
+      `
+        SELECT * FROM workflow_runs
+        WHERE campaign_name = ? AND project_path = ?
+          AND status = 'blocked'
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `
+    )
+    .get(campaignName, projectPath) as Row | null
+  return row ? workflowRunFromRow(row) : null
+}
+
+export async function abandonBlockedWorkflowRunsForSession({
+  root,
+  sessionId,
+  reason,
+}: {
+  root: string
+  sessionId: string
+  reason: string
+}) {
+  const db = await openDb(root)
+  const at = nowIso()
+  db.query(
+    `
+      UPDATE workflow_runs
+      SET
+        status = 'abandoned',
+        block_reason = CASE
+          WHEN block_reason IS NULL OR block_reason = '' THEN ?
+          ELSE block_reason || '; ' || ?
+        END,
+        completed_at = COALESCE(completed_at, ?),
+        updated_at = ?
+      WHERE session_id = ? AND status = 'blocked'
+    `
+  ).run(reason, reason, at, at, sessionId)
 }
 
 export async function readLatestWorkflowRun({

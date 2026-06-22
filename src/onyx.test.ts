@@ -31,6 +31,7 @@ import {
   commandSync,
   commandWorkerRun,
   commandWorkflowStatus,
+  finalizeHypothesisAttempt,
   localResearchRecordSchema,
   mergeHistory,
   main,
@@ -66,6 +67,8 @@ import {
   localCampaignByName,
   logLocalExperiment,
   pendingResearchSyncCount,
+  readWorkflowRun,
+  upsertWorkflowRun,
   writeLocalAttempt,
 } from "./lib/research-db"
 import { runProcess } from "./lib/process"
@@ -197,6 +200,70 @@ async function writeResearchSmokeRepo() {
   })
 
   return { root, baseCommitSha, campaignId, campaignName }
+}
+
+async function addBareOrigin(root: string) {
+  const origin = await mkdtemp(join(tmpdir(), "onyx-origin-"))
+  await runProcess("git", ["init", "--bare"], { cwd: origin })
+  await runProcess("git", ["remote", "add", "origin", origin], { cwd: root })
+  return origin
+}
+
+function testCampaign({
+  campaignId,
+  campaignName,
+  baseCommitSha,
+}: {
+  campaignId: string
+  campaignName: string
+  baseCommitSha: string
+}) {
+  return {
+    id: campaignId,
+    projectId: "44444444-4444-4444-8444-444444444444",
+    name: campaignName,
+    description: "Improve score.",
+    baseCommitSha,
+    metricName: "score",
+    metricUnit: null,
+    metricDirection: "maximize" as const,
+    bestMetricValue: null,
+    bestCommitSha: null,
+    experimentCount: 0,
+    promotionRefName: null,
+  }
+}
+
+function testHypothesis({
+  campaignId,
+  baseCommitSha,
+}: {
+  campaignId: string
+  baseCommitSha: string
+}) {
+  return {
+    id: "66666666-6666-4666-8666-666666666666",
+    campaignId,
+    createdBySessionId: "22222222-2222-4222-8222-222222222222",
+    name: "hypothesis-1",
+    description: null,
+    status: "active" as const,
+    baseCommitSha,
+    bestExperimentId: null,
+    bestMetricValue: null,
+    lastWorkedAt: null,
+    plan: {
+      focus: "Scoped text tuning",
+      statement: "A small scoped change can improve the score.",
+      startingPoints: ["src/controller.txt"],
+      avoidList: ["onyx/"],
+      successSignals: ["METRIC score improves"],
+      giveUpSignals: ["No clean scoped change"],
+    },
+    metadata: {},
+    createdAt: "2026-06-20T00:00:00.000Z",
+    updatedAt: "2026-06-20T00:00:00.000Z",
+  }
 }
 
 async function withMockResearchApi(
@@ -626,6 +693,221 @@ describe("exp run", () => {
     } finally {
       process.chdir(previousCwd)
       process.exitCode = previousExitCode
+      console.log = originalLog
+    }
+  })
+
+  test("--active excludes blocked workflow runs and --blocked shows them", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await upsertWorkflowRun({
+        root,
+        run: {
+          id: "workflow-blocked",
+          campaignId,
+          campaignName,
+          projectPath: "",
+          runRef: "local/smoke/blocked",
+          baseCommitSha,
+          resultCommitSha: null,
+          resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/blocked`,
+          setupHash: setupHash(await readSetupFile(root, "")),
+          status: "blocked",
+          currentStepIndex: 0,
+          metrics: {},
+          blockReason:
+            "Workflow attempts must contain exactly one result commit over the base commit.",
+          createdAt: "2026-06-20T00:00:00.000Z",
+          startedAt: "2026-06-20T00:00:00.000Z",
+          completedAt: null,
+          updatedAt: "2026-06-20T00:00:00.000Z",
+          sessionId: "22222222-2222-4222-8222-222222222222",
+          workerId: "77777777-7777-4777-8777-777777777777",
+          hypothesisId: "66666666-6666-4666-8666-666666666666",
+        },
+      })
+
+      await expect(
+        commandWorkflowStatus({
+          positional: ["workflow", "status"],
+          options: { campaign: campaignName, active: "true", json: "true" },
+        })
+      ).rejects.toThrow("No active workflow runs exist")
+      const blocked = await commandWorkflowStatus({
+        positional: ["workflow", "status"],
+        options: { campaign: campaignName, blocked: "true", json: "true" },
+      })
+      expect(blocked?.run.id).toBe("workflow-blocked")
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+})
+
+describe("worker finalization", () => {
+  test("measures and logs exactly one unlogged worker commit", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    await addBareOrigin(root)
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate")
+      const head = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim()
+
+      const manifest = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis: testHypothesis({ campaignId, baseCommitSha }),
+        sessionId: "22222222-2222-4222-8222-222222222222",
+        workerId: "77777777-7777-4777-8777-777777777777",
+        workerBranch: "onyx/test/finalization",
+        args: { positional: ["worker", "run"], options: { offline: "true" } },
+        workerFailed: false,
+      })
+
+      expect(manifest.finalizationStatus).toBe("measured_and_logged")
+      expect(manifest.commitSha).toBe(head)
+      expect(manifest.measurementBaseCommitSha).toBe(baseCommitSha)
+      expect(manifest.unloggedCommitCount).toBe(1)
+      expect(manifest.workerBranchPushStatus).toBe("pushed")
+      const history = await listLocalExperimentHistory(root)
+      expect(history).toHaveLength(1)
+      expect(history[0]?.resultCommitSha).toBe(head)
+      expect(history[0]?.baseCommitSha).toBe(baseCommitSha)
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
+  test("treats an already logged worker HEAD as already_logged", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    await addBareOrigin(root)
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate")
+      const head = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim()
+      const hypothesis = testHypothesis({ campaignId, baseCommitSha })
+      await writeLocalAttempt({
+        root,
+        record: {
+          schemaVersion: 1,
+          createdAt: "2026-06-20T00:00:00.000Z",
+          runRef: "local/smoke/already-logged",
+          campaignName,
+          projectPath: "",
+          baseCommitSha,
+          resultCommitSha: head,
+          resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/already-logged`,
+          status: "succeeded",
+          setupCompliance: {
+            status: "passed",
+            protectedPathsChanged: [],
+            outOfScopePathsChanged: [],
+            setupPathsChanged: [],
+            notes: null,
+          },
+          primaryMetricName: "score",
+          primaryMetricValue: 1.25,
+          metrics: { score: 1.25 },
+          agentNotes: {},
+          checks: null,
+          durationMs: null,
+          startedAt: null,
+          completedAt: null,
+          outputSummary: null,
+          hypothesisId: hypothesis.id,
+          sessionId: hypothesis.createdBySessionId,
+          workerId: "77777777-7777-4777-8777-777777777777",
+        },
+      })
+
+      const manifest = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis,
+        sessionId: hypothesis.createdBySessionId,
+        workerId: "77777777-7777-4777-8777-777777777777",
+        workerBranch: "onyx/test/already-logged",
+        args: { positional: ["worker", "run"], options: { offline: "true" } },
+        workerFailed: false,
+      })
+
+      expect(manifest.finalizationStatus).toBe("already_logged")
+      expect(manifest.commitSha).toBe(head)
+      expect(manifest.unloggedCommitCount).toBe(0)
+      const attempts = await listLocalAttempts(root)
+      expect(attempts).toHaveLength(1)
+      expect(attempts[0]?.runRef).toBe("local/smoke/already-logged")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("salvages multiple unlogged commits without creating a workflow run", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    await addBareOrigin(root)
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate one")
+      await writeFile(
+        join(root, "src", "candidate-2.txt"),
+        "candidate\n",
+        "utf8"
+      )
+      await commitAll(root, "candidate two")
+
+      const manifest = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis: testHypothesis({ campaignId, baseCommitSha }),
+        sessionId: "22222222-2222-4222-8222-222222222222",
+        workerId: "77777777-7777-4777-8777-777777777777",
+        workerBranch: "onyx/test/multi-commit",
+        args: { positional: ["worker", "run"], options: { offline: "true" } },
+        workerFailed: false,
+      })
+
+      expect(manifest.finalizationStatus).toBe("salvaged_unmeasured")
+      expect(manifest.unloggedCommitCount).toBe(2)
+      expect(manifest.error).toContain("exactly one unlogged HEAD commit")
+      expect(await listLocalAttempts(root)).toHaveLength(0)
+      await expect(
+        commandWorkflowStatus({
+          positional: ["workflow", "status"],
+          options: { campaign: campaignName, active: "true", json: "true" },
+        })
+      ).rejects.toThrow("No active workflow runs exist")
+    } finally {
+      process.chdir(previousCwd)
       console.log = originalLog
     }
   })
@@ -1882,6 +2164,32 @@ describe("research status", () => {
         },
       },
     })
+    await upsertWorkflowRun({
+      root,
+      run: {
+        id: "workflow-finish-blocked",
+        campaignId: campaign.id,
+        campaignName,
+        projectPath: "",
+        runRef: "local/smoke/finish-blocked",
+        baseCommitSha,
+        resultCommitSha: null,
+        resultRef: `refs/onyx/experiments/${campaign.id}/local/smoke/finish-blocked`,
+        setupHash: setupHash(setup),
+        status: "blocked",
+        currentStepIndex: 0,
+        metrics: {},
+        blockReason:
+          "Workflow attempts must contain exactly one result commit over the base commit.",
+        createdAt: "2026-06-20T00:00:00.000Z",
+        startedAt: "2026-06-20T00:00:00.000Z",
+        completedAt: null,
+        updatedAt: "2026-06-20T00:00:00.000Z",
+        sessionId: session.session.id,
+        workerId: "77777777-7777-4777-8777-777777777777",
+        hypothesisId: hypothesis.id,
+      },
+    })
 
     const sessionStateDir = join(
       await onyxStateDir(root),
@@ -1950,6 +2258,19 @@ describe("research status", () => {
     expect(status.session.status).toBe("completed")
     expect(status.session.openSlots).toBe(2)
     expect(status.launchSuggestions).toEqual([])
+    const abandoned = await readWorkflowRun(root, "workflow-finish-blocked")
+    expect(abandoned?.status).toBe("abandoned")
+    await expect(
+      commandWorkflowStatus({
+        positional: ["workflow", "status"],
+        options: {
+          cwd: root,
+          campaign: campaignName,
+          active: "true",
+          json: "true",
+        },
+      })
+    ).rejects.toThrow("No active workflow runs exist")
   })
 })
 
@@ -2387,6 +2708,14 @@ describe("setup workflow", () => {
         "edit",
         "evaluate",
       ])
+      const instructions = await readFile(join(root, "onyx", "onyx.md"), "utf8")
+      expect(instructions).toContain("## Goal")
+      expect(instructions).toContain("Improve score")
+      expect(instructions).toContain("## Primary Metric")
+      expect(instructions).toContain("METRIC score=<number>")
+      expect(instructions).toContain("## Workflow Contract")
+      expect(instructions).toContain("onyx exp run")
+      expect(instructions).toContain("## First-Run Checklist")
       expect(USAGE).not.toContain("onyx setup require")
     } finally {
       process.chdir(previousCwd)
@@ -2417,7 +2746,10 @@ describe("setup workflow", () => {
       expect(evalSh).toContain("printf 'METRIC score=7\\n'")
       expect(evalSh).not.toContain("TODO: replace")
       const instructions = await readFile(join(root, "onyx", "onyx.md"), "utf8")
-      expect(instructions).toContain("the orchestrator should edit")
+      expect(instructions).toContain("- src")
+      expect(instructions).toContain("- tests/fixtures")
+      expect(instructions).toContain("printf 'METRIC score=7\\n'")
+      expect(instructions).toContain("METRIC score=<number>")
     } finally {
       process.chdir(previousCwd)
     }

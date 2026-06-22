@@ -93,7 +93,10 @@ pauses for the agent edit, requires exactly one clean result commit, executes
 workflow command steps, parses the primary metric, and records setup compliance.
 `onyx setup init` stays explicit: `--editable-scope` and `--eval-command` write
 only the caller-provided values, and the default eval tool keeps failing until
-the orchestrator deliberately configures it.
+the orchestrator deliberately configures it. The generated `onyx/onyx.md`
+still includes the supplied goal, metric contract, editable scope, evaluation
+command, workflow contract, and first-run checklist so workers have useful
+initial context before project-specific edits.
 
 Local research state is SQLite-first. The agent stores campaigns, sessions,
 hypotheses, workers, experiments, summaries, knowledge, resource leases, and
@@ -140,6 +143,9 @@ readable `.activity.log` files, and launch manifests under
 including activity/raw log paths, last-output age, timeout state, and manifest
 errors when local manifests are available. `--max-iterations` is a cap, not a
 target count.
+`onyx workflow status --active` shows only actionable running or paused
+workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked
+diagnostics.
 
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<hypothesis>/<worker>`,
 while each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
@@ -155,13 +161,17 @@ publish shared learning with `onyx knowledge add` and read it back with
 `onyx knowledge list`, but successor hypothesis selection remains an
 orchestrator/human decision.
 After the agent exits, the worker harness performs one final best-effort
-commit, measurement for exactly one unlogged commit when possible, local
-experiment log, and worker-branch push so useful offline work is not lost.
-Multi-commit or dirty salvage preserves the branch without producing a
-measured experiment. If `onyx research stop` is requested while a provider
-process is still running, the harness gives it the configured stop grace
-(30 seconds by default), terminates it if needed, then runs the same
-finalization path. Use `--worker-command` only for custom harnesses.
+commit, checks whether HEAD is already represented by a local experiment,
+measures/logs exactly one unlogged HEAD commit using that commit's parent as
+the workflow base, and pushes the worker branch so useful offline work is not
+lost. Multi-commit, restore-forward, or dirty salvage preserves the branch
+without producing a measured experiment or blocked workflow run. Worker
+manifests report `finalizationStatus` as `none`, `already_logged`,
+`measured_and_logged`, `salvaged_unmeasured`, or `failed`. If
+`onyx research stop` is requested while a provider process is still running,
+the harness gives it the configured stop grace (30 seconds by default),
+terminates it if needed, then runs the same finalization path. Use
+`--worker-command` only for custom harnesses.
 
 Stop and finalize campaigns explicitly:
 

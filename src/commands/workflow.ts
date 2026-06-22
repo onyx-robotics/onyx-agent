@@ -5,6 +5,7 @@ import { resolveProjectPath } from "../lib/project"
 import {
   listWorkflowSteps,
   readLatestActiveWorkflowRun,
+  readLatestBlockedWorkflowRun,
   readLatestWorkflowRun,
   readWorkflowRun,
 } from "../lib/research-db"
@@ -28,7 +29,13 @@ export async function commandWorkflowStatus(args: Args) {
     : await activeCampaignName(root, args)
   const run = args.options.run
     ? await readWorkflowRun(root, args.options.run)
-    : args.options.active === "true"
+    : args.options.blocked === "true"
+      ? await readLatestBlockedWorkflowRun({
+          root,
+          campaignName: campaignName!,
+          projectPath,
+        })
+      : args.options.active === "true"
       ? await readLatestActiveWorkflowRun({
           root,
           campaignName: campaignName!,
@@ -43,7 +50,9 @@ export async function commandWorkflowStatus(args: Args) {
     throw new Error(
       args.options.run
         ? `No workflow run ${args.options.run} was found.`
-        : args.options.active === "true"
+        : args.options.blocked === "true"
+          ? `No blocked workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
+          : args.options.active === "true"
           ? `No active workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
           : `No workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
     )
