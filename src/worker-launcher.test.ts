@@ -183,6 +183,7 @@ describe("worker launchers", () => {
     expect(preflight.version).toContain("codex fake 1.0")
 
     const logPath = join(root, "worker.log")
+    const activityLogPath = join(root, "worker.activity.log")
     const result = await runStreamingProcess(
       invocation.command,
       invocation.args,
@@ -191,6 +192,7 @@ describe("worker launchers", () => {
         env,
         stdin: invocation.stdin,
         logPath,
+        activityLogPath,
         timeoutMs: 5000,
         startupTimeoutMs: 1000,
         killGraceMs: 100,
@@ -204,6 +206,10 @@ describe("worker launchers", () => {
     )
     expect(await readFile(argsFile, "utf8")).not.toContain("do useful work")
     expect(await readFile(logPath, "utf8")).toContain("codex fake 1.0 output")
+    expect(await readFile(activityLogPath, "utf8")).toContain(
+      "codex fake 1.0 output"
+    )
+    expect(result.activityLogPath).toBe(activityLogPath)
   })
 
   test("preflights Claude with its direct print-mode launcher", async () => {
@@ -250,6 +256,7 @@ describe("worker launchers", () => {
       cwd: root,
       promptPath: join(root, "prompt.md"),
       logPath: join(root, "worker.log"),
+      activityLogPath: join(root, "worker.activity.log"),
       manifestPath,
       sessionId: "session",
       hypothesisId: "hypothesis",
@@ -346,6 +353,31 @@ describe("worker launchers", () => {
 
     expect(result.timedOut).toBe(true)
     expect(result.startupTimedOut).toBe(true)
+  })
+
+  test("cancellation terminates workers after grace and writes activity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-cancel-"))
+    const activityLogPath = join(root, "worker.activity.log")
+    const result = await runStreamingProcess(
+      "sh",
+      ["-c", "trap '' TERM; echo ready; sleep 5"],
+      {
+        logPath: join(root, "worker.log"),
+        activityLogPath,
+        timeoutMs: 5000,
+        startupTimeoutMs: 1000,
+        killGraceMs: 50,
+        cancel: {
+          pollMs: 10,
+          graceMs: 50,
+          shouldCancel: () => true,
+        },
+      }
+    )
+
+    expect(result.cancelled).toBe(true)
+    expect(result.timedOut).toBe(false)
+    expect(await readFile(activityLogPath, "utf8")).toContain("stop requested")
   })
 
   test("pushRefs dedupes duplicate destinations and rejects conflicts", async () => {

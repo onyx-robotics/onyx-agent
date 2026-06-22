@@ -60,7 +60,7 @@ export type ResearchSyncEvent = {
 }
 
 export type LocalCampaign = ApiCampaign & {
-  status: "active" | "completed" | "deleted"
+  status: "active" | "completed" | "archived"
   projectPath: string
   setup: ResearchSetupFile | Record<string, unknown>
   humanFeedback: string | null
@@ -1051,7 +1051,7 @@ export async function completeLocalCampaign({
   const at = nowIso()
   const tx = db.transaction(() => {
     db.query(
-      "UPDATE campaigns SET status = 'completed', updated_at = ? WHERE id = ? AND status != 'deleted'"
+      "UPDATE campaigns SET status = 'completed', updated_at = ? WHERE id = ? AND status != 'archived'"
     ).run(at, campaignId)
     const row = db
       .query("SELECT * FROM campaigns WHERE id = ?")
@@ -1097,7 +1097,7 @@ export async function listLocalCampaigns(root: string) {
   const db = await openDb(root)
   const rows = db
     .query(
-      "SELECT * FROM campaigns WHERE status != 'deleted' ORDER BY updated_at DESC"
+      "SELECT * FROM campaigns WHERE status != 'archived' ORDER BY updated_at DESC"
     )
     .all() as Row[]
   return rows.map((row) => campaignFromRowForDb(db, row))
@@ -1727,7 +1727,8 @@ function bestVisibleExperimentForCampaign(
   experiments: ApiCampaignExperiment[]
 ) {
   return experiments.reduce<ApiCampaignExperiment | null>((current, next) => {
-    if (!isBestEligible(next) || next.primaryMetricValue === null) return current
+    if (!isBestEligible(next) || next.primaryMetricValue === null)
+      return current
     return isBetter(
       campaign.metricDirection,
       current?.primaryMetricValue ?? null,
@@ -1736,6 +1737,13 @@ function bestVisibleExperimentForCampaign(
       ? next
       : current
   }, null)
+}
+
+function bestVisibleExperimentForHypothesis(
+  campaign: Pick<LocalCampaign, "metricDirection">,
+  experiments: ApiCampaignExperiment[]
+) {
+  return bestVisibleExperimentForCampaign(campaign, experiments)
 }
 
 function campaignWithVisibleProjection(
@@ -1754,10 +1762,71 @@ function campaignWithVisibleProjection(
 
 function campaignFromRowForDb(db: Db, row: Row) {
   const campaign = campaignFromRow(row)
-  if (campaign.status === "deleted") return campaign
   return campaignWithVisibleProjection(
     campaign,
     listLocalExperimentsForDb(db, campaign.id)
+  )
+}
+
+function listLocalExperimentsForHypothesisForDb(
+  db: Db,
+  campaignId: string,
+  hypothesisId: string
+) {
+  const rows = db
+    .query(
+      `
+        SELECT e.*
+        FROM experiments e
+        INNER JOIN campaigns c ON c.id = e.campaign_id
+        WHERE e.campaign_id = ?
+          AND e.hypothesis_id = ?
+          AND ${visibleExperimentPredicateSql()}
+        ORDER BY e.created_at ASC
+      `
+    )
+    .all(campaignId, hypothesisId) as Row[]
+  return rows.map(experimentFromRow)
+}
+
+function recomputeLocalHypothesisProjectionForDb({
+  db,
+  campaignId,
+  hypothesisId,
+  at,
+}: {
+  db: Db
+  campaignId: string
+  hypothesisId: string | null | undefined
+  at: string
+}) {
+  if (!hypothesisId) return
+  const campaignRow = db
+    .query("SELECT * FROM campaigns WHERE id = ?")
+    .get(campaignId) as Row | null
+  if (!campaignRow) return
+  const campaign = campaignFromRow(campaignRow)
+  const experiments = listLocalExperimentsForHypothesisForDb(
+    db,
+    campaignId,
+    hypothesisId
+  )
+  const latest = experiments.at(-1)
+  const best = bestVisibleExperimentForHypothesis(campaign, experiments)
+  db.query(
+    `
+      UPDATE hypotheses
+      SET last_worked_at = ?, best_experiment_id = ?, best_metric_value = ?,
+        updated_at = ?
+      WHERE id = ? AND campaign_id = ?
+    `
+  ).run(
+    latest?.completedAt ?? latest?.createdAt ?? null,
+    best?.id ?? null,
+    best?.primaryMetricValue ?? null,
+    at,
+    hypothesisId,
+    campaignId
   )
 }
 
@@ -1774,7 +1843,7 @@ export async function logLocalExperiment({
   const tx = db.transaction(() => {
     const campaign = db
       .query(
-        "SELECT * FROM campaigns WHERE project_path = ? AND name = ? AND status != 'deleted'"
+        "SELECT * FROM campaigns WHERE project_path = ? AND name = ? AND status != 'archived'"
       )
       .get(record.projectPath ?? "", record.campaignName) as Row | null
     if (!campaign)
@@ -1877,7 +1946,16 @@ export async function logLocalExperiment({
     const existing = db
       .query("SELECT * FROM experiments WHERE campaign_id = ? AND run_ref = ?")
       .get(campaignId, record.runRef) as Row | null
-    if (existing) return experimentFromRow(existing)
+    if (existing) {
+      const experiment = experimentFromRow(existing)
+      recomputeLocalHypothesisProjectionForDb({
+        db,
+        campaignId,
+        hypothesisId: experiment.hypothesisId,
+        at,
+      })
+      return experiment
+    }
 
     const secondaryMetrics: Record<string, unknown> = { ...record.metrics }
     delete secondaryMetrics[record.primaryMetricName]
@@ -1954,22 +2032,13 @@ export async function logLocalExperiment({
         at,
         campaign.id as string
       )
-      if (hypothesisId) {
-        db.query(
-          `
-            UPDATE hypotheses
-            SET best_experiment_id = ?, best_metric_value = ?, last_worked_at = ?, updated_at = ?
-            WHERE id = ?
-          `
-        ).run(
-          experiment.id,
-          experiment.primaryMetricValue,
-          at,
-          at,
-          hypothesisId
-        )
-      }
     }
+    recomputeLocalHypothesisProjectionForDb({
+      db,
+      campaignId,
+      hypothesisId,
+      at,
+    })
     enqueueSyncEvent({
       db,
       type: "experiment.logged",
@@ -1987,11 +2056,7 @@ export async function logLocalExperiment({
   return tx()
 }
 
-function listLocalExperimentsForDb(
-  db: Db,
-  campaignId: string,
-  limit?: number
-) {
+function listLocalExperimentsForDb(db: Db, campaignId: string, limit?: number) {
   const sql = `
     SELECT e.*
     FROM experiments e
@@ -2288,8 +2353,7 @@ function workflowStepFromRow(row: Row): LocalWorkflowStep {
     toolId: nullableString(row.tool_id),
     status: row.status as LocalWorkflowStepStatus,
     attempt: Number(row.attempt ?? 0),
-    exitCode:
-      typeof row.exit_code === "number" ? Number(row.exit_code) : null,
+    exitCode: typeof row.exit_code === "number" ? Number(row.exit_code) : null,
     timedOut: bool(row.timed_out),
     outputSummary: nullableString(row.output_summary),
     metrics: numericRecord(parseJson(row.metrics_json, {})),
@@ -2383,6 +2447,28 @@ export async function readLatestActiveWorkflowRun({
         SELECT * FROM workflow_runs
         WHERE campaign_name = ? AND project_path = ?
           AND status IN ('running', 'paused', 'blocked')
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `
+    )
+    .get(campaignName, projectPath) as Row | null
+  return row ? workflowRunFromRow(row) : null
+}
+
+export async function readLatestWorkflowRun({
+  root,
+  campaignName,
+  projectPath,
+}: {
+  root: string
+  campaignName: string
+  projectPath: string
+}) {
+  const row = (await openDb(root))
+    .query(
+      `
+        SELECT * FROM workflow_runs
+        WHERE campaign_name = ? AND project_path = ?
         ORDER BY updated_at DESC
         LIMIT 1
       `
@@ -2752,7 +2838,35 @@ async function insertLocalTombstones({
     `
   )
   db.transaction(() => {
+    const affectedHypotheses = new Map<string, Set<string>>()
+    const addAffectedHypothesis = (
+      campaignId: string | null | undefined,
+      hypothesisId: string | null | undefined
+    ) => {
+      if (!campaignId || !hypothesisId) return
+      const set = affectedHypotheses.get(campaignId) ?? new Set<string>()
+      set.add(hypothesisId)
+      affectedHypotheses.set(campaignId, set)
+    }
     for (const tombstone of tombstones) {
+      if (tombstone.entityType === "experiment") {
+        const experiment = db
+          .query(
+            "SELECT campaign_id, hypothesis_id FROM experiments WHERE id = ? OR run_ref = ?"
+          )
+          .get(tombstone.entityId, tombstone.runRef ?? "") as Row | null
+        addAffectedHypothesis(
+          nullableString(experiment?.campaign_id),
+          nullableString(experiment?.hypothesis_id)
+        )
+      } else if (tombstone.entityType === "campaign") {
+        const hypotheses = db
+          .query("SELECT id FROM hypotheses WHERE campaign_id = ?")
+          .all(tombstone.campaignId) as Row[]
+        for (const hypothesis of hypotheses) {
+          addAffectedHypothesis(tombstone.campaignId, hypothesis.id as string)
+        }
+      }
       insert.run(
         `${tombstone.entityType}:${tombstone.entityId}`,
         tombstone.entityType,
@@ -2763,6 +2877,17 @@ async function insertLocalTombstones({
         tombstone.reason,
         tombstone.deletedAt
       )
+    }
+    const at = nowIso()
+    for (const [campaignId, hypothesisIds] of affectedHypotheses) {
+      for (const hypothesisId of hypothesisIds) {
+        recomputeLocalHypothesisProjectionForDb({
+          db,
+          campaignId,
+          hypothesisId,
+          at,
+        })
+      }
     }
   })()
 }

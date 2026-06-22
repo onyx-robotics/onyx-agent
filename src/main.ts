@@ -55,26 +55,26 @@ Usage:
       (creates a campaign and draft setup; each measured experiment is pushed
       as an immutable refs/onyx/experiments/* ref; setup comes from onyx/setup.json)
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
-  onyx setup init [--project-path <path>] [--goal <text>] [--metric-name <name>] [--metric-unit <unit>] [--metric-direction maximize|minimize]
+  onyx setup init [--project-path <path>] [--goal <text>] [--metric-name <name>] [--metric-unit <unit>] [--metric-direction maximize|minimize] [--editable-scope <paths>] [--eval-command <cmd>]
   onyx setup validate [--project-path <path>]
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-iterations <n>] [--max-minutes <n>]
+  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>]
       (creates an async research session and prints worker launch commands)
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]
-  onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <n>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>]
+  onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <cap>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>] [--quiet]
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
-  onyx research finish [--campaign <name>] [--session <id>]
+  onyx research finish [--campaign <name>] [--session <id>] [--final-sync-timeout <seconds>] [--require-online]
   onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text>
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run (--campaign <name> [--base <sha>] | --resume <workflowRunId>) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
-  onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--project-path <path>] [--json]
+  onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--project-path <path>] [--json]
   onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen

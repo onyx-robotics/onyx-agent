@@ -5,6 +5,7 @@ import { resolveProjectPath } from "../lib/project"
 import {
   listWorkflowSteps,
   readLatestActiveWorkflowRun,
+  readLatestWorkflowRun,
   readWorkflowRun,
 } from "../lib/research-db"
 
@@ -22,15 +23,30 @@ async function activeCampaignName(root: string, args: Args) {
 export async function commandWorkflowStatus(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
+  const campaignName = args.options.run
+    ? null
+    : await activeCampaignName(root, args)
   const run = args.options.run
     ? await readWorkflowRun(root, args.options.run)
-    : await readLatestActiveWorkflowRun({
-        root,
-        campaignName: await activeCampaignName(root, args),
-        projectPath,
-      })
+    : args.options.active === "true"
+      ? await readLatestActiveWorkflowRun({
+          root,
+          campaignName: campaignName!,
+          projectPath,
+        })
+      : await readLatestWorkflowRun({
+          root,
+          campaignName: campaignName!,
+          projectPath,
+        })
   if (!run) {
-    throw new Error("No matching workflow run was found.")
+    throw new Error(
+      args.options.run
+        ? `No workflow run ${args.options.run} was found.`
+        : args.options.active === "true"
+          ? `No active workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
+          : `No workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
+    )
   }
   const steps = await listWorkflowSteps(root, run.id)
   const payload = {

@@ -121,6 +121,23 @@ function toolFileReferences(setup: ResearchSetupFile) {
   return [...refs].sort()
 }
 
+function defaultEvalScript(setup: ResearchSetupFile, args: Args) {
+  const evalCommand = args.options["eval-command"]
+  if (evalCommand) {
+    return ["#!/usr/bin/env bash", "set -euo pipefail", evalCommand, ""].join(
+      "\n"
+    )
+  }
+  return [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    `echo ${shellQuote(`TODO: replace onyx/tools/evaluation/run.sh with a real eval that emits METRIC ${setup.metric.name}=<number>`)} >&2`,
+    'echo "Setup validation is static; configure this tool before running a workflow." >&2',
+    "exit 1",
+    "",
+  ].join("\n")
+}
+
 async function buildValidation({
   root,
   projectPath,
@@ -286,6 +303,7 @@ export async function commandSetupInit(args: Args) {
     [
       "# Onyx Worker Instructions",
       "",
+      "Before validation and research, the orchestrator should edit onyx/setup.json, onyx/onyx.md, and onyx/tools/* for this repository.",
       "Read onyx/setup.json and onyx/validation.json before starting work.",
       "Use onyx exp run to pause, resume, and measure exactly one committed experiment attempt.",
       "Do not edit protected setup files during research.",
@@ -294,14 +312,7 @@ export async function commandSetupInit(args: Args) {
   )
   const wroteEval = await writeIfMissing(
     onyxPath(root, projectPath, "tools", "evaluation", "run.sh"),
-    [
-      "#!/usr/bin/env bash",
-      "set -euo pipefail",
-      `echo ${shellQuote(`TODO: replace onyx/tools/evaluation/run.sh with a real eval that emits METRIC ${setupFile.metric.name}=<number>`)} >&2`,
-      'echo "Setup validation is static; configure this tool before running a workflow." >&2',
-      "exit 1",
-      "",
-    ].join("\n"),
+    defaultEvalScript(setupFile, args),
     0o755
   )
   const validation = await validateAndWrite(root, projectPath)
@@ -317,7 +328,7 @@ export async function commandSetupInit(args: Args) {
   console.log(`wrote ${validationPath(root, projectPath)}`)
   console.log(`setup validation: ${validation.status}`)
   console.log(
-    "next: configure onyx/tools/evaluation/run.sh, then run `onyx tools run evaluation.run` for a transient eval preflight."
+    "next: edit onyx/setup.json, onyx/onyx.md, and onyx/tools/* for this repository, then run `onyx tools run evaluation.run` for a transient eval preflight."
   )
 }
 

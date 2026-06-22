@@ -47,6 +47,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "- Final shutdown deadline: 2026-06-20T14:10:00.000Z"
     )
+    expect(prompt).toContain("- Iteration cap: 8 maximum")
     expect(prompt).toContain(
       "- Worktree root: /repo/.git/onyx/worktrees/session-hypothesis"
     )
@@ -75,6 +76,7 @@ describe("hypothesis worker prompt", () => {
       'onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json'
     )
     expect(prompt).toContain('"shouldStop": true')
+    expect(prompt).toContain("maximum cap, not a target count")
     expect(prompt).toContain("Make one small, measured, logged attempt early")
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
     expect(prompt).toContain("Primary metric is king")

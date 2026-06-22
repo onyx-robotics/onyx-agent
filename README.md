@@ -67,7 +67,7 @@ onyx agent skill-path
 ## Core Workflow
 
 ```bash
-onyx setup init --goal "Improve score" --metric-name score
+onyx setup init --goal "Improve score" --metric-name score --editable-scope src --eval-command "printf 'METRIC score=1\n'"
 # edit onyx/setup.json, onyx/onyx.md, and onyx/tools/evaluation/run.sh
 onyx setup validate
 git add onyx
@@ -91,6 +91,9 @@ the setup hash and static checks; then creates an async research session with
 deliberate hypothesis plans. Runtime rigor remains in `onyx exp run`, which
 pauses for the agent edit, requires exactly one clean result commit, executes
 workflow command steps, parses the primary metric, and records setup compliance.
+`onyx setup init` stays explicit: `--editable-scope` and `--eval-command` write
+only the caller-provided values, and the default eval tool keeps failing until
+the orchestrator deliberately configures it.
 
 Local research state is SQLite-first. The agent stores campaigns, sessions,
 hypotheses, workers, experiments, summaries, knowledge, resource leases, and
@@ -122,19 +125,21 @@ agent launcher:
 
 ```bash
 plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
-onyx research start --campaign fast-eval --workers 4 --hypotheses "$plans" --max-minutes 10
-onyx worker run --session <id> --hypothesis <hypothesis-id> --agent codex --max-minutes 10
-onyx worker run --session <id> --hypothesis <hypothesis-id> --agent claude --max-minutes 10
+onyx research start --campaign fast-eval --workers 4 --hypotheses "$plans" --max-minutes 10 --max-iterations 5
+onyx worker run --session <id> --hypothesis <hypothesis-id> --agent codex --max-minutes 10 --stop-grace-seconds 30
+onyx worker run --session <id> --hypothesis <hypothesis-id> --agent claude --max-minutes 10 --quiet
 onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
-receive the worker prompt over stdin, and write live stdout/stderr logs plus
-launch manifests under `.git/onyx/worker-logs/`.
+receive the worker prompt over stdin, and write raw stdout/stderr logs,
+readable `.activity.log` files, and launch manifests under
+`.git/onyx/worker-logs/`.
 `onyx research status` shows active-session hypotheses and workers by default,
-including log paths, last-output age, timeout state, and manifest errors when
-local manifests are available.
+including activity/raw log paths, last-output age, timeout state, and manifest
+errors when local manifests are available. `--max-iterations` is a cap, not a
+target count.
 
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<hypothesis>/<worker>`,
 while each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
@@ -153,7 +158,10 @@ After the agent exits, the worker harness performs one final best-effort
 commit, measurement for exactly one unlogged commit when possible, local
 experiment log, and worker-branch push so useful offline work is not lost.
 Multi-commit or dirty salvage preserves the branch without producing a
-measured experiment. Use `--worker-command` only for custom harnesses.
+measured experiment. If `onyx research stop` is requested while a provider
+process is still running, the harness gives it the configured stop grace
+(30 seconds by default), terminates it if needed, then runs the same
+finalization path. Use `--worker-command` only for custom harnesses.
 
 Stop and finalize campaigns explicitly:
 
@@ -162,8 +170,8 @@ onyx research stop --session <id>
 onyx research finish --campaign fast-eval
 ```
 
-`finish` reconciles state and prints local extraction branches such as
-`onyx/fast-eval/best`.
+`finish` reconciles state, drains final sync, prints accepted/pending/conflict
+counts, and prints local extraction branches such as `onyx/fast-eval/best`.
 
 To delete a research direction entirely — the campaign record with all its
 experiments and matching local cache rows:

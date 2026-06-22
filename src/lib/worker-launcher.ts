@@ -69,6 +69,7 @@ export type WorkerLaunchManifest = {
   cwd: string
   promptPath: string
   logPath: string
+  activityLogPath: string
   manifestPath: string
   sessionId: string
   hypothesisId: string
@@ -78,7 +79,7 @@ export type WorkerLaunchManifest = {
   startedAt: string
   lastOutputAt: string | null
   completedAt: string | null
-  status: "starting" | "running" | "completed" | "failed"
+  status: "starting" | "running" | "completed" | "failed" | "stopped"
   exitCode: number | null
   signal: string | null
   timedOut: boolean
@@ -440,13 +441,7 @@ export async function preflightWorkerInvocation(
     await runCheck(
       "onyx evaluation tool",
       "onyx",
-      [
-        "tools",
-        "run",
-        "evaluation.run",
-        "--timeout",
-        "120",
-      ],
+      ["tools", "run", "evaluation.run", "--timeout", "120"],
       { allowExitCodes: [0, 1] }
     )
   }
@@ -478,6 +473,7 @@ export async function workerLaunchPaths({
   return {
     dir,
     logPath: join(dir, `${base}.log`),
+    activityLogPath: join(dir, `${base}.activity.log`),
     manifestPath: join(dir, `${base}.manifest.json`),
   }
 }

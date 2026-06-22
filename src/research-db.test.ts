@@ -416,6 +416,109 @@ describe("SQLite research ledger", () => {
     expect(brief).not.toContain("deleted-best")
   })
 
+  test("updates hypothesis projections independently of campaign best", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "hypothesis-projection",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 2,
+      hypotheses: [
+        {
+          focus: "fast controller",
+          statement: "Try aggressive tuning.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+        {
+          focus: "stable controller",
+          statement: "Try conservative tuning.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const [bestHypothesis, nonBestHypothesis] = session.hypotheses
+    if (!bestHypothesis || !nonBestHypothesis) {
+      throw new Error("expected hypotheses")
+    }
+
+    const campaignBest = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/hypothesis-projection/best",
+        name: "campaign-best",
+        value: 10,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        sessionId: session.session.id,
+        hypothesisId: bestHypothesis.id,
+      }),
+    })
+    const hypothesisProgress = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/hypothesis-projection/non-best",
+        name: "non-best-progress",
+        value: 2,
+        createdAt: "2026-01-02T00:00:00.000Z",
+        sessionId: session.session.id,
+        hypothesisId: nonBestHypothesis.id,
+      }),
+    })
+
+    const state = await getLocalSessionState(root, session.session.id)
+    expect(state.bestExperiment?.id).toBe(campaignBest.id)
+    const projected = state.hypotheses.find(
+      (hypothesis) => hypothesis.id === nonBestHypothesis.id
+    )
+    expect(projected?.bestExperimentId).toBe(hypothesisProgress.id)
+    expect(projected?.bestMetricValue).toBe(2)
+    expect(projected?.lastWorkedAt).toBe("2026-01-02T00:00:00.000Z")
+
+    await applyProjectDeletions({
+      root,
+      deletions: {
+        campaigns: [],
+        experiments: [
+          {
+            experimentId: hypothesisProgress.id,
+            runRef: hypothesisProgress.runRef,
+            campaignId: campaign.id,
+            campaignName: campaign.name,
+            deletedAt: "2026-01-03T00:00:00.000Z",
+          },
+        ],
+      },
+    })
+
+    const afterTombstone = await getLocalSessionState(root, session.session.id)
+    const cleared = afterTombstone.hypotheses.find(
+      (hypothesis) => hypothesis.id === nonBestHypothesis.id
+    )
+    expect(afterTombstone.bestExperiment?.id).toBe(campaignBest.id)
+    expect(cleared?.bestExperimentId).toBeNull()
+    expect(cleared?.bestMetricValue).toBeNull()
+    expect(cleared?.lastWorkedAt).toBeNull()
+  })
+
   test("filters experiments that predate a campaign tombstone", async () => {
     const root = await fixtureRepo()
     const campaign = await createLocalCampaign({

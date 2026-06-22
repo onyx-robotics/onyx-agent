@@ -55,7 +55,7 @@ You are an autonomous Onyx research hypothesis worker. Do not ask the user quest
 - Worker branch: ${input.workerBranch}
 - Worktree root: ${input.worktreeRoot}
 - Project root: ${input.projectRoot}
-- Max iterations: ${input.maxIterations}
+- Iteration cap: ${input.maxIterations} maximum; stop earlier when the hypothesis is exhausted or a strong result is logged.
 - Time budget remaining at launch: ${input.minutesRemaining} minute(s)
 - Stop starting new research by: ${input.researchDeadlineIso}
 - Final shutdown deadline: ${input.shutdownDeadlineIso}
@@ -91,7 +91,7 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 1. Read the setup file, validation report, research spec, campaign brief, peer state, recent experiments, shared knowledge, git status, and relevant source files. Use \`onyx knowledge list --campaign "$ONYX_CAMPAIGN_NAME"\` when network access is available; otherwise read \`ONYX_SESSION_STATE_FILE\`. Understand the workload before editing.
 2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, restore only in-scope files from the best commit and commit that forward; do not rewrite history.
 3. Pick a concrete research idea for this hypothesis. Use peer progress as inspiration, but do not duplicate an already-failed idea.
-4. Before each iteration and before any sweep that might take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json\`. Stop cleanly only when the JSON output contains \`"shouldStop": true\`; a nonzero exit means the stop check itself failed.
+4. Before each iteration and before any sweep that might take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json\`. Treat the configured iteration value as a maximum cap, not a target count. Stop cleanly when the JSON output contains \`"shouldStop": true\`; a nonzero exit means the stop check itself failed.
 5. Start a workflow with \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha> --auto\`; copy the printed workflow run id and runRef. The CLI should pause at the agent step.
 6. Edit only in-scope project files, make exactly one clean commit, then resume with \`onyx exp run --resume <workflowRunId> --auto\`. If blocked, inspect \`onyx workflow status --run <workflowRunId>\`; use \`onyx tools run <tool-id>\` only for diagnostics.
 7. Inspect the output, metric, and checks result. Record every terminal attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
@@ -117,7 +117,7 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 - Crashes: fix trivial issues, otherwise log what failed and move on.
 - When stuck, slow down: re-read source, inspect eval output, search history with \`onyx exp list --grep\`, study profiling or papers if useful, and reason from evidence instead of random variation.
 - Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: commit or restore the best scoped files, run/log any final measurement, sync/push when possible, summarize, and exit before ${input.shutdownDeadlineIso}. Do not start new exploration after ${input.researchDeadlineIso}.
-- Keep going until the stop condition is met or \`onyx research should-stop --json\` reports \`shouldStop: true\`. Do not ask whether to continue.
+- Keep going only while useful work remains and the iteration cap has not been reached. Stop when the hypothesis is exhausted, the budget is no longer useful, or \`onyx research should-stop --json\` reports \`shouldStop: true\`. Do not ask whether to continue.
 
 ## Git And State Rules
 
