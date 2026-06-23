@@ -33,6 +33,15 @@ function shellQuote(value: string) {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
+function stripShellQuotes(value: string) {
+  if (value.length < 2) return value
+  const first = value[0]
+  const last = value[value.length - 1]
+  return (first === "'" && last === "'") || (first === '"' && last === '"')
+    ? value.slice(1, -1)
+    : value
+}
+
 function markdownList(items: string[], empty: string) {
   return items.length > 0
     ? items.map((item) => `- ${item}`).join("\n")
@@ -127,13 +136,44 @@ function toolFileReferences(setup: ResearchSetupFile) {
   return [...refs].sort()
 }
 
-function defaultEvalScript(setup: ResearchSetupFile, args: Args) {
-  const evalCommand = args.options["eval-command"]
-  if (evalCommand) {
-    return ["#!/usr/bin/env bash", "set -euo pipefail", evalCommand, ""].join(
-      "\n"
-    )
+function normalizedEvalScriptPath(value: string, projectPath: string) {
+  let normalized = stripShellQuotes(value.trim())
+  while (normalized.startsWith("./")) normalized = normalized.slice(2)
+  const projectPrefix = projectPath
+    ? `${projectPath.replace(/^\.?\//, "")}/`
+    : ""
+  if (projectPrefix && normalized.startsWith(projectPrefix)) {
+    normalized = normalized.slice(projectPrefix.length)
   }
+  return normalized
+}
+
+function isShellInterpreter(value: string) {
+  const executable = stripShellQuotes(value).split("/").pop()
+  return executable === "bash" || executable === "sh" || executable === "zsh"
+}
+
+function isSelfReferentialEvalCommand(
+  evalCommand: string | undefined,
+  projectPath: string
+) {
+  if (!evalCommand) return false
+  const target = "onyx/tools/evaluation/run.sh"
+  const tokens = evalCommand.trim().split(/\s+/).filter(Boolean)
+  if (tokens.length === 0) return false
+  const command = tokens[0]
+  if (!command) return false
+  const normalizedTokens = tokens.map((token) =>
+    normalizedEvalScriptPath(token, projectPath)
+  )
+  if (normalizedTokens[0] === target) return true
+  if (isShellInterpreter(command)) {
+    return normalizedTokens.slice(1).some((token) => token === target)
+  }
+  return false
+}
+
+function placeholderEvalScript(setup: ResearchSetupFile) {
   return [
     "#!/usr/bin/env bash",
     "set -euo pipefail",
@@ -142,6 +182,19 @@ function defaultEvalScript(setup: ResearchSetupFile, args: Args) {
     "exit 1",
     "",
   ].join("\n")
+}
+
+function defaultEvalScript(setup: ResearchSetupFile, args: Args) {
+  const evalCommand = args.options["eval-command"]
+  if (
+    evalCommand &&
+    !isSelfReferentialEvalCommand(evalCommand, setup.projectPath)
+  ) {
+    return ["#!/usr/bin/env bash", "set -euo pipefail", evalCommand, ""].join(
+      "\n"
+    )
+  }
+  return placeholderEvalScript(setup)
 }
 
 function defaultInstructions(setup: ResearchSetupFile, args: Args) {
@@ -412,6 +465,11 @@ export async function commandSetupInit(args: Args) {
   )
   console.log(`wrote ${validationPath(root, projectPath)}`)
   console.log(`setup validation: ${validation.status}`)
+  if (isSelfReferentialEvalCommand(args.options["eval-command"], projectPath)) {
+    console.warn(
+      "warning: --eval-command points at onyx/tools/evaluation/run.sh, which would make the generated script call itself; kept the placeholder eval script instead."
+    )
+  }
   console.log(
     "next: edit onyx/setup.json, onyx/onyx.md, and onyx/tools/* for this repository, then run `onyx tools run evaluation.run` for a transient eval preflight."
   )

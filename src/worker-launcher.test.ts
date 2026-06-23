@@ -212,6 +212,36 @@ describe("worker launchers", () => {
     expect(result.activityLogPath).toBe(activityLogPath)
   })
 
+  test("streams full output to logs while retaining only bounded tails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-tail-"))
+    const logPath = join(root, "worker.log")
+    const result = await runStreamingProcess(
+      "sh",
+      [
+        "-c",
+        "printf 'abcdefghijklmnopqrstuvwxyz'; printf '0123456789abcdef' >&2",
+      ],
+      {
+        logPath,
+        timeoutMs: 5000,
+        startupTimeoutMs: 1000,
+        killGraceMs: 100,
+        outputTailBytes: 10,
+      }
+    )
+
+    expect(result.code).toBe(0)
+    expect(result.stdout).toBe("qrstuvwxyz")
+    expect(result.stderr).toBe("6789abcdef")
+    expect(result.stdoutBytes).toBe(26)
+    expect(result.stderrBytes).toBe(16)
+    expect(result.stdoutTruncated).toBe(true)
+    expect(result.stderrTruncated).toBe(true)
+    const log = await readFile(logPath, "utf8")
+    expect(log).toContain("abcdefghijklmnopqrstuvwxyz")
+    expect(log).toContain("0123456789abcdef")
+  })
+
   test("preflights Claude with its direct print-mode launcher", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-claude-launcher-"))
     const bin = join(root, "bin")
@@ -262,6 +292,7 @@ describe("worker launchers", () => {
       hypothesisId: "hypothesis",
       hypothesisName: "hypothesis-one",
       workerId: "worker",
+      workerName: "hypothesis-one-codex",
       version: null,
       startedAt: "2026-06-20T00:00:00.000Z",
       lastOutputAt: null,
@@ -338,6 +369,46 @@ describe("worker launchers", () => {
         delete process.env.XDG_CONFIG_HOME
       } else {
         process.env.XDG_CONFIG_HOME = previousConfigHome
+      }
+    }
+  })
+
+  test("onyx shim falls back to the source checkout when PATH has no onyx", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-source-shim-"))
+    const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-source-config-"))
+    await runProcess("git", ["init"], { cwd: root })
+    const previousConfigHome = process.env.XDG_CONFIG_HOME
+    const previousPath = process.env.PATH
+    process.env.XDG_CONFIG_HOME = configHome
+    process.env.PATH = "/usr/bin:/bin"
+
+    try {
+      await writeConfig({
+        currentProfile: "",
+        profiles: {},
+        developer: { mode: "release" },
+      })
+
+      const shim = await writeWorkerOnyxShim({ root, sessionId: "session" })
+      expect(shim.mode).toBe("source")
+      expect(shim.target).toContain("/bin/onyx.js")
+
+      if (previousPath !== undefined) process.env.PATH = previousPath
+      const help = await runProcess(shim.onyxPath, ["--help"], {
+        timeoutMs: 5000,
+      })
+      expect(help.code).toBe(0)
+      expect(help.stdout).toContain("onyx research run")
+    } finally {
+      if (previousConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME
+      } else {
+        process.env.XDG_CONFIG_HOME = previousConfigHome
+      }
+      if (previousPath === undefined) {
+        delete process.env.PATH
+      } else {
+        process.env.PATH = previousPath
       }
     }
   })

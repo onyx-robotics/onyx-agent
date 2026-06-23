@@ -9,6 +9,10 @@ export type ProcessResult = {
   stderr: string
   timedOut: boolean
   cancelled?: boolean
+  stdoutTruncated?: boolean
+  stderrTruncated?: boolean
+  stdoutBytes?: number
+  stderrBytes?: number
 }
 
 export type StreamingProcessResult = ProcessResult & {
@@ -95,6 +99,13 @@ function activityLinesForOutput(
   return lines.map((line) => `[${stream}] ${line}`)
 }
 
+function appendTail(existing: Buffer, chunk: Buffer, limit: number) {
+  if (limit <= 0) return Buffer.alloc(0)
+  const combined = Buffer.concat([existing, chunk])
+  if (combined.byteLength <= limit) return combined
+  return combined.subarray(combined.byteLength - limit)
+}
+
 export function runProcess(
   command: string,
   args: string[],
@@ -150,6 +161,7 @@ export async function runStreamingProcess(
     timeoutMs?: number
     startupTimeoutMs?: number
     killGraceMs?: number
+    outputTailBytes?: number
     logPath: string
     activityLogPath?: string
     logHeader?: string
@@ -207,8 +219,11 @@ export async function runStreamingProcess(
       detached: useProcessGroup,
       stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     })
-    const stdout: Buffer[] = []
-    const stderr: Buffer[] = []
+    const outputTailBytes = options.outputTailBytes ?? 256 * 1024
+    let stdout = Buffer.alloc(0)
+    let stderr = Buffer.alloc(0)
+    let stdoutBytes = 0
+    let stderrBytes = 0
     let timedOut = false
     let startupTimedOut = false
     let cancelled = false
@@ -322,8 +337,13 @@ export async function runStreamingProcess(
       const at = new Date().toISOString()
       const text = chunk.toString("utf8")
       lastOutputAt = at
-      if (stream === "stdout") stdout.push(chunk)
-      else stderr.push(chunk)
+      if (stream === "stdout") {
+        stdoutBytes += chunk.byteLength
+        stdout = appendTail(stdout, chunk, outputTailBytes)
+      } else {
+        stderrBytes += chunk.byteLength
+        stderr = appendTail(stderr, chunk, outputTailBytes)
+      }
       log.write(`\n[${stream} ${at}]\n`)
       log.write(chunk)
       for (const line of activityLinesForOutput(stream, text)) {
@@ -379,10 +399,14 @@ export async function runStreamingProcess(
       resolveProcess({
         code,
         signal,
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
+        stdout: stdout.toString("utf8"),
+        stderr: stderr.toString("utf8"),
         timedOut,
         cancelled,
+        stdoutTruncated: stdoutBytes > stdout.byteLength,
+        stderrTruncated: stderrBytes > stderr.byteLength,
+        stdoutBytes,
+        stderrBytes,
         startupTimedOut,
         lastOutputAt,
         logPath: options.logPath,

@@ -272,6 +272,10 @@ export type ApiResearchSyncResponse = {
   }
 }
 
+export type ApiResearchPresenceResponse = {
+  workers: ApiWorker[]
+}
+
 export type ApiReconcileCampaignResponse = {
   campaign: ApiCampaign
   hypotheses: ApiHypothesis[]
@@ -819,6 +823,30 @@ export async function syncResearchEvents(
 ): Promise<ApiResearchSyncResponse> {
   return apiData<ApiResearchSyncResponse>(
     await callApi("POST", "/api/v1/research/sync", body, args)
+  )
+}
+
+export async function syncResearchPresence(
+  body: {
+    siteId: string
+    repositoryUrl: string
+    projectPath: string
+    sessionId: string
+    workers: Array<{
+      id: string
+      status: ApiWorker["status"]
+      phase?: string | null
+      progressMessage?: string | null
+      gitLabel?: string | null
+      lastOutputAt?: string | null
+      metadata?: Record<string, unknown>
+      observedAt: string
+    }>
+  },
+  args?: Args
+): Promise<ApiResearchPresenceResponse> {
+  return apiData<ApiResearchPresenceResponse>(
+    await callApi("POST", "/api/v1/research/presence", body, args)
   )
 }
 

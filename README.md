@@ -75,7 +75,7 @@ git commit -m "Add Onyx setup"
 git push origin HEAD
 onyx campaign setup --name fast-eval --description "Improve score"
 onyx tools run evaluation.run
-onyx research start --campaign fast-eval --workers 4
+onyx research run --campaign fast-eval --workers 4
 onyx push
 ```
 
@@ -108,7 +108,7 @@ Use `onyx sync status`, `onyx sync conflicts`, `onyx sync retry`,
 `onyx sync export`, and `onyx sync doctor` to inspect and repair the local
 ledger.
 
-`onyx campaign setup` and `onyx research start` require the `onyx/` setup
+`onyx campaign setup` and `onyx research run` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
 declared workflow tools. GitHub-backed campaigns also require that base commit
@@ -123,40 +123,50 @@ Hypothesis workers are driven by the TypeScript-rendered Markdown prompt in
 `src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the
 editor and standalone release binaries stay self-contained.
 
-To run multiple local research hypotheses directly from the CLI, choose a built-in
-agent launcher:
+To run multiple local research hypotheses directly from the CLI, use the
+repo-level supervisor with a built-in agent launcher:
 
 ```bash
 plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
-onyx research start --campaign fast-eval --workers 4 --hypotheses "$plans" --max-minutes 10 --max-iterations 5
-onyx worker run --session <id> --hypothesis <hypothesis-id> --agent codex --max-minutes 10 --stop-grace-seconds 30
-onyx worker run --session <id> --hypothesis <hypothesis-id> --agent claude --max-minutes 10 --quiet
+onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --max-iterations 5
 onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
+```
+
+`--workers` is the active slot target: when a short worker exits, the
+supervisor backfills that slot. For a bounded fake-worker smoke test, cap
+launches explicitly:
+
+```bash
+onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --max-launches 2 --worker-command "<cmd>"
 ```
 
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
 receive the worker prompt over stdin, and write raw stdout/stderr logs,
 readable `.activity.log` files, and launch manifests under
-`.git/onyx/worker-logs/`.
+`.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
+shared sync, coalesced presence updates, stop handling, and final sync for the
+session. `onyx worker run --session <id> --hypothesis <id>` remains available
+as a low-level debugging and recovery primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
 errors when local manifests are available. `--max-iterations` is a cap, not a
-target count.
+target count. `--max-launches` caps only new workers launched by the current
+supervisor invocation and does not change the session's active slot target.
 `onyx workflow status --active` shows only actionable running or paused
 workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked
 diagnostics.
 
-Each worker gets its own work branch under `refs/heads/onyx/<session>/<hypothesis>/<worker>`,
-while each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
+Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
+and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
+each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
 `onyx research should-stop`, run the setup workflow through `onyx exp run
 --campaign <name> --base <sha> --auto` and `onyx exp run --resume <id> --auto`,
 push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment
 with setup/session/hypothesis/worker context. `onyx research hypothesis add`
 can create another campaign hypothesis at any time from a JSON plan file or inline
-focus/hypothesis flags; when a worker slot is open, it prints a
-ready `onyx worker run --session ... --hypothesis ...` command and reuses the
-session's start agent unless `--agent codex|claude` overrides it. Workers
+focus/hypothesis flags; a running supervisor picks up new active hypotheses as
+soon as worker slots open. Workers
 publish shared learning with `onyx knowledge add` and read it back with
 `onyx knowledge list`, but successor hypothesis selection remains an
 orchestrator/human decision.
@@ -200,9 +210,7 @@ created before the deletion.
 
 ```bash
 bun install
-bun run typecheck
-bun run lint
-bun test
+bun run ci
 ```
 
 To make the persistent `onyx` command use this checkout during development:

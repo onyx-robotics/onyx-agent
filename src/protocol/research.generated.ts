@@ -696,6 +696,31 @@ export const researchWorkerHeartbeatRequestSchema = z.object({
   metadata: metadataSchema.default({}),
 })
 
+export const researchPresenceWorkerSnapshotSchema = z.object({
+  id: z.uuid(),
+  status: researchWorkerStatusSchema.default("running"),
+  phase: z.string().trim().max(120).nullable().optional(),
+  progressMessage: z.string().trim().max(1000).nullable().optional(),
+  gitLabel: z.string().trim().max(240).nullable().optional(),
+  lastOutputAt: z.iso.datetime().nullable().optional(),
+  metadata: metadataSchema.default({}),
+  observedAt: z.iso.datetime(),
+})
+
+export const syncResearchPresenceRequestSchema = z.object({
+  siteId: z.uuid(),
+  repositoryUrl: z.string().trim().min(1).max(2000),
+  projectPath: projectPathSchema.default(""),
+  sessionId: z.uuid(),
+  workers: z.array(researchPresenceWorkerSnapshotSchema).min(1).max(500),
+})
+
+export const syncResearchPresenceResponseSchema = z.object({
+  data: z.object({
+    workers: z.array(researchWorkerSchema),
+  }),
+})
+
 export const researchSyncEventTypeSchema = z.enum([
   "campaign.upserted",
   "session.started",
@@ -1762,6 +1787,15 @@ export type ResearchWorkerHeartbeatRequest = z.infer<
 >
 export type ResearchWorkerHeartbeatResponse = z.infer<
   typeof researchWorkerHeartbeatResponseSchema
+>
+export type ResearchPresenceWorkerSnapshot = z.infer<
+  typeof researchPresenceWorkerSnapshotSchema
+>
+export type SyncResearchPresenceRequest = z.infer<
+  typeof syncResearchPresenceRequestSchema
+>
+export type SyncResearchPresenceResponse = z.infer<
+  typeof syncResearchPresenceResponseSchema
 >
 export type ResearchSyncEventType = z.infer<typeof researchSyncEventTypeSchema>
 export type ResearchSyncEvent = z.infer<typeof researchSyncEventSchema>
