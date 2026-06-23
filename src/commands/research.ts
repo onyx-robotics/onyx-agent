@@ -843,7 +843,12 @@ function printFinalSyncReport(
   }
 }
 
-async function campaignForName(root: string, args: Args) {
+async function campaignForName(
+  root: string,
+  args: Args,
+  options: { persistState?: boolean } = {}
+) {
+  const persistState = options.persistState ?? true
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
   const campaignName =
@@ -864,21 +869,23 @@ async function campaignForName(root: string, args: Args) {
     name: campaignName,
   })
   if (localCampaign) {
-    state.projectPath = projectPath
-    state.activeCampaign = localCampaign.name
-    state.campaigns = state.campaigns ?? {}
-    state.campaigns[key] = {
-      ...state.campaigns[key],
-      campaignId: localCampaign.id,
-      projectPath,
-      baseCommitSha: localCampaign.baseCommitSha,
-      description: localCampaign.description,
-      metricName: localCampaign.metricName,
-      metricUnit: localCampaign.metricUnit,
-      metricDirection: localCampaign.metricDirection,
-      promotionRefName: localCampaign.promotionRefName,
+    if (persistState) {
+      state.projectPath = projectPath
+      state.activeCampaign = localCampaign.name
+      state.campaigns = state.campaigns ?? {}
+      state.campaigns[key] = {
+        ...state.campaigns[key],
+        campaignId: localCampaign.id,
+        projectPath,
+        baseCommitSha: localCampaign.baseCommitSha,
+        description: localCampaign.description,
+        metricName: localCampaign.metricName,
+        metricUnit: localCampaign.metricUnit,
+        metricDirection: localCampaign.metricDirection,
+        promotionRefName: localCampaign.promotionRefName,
+      }
+      await writeState(root, state)
     }
-    await writeState(root, state)
     return {
       projectPath,
       campaign: localCampaign,
@@ -898,27 +905,29 @@ async function campaignForName(root: string, args: Args) {
     try {
       const overview = await getCampaignOverview(cached.campaignId, args)
       const campaign = overview.campaign
-      state.projectPath = projectPath
-      state.activeCampaign = campaign.name
-      state.campaigns = state.campaigns ?? {}
-      state.campaigns[key] = {
-        ...state.campaigns[key],
-        campaignId: campaign.id,
-        projectPath,
-        baseCommitSha: campaign.baseCommitSha,
-        description: campaign.description,
-        metricName: campaign.metricName,
-        metricUnit: campaign.metricUnit,
-        metricDirection: campaign.metricDirection,
-        promotionRefName: campaign.promotionRefName,
+      if (persistState) {
+        state.projectPath = projectPath
+        state.activeCampaign = campaign.name
+        state.campaigns = state.campaigns ?? {}
+        state.campaigns[key] = {
+          ...state.campaigns[key],
+          campaignId: campaign.id,
+          projectPath,
+          baseCommitSha: campaign.baseCommitSha,
+          description: campaign.description,
+          metricName: campaign.metricName,
+          metricUnit: campaign.metricUnit,
+          metricDirection: campaign.metricDirection,
+          promotionRefName: campaign.promotionRefName,
+        }
+        await writeState(root, state)
+        await cacheLocalCampaign({
+          root,
+          campaign,
+          projectPath,
+          setup: state.campaigns[key]?.setup ?? {},
+        }).catch(() => null)
       }
-      await writeState(root, state)
-      await cacheLocalCampaign({
-        root,
-        campaign,
-        projectPath,
-        setup: state.campaigns[key]?.setup ?? {},
-      }).catch(() => null)
       return { projectPath, campaign, overview }
     } catch {
       // Fall back to repository/project resolution; the cached campaign may
@@ -943,28 +952,30 @@ async function campaignForName(root: string, args: Args) {
   }
 
   const overview = await getCampaignOverview(campaign.id, args)
-  state.projectId = projectId
-  state.projectPath = projectPath
-  state.activeCampaign = campaign.name
-  state.campaigns = state.campaigns ?? {}
-  state.campaigns[key] = {
-    ...state.campaigns[key],
-    campaignId: campaign.id,
-    projectPath,
-    baseCommitSha: campaign.baseCommitSha,
-    description: campaign.description,
-    metricName: campaign.metricName,
-    metricUnit: campaign.metricUnit,
-    metricDirection: campaign.metricDirection,
-    promotionRefName: campaign.promotionRefName,
+  if (persistState) {
+    state.projectId = projectId
+    state.projectPath = projectPath
+    state.activeCampaign = campaign.name
+    state.campaigns = state.campaigns ?? {}
+    state.campaigns[key] = {
+      ...state.campaigns[key],
+      campaignId: campaign.id,
+      projectPath,
+      baseCommitSha: campaign.baseCommitSha,
+      description: campaign.description,
+      metricName: campaign.metricName,
+      metricUnit: campaign.metricUnit,
+      metricDirection: campaign.metricDirection,
+      promotionRefName: campaign.promotionRefName,
+    }
+    await writeState(root, state)
+    await cacheLocalCampaign({
+      root,
+      campaign: overview.campaign,
+      projectPath,
+      setup: state.campaigns[key]?.setup ?? {},
+    }).catch(() => null)
   }
-  await writeState(root, state)
-  await cacheLocalCampaign({
-    root,
-    campaign: overview.campaign,
-    projectPath,
-    setup: state.campaigns[key]?.setup ?? {},
-  }).catch(() => null)
 
   return { projectPath, campaign: overview.campaign, overview }
 }
@@ -1403,6 +1414,9 @@ export async function finalizeHypothesisAttempt({
             cwd: worktree,
             campaign: campaign.name,
             base: measurementBaseCommitSha,
+            hypothesis: hypothesis.id,
+            session: sessionId,
+            worker: workerId,
             timeout: "120",
             "checks-timeout": "120",
           },
@@ -2000,6 +2014,7 @@ async function runHypothesisOnce({
       hypothesisId: hypothesis.id,
       hypothesisName: hypothesis.name,
       workerId: worker.id,
+      workerName: worker.workerName,
       version: preflight.version,
       startedAt: new Date().toISOString(),
       lastOutputAt: null,
@@ -2611,10 +2626,13 @@ export async function commandResearchHypothesisAdd(args: Args) {
 
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot()
-  const campaignInfo = await campaignForName(root, args)
+  const shouldReconcile = args.options.reconcile === "true"
+  const campaignInfo = await campaignForName(root, args, {
+    persistState: shouldReconcile,
+  })
   const { campaign } = campaignInfo
   const projectPath = await resolveProjectPath(root, args)
-  if (args.options.reconcile === "true") {
+  if (shouldReconcile) {
     await reconcileCampaignIntoLocalState({
       root,
       campaignId: campaign.id,
@@ -3500,6 +3518,7 @@ export async function commandResearchRun(args: Args) {
   await assertMainWorktreeClean(root, "before running research")
 
   const agentKind = workerAgentOption(args)
+  const sessionAgentKind = args.options["worker-command"] ? "custom" : agentKind
   const sessionMetadata = sessionState?.session.metadata ?? {}
   const maxIterations = positiveIntegerOption(
     args,
@@ -3581,7 +3600,7 @@ export async function commandResearchRun(args: Args) {
         startedBy: "onyx-research-supervisor",
         maxIterations,
         maxMinutes,
-        agentKind,
+        agentKind: sessionAgentKind,
         maxConcurrency,
         ...(maxLaunches ? { maxLaunches } : {}),
         presenceIntervalSeconds: presenceIntervalMs / 1000,

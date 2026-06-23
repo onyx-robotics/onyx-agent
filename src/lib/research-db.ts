@@ -1160,9 +1160,11 @@ export async function completeLocalCampaign({
       db.query(
         "UPDATE campaigns SET status = 'completed', updated_at = ? WHERE id = ? AND status != 'archived'"
       ).run(at, campaignId)
-      const row = db
-        .query("SELECT * FROM campaigns WHERE id = ?")
-        .get(campaignId) as Row | null
+      const row = recomputeLocalCampaignProjectionForDb({
+        db,
+        campaignId,
+        at,
+      })
       if (!row) throw new Error("Local campaign not found")
       enqueueSyncEvent({
         db,
@@ -1828,6 +1830,39 @@ function isBetter(
   return direction === "maximize" ? next > current : next < current
 }
 
+function timestampMs(value?: string | null) {
+  if (!value) return Number.POSITIVE_INFINITY
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY
+}
+
+function experimentImprovementMs(experiment: ApiCampaignExperiment) {
+  return timestampMs(experiment.completedAt ?? experiment.createdAt)
+}
+
+function experimentCreatedMs(experiment: ApiCampaignExperiment) {
+  return timestampMs(experiment.createdAt)
+}
+
+function isEarlierExperiment(
+  candidate: ApiCampaignExperiment,
+  current: ApiCampaignExperiment
+) {
+  const candidateImprovement = experimentImprovementMs(candidate)
+  const currentImprovement = experimentImprovementMs(current)
+  if (candidateImprovement !== currentImprovement) {
+    return candidateImprovement < currentImprovement
+  }
+
+  const candidateCreated = experimentCreatedMs(candidate)
+  const currentCreated = experimentCreatedMs(current)
+  if (candidateCreated !== currentCreated) {
+    return candidateCreated < currentCreated
+  }
+
+  return candidate.id < current.id
+}
+
 function visibleExperimentPredicateSql() {
   return `
     NOT EXISTS (
@@ -1858,13 +1893,23 @@ function bestVisibleExperimentForCampaign(
   return experiments.reduce<ApiCampaignExperiment | null>((current, next) => {
     if (!isBestEligible(next) || next.primaryMetricValue === null)
       return current
-    return isBetter(
-      campaign.metricDirection,
-      current?.primaryMetricValue ?? null,
-      next.primaryMetricValue
-    )
-      ? next
-      : current
+    if (!current || current.primaryMetricValue === null) return next
+    if (
+      isBetter(
+        campaign.metricDirection,
+        current.primaryMetricValue,
+        next.primaryMetricValue
+      )
+    ) {
+      return next
+    }
+    if (
+      next.primaryMetricValue === current.primaryMetricValue &&
+      isEarlierExperiment(next, current)
+    ) {
+      return next
+    }
+    return current
   }, null)
 }
 
@@ -1895,6 +1940,44 @@ function campaignFromRowForDb(db: Db, row: Row) {
     campaign,
     listLocalExperimentsForDb(db, campaign.id)
   )
+}
+
+function recomputeLocalCampaignProjectionForDb({
+  db,
+  campaignId,
+  at,
+}: {
+  db: Db
+  campaignId: string
+  at: string
+}) {
+  const campaignRow = db
+    .query("SELECT * FROM campaigns WHERE id = ?")
+    .get(campaignId) as Row | null
+  if (!campaignRow) return null
+  const campaign = campaignFromRow(campaignRow)
+  const experiments = listLocalExperimentsForDb(db, campaignId)
+  const best = bestVisibleExperimentForCampaign(campaign, experiments)
+  const latest = experiments.at(0)
+  db.query(
+    `
+      UPDATE campaigns
+      SET best_experiment_id = ?, best_metric_value = ?, best_commit_sha = ?,
+        experiment_count = ?, last_experiment_at = ?, updated_at = ?
+      WHERE id = ?
+    `
+  ).run(
+    best?.id ?? null,
+    best?.primaryMetricValue ?? null,
+    best?.resultCommitSha ?? null,
+    experiments.length,
+    latest?.completedAt ?? latest?.createdAt ?? null,
+    at,
+    campaignId
+  )
+  return db
+    .query("SELECT * FROM campaigns WHERE id = ?")
+    .get(campaignId) as Row | null
 }
 
 function listLocalExperimentsForHypothesisForDb(
@@ -2079,6 +2162,7 @@ export async function logLocalExperiment({
         .get(campaignId, record.runRef) as Row | null
       if (existing) {
         const experiment = experimentFromRow(existing)
+        recomputeLocalCampaignProjectionForDb({ db, campaignId, at })
         recomputeLocalHypothesisProjectionForDb({
           db,
           campaignId,
@@ -2131,39 +2215,7 @@ export async function logLocalExperiment({
       const experiment = experimentFromRow(
         db.query("SELECT * FROM experiments WHERE id = ?").get(id) as Row
       )
-      db.query(
-        `
-        UPDATE campaigns
-        SET experiment_count = experiment_count + 1,
-          last_experiment_at = ?,
-          updated_at = ?
-        WHERE id = ?
-      `
-      ).run(record.completedAt ?? at, at, campaign.id as string)
-
-      if (
-        isBestEligible(experiment) &&
-        experiment.primaryMetricValue !== null &&
-        isBetter(
-          campaign.metric_direction as "maximize" | "minimize",
-          numberOrNull(campaign.best_metric_value),
-          experiment.primaryMetricValue
-        )
-      ) {
-        db.query(
-          `
-          UPDATE campaigns
-          SET best_experiment_id = ?, best_metric_value = ?, best_commit_sha = ?, updated_at = ?
-          WHERE id = ?
-        `
-        ).run(
-          experiment.id,
-          experiment.primaryMetricValue,
-          experiment.resultCommitSha,
-          at,
-          campaign.id as string
-        )
-      }
+      recomputeLocalCampaignProjectionForDb({ db, campaignId, at })
       recomputeLocalHypothesisProjectionForDb({
         db,
         campaignId,
@@ -3053,6 +3105,7 @@ async function insertLocalTombstones({
     )
     db.transaction(() => {
       const affectedHypotheses = new Map<string, Set<string>>()
+      const affectedCampaigns = new Set<string>()
       const addAffectedHypothesis = (
         campaignId: string | null | undefined,
         hypothesisId: string | null | undefined
@@ -3063,14 +3116,19 @@ async function insertLocalTombstones({
         affectedHypotheses.set(campaignId, set)
       }
       for (const tombstone of tombstones) {
+        if (tombstone.campaignId) {
+          affectedCampaigns.add(tombstone.campaignId)
+        }
         if (tombstone.entityType === "experiment") {
           const experiment = db
             .query(
               "SELECT campaign_id, hypothesis_id FROM experiments WHERE id = ? OR run_ref = ?"
             )
             .get(tombstone.entityId, tombstone.runRef ?? "") as Row | null
+          const experimentCampaignId = nullableString(experiment?.campaign_id)
+          if (experimentCampaignId) affectedCampaigns.add(experimentCampaignId)
           addAffectedHypothesis(
-            nullableString(experiment?.campaign_id),
+            experimentCampaignId,
             nullableString(experiment?.hypothesis_id)
           )
         } else if (tombstone.entityType === "campaign") {
@@ -3102,6 +3160,9 @@ async function insertLocalTombstones({
             at,
           })
         }
+      }
+      for (const campaignId of affectedCampaigns) {
+        recomputeLocalCampaignProjectionForDb({ db, campaignId, at })
       }
     })()
   })

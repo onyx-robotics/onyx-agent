@@ -84,6 +84,7 @@ export type WorkerLaunchManifest = {
   hypothesisId: string
   hypothesisName: string
   workerId: string
+  workerName: string
   version: string | null
   startedAt: string
   lastOutputAt: string | null

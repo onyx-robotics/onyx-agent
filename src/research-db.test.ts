@@ -511,6 +511,154 @@ describe("SQLite research ledger", () => {
     expect(history[0]?.primaryMetricValue).toBe(2)
   })
 
+  test("keeps the earliest maximizing experiment when best metrics tie", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "maximize-tie",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/maximize-tie/baseline",
+        name: "baseline",
+        value: 1,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    })
+    const firstBest = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/maximize-tie/first-best",
+        name: "first-best",
+        value: 2,
+        createdAt: "2026-01-02T00:00:00.000Z",
+      }),
+    })
+    await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/maximize-tie/later-tie",
+        name: "later-tie",
+        value: 2,
+        createdAt: "2026-01-03T00:00:00.000Z",
+      }),
+    })
+
+    const projected = await localCampaignByName({
+      root,
+      projectPath: "",
+      name: campaign.name,
+    })
+    expect(projected?.bestExperimentId).toBe(firstBest.id)
+    expect(projected?.bestMetricValue).toBe(2)
+    expect(projected?.bestCommitSha).toBe(firstBest.resultCommitSha)
+
+    const db = new Database(await researchDbPath(root), { readonly: true })
+    try {
+      const row = db
+        .query(
+          "SELECT best_experiment_id AS bestExperimentId, best_metric_value AS bestMetricValue, best_commit_sha AS bestCommitSha FROM campaigns WHERE id = ?"
+        )
+        .get(campaign.id) as {
+          bestExperimentId: string | null
+          bestMetricValue: number | null
+          bestCommitSha: string | null
+        }
+      expect(row.bestExperimentId).toBe(firstBest.id)
+      expect(row.bestMetricValue).toBe(2)
+      expect(row.bestCommitSha).toBe(firstBest.resultCommitSha)
+    } finally {
+      db.close()
+    }
+  })
+
+  test("keeps the earliest minimizing experiment when best metrics tie", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "minimize-tie",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "minimize",
+    })
+    await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/minimize-tie/baseline",
+        name: "baseline",
+        value: 5,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    })
+    const firstBest = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/minimize-tie/first-best",
+        name: "first-best",
+        value: 3,
+        createdAt: "2026-01-02T00:00:00.000Z",
+      }),
+    })
+    await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/minimize-tie/later-tie",
+        name: "later-tie",
+        value: 3,
+        createdAt: "2026-01-03T00:00:00.000Z",
+      }),
+    })
+
+    const projected = await localCampaignByName({
+      root,
+      projectPath: "",
+      name: campaign.name,
+    })
+    expect(projected?.bestExperimentId).toBe(firstBest.id)
+    expect(projected?.bestMetricValue).toBe(3)
+    expect(projected?.bestCommitSha).toBe(firstBest.resultCommitSha)
+
+    const db = new Database(await researchDbPath(root), { readonly: true })
+    try {
+      const row = db
+        .query(
+          "SELECT best_experiment_id AS bestExperimentId, best_metric_value AS bestMetricValue, best_commit_sha AS bestCommitSha FROM campaigns WHERE id = ?"
+        )
+        .get(campaign.id) as {
+          bestExperimentId: string | null
+          bestMetricValue: number | null
+          bestCommitSha: string | null
+        }
+      expect(row.bestExperimentId).toBe(firstBest.id)
+      expect(row.bestMetricValue).toBe(3)
+      expect(row.bestCommitSha).toBe(firstBest.resultCommitSha)
+    } finally {
+      db.close()
+    }
+  })
+
   test("filters tombstoned experiments from offline history and read models", async () => {
     const root = await fixtureRepo()
     const campaign = await createLocalCampaign({

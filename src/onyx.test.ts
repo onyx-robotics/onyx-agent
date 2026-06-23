@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -1374,10 +1374,10 @@ describe("automated research smoke", () => {
         positional: ["research", "run"],
         options: {
           campaign: campaignName,
-          workers: "2",
-          "max-concurrency": "2",
-          "max-launches": "2",
-          hypotheses: JSON.stringify(supervisorPlans(2)),
+          workers: "5",
+          "max-concurrency": "5",
+          "max-launches": "5",
+          hypotheses: JSON.stringify(supervisorPlans(5)),
           "worker-command": fastWorkerCommand(),
           "max-minutes": "1",
           "worker-timeout": "20",
@@ -1401,10 +1401,15 @@ describe("automated research smoke", () => {
     if (!sessionId) throw new Error("expected session id")
     const sessionState = await getLocalSessionState(root, sessionId)
     expect(sessionState.session.status).toBe("completed")
-    expect(sessionState.workers).toHaveLength(2)
+    expect(sessionState.session.metadata).toMatchObject({
+      agentKind: "custom",
+      maxConcurrency: 5,
+      maxLaunches: 5,
+    })
+    expect(sessionState.workers).toHaveLength(5)
     expect(
       new Set(sessionState.workers.map((worker) => worker.hypothesisId)).size
-    ).toBe(2)
+    ).toBe(5)
     for (const worker of sessionState.workers) {
       expect(worker.agentKind).toBe("custom")
       expect(worker.workerName.endsWith("-custom")).toBe(true)
@@ -1413,9 +1418,10 @@ describe("automated research smoke", () => {
     }
 
     const manifests = await readWorkerLaunchManifests(root, sessionId)
-    expect(manifests).toHaveLength(2)
+    expect(manifests).toHaveLength(5)
     for (const manifest of manifests) {
       expect(manifest.agentKind).toBe("custom")
+      expect(manifest.workerName.endsWith("-custom")).toBe(true)
       expect(manifest.status).toBe("completed")
       expect(manifest.finalization?.finalizationStatus).toBe(
         "measured_and_logged"
@@ -1425,7 +1431,7 @@ describe("automated research smoke", () => {
     const experiments = (await listLocalExperimentHistory(root)).filter(
       (experiment) => experiment.campaignName === campaignName
     )
-    expect(experiments).toHaveLength(2)
+    expect(experiments).toHaveLength(5)
 
     const db = new Database(await researchDbPath(root), { readonly: true })
     try {
@@ -1447,7 +1453,25 @@ describe("automated research smoke", () => {
           "SELECT COUNT(*) AS count FROM sync_events WHERE status = 'conflict'"
         )
         .get() as { count: number }
-      expect(launchCount.count).toBe(2)
+      const workflowRuns = experiments.map((experiment) =>
+        db
+          .query(
+            `
+              SELECT session_id AS sessionId, worker_id AS workerId,
+                hypothesis_id AS hypothesisId,
+                result_commit_sha AS resultCommitSha
+              FROM workflow_runs
+              WHERE run_ref = ?
+            `
+          )
+          .get(experiment.runRef)
+      ) as Array<{
+        sessionId: string | null
+        workerId: string | null
+        hypothesisId: string | null
+        resultCommitSha: string | null
+      } | null>
+      expect(launchCount.count).toBe(5)
       expect(
         launchRows.every(
           (row) =>
@@ -1455,6 +1479,16 @@ describe("automated research smoke", () => {
             JSON.parse(row.metadataJson).agentKind === "custom"
         )
       ).toBe(true)
+      expect(workflowRuns).toHaveLength(5)
+      for (const [index, workflow] of workflowRuns.entries()) {
+        const experiment = experiments[index]!
+        expect(workflow).toMatchObject({
+          sessionId,
+          workerId: experiment.workerId,
+          hypothesisId: experiment.hypothesisId,
+          resultCommitSha: experiment.resultCommitSha,
+        })
+      }
       expect(schema.version).toBe(3)
       expect(conflicts.count).toBe(0)
     } finally {
@@ -2325,6 +2359,9 @@ describe("research status", () => {
     console.log = () => {}
     try {
       process.chdir(root)
+      const stateFile = join(await onyxStateDir(root), "state.json")
+      const beforeState = await readFile(stateFile, "utf8")
+      const beforeStat = await stat(stateFile)
       await withMockResearchApi(
         (request) => {
           if (request.method === "POST") {
@@ -2390,6 +2427,10 @@ describe("research status", () => {
             options: { campaign: campaignName },
           })
       )
+      const afterState = await readFile(stateFile, "utf8")
+      const afterStat = await stat(stateFile)
+      expect(afterState).toBe(beforeState)
+      expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs)
     } finally {
       process.chdir(previousCwd)
       console.log = originalLog
@@ -2454,6 +2495,7 @@ describe("research status", () => {
       hypothesisId: hypothesis.id,
       hypothesisName: hypothesis.name,
       workerId: worker.id,
+      workerName: worker.workerName,
       version: null,
       startedAt: "2026-06-20T00:00:00.000Z",
       lastOutputAt: "2026-06-20T00:00:01.000Z",
@@ -2902,6 +2944,183 @@ describe("research status", () => {
         },
       })
     ).rejects.toThrow("No active workflow runs exist")
+  })
+
+  test("research finish promotes the earliest experiment that first reached a tied best metric", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "tie-finish"
+    const setup = await readSetupFile(root, "")
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      description: "Improve score.",
+      projectPath: "",
+      baseCommitSha,
+      setup,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "Try a new controller",
+          statement: "A focused controller change can improve score.",
+          startingPoints: ["src"],
+          avoidList: ["onyx/"],
+          successSignals: ["METRIC score improves"],
+          giveUpSignals: [],
+        },
+      ],
+      metadata: { agentKind: "custom" },
+    })
+    const hypothesis = session.hypotheses[0]!
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          projectPath: "",
+          baseCommitSha,
+          metricName: "score",
+          metricUnit: null,
+          metricDirection: "maximize",
+          sessionId: session.session.id,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          maxIterations: 10,
+          endTimeMs: Date.now() + 60_000,
+          status: "running",
+        },
+      },
+    })
+
+    await writeFile(join(root, "src", "first-best.txt"), "first best\n", "utf8")
+    await commitAll(root, "first best")
+    const firstBestCommit = (
+      await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+    ).stdout.trim()
+    await writeFile(join(root, "src", "later-tie.txt"), "later tie\n", "utf8")
+    await commitAll(root, "later tied best")
+    const laterTieCommit = (
+      await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+    ).stdout.trim()
+
+    const logExperiment = async ({
+      suffix,
+      resultCommitSha,
+      metric,
+      createdAt,
+    }: {
+      suffix: string
+      resultCommitSha: string
+      metric: number
+      createdAt: string
+    }) =>
+      logLocalExperiment({
+        root,
+        record: {
+          schemaVersion: 1,
+          type: "campaign_experiment_logged",
+          createdAt,
+          runRef: `local/tie-finish/${suffix}`,
+          campaignName,
+          name: suffix,
+          description: null,
+          projectPath: "",
+          baseCommitSha,
+          resultCommitSha,
+          resultRef: `refs/onyx/experiments/${campaign.id}/local/tie-finish/${suffix}`,
+          status: "succeeded",
+          setupCompliance: {
+            status: "passed",
+            protectedPathsChanged: [],
+            outOfScopePathsChanged: [],
+            setupPathsChanged: [],
+            notes: null,
+          },
+          primaryMetricName: "score",
+          primaryMetricValue: metric,
+          metrics: { score: metric },
+          agentNotes: {},
+          checks: null,
+          durationMs: null,
+          startedAt: createdAt,
+          completedAt: createdAt,
+          outputSummary: null,
+          sessionId: session.session.id,
+          hypothesisId: hypothesis.id,
+        },
+      })
+
+    await logExperiment({
+      suffix: "baseline",
+      resultCommitSha: baseCommitSha,
+      metric: 1,
+      createdAt: "2026-06-20T00:00:00.000Z",
+    })
+    await logExperiment({
+      suffix: "first-best",
+      resultCommitSha: firstBestCommit,
+      metric: 2,
+      createdAt: "2026-06-20T00:01:00.000Z",
+    })
+    await logExperiment({
+      suffix: "later-tie",
+      resultCommitSha: laterTieCommit,
+      metric: 2,
+      createdAt: "2026-06-20T00:02:00.000Z",
+    })
+
+    const projectedBeforeFinish = await localCampaignByName({
+      root,
+      projectPath: "",
+      name: campaignName,
+    })
+    expect(projectedBeforeFinish?.bestCommitSha).toBe(firstBestCommit)
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await commandResearchFinish({
+        positional: ["research", "finish"],
+        options: {
+          campaign: campaignName,
+          session: session.session.id,
+          offline: "true",
+        },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const projectedAfterFinish = await localCampaignByName({
+      root,
+      projectPath: "",
+      name: campaignName,
+    })
+    const promotedCommit = (
+      await runProcess("git", ["rev-parse", `onyx/${campaignName}/best`], {
+        cwd: root,
+      })
+    ).stdout.trim()
+    const projectedBestCommit = projectedAfterFinish?.bestCommitSha
+    if (!projectedBestCommit) throw new Error("expected projected best commit")
+    expect(projectedBestCommit).toBe(firstBestCommit)
+    expect(promotedCommit).toBe(projectedBestCommit)
+    expect(promotedCommit).not.toBe(laterTieCommit)
   })
 })
 
