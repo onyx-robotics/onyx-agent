@@ -132,6 +132,14 @@ onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$
 onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 
+`--workers` is the active slot target: when a short worker exits, the
+supervisor backfills that slot. For a bounded fake-worker smoke test, cap
+launches explicitly:
+
+```bash
+onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --max-launches 2 --worker-command "<cmd>"
+```
+
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
 receive the worker prompt over stdin, and write raw stdout/stderr logs,
@@ -143,7 +151,8 @@ as a low-level debugging and recovery primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
 errors when local manifests are available. `--max-iterations` is a cap, not a
-target count.
+target count. `--max-launches` caps only new workers launched by the current
+supervisor invocation and does not change the session's active slot target.
 `onyx workflow status --active` shows only actionable running or paused
 workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked
 diagnostics.

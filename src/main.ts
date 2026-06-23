@@ -63,7 +63,7 @@ Usage:
   onyx campaign delete --name <name> [--project-path <path>]
   onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>]
       (creates an async research session and prints low-level worker launch commands)
-  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>]
+  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--max-launches <n>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>]
       (runs the local supervisor with shared sync/presence loops for parallel workers)
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]

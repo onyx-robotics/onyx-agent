@@ -104,6 +104,16 @@ function positiveIntegerOption(args: Args, name: string, fallback: number) {
   return value
 }
 
+function optionalPositiveIntegerOption(args: Args, name: string) {
+  const raw = args.options[name]
+  if (raw === undefined) return null
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`--${name} must be a positive integer`)
+  }
+  return value
+}
+
 function positiveNumberOption(args: Args, name: string, fallback: number) {
   const raw = args.options[name]
   if (raw === undefined) return fallback
@@ -550,9 +560,11 @@ function launchSuggestionsForSession({
 function chooseSupervisorHypothesis({
   hypotheses,
   workers,
+  reservations = [],
 }: {
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
+  reservations?: LaunchReservation[]
 }) {
   const activeHypotheses = hypotheses.filter(
     (hypothesis) => hypothesis.status === "active"
@@ -561,6 +573,13 @@ function chooseSupervisorHypothesis({
 
   const activeWorkers = workers.filter(workerIsActive)
   const completedWorkers = workers.filter(workerIsCompleted)
+  const reservedCountFor = (hypothesisId: string) =>
+    reservations.filter(
+      (reservation) => reservation.hypothesisId === hypothesisId
+    ).length
+  const activeCountFor = (hypothesisId: string) =>
+    activeWorkers.filter((worker) => worker.hypothesisId === hypothesisId)
+      .length + reservedCountFor(hypothesisId)
   const neverWorked = activeHypotheses.find((hypothesis) => {
     const relatedActive = activeWorkers.some(
       (worker) => worker.hypothesisId === hypothesis.id
@@ -568,19 +587,23 @@ function chooseSupervisorHypothesis({
     const relatedCompleted = completedWorkers.some(
       (worker) => worker.hypothesisId === hypothesis.id
     )
-    return !hypothesis.lastWorkedAt && !relatedActive && !relatedCompleted
+    const relatedReserved = reservations.some(
+      (reservation) => reservation.hypothesisId === hypothesis.id
+    )
+    return (
+      !hypothesis.lastWorkedAt &&
+      !relatedActive &&
+      !relatedCompleted &&
+      !relatedReserved
+    )
   })
   if (neverWorked) return neverWorked
 
   return activeHypotheses
     .slice()
     .sort((left, right) => {
-      const leftActive = activeWorkers.filter(
-        (worker) => worker.hypothesisId === left.id
-      ).length
-      const rightActive = activeWorkers.filter(
-        (worker) => worker.hypothesisId === right.id
-      ).length
+      const leftActive = activeCountFor(left.id)
+      const rightActive = activeCountFor(right.id)
       if (leftActive !== rightActive) return leftActive - rightActive
       const leftWorked = left.lastWorkedAt ? Date.parse(left.lastWorkedAt) : 0
       const rightWorked = right.lastWorkedAt
@@ -1781,6 +1804,7 @@ async function runHypothesisOnce({
   stopGraceMs,
   quiet,
   syncSupervisor,
+  onRegistered,
   args,
 }: {
   root: string
@@ -1799,6 +1823,7 @@ async function runHypothesisOnce({
   stopGraceMs: number
   quiet: boolean
   syncSupervisor: ReturnType<typeof createSyncSupervisor>
+  onRegistered?: (worker: { workerId: string; hypothesisId: string }) => void
   args: Args
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
@@ -1814,16 +1839,18 @@ async function runHypothesisOnce({
   }
 
   try {
+    const effectiveAgentKind = workerCommand ? "custom" : agentKind
     const worker = await registerLocalWorker({
       root,
       campaignId: campaign.id,
       sessionId,
       hypothesisId: hypothesis.id,
-      workerName: `${hypothesis.name}-${agentKind}`,
-      agentKind,
+      workerName: `${hypothesis.name}-${effectiveAgentKind}`,
+      agentKind: effectiveAgentKind,
       runtime: "local",
     })
     workerId = worker.id
+    onRegistered?.({ workerId: worker.id, hypothesisId: hypothesis.id })
     await recordLocalWorkerHeartbeat({
       root,
       workerId: worker.id,
@@ -3411,6 +3438,21 @@ function activeSessionWorkers({
   )
 }
 
+type LaunchReservation = {
+  hypothesisId: string
+  workerId: string | null
+}
+
+function unresolvedReservationCount(
+  reservations: Iterable<LaunchReservation>
+) {
+  let count = 0
+  for (const reservation of reservations) {
+    if (!reservation.workerId) count += 1
+  }
+  return count
+}
+
 function sessionStopRequested({
   state,
   sessionId,
@@ -3493,6 +3535,7 @@ export async function commandResearchRun(args: Args) {
       `--max-concurrency is capped at ${MAX_LOCAL_SUPERVISOR_WORKERS}`
     )
   }
+  const maxLaunches = optionalPositiveIntegerOption(args, "max-launches")
 
   const now = Date.now()
   const existingEndTime =
@@ -3540,6 +3583,7 @@ export async function commandResearchRun(args: Args) {
         maxMinutes,
         agentKind,
         maxConcurrency,
+        ...(maxLaunches ? { maxLaunches } : {}),
         presenceIntervalSeconds: presenceIntervalMs / 1000,
         syncIntervalSeconds: syncIntervalMs / 1000,
       },
@@ -3608,6 +3652,7 @@ export async function commandResearchRun(args: Args) {
   presenceSupervisor.request()
 
   const activeRuns = new Map<string, Promise<HypothesisRunResult>>()
+  const launchReservations = new Map<string, LaunchReservation>()
   let launched = 0
   let completed = 0
   let failed = 0
@@ -3616,7 +3661,11 @@ export async function commandResearchRun(args: Args) {
 
   console.log(`Research supervisor: ${sessionId}`)
   console.log(`Campaign: ${campaign.name}`)
-  console.log(`Workers: target=${workerTarget} concurrency=${maxConcurrency}`)
+  console.log(
+    `Workers: target=${workerTarget} concurrency=${maxConcurrency}${
+      maxLaunches ? ` maxLaunches=${maxLaunches}` : ""
+    }`
+  )
   console.log(`Agent: ${args.options["worker-command"] ? "custom" : agentKind}`)
   console.log(`Presence: every ${presenceIntervalMs / 1000}s`)
   console.log(`Sync: every ${syncIntervalMs / 1000}s`)
@@ -3629,7 +3678,9 @@ export async function commandResearchRun(args: Args) {
         sessionId,
         args,
       }).catch(() => false)
-      if (shouldStop || Date.now() >= endTimeMs) {
+      const launchLimitReached =
+        maxLaunches !== null && launched >= maxLaunches
+      if (shouldStop || Date.now() >= endTimeMs || launchLimitReached) {
         if (activeRuns.size === 0) break
         await Promise.race([
           ...activeRuns.values(),
@@ -3646,9 +3697,16 @@ export async function commandResearchRun(args: Args) {
         workers: latest.workers,
         sessionId,
       }).length
-      const openSlots = Math.max(0, workerTarget - activeWorkers)
+      const openSlots = Math.max(
+        0,
+        workerTarget -
+          activeWorkers -
+          unresolvedReservationCount(launchReservations.values())
+      )
       const concurrencySlots = Math.max(0, maxConcurrency - activeRuns.size)
-      const launchSlots = Math.min(openSlots, concurrencySlots)
+      const launchCapSlots =
+        maxLaunches === null ? Number.POSITIVE_INFINITY : maxLaunches - launched
+      const launchSlots = Math.min(openSlots, concurrencySlots, launchCapSlots)
       let launchedThisTick = 0
 
       for (let index = 0; index < launchSlots; index += 1) {
@@ -3658,10 +3716,11 @@ export async function commandResearchRun(args: Args) {
         const activeCount = activeSessionWorkers({
           workers: refreshed.workers,
           sessionId,
-        }).length
+        }).length + unresolvedReservationCount(launchReservations.values())
         if (
           activeCount >= workerTarget ||
           activeRuns.size >= maxConcurrency ||
+          (maxLaunches !== null && launched >= maxLaunches) ||
           refreshed.session.status !== "running"
         ) {
           break
@@ -3671,6 +3730,7 @@ export async function commandResearchRun(args: Args) {
           workers: refreshed.workers.filter(
             (worker) => worker.sessionId === sessionId
           ),
+          reservations: [...launchReservations.values()],
         })
         if (!hypothesis) break
 
@@ -3678,6 +3738,10 @@ export async function commandResearchRun(args: Args) {
         launched += 1
         launchedThisTick += 1
         const runKey = `${Date.now()}:${launched}:${hypothesis.id}`
+        launchReservations.set(runKey, {
+          hypothesisId: hypothesis.id,
+          workerId: null,
+        })
         const run = runHypothesisOnce({
           root,
           projectPath: effectiveProjectPath,
@@ -3695,6 +3759,14 @@ export async function commandResearchRun(args: Args) {
           stopGraceMs,
           quiet: args.options.quiet === "true",
           syncSupervisor,
+          onRegistered: ({ workerId }) => {
+            const reservation = launchReservations.get(runKey)
+            if (!reservation) return
+            launchReservations.set(runKey, {
+              ...reservation,
+              workerId,
+            })
+          },
           args,
         })
           .then(async (result) => {
@@ -3705,9 +3777,9 @@ export async function commandResearchRun(args: Args) {
                 status: result.status,
                 sessionId,
                 hypothesisId: result.hypothesis.id,
-                phase: "syncing",
+                phase: result.status,
                 event: "final_sync_started",
-                progressMessage: `Draining sync after ${result.hypothesis.name}`,
+                progressMessage: `Final sync queued after ${result.hypothesis.name}`,
                 gitLabel: result.resultCommitSha ?? null,
               }).catch(() => {})
             }
@@ -3729,6 +3801,7 @@ export async function commandResearchRun(args: Args) {
           })
           .finally(() => {
             activeRuns.delete(runKey)
+            launchReservations.delete(runKey)
             syncSupervisor.request()
             presenceSupervisor.request()
           })
@@ -3786,7 +3859,9 @@ export async function commandResearchRun(args: Args) {
   const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
 
   console.log(
-    `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; ${pending} sync record(s) pending.`
+    `Research run ${finalStatus}: launched=${launched}${
+      maxLaunches ? `/${maxLaunches}` : ""
+    } completed=${completed} failed=${failed} stopped=${stopped}; ${pending} sync record(s) pending.`
   )
 }
 
