@@ -9,6 +9,7 @@ import {
 import { randomUUID } from "node:crypto"
 import { delimiter } from "node:path"
 import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { onyxStateDir } from "./outbox"
 import { readConfig } from "./config"
@@ -45,7 +46,7 @@ export type WorkerPreflightResult = {
 export type WorkerOnyxShim = {
   binDir: string
   onyxPath: string
-  mode: "dev" | "release"
+  mode: "dev" | "release" | "source"
   target: string
 }
 
@@ -116,6 +117,11 @@ function unique(values: string[]) {
   return [...new Set(values.filter(Boolean))]
 }
 
+async function sourceCheckoutOnyxBin() {
+  const binPath = fileURLToPath(new URL("../../bin/onyx.js", import.meta.url))
+  return (await pathExists(binPath)) ? binPath : null
+}
+
 export async function workerGitWritableRoots(worktree: string) {
   return unique([await gitDir(worktree), await gitCommonDir(worktree)])
 }
@@ -154,18 +160,33 @@ export async function writeWorkerOnyxShim({
     const resolved = await runProcess("sh", ["-lc", "command -v onyx"], {
       timeoutMs: 5000,
     })
-    if (resolved.code !== 0 || !resolved.stdout.trim()) {
+    const resolvedPath = resolved.stdout.trim().split("\n")[0]
+    const sourceBinPath =
+      resolved.code === 0 && resolvedPath
+        ? null
+        : await sourceCheckoutOnyxBin()
+    if (resolved.code === 0 && resolvedPath) {
+      target = resolvedPath
+      script = [
+        "#!/usr/bin/env sh",
+        "set -eu",
+        `exec env ${ONYX_LAUNCHER_BYPASS}=1 ${shellQuote(target)} "$@"`,
+        "",
+      ].join("\n")
+    } else if (sourceBinPath) {
+      mode = "source"
+      target = sourceBinPath
+      script = [
+        "#!/usr/bin/env sh",
+        "set -eu",
+        `exec env ${ONYX_LAUNCHER_BYPASS}=1 bun ${shellQuote(target)} "$@"`,
+        "",
+      ].join("\n")
+    } else {
       throw new Error(
-        "Unable to resolve the Onyx CLI on PATH for worker launch. Install `onyx`, or use developer mode with `onyx developer link <path>`."
+        "Unable to resolve the Onyx CLI on PATH for worker launch. Install `onyx`, run from an Onyx agent source checkout, or use developer mode with `onyx developer link <path>`."
       )
     }
-    target = resolved.stdout.trim().split("\n")[0]!
-    script = [
-      "#!/usr/bin/env sh",
-      "set -eu",
-      `exec env ${ONYX_LAUNCHER_BYPASS}=1 ${shellQuote(target)} "$@"`,
-      "",
-    ].join("\n")
   }
 
   await writeFile(onyxPath, script, "utf8")

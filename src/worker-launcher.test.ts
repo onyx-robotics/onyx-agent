@@ -373,6 +373,46 @@ describe("worker launchers", () => {
     }
   })
 
+  test("onyx shim falls back to the source checkout when PATH has no onyx", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-source-shim-"))
+    const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-source-config-"))
+    await runProcess("git", ["init"], { cwd: root })
+    const previousConfigHome = process.env.XDG_CONFIG_HOME
+    const previousPath = process.env.PATH
+    process.env.XDG_CONFIG_HOME = configHome
+    process.env.PATH = "/usr/bin:/bin"
+
+    try {
+      await writeConfig({
+        currentProfile: "",
+        profiles: {},
+        developer: { mode: "release" },
+      })
+
+      const shim = await writeWorkerOnyxShim({ root, sessionId: "session" })
+      expect(shim.mode).toBe("source")
+      expect(shim.target).toContain("/bin/onyx.js")
+
+      if (previousPath !== undefined) process.env.PATH = previousPath
+      const help = await runProcess(shim.onyxPath, ["--help"], {
+        timeoutMs: 5000,
+      })
+      expect(help.code).toBe(0)
+      expect(help.stdout).toContain("onyx research run")
+    } finally {
+      if (previousConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME
+      } else {
+        process.env.XDG_CONFIG_HOME = previousConfigHome
+      }
+      if (previousPath === undefined) {
+        delete process.env.PATH
+      } else {
+        process.env.PATH = previousPath
+      }
+    }
+  })
+
   test("startup timeout kills silent workers", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-timeout-"))
     const result = await runStreamingProcess("sh", ["-c", "sleep 5"], {
