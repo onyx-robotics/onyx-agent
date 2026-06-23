@@ -1846,6 +1846,17 @@ async function runHypothesisOnce({
   let resultCommitSha: string | undefined
   let workerBranch = "unknown"
   let launchManifest: WorkerLaunchManifest | null = null
+  let launchPersistQueue: Promise<void> = Promise.resolve()
+  const persistLaunchManifest = (manifest: WorkerLaunchManifest) => {
+    const snapshot = manifest
+    const write = launchPersistQueue
+      .catch(() => {})
+      .then(() =>
+        persistWorkerLaunchState({ root, manifest: snapshot, workerBranch })
+      )
+    launchPersistQueue = write
+    return write
+  }
   let workerShim: WorkerOnyxShim | null = null
   let workerTempDir: string | null = null
   const cleanupWorkerTempDir = async () => {
@@ -2030,7 +2041,7 @@ async function runHypothesisOnce({
       preflight,
       finalization: null,
     }
-    await persistWorkerLaunchState({ root, manifest: launchManifest, workerBranch })
+    await persistLaunchManifest(launchManifest)
     console.log(`worker: ${worker.id}`)
     console.log(`hypothesis: ${hypothesis.id} ${hypothesis.name}`)
     console.log(`worktree: ${worktree}`)
@@ -2118,11 +2129,7 @@ async function runHypothesisOnce({
               status: "running",
               lastOutputAt: at,
             }
-            void persistWorkerLaunchState({
-              root,
-              manifest: launchManifest,
-              workerBranch,
-            }).catch(() => {})
+            void persistLaunchManifest(launchManifest).catch(() => {})
           },
         }),
       quiet,
@@ -2144,7 +2151,7 @@ async function runHypothesisOnce({
         startupTimedOut: workerResult.startupTimedOut,
         lastOutputAt: workerResult.lastOutputAt,
       }
-      await persistWorkerLaunchState({ root, manifest: launchManifest, workerBranch })
+      await persistLaunchManifest(launchManifest)
     }
     const workerFailure = processFailure(
       workerResult,
@@ -2178,7 +2185,7 @@ async function runHypothesisOnce({
         ...launchManifest,
         finalization,
       }
-      await persistWorkerLaunchState({ root, manifest: launchManifest, workerBranch })
+      await persistLaunchManifest(launchManifest)
     }
     if (finalizationLoggedExperiment(finalization.finalizationStatus)) {
       syncSupervisor.request()
@@ -2308,11 +2315,7 @@ async function runHypothesisOnce({
         status: "failed",
         error: message,
       }
-      await persistWorkerLaunchState({
-        root,
-        manifest: launchManifest,
-        workerBranch,
-      }).catch(() => {})
+      await persistLaunchManifest(launchManifest).catch(() => {})
     }
     if (workerId) {
       const metadata = launchManifest
