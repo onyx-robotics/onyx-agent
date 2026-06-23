@@ -413,8 +413,10 @@ type ResearchLaunchSuggestion =
 function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
   const kind = args.options.kind ?? fallback
   if (!SUMMARY_KINDS.includes(kind as SummaryKind)) {
+    const hint =
+      kind === "hypothesis" ? " Did you mean hypothesis_summary?" : ""
     throw new Error(
-      "--kind must be campaign_brief, session_brief, hypothesis_summary, transfer_brief, or setup_notes"
+      `--kind must be campaign_brief, session_brief, hypothesis_summary, transfer_brief, or setup_notes.${hint}`
     )
   }
   return kind as SummaryKind
@@ -3226,8 +3228,8 @@ export async function commandResearchFinish(args: Args) {
 
 export async function commandSummaryUpsert(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
   const kind = summaryKindOption(args, "hypothesis_summary")
+  const { campaign } = await campaignForName(root, args)
   const title = args.options.title ?? `${kind} ${new Date().toISOString()}`
   const body = args.options.body
   if (!body) throw new Error("Pass --body <text>.")

@@ -97,7 +97,7 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 7. Inspect the output, metric, and checks result. Record every terminal attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
 8. Publish concise shared learnings with \`onyx knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
 9. Periodically review summaries with \`onyx summary list\` and update a concise hypothesis summary with \`onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"\` if available; otherwise include the summary in final output. Do not pipe mutation commands through \`tail\`, \`head\`, or other filters that can hide failed exits.
-10. Run \`onyx sync\` or \`onyx push\` periodically when network access is available.
+10. Supervisor/harness sync owns durable pushes for worker results. Use \`onyx sync status\` to inspect pending local records, and run \`onyx push\` only when network access is clearly available.
 
 ## Research Rules
 
@@ -116,7 +116,7 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 - Do not thrash. If you keep circling the same idea, try something structurally different.
 - Crashes: fix trivial issues, otherwise log what failed and move on.
 - When stuck, slow down: re-read source, inspect eval output, search history with \`onyx exp list --grep\`, study profiling or papers if useful, and reason from evidence instead of random variation.
-- Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: finish/log the current one-commit workflow if possible, sync/push when possible, summarize, and exit before ${input.shutdownDeadlineIso}. Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow. Do not start new exploration after ${input.researchDeadlineIso}.
+- Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: finish/log the current one-commit workflow if possible, inspect sync status, summarize, and exit before ${input.shutdownDeadlineIso}. Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow. Do not start new exploration after ${input.researchDeadlineIso}.
 - Keep going only while useful work remains and the iteration cap has not been reached. Stop when the hypothesis is exhausted, the budget is no longer useful, or \`onyx research should-stop --json\` reports \`shouldStop: true\`. Do not ask whether to continue.
 
 ## Git And State Rules
@@ -128,5 +128,5 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 - Use \`onyx exp list --limit 20\` for recent history and \`onyx exp list --grep <regex>\` before repeating an idea.
 - Use \`onyx knowledge list\` before repeating an idea, and \`onyx knowledge add\` for promising ideas, dead-end themes, risks, and transfer notes. If you keep a local backlog file, avoid protected setup paths and commit it normally.
 
-On stop: leave the worktree clean, make sure every committed attempt is logged, run \`onyx push\` or \`onyx sync\` when network access is available, and summarize best result, failed ideas, and next promising ideas. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, local experiment log, and worker-branch push.`
+On stop: leave the worktree clean, make sure every committed attempt is logged, check \`onyx sync status\`, and summarize best result, failed ideas, and next promising ideas. The supervisor/harness will push durable experiment refs and sync events when network access is available. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, local experiment log, and worker-branch push.`
 }

@@ -30,7 +30,6 @@ import {
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import {
   cacheLocalCampaign,
-  clearLocalAttempt,
   listWorkflowSteps,
   listLocalAttempts,
   listLocalExperimentHistory,
@@ -1162,7 +1161,7 @@ export async function commandExpLog(args: Args) {
     lastRun.projectPath === projectPath
       ? lastRun
       : null
-  if (args.options["run-ref"] && !usableLastRun) {
+  if (args.options["run-ref"]) {
     const localHistory = await listLocalExperimentHistory(root).catch(() => [])
     const logged = localHistory.find(
       (record) =>
@@ -1175,6 +1174,8 @@ export async function commandExpLog(args: Args) {
       )
       return
     }
+  }
+  if (args.options["run-ref"] && !usableLastRun) {
     throw new Error(
       `No measured run found for --run-ref ${args.options["run-ref"]}. Run \`onyx exp list --json\` to inspect unlogged local runs.`
     )
@@ -1308,8 +1309,6 @@ export async function commandExpLog(args: Args) {
   console.log(
     `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}`
   )
-  if (usableLastRun)
-    await clearLocalAttempt(root, { runRef: usableLastRun.runRef })
 }
 
 export async function commandExpList(args: Args) {

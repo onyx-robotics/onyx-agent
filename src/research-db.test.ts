@@ -988,7 +988,7 @@ describe("SQLite research ledger", () => {
     }
   })
 
-  test("stores measured attempts in SQLite and clears them after logging", async () => {
+  test("stores measured attempts in SQLite and supports explicit cleanup", async () => {
     const root = await fixtureRepo()
     await writeLocalAttempt({
       root,

@@ -925,7 +925,7 @@ describe("worker finalization", () => {
 })
 
 describe("exp log", () => {
-  test("uses explicit scoped run refs without consuming another worker run", async () => {
+  test("preserves explicit scoped run attempts and logs each run ref once", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
       await writeResearchSmokeRepo()
     const sessionId = "22222222-2222-4222-8222-222222222222"
@@ -974,7 +974,10 @@ describe("exp log", () => {
 
     const previousCwd = process.cwd()
     const originalLog = console.log
-    console.log = () => {}
+    const logs: string[] = []
+    console.log = (message?: unknown) => {
+      logs.push(String(message ?? ""))
+    }
     try {
       process.chdir(root)
       await commandExpLog({
@@ -997,10 +1000,13 @@ describe("exp log", () => {
           session: sessionId,
           worker: workerTwoId,
           hypothesis: hypothesisTwoId,
-          name: "worker-two-result",
-          description: "logged the second worker",
+          name: "mutated-worker-two-result",
+          description: "this repeat should not mutate",
         },
       })
+      expect(logs.join("\n")).toContain(
+        `Experiment ${workerTwo.runRef} is already recorded for campaign ${campaignName}`
+      )
     } finally {
       process.chdir(previousCwd)
       console.log = originalLog
@@ -1020,7 +1026,28 @@ describe("exp log", () => {
       records.filter((record) => record.runRef === workerTwo.runRef)
     ).toHaveLength(1)
     const remainingRuns = await listLocalAttempts(root)
-    expect(remainingRuns.map((run) => run.runRef)).toEqual([workerOne.runRef])
+    expect(new Set(remainingRuns.map((run) => run.runRef))).toEqual(
+      new Set([workerOne.runRef, workerTwo.runRef])
+    )
+
+    const listLogs: string[] = []
+    console.log = (message?: unknown) => {
+      listLogs.push(String(message ?? ""))
+    }
+    try {
+      process.chdir(root)
+      await commandExpList({
+        positional: ["exp", "list"],
+        options: { campaign: campaignName, json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+    const listed = JSON.parse(listLogs.join("\n")) as LocalResearchHistoryRecord[]
+    expect(
+      listed.filter((record) => record.runRef === workerTwo.runRef)
+    ).toHaveLength(1)
   })
 
   test("--run-ref fails clearly when the measured run is missing", async () => {
@@ -2153,6 +2180,27 @@ describe("automated research smoke", () => {
 })
 
 describe("summary CLI", () => {
+  test("suggests hypothesis_summary for hypothesis summary kind", async () => {
+    const { root, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandSummaryUpsert({
+          positional: ["summary", "upsert"],
+          options: {
+            campaign: campaignName,
+            kind: "hypothesis",
+            body: "summary",
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow("Did you mean hypothesis_summary?")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
   test("rejects non-UUID summary identity flags locally", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
       await writeResearchSmokeRepo()
@@ -3602,6 +3650,41 @@ describe("setup workflow", () => {
       expect(instructions).toContain("METRIC score=<number>")
     } finally {
       process.chdir(previousCwd)
+    }
+  })
+
+  test("setup init keeps placeholder eval script for self-referential eval command", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-setup-self-eval-"))
+    const previousCwd = process.cwd()
+    const originalWarn = console.warn
+    const warnings: string[] = []
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message ?? ""))
+    }
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: {
+          goal: "Improve score",
+          "metric-name": "score",
+          "eval-command": "bash onyx/tools/evaluation/run.sh",
+        },
+      })
+      const evalSh = await readFile(
+        join(root, "onyx", "tools", "evaluation", "run.sh"),
+        "utf8"
+      )
+      expect(evalSh).toContain("TODO: replace onyx/tools/evaluation/run.sh")
+      expect(evalSh).toContain("METRIC score=<number>")
+      expect(evalSh).not.toContain("\nbash onyx/tools/evaluation/run.sh\n")
+      expect(warnings.join("\n")).toContain(
+        "--eval-command points at onyx/tools/evaluation/run.sh"
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.warn = originalWarn
     }
   })
 

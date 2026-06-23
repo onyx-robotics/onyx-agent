@@ -86,6 +86,14 @@ describe("hypothesis worker prompt", () => {
       "allowed only inside a normal `onyx exp run` attempt"
     )
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
+    expect(prompt).toContain("Supervisor/harness sync owns durable pushes")
+    expect(prompt).toContain("onyx sync status")
+    expect(prompt).toContain(
+      "run `onyx push` only when network access is clearly available"
+    )
+    expect(prompt).not.toContain(
+      "Run `onyx sync` or `onyx push` periodically"
+    )
     expect(prompt).toContain("Primary metric is king")
     expect(prompt).toContain("Do not ask whether to continue")
     expect(prompt).not.toContain("Peer hypothesis state")
