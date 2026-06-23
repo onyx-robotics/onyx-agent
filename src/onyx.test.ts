@@ -68,10 +68,13 @@ import {
   logLocalExperiment,
   pendingResearchSyncCount,
   readWorkflowRun,
+  registerLocalWorker,
+  recordLocalWorkerHeartbeat,
   upsertWorkflowRun,
   writeLocalAttempt,
 } from "./lib/research-db"
 import { runProcess } from "./lib/process"
+import { writeWorkerLaunchManifest } from "./lib/worker-launcher"
 
 async function commitAll(root: string, message: string) {
   await runProcess("git", ["add", "-A"], { cwd: root })
@@ -1981,6 +1984,224 @@ describe("research status", () => {
       process.chdir(previousCwd)
       console.log = originalLog
     }
+  })
+
+  test("repairs terminal worker manifests before computing open slots", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      projectPath: "",
+      baseCommitSha,
+      setup: await readSetupFile(root, ""),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "A focused local change can improve score.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      workerName: "worker-1",
+      agentKind: "codex",
+    })
+    const manifestDir = join(
+      await onyxStateDir(root),
+      "worker-logs",
+      session.session.id
+    )
+    await writeWorkerLaunchManifest({
+      schemaVersion: 1,
+      agentKind: "codex",
+      command: "codex",
+      args: [],
+      onyxShimPath: null,
+      addedWritableRoots: [],
+      cwd: root,
+      promptPath: join(manifestDir, "prompt.md"),
+      logPath: join(manifestDir, "worker.log"),
+      activityLogPath: join(manifestDir, "worker.activity.log"),
+      manifestPath: join(manifestDir, "worker.manifest.json"),
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+      version: null,
+      startedAt: "2026-06-20T00:00:00.000Z",
+      lastOutputAt: "2026-06-20T00:00:01.000Z",
+      completedAt: "2026-06-20T00:00:02.000Z",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+      preflight: null,
+      finalization: {
+        attempted: true,
+        salvaged: false,
+        finalizationStatus: "already_logged",
+        commitSha: baseCommitSha,
+        measurementBaseCommitSha: null,
+        unloggedCommitCount: 0,
+        workerBranchPushStatus: "pushed",
+        rootDriftStatus: "clean",
+        error: null,
+      },
+    })
+    await writeState(root, {
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          sessionId: session.session.id,
+          baseCommitSha,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          status: "running",
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const lines: string[] = []
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const output = JSON.parse(lines.join("\n")) as {
+      session: { activeWorkers: number; openSlots: number }
+      workers: Array<{ id: string; status: string }>
+    }
+    expect(output.session.activeWorkers).toBe(0)
+    expect(output.session.openSlots).toBe(1)
+    expect(output.workers.find((item) => item.id === worker.id)?.status).toBe(
+      "completed"
+    )
+  })
+
+  test("reports open slots immediately after a worker completes", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      projectPath: "",
+      baseCommitSha,
+      setup: await readSetupFile(root, ""),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "A focused local change can improve score.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      workerName: "worker-1",
+      agentKind: "codex",
+    })
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "completed",
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      event: "completed",
+    })
+    await writeState(root, {
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          sessionId: session.session.id,
+          baseCommitSha,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          status: "running",
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const lines: string[] = []
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const output = JSON.parse(lines.join("\n")) as {
+      session: { activeWorkers: number; openSlots: number }
+      workers: Array<{ id: string; status: string }>
+    }
+    expect(output.session.activeWorkers).toBe(0)
+    expect(output.session.openSlots).toBe(1)
+    expect(output.workers.find((item) => item.id === worker.id)?.status).toBe(
+      "completed"
+    )
   })
 
   test("emits structured launch suggestions only for unworked hypotheses", async () => {

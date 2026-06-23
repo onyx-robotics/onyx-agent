@@ -406,6 +406,58 @@ function workerIsCompleted(worker: Pick<ApiWorker, "status">) {
   return worker.status === "completed"
 }
 
+function terminalStatusFromManifest(
+  manifest: WorkerLaunchManifest
+): ApiWorker["status"] | null {
+  if (manifest.status === "completed") return "completed"
+  if (manifest.status === "failed") return "failed"
+  if (manifest.status === "stopped") return "stopped"
+  return null
+}
+
+async function reconcileTerminalWorkerManifests({
+  root,
+  sessionId,
+  workers,
+  manifests,
+}: {
+  root: string
+  sessionId: string
+  workers: ApiWorker[]
+  manifests: WorkerLaunchManifest[]
+}) {
+  const workersById = new Map(workers.map((worker) => [worker.id, worker]))
+  let repaired = 0
+  for (const manifest of manifests) {
+    const status = terminalStatusFromManifest(manifest)
+    if (!status) continue
+    const worker = workersById.get(manifest.workerId)
+    if (!worker || worker.sessionId !== sessionId || !workerIsActive(worker)) {
+      continue
+    }
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status,
+      sessionId,
+      hypothesisId: worker.hypothesisId,
+      phase: status,
+      event: "manifest_reconciled",
+      progressMessage: `Worker manifest shows ${status}`,
+      gitLabel:
+        manifest.finalization?.commitSha ??
+        manifest.finalization?.measurementBaseCommitSha ??
+        worker.gitLabel,
+      metadata: {
+        manifestPath: manifest.manifestPath,
+        reconciledFrom: "worker-manifest",
+      },
+    })
+    repaired += 1
+  }
+  return repaired
+}
+
 function launchSuggestionsForSession({
   sessionId,
   sessionStatus,
@@ -2025,37 +2077,39 @@ async function runHypothesisOnce({
         metadata,
       }).catch(() => {})
     }
-    await upsertLocalSummary({
-      root,
-      campaignId: campaign.id,
-      sessionId,
-      hypothesisId: hypothesis.id,
-      authoredByWorkerId: workerId,
-      summaryKind: "hypothesis_summary",
-      title: `${hypothesis.name} worker finalization failed`,
-      body: [
-        `Outcome: failed`,
-        `Error: ${message}`,
-        resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
-        launchManifest?.manifestPath
-          ? `Worker manifest: ${launchManifest.manifestPath}`
-          : "",
-        launchManifest?.activityLogPath
-          ? `Worker activity log: ${launchManifest.activityLogPath}`
-          : "",
-        launchManifest?.logPath
-          ? `Worker raw log: ${launchManifest.logPath}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      isCurrent: false,
-      metadata: {
-        authoredBy: "worker-harness",
-        outcome: "failed",
-        resultCommitSha: resultCommitSha ?? null,
-      },
-    })
+    if (workerId) {
+      await upsertLocalSummary({
+        root,
+        campaignId: campaign.id,
+        sessionId,
+        hypothesisId: hypothesis.id,
+        authoredByWorkerId: workerId,
+        summaryKind: "hypothesis_summary",
+        title: `${hypothesis.name} worker finalization failed`,
+        body: [
+          `Outcome: failed`,
+          `Error: ${message}`,
+          resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
+          launchManifest?.manifestPath
+            ? `Worker manifest: ${launchManifest.manifestPath}`
+            : "",
+          launchManifest?.activityLogPath
+            ? `Worker activity log: ${launchManifest.activityLogPath}`
+            : "",
+          launchManifest?.logPath
+            ? `Worker raw log: ${launchManifest.logPath}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        isCurrent: false,
+        metadata: {
+          authoredBy: "worker-harness",
+          outcome: "failed",
+          resultCommitSha: resultCommitSha ?? null,
+        },
+      })
+    }
     await cleanupWorkerTempDir()
     return {
       hypothesis,
@@ -2329,9 +2383,26 @@ export async function commandResearchStatus(args: Args) {
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   const scopeAll = args.options["all-sessions"] === "true"
-  const localSessionState = activeSessionId
+  let localSessionState = activeSessionId
     ? await getLocalSessionState(root, activeSessionId).catch(() => null)
     : null
+  const manifests = activeSessionId
+    ? await readWorkerLaunchManifests(root, activeSessionId)
+    : []
+  if (activeSessionId && localSessionState) {
+    const repaired = await reconcileTerminalWorkerManifests({
+      root,
+      sessionId: activeSessionId,
+      workers: localSessionState.workers,
+      manifests,
+    })
+    if (repaired > 0) {
+      localSessionState = await getLocalSessionState(
+        root,
+        activeSessionId
+      ).catch(() => localSessionState)
+    }
+  }
   const overview = localSessionState
     ? {
         campaign: localSessionState.campaign,
@@ -2348,9 +2419,6 @@ export async function commandResearchStatus(args: Args) {
           (worker) => worker.sessionId === activeSessionId
         )
       : overview.workers
-  const manifests = activeSessionId
-    ? await readWorkerLaunchManifests(root, activeSessionId)
-    : []
   const manifestByWorker = new Map(
     manifests.map((manifest) => [manifest.workerId, manifest])
   )
@@ -3192,7 +3260,7 @@ export async function commandWorkerRun(args: Args) {
     await recordLocalWorkerHeartbeat({
       root,
       workerId: result.workerId,
-      status: result.status === "failed" ? "failed" : "running",
+      status: result.status,
       sessionId,
       hypothesisId: hypothesis.id,
       phase: "syncing",
