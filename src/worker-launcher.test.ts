@@ -212,6 +212,36 @@ describe("worker launchers", () => {
     expect(result.activityLogPath).toBe(activityLogPath)
   })
 
+  test("streams full output to logs while retaining only bounded tails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-tail-"))
+    const logPath = join(root, "worker.log")
+    const result = await runStreamingProcess(
+      "sh",
+      [
+        "-c",
+        "printf 'abcdefghijklmnopqrstuvwxyz'; printf '0123456789abcdef' >&2",
+      ],
+      {
+        logPath,
+        timeoutMs: 5000,
+        startupTimeoutMs: 1000,
+        killGraceMs: 100,
+        outputTailBytes: 10,
+      }
+    )
+
+    expect(result.code).toBe(0)
+    expect(result.stdout).toBe("qrstuvwxyz")
+    expect(result.stderr).toBe("6789abcdef")
+    expect(result.stdoutBytes).toBe(26)
+    expect(result.stderrBytes).toBe(16)
+    expect(result.stdoutTruncated).toBe(true)
+    expect(result.stderrTruncated).toBe(true)
+    const log = await readFile(logPath, "utf8")
+    expect(log).toContain("abcdefghijklmnopqrstuvwxyz")
+    expect(log).toContain("0123456789abcdef")
+  })
+
   test("preflights Claude with its direct print-mode launcher", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-claude-launcher-"))
     const bin = join(root, "bin")

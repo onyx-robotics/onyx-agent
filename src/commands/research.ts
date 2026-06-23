@@ -14,6 +14,7 @@ import {
   listProjectCampaigns,
   reconcileCampaign,
   stopCampaignSession,
+  syncResearchPresence,
   resolveProject,
   type ApiCampaign,
   type ApiHypothesis,
@@ -29,8 +30,8 @@ import {
   type ResearchSetupFile,
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
-import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
-import { onyxStateDir, readState, writeState } from "../lib/outbox"
+import { currentCommit, git, gitResult, repoRoot, repositoryUrl } from "../lib/git"
+import { onyxStateDir, readState, withOnyxLock, writeState } from "../lib/outbox"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
   pathExists,
@@ -60,8 +61,10 @@ import {
   researchSyncConflictCount,
   recordLocalWorkerHeartbeat,
   registerLocalWorker,
+  getResearchSiteId,
   researchDbPath,
   stopLocalSession,
+  upsertWorkerLaunch,
   upsertLocalSummary,
 } from "../lib/research-db"
 import { assertSetupCommitted } from "../lib/setup-git"
@@ -89,6 +92,7 @@ const MAX_WORKER_SHUTDOWN_CUSHION_MS = 90_000
 const MIN_WORKER_SHUTDOWN_CUSHION_MS = 15_000
 const MAX_WORKER_HARD_STOP_GRACE_MS = 30_000
 const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
+const MAX_LOCAL_SUPERVISOR_WORKERS = 100
 
 function positiveIntegerOption(args: Args, name: string, fallback: number) {
   const raw = args.options[name]
@@ -285,6 +289,14 @@ function workerBudgetOptions({
   maxMinutes: number
 }) {
   return ` --max-iterations ${maxIterations} --max-minutes ${maxMinutes}`
+}
+
+function workerAgentOption(args: Args) {
+  const agentKind = args.options.agent ?? "codex"
+  if (agentKind !== "codex" && agentKind !== "claude") {
+    throw new Error("--agent must be codex or claude")
+  }
+  return agentKind
 }
 
 async function createWorkerTempDir({
@@ -535,6 +547,49 @@ function launchSuggestionsForSession({
   return []
 }
 
+function chooseSupervisorHypothesis({
+  hypotheses,
+  workers,
+}: {
+  hypotheses: ApiHypothesis[]
+  workers: ApiWorker[]
+}) {
+  const activeHypotheses = hypotheses.filter(
+    (hypothesis) => hypothesis.status === "active"
+  )
+  if (activeHypotheses.length === 0) return null
+
+  const activeWorkers = workers.filter(workerIsActive)
+  const completedWorkers = workers.filter(workerIsCompleted)
+  const neverWorked = activeHypotheses.find((hypothesis) => {
+    const relatedActive = activeWorkers.some(
+      (worker) => worker.hypothesisId === hypothesis.id
+    )
+    const relatedCompleted = completedWorkers.some(
+      (worker) => worker.hypothesisId === hypothesis.id
+    )
+    return !hypothesis.lastWorkedAt && !relatedActive && !relatedCompleted
+  })
+  if (neverWorked) return neverWorked
+
+  return activeHypotheses
+    .slice()
+    .sort((left, right) => {
+      const leftActive = activeWorkers.filter(
+        (worker) => worker.hypothesisId === left.id
+      ).length
+      const rightActive = activeWorkers.filter(
+        (worker) => worker.hypothesisId === right.id
+      ).length
+      if (leftActive !== rightActive) return leftActive - rightActive
+      const leftWorked = left.lastWorkedAt ? Date.parse(left.lastWorkedAt) : 0
+      const rightWorked = right.lastWorkedAt
+        ? Date.parse(right.lastWorkedAt)
+        : 0
+      return leftWorked - rightWorked
+    })[0]
+}
+
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
@@ -599,6 +654,114 @@ function createSyncSupervisor({
     stop() {
       stopped = true
       if (timer) clearInterval(timer)
+    },
+  }
+}
+
+function createPresenceSupervisor({
+  root,
+  args,
+  sessionId,
+  projectPath,
+  intervalMs,
+}: {
+  root: string
+  args: Args
+  sessionId: string
+  projectPath: string
+  intervalMs: number
+}) {
+  const lastSent = new Map<string, string>()
+  let running: Promise<void> | null = null
+  let stopped = false
+  let timer: ReturnType<typeof setInterval> | null = null
+
+  const snapshot = async () => {
+    if (args.options.offline === "true") return
+    const state = await getLocalSessionState(root, sessionId)
+    const manifests = await readWorkerLaunchManifests(root, sessionId)
+    const manifestByWorker = new Map(
+      manifests.map((manifest) => [manifest.workerId, manifest])
+    )
+    const observedAt = new Date().toISOString()
+    const workers = state.workers
+      .filter((worker) => worker.sessionId === sessionId)
+      .map((worker) => {
+        const manifest = manifestByWorker.get(worker.id)
+        const metadata = manifest
+          ? {
+              workerLogPath: manifest.logPath,
+              workerActivityLogPath: manifest.activityLogPath,
+              workerPromptPath: manifest.promptPath,
+              manifestPath: manifest.manifestPath,
+              finalizationStatus:
+                manifest.finalization?.finalizationStatus ?? null,
+            }
+          : {}
+        return {
+          id: worker.id,
+          status: worker.status,
+          phase: worker.phase,
+          progressMessage: worker.progressMessage,
+          gitLabel: worker.gitLabel,
+          lastOutputAt: manifest?.lastOutputAt ?? null,
+          metadata,
+          observedAt,
+        }
+      })
+      .filter((worker) => {
+        const signature = JSON.stringify({ ...worker, observedAt: undefined })
+        const active = ["idle", "running", "stale"].includes(worker.status)
+        const changed = lastSent.get(worker.id) !== signature
+        if (active || changed) {
+          lastSent.set(worker.id, signature)
+          return true
+        }
+        return false
+      })
+    if (workers.length === 0) return
+    await syncResearchPresence(
+      {
+        siteId: await getResearchSiteId(root),
+        repositoryUrl: await repositoryUrl(root, args.options["repository-url"]),
+        projectPath,
+        sessionId,
+        workers,
+      },
+      args
+    )
+  }
+
+  const run = () => {
+    if (running) return running
+    running = snapshot()
+      .catch((error) => {
+        if (!stopped) {
+          console.warn(
+            `Presence sync skipped: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          )
+        }
+      })
+      .finally(() => {
+        running = null
+      })
+    return running
+  }
+
+  timer = setInterval(() => {
+    if (!stopped) void run()
+  }, intervalMs)
+
+  return {
+    request() {
+      if (!stopped) void run()
+    },
+    async stop() {
+      stopped = true
+      if (timer) clearInterval(timer)
+      await run().catch(() => {})
     },
   }
 }
@@ -945,39 +1108,38 @@ async function ensureWorktree({
   sessionId: string
   workerId: string
 }) {
-  const branch = workerBranchName({ sessionId, hypothesis, workerId })
+  const branch = workerBranchName({ sessionId, workerId })
   const dir = join(
     await onyxStateDir(root),
     "worktrees",
-    `${sessionId}-${hypothesis.name}-${workerId.slice(0, 8)}`
+    sessionId,
+    workerId
   )
   if (!(await pathExists(dir))) {
-    await mkdir(join(await onyxStateDir(root), "worktrees"), {
-      recursive: true,
+    await withOnyxLock(root, "git-worktree", async () => {
+      if (await pathExists(dir)) return
+      await mkdir(join(await onyxStateDir(root), "worktrees", sessionId), {
+        recursive: true,
+      })
+      await git(
+        ["worktree", "add", "-B", branch, dir, hypothesis.baseCommitSha],
+        root
+      )
     })
-    await git(
-      ["worktree", "add", "-B", branch, dir, hypothesis.baseCommitSha],
-      root
-    )
   }
   return { dir, branch }
 }
 
 function workerBranchName({
   sessionId,
-  hypothesis,
   workerId,
 }: {
   sessionId: string
-  hypothesis: ApiHypothesis
   workerId: string
 }) {
-  return [
-    "onyx",
-    safeBranchSegment(sessionId).slice(0, 12),
-    safeBranchSegment(hypothesis.name),
-    safeBranchSegment(workerId).slice(0, 12),
-  ].join("/")
+  return ["onyx", safeBranchSegment(sessionId), safeBranchSegment(workerId)].join(
+    "/"
+  )
 }
 
 async function commitIfNeeded(worktree: string, hypothesis: ApiHypothesis) {
@@ -1551,6 +1713,49 @@ function workerMetadata({
   }
 }
 
+async function persistWorkerLaunchState({
+  root,
+  manifest,
+  workerBranch,
+}: {
+  root: string
+  manifest: WorkerLaunchManifest
+  workerBranch: string
+}) {
+  await writeWorkerLaunchManifest(manifest)
+  await upsertWorkerLaunch({
+    root,
+    launch: {
+      workerId: manifest.workerId,
+      sessionId: manifest.sessionId,
+      hypothesisId: manifest.hypothesisId,
+      status: manifest.status,
+      worktree: manifest.cwd,
+      branchName: workerBranch,
+      promptPath: manifest.promptPath,
+      logPath: manifest.logPath,
+      activityLogPath: manifest.activityLogPath,
+      manifestPath: manifest.manifestPath,
+      exitCode: manifest.exitCode,
+      signal: manifest.signal,
+      timedOut: manifest.timedOut,
+      startupTimedOut: manifest.startupTimedOut,
+      lastOutputAt: manifest.lastOutputAt,
+      finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
+      error: manifest.error ?? manifest.finalization?.error ?? null,
+      metadata: {
+        agentKind: manifest.agentKind,
+        command: manifest.command,
+        args: manifest.args,
+        onyxShimPath: manifest.onyxShimPath,
+        addedWritableRoots: manifest.addedWritableRoots,
+      },
+      startedAt: manifest.startedAt,
+      completedAt: manifest.completedAt,
+    },
+  })
+}
+
 type HypothesisRunResult = {
   hypothesis: ApiHypothesis
   workerId?: string
@@ -1598,6 +1803,7 @@ async function runHypothesisOnce({
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
   let resultCommitSha: string | undefined
+  let workerBranch = "unknown"
   let launchManifest: WorkerLaunchManifest | null = null
   let workerShim: WorkerOnyxShim | null = null
   let workerTempDir: string | null = null
@@ -1629,12 +1835,14 @@ async function runHypothesisOnce({
       progressMessage: `Preparing ${hypothesis.name} worker preflight`,
     })
 
-    const { dir: worktree, branch: workerBranch } = await ensureWorktree({
+    const worktreeInfo = await ensureWorktree({
       root,
       hypothesis,
       sessionId,
       workerId: worker.id,
     })
+    const worktree = worktreeInfo.dir
+    workerBranch = worktreeInfo.branch
     await emitEvent(root, {
       type: "hypothesis_started",
       campaignName: campaign.name,
@@ -1778,7 +1986,7 @@ async function runHypothesisOnce({
       preflight,
       finalization: null,
     }
-    await writeWorkerLaunchManifest(launchManifest)
+    await persistWorkerLaunchState({ root, manifest: launchManifest, workerBranch })
     console.log(`worker: ${worker.id}`)
     console.log(`hypothesis: ${hypothesis.id} ${hypothesis.name}`)
     console.log(`worktree: ${worktree}`)
@@ -1866,7 +2074,11 @@ async function runHypothesisOnce({
               status: "running",
               lastOutputAt: at,
             }
-            void writeWorkerLaunchManifest(launchManifest).catch(() => {})
+            void persistWorkerLaunchState({
+              root,
+              manifest: launchManifest,
+              workerBranch,
+            }).catch(() => {})
           },
         }),
       quiet,
@@ -1888,7 +2100,7 @@ async function runHypothesisOnce({
         startupTimedOut: workerResult.startupTimedOut,
         lastOutputAt: workerResult.lastOutputAt,
       }
-      await writeWorkerLaunchManifest(launchManifest)
+      await persistWorkerLaunchState({ root, manifest: launchManifest, workerBranch })
     }
     const workerFailure = processFailure(
       workerResult,
@@ -1922,7 +2134,7 @@ async function runHypothesisOnce({
         ...launchManifest,
         finalization,
       }
-      await writeWorkerLaunchManifest(launchManifest)
+      await persistWorkerLaunchState({ root, manifest: launchManifest, workerBranch })
     }
     if (finalizationLoggedExperiment(finalization.finalizationStatus)) {
       syncSupervisor.request()
@@ -2052,7 +2264,11 @@ async function runHypothesisOnce({
         status: "failed",
         error: message,
       }
-      await writeWorkerLaunchManifest(launchManifest).catch(() => {})
+      await persistWorkerLaunchState({
+        root,
+        manifest: launchManifest,
+        workerBranch,
+      }).catch(() => {})
     }
     if (workerId) {
       const metadata = launchManifest
@@ -3143,6 +3359,435 @@ export async function commandKnowledgeList(args: Args) {
         .join("\n")
     )
   }
+}
+
+async function existingRunSession({
+  root,
+  sessionId,
+  args,
+}: {
+  root: string
+  sessionId: string
+  args: Args
+}) {
+  const sessionState = await getLocalSessionState(root, sessionId).catch(() =>
+    getResearchSessionState(sessionId, args)
+  )
+  if (sessionState.session.status !== "running") {
+    throw new Error(
+      `Research session ${sessionId} is ${sessionState.session.status}; cannot supervise new workers.`
+    )
+  }
+  if (
+    args.options.campaign &&
+    sessionState.campaign.name !== args.options.campaign
+  ) {
+    throw new Error(
+      `Session ${sessionId} belongs to ${sessionState.campaign.name}, not ${args.options.campaign}.`
+    )
+  }
+  return sessionState
+}
+
+function supervisorWorkerTarget(args: Args, fallback: number) {
+  const target = positiveIntegerOption(args, "workers", fallback)
+  if (target > MAX_LOCAL_SUPERVISOR_WORKERS) {
+    throw new Error(
+      `--workers is capped at ${MAX_LOCAL_SUPERVISOR_WORKERS} for the local supervisor`
+    )
+  }
+  return target
+}
+
+function activeSessionWorkers({
+  workers,
+  sessionId,
+}: {
+  workers: ApiWorker[]
+  sessionId: string
+}) {
+  return workers.filter(
+    (worker) => worker.sessionId === sessionId && workerIsActive(worker)
+  )
+}
+
+function sessionStopRequested({
+  state,
+  sessionId,
+}: {
+  state: Awaited<ReturnType<typeof readState>>
+  sessionId: string
+}) {
+  const session = state.sessions?.[sessionId]
+  return Boolean(
+    session?.stopRequested || session?.status === "stop_requested"
+  )
+}
+
+export async function commandResearchRun(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const requestedSessionId =
+    args.options.session ??
+    activeSessionIdFromState({
+      state,
+      projectPath,
+      campaignName: args.options.campaign,
+    })
+  const hypotheses = await hypothesisPlansOption(args)
+  if (requestedSessionId && hypotheses) {
+    throw new Error(
+      "--hypotheses can only be used when creating a new research session. Use `onyx research hypothesis add --session <id>` for an existing session."
+    )
+  }
+
+  const sessionState = requestedSessionId
+    ? await existingRunSession({ root, sessionId: requestedSessionId, args })
+    : null
+  const campaignInfo = sessionState ? null : await campaignForName(root, args)
+  const campaign = sessionState?.campaign ?? campaignInfo!.campaign
+  const effectiveProjectPath = campaignInfo?.projectPath ?? projectPath
+  const { setup } = await assertLocalSetupReady(root, effectiveProjectPath)
+  await assertSetupCommitted({
+    root,
+    projectPath: effectiveProjectPath,
+    baseCommitSha: campaign.baseCommitSha,
+    requireBaseMatchesHead: true,
+  })
+  await assertMainWorktreeClean(root, "before running research")
+
+  const agentKind = workerAgentOption(args)
+  const sessionMetadata = sessionState?.session.metadata ?? {}
+  const maxIterations = positiveIntegerOption(
+    args,
+    "max-iterations",
+    typeof sessionMetadata.maxIterations === "number"
+      ? sessionMetadata.maxIterations
+      : 10
+  )
+  const maxMinutes = positiveNumberOption(
+    args,
+    "max-minutes",
+    typeof sessionMetadata.maxMinutes === "number"
+      ? sessionMetadata.maxMinutes
+      : 120
+  )
+  const workerFallback = sessionState
+    ? (sessionState.session.workerTarget ?? 1)
+    : (hypotheses?.length ?? 1)
+  const workerTarget = supervisorWorkerTarget(args, workerFallback)
+  const sessionTarget = sessionState?.session.workerTarget ?? workerTarget
+  if (workerTarget > sessionTarget) {
+    throw new Error(
+      `Session ${sessionState?.session.id} has ${sessionTarget} worker slot(s). Create a new session with --workers ${workerTarget}, or omit --session.`
+    )
+  }
+  const maxConcurrency = positiveIntegerOption(
+    args,
+    "max-concurrency",
+    workerTarget
+  )
+  if (maxConcurrency > MAX_LOCAL_SUPERVISOR_WORKERS) {
+    throw new Error(
+      `--max-concurrency is capped at ${MAX_LOCAL_SUPERVISOR_WORKERS}`
+    )
+  }
+
+  const now = Date.now()
+  const existingEndTime =
+    requestedSessionId && state.sessions?.[requestedSessionId]?.endTimeMs
+  const endTimeMs =
+    args.options["max-minutes"] === undefined &&
+    typeof existingEndTime === "number" &&
+    existingEndTime > now
+      ? existingEndTime
+      : now + maxMinutes * 60_000
+  const sessionBudgetMs = Math.max(1, endTimeMs - now)
+  const shutdownCushionMs = workerShutdownCushionMs(sessionBudgetMs)
+  const hardStopGraceMs = workerHardStopGraceMs(shutdownCushionMs)
+  const hardEndTimeMs = endTimeMs + hardStopGraceMs
+  const workerTimeoutMs =
+    positiveNumberOption(
+      args,
+      "worker-timeout",
+      (sessionBudgetMs + hardStopGraceMs) / 1000
+    ) * 1000
+  const startupTimeoutMs =
+    nonnegativeNumberOption(args, "startup-timeout", 90) * 1000
+  const stopGraceMs =
+    nonnegativeNumberOption(args, "stop-grace-seconds", 30) * 1000
+  const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
+  const presenceIntervalMs =
+    positiveNumberOption(args, "presence-interval", 5) * 1000
+  const finalSyncTimeoutMs =
+    positiveNumberOption(args, "final-sync-timeout", 120) * 1000
+
+  let sessionId = requestedSessionId
+  let initialHypotheses = sessionState?.hypotheses ?? []
+  if (!sessionId) {
+    const result = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: args.options.name ?? `research-${new Date().toISOString()}`,
+      workerTarget,
+      hypotheses,
+      maxIterations,
+      endTimeMs,
+      metadata: {
+        startedBy: "onyx-research-supervisor",
+        maxIterations,
+        maxMinutes,
+        agentKind,
+        maxConcurrency,
+        presenceIntervalSeconds: presenceIntervalMs / 1000,
+        syncIntervalSeconds: syncIntervalMs / 1000,
+      },
+    })
+    sessionId = result.session.id
+    initialHypotheses = result.hypotheses
+  }
+
+  const nextState = await readState(root)
+  const key = campaignStateKey(effectiveProjectPath, campaign.name)
+  nextState.campaigns = nextState.campaigns ?? {}
+  nextState.campaigns[key] = {
+    ...nextState.campaigns[key],
+    campaignId: campaign.id,
+    sessionId,
+  }
+  nextState.sessions = nextState.sessions ?? {}
+  nextState.sessions[sessionId] = {
+    ...(nextState.sessions[sessionId] ?? {}),
+    campaignName: campaign.name,
+    campaignId: campaign.id,
+    endTimeMs,
+    maxIterations,
+    status: "running",
+  }
+  await writeState(root, nextState)
+
+  await Promise.all(
+    initialHypotheses.map((hypothesis) =>
+      Promise.all([
+        writeBrief({
+          root,
+          campaignId: campaign.id,
+          sessionId,
+          hypothesis,
+          args,
+        }),
+        writeSessionState({ root, sessionId, hypothesis, args }).catch(
+          () => null
+        ),
+      ])
+    )
+  )
+
+  await emitEvent(root, {
+    type: "research_started",
+    campaignName: campaign.name,
+    campaignId: campaign.id,
+    sessionId,
+    message: `supervisor target ${workerTarget}, concurrency ${maxConcurrency}`,
+  })
+
+  const syncSupervisor = createSyncSupervisor({
+    root,
+    args,
+    intervalMs: syncIntervalMs,
+  })
+  const presenceSupervisor = createPresenceSupervisor({
+    root,
+    args,
+    sessionId,
+    projectPath: effectiveProjectPath,
+    intervalMs: presenceIntervalMs,
+  })
+  syncSupervisor.request()
+  presenceSupervisor.request()
+
+  const activeRuns = new Map<string, Promise<HypothesisRunResult>>()
+  let launched = 0
+  let completed = 0
+  let failed = 0
+  let stopped = 0
+  let waitingLogged = false
+
+  console.log(`Research supervisor: ${sessionId}`)
+  console.log(`Campaign: ${campaign.name}`)
+  console.log(`Workers: target=${workerTarget} concurrency=${maxConcurrency}`)
+  console.log(`Agent: ${args.options["worker-command"] ? "custom" : agentKind}`)
+  console.log(`Presence: every ${presenceIntervalMs / 1000}s`)
+  console.log(`Sync: every ${syncIntervalMs / 1000}s`)
+
+  let supervisorLoopCompleted = false
+  try {
+    while (Date.now() < hardEndTimeMs) {
+      const shouldStop = await harnessShouldStopSession({
+        root,
+        sessionId,
+        args,
+      }).catch(() => false)
+      if (shouldStop || Date.now() >= endTimeMs) {
+        if (activeRuns.size === 0) break
+        await Promise.race([
+          ...activeRuns.values(),
+          sleep(Math.min(5000, Math.max(1, hardEndTimeMs - Date.now()))),
+        ])
+        continue
+      }
+
+      const latest = await getLocalSessionState(root, sessionId).catch(() =>
+        getResearchSessionState(sessionId, args)
+      )
+      if (latest.session.status !== "running") break
+      const activeWorkers = activeSessionWorkers({
+        workers: latest.workers,
+        sessionId,
+      }).length
+      const openSlots = Math.max(0, workerTarget - activeWorkers)
+      const concurrencySlots = Math.max(0, maxConcurrency - activeRuns.size)
+      const launchSlots = Math.min(openSlots, concurrencySlots)
+      let launchedThisTick = 0
+
+      for (let index = 0; index < launchSlots; index += 1) {
+        const refreshed = await getLocalSessionState(root, sessionId).catch(
+          () => getResearchSessionState(sessionId, args)
+        )
+        const activeCount = activeSessionWorkers({
+          workers: refreshed.workers,
+          sessionId,
+        }).length
+        if (
+          activeCount >= workerTarget ||
+          activeRuns.size >= maxConcurrency ||
+          refreshed.session.status !== "running"
+        ) {
+          break
+        }
+        const hypothesis = chooseSupervisorHypothesis({
+          hypotheses: refreshed.hypotheses,
+          workers: refreshed.workers.filter(
+            (worker) => worker.sessionId === sessionId
+          ),
+        })
+        if (!hypothesis) break
+
+        waitingLogged = false
+        launched += 1
+        launchedThisTick += 1
+        const runKey = `${Date.now()}:${launched}:${hypothesis.id}`
+        const run = runHypothesisOnce({
+          root,
+          projectPath: effectiveProjectPath,
+          campaign,
+          setup,
+          sessionId,
+          hypothesis,
+          workerCommand: args.options["worker-command"],
+          agentKind,
+          maxIterations,
+          endTimeMs,
+          hardEndTimeMs,
+          workerTimeoutMs,
+          startupTimeoutMs,
+          stopGraceMs,
+          quiet: args.options.quiet === "true",
+          syncSupervisor,
+          args,
+        })
+          .then(async (result) => {
+            if (result.workerId) {
+              await recordLocalWorkerHeartbeat({
+                root,
+                workerId: result.workerId,
+                status: result.status,
+                sessionId,
+                hypothesisId: result.hypothesis.id,
+                phase: "syncing",
+                event: "final_sync_started",
+                progressMessage: `Draining sync after ${result.hypothesis.name}`,
+                gitLabel: result.resultCommitSha ?? null,
+              }).catch(() => {})
+            }
+            if (result.status === "completed") completed += 1
+            else if (result.status === "stopped") stopped += 1
+            else failed += 1
+            return result
+          })
+          .catch((error) => {
+            failed += 1
+            console.warn(
+              `worker failed: ${error instanceof Error ? error.message : String(error)}`
+            )
+            return {
+              hypothesis,
+              status: "failed" as const,
+              error: error instanceof Error ? error.message : String(error),
+            }
+          })
+          .finally(() => {
+            activeRuns.delete(runKey)
+            syncSupervisor.request()
+            presenceSupervisor.request()
+          })
+        activeRuns.set(runKey, run)
+        presenceSupervisor.request()
+      }
+
+      if (launchedThisTick === 0) {
+        if (activeRuns.size === 0 && !waitingLogged) {
+          waitingLogged = true
+          console.log(
+            "Supervisor waiting for active hypotheses or open worker slots."
+          )
+        }
+        if (activeRuns.size > 0) {
+          await Promise.race([...activeRuns.values(), sleep(2000)])
+        } else {
+          await sleep(3000)
+        }
+      }
+    }
+
+    if (activeRuns.size > 0) {
+      console.log(`Waiting for ${activeRuns.size} active worker(s) to finish.`)
+      await Promise.allSettled(activeRuns.values())
+    }
+    supervisorLoopCompleted = true
+  } finally {
+    presenceSupervisor.request()
+    await presenceSupervisor.stop()
+    if (!supervisorLoopCompleted) syncSupervisor.stop()
+  }
+
+  const finalState = await readState(root)
+  const explicitStop = sessionStopRequested({ state: finalState, sessionId })
+  const finalStatus = explicitStop ? "stopped" : "completed"
+  finalState.sessions = finalState.sessions ?? {}
+  finalState.sessions[sessionId] = {
+    ...(finalState.sessions[sessionId] ?? {}),
+    campaignName: campaign.name,
+    campaignId: campaign.id,
+    status: finalStatus,
+    stopRequested: false,
+  }
+  await writeState(root, finalState)
+  await stopLocalSession({
+    root,
+    sessionId,
+    status: finalStatus,
+    reason: explicitStop ? "stop requested" : "research run completed",
+  }).catch(() => {})
+  await refreshSessionStateFiles({ root, sessionId, args }).catch(() => {})
+  presenceSupervisor.request()
+  await presenceSupervisor.stop()
+  const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
+
+  console.log(
+    `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; ${pending} sync record(s) pending.`
+  )
 }
 
 export async function commandWorkerRun(args: Args) {

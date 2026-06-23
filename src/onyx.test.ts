@@ -320,6 +320,7 @@ describe("campaign CLI surface", () => {
     expect(USAGE).not.toContain("onyx setup require")
     expect(USAGE).toContain("onyx workflow status")
     expect(USAGE).toContain("onyx research start --campaign")
+    expect(USAGE).toContain("onyx research run --campaign")
     expect(USAGE).toContain("onyx research hypotheses --example")
     expect(USAGE).toContain(
       "onyx research hypothesis add (--campaign <name> | --session <id>)"

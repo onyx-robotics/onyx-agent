@@ -30,6 +30,7 @@ import {
   pendingResearchSyncCount,
   pendingResearchSyncEvents,
   recordLocalWorkerHeartbeat,
+  researchDbPath,
   researchDbDoctor,
   readLocalAttempt,
   registerLocalWorker,
@@ -134,7 +135,18 @@ describe("SQLite research ledger", () => {
     const root = await fixtureRepo()
     const doctor = await researchDbDoctor(root)
     expect(doctor.ok).toBe(true)
-    expect(doctor.schemaVersion).toBe(2)
+    expect(doctor.schemaVersion).toBe(3)
+    const localDb = new Database(await researchDbPath(root))
+    try {
+      const launchTable = localDb
+        .query(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'worker_launches'"
+        )
+        .get() as { name: string } | null
+      expect(launchTable?.name).toBe("worker_launches")
+    } finally {
+      localDb.close()
+    }
 
     const dbPath = join(
       await mkdtemp(join(tmpdir(), "onyx-newer-db-")),

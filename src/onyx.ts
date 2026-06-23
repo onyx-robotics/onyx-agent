@@ -131,6 +131,7 @@ export {
   commandResearchFinish,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
+  commandResearchRun,
   commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,

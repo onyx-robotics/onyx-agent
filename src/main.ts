@@ -16,6 +16,7 @@ import {
   commandResearchFinish,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
+  commandResearchRun,
   commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
@@ -61,7 +62,9 @@ Usage:
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
   onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>]
-      (creates an async research session and prints worker launch commands)
+      (creates an async research session and prints low-level worker launch commands)
+  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>]
+      (runs the local supervisor with shared sync/presence loops for parallel workers)
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]
   onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-iterations <cap>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>] [--quiet]
@@ -152,6 +155,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandCampaignDelete(args)
     if (command === "research" && sub === "start")
       return commandResearchStart(args)
+    if (command === "research" && sub === "run")
+      return commandResearchRun(args)
     if (command === "research" && sub === "hypotheses")
       return commandResearchHypotheses(args)
     if (command === "research" && sub === "lane") {
