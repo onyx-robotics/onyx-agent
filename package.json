@@ -30,6 +30,7 @@
   ],
   "scripts": {
     "build:release": "bun scripts/build-release.ts",
+    "ci": "bun run lint && bun run typecheck && bun run test",
     "lint": "eslint .",
     "test": "bun test",
     "typecheck": "tsc --noEmit"

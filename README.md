@@ -210,9 +210,7 @@ created before the deletion.
 
 ```bash
 bun install
-bun run typecheck
-bun run lint
-bun test
+bun run ci
 ```
 
 To make the persistent `onyx` command use this checkout during development:
