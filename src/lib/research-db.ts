@@ -27,6 +27,7 @@ import type {
 import { currentCommit } from "./git"
 import {
   onyxStateDir,
+  withOnyxLock,
   type LastRunRecord,
   type LastRunSelector,
 } from "./outbox"
@@ -60,7 +61,7 @@ export type ResearchSyncEvent = {
 }
 
 export type LocalCampaign = ApiCampaign & {
-  status: "active" | "completed" | "deleted"
+  status: "active" | "completed" | "archived"
   projectPath: string
   setup: ResearchSetupFile | Record<string, unknown>
   humanFeedback: string | null
@@ -73,6 +74,8 @@ export type LocalWorkflowRunStatus =
   | "running"
   | "paused"
   | "blocked"
+  | "abandoned"
+  | "superseded"
   | "failed"
   | "checks_failed"
   | "setup_violation"
@@ -143,9 +146,72 @@ type LocalTombstoneInput = {
 
 const dbCache = new Map<string, Database>()
 const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 2
+const TERMINAL_WORKER_STATUSES = new Set([
+  "completed",
+  "failed",
+  "stopped",
+  "lost",
+])
 
 function nowIso() {
   return new Date().toISOString()
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function sqliteBusyMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function isSqliteBusyError(error: unknown) {
+  const message = sqliteBusyMessage(error)
+  return /SQLITE_(BUSY|LOCKED)|database is (locked|busy)|database table is locked/i.test(
+    message
+  )
+}
+
+async function withSqliteBusyRetry<T>(fn: () => T | Promise<T>): Promise<T> {
+  const attempts = 6
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn()
+    } catch (error) {
+      if (!isSqliteBusyError(error) || attempt === attempts - 1) throw error
+      await sleep(50 * 2 ** attempt + Math.floor(Math.random() * 50))
+    }
+  }
+  return fn()
+}
+
+async function withResearchDbWrite<T>(
+  root: string,
+  fn: (db: Db) => T | Promise<T>
+): Promise<T> {
+  return withOnyxLock(
+    root,
+    "research-db",
+    () => withSqliteBusyRetry(async () => fn(await openDb(root))),
+    { timeoutMs: 60_000, staleMs: 180_000 }
+  )
+}
+
+function isTerminalWorkerStatus(status: unknown) {
+  return typeof status === "string" && TERMINAL_WORKER_STATUSES.has(status)
+}
+
+function nextWorkerStatus({
+  current,
+  requested,
+}: {
+  current: unknown
+  requested: ApiWorker["status"]
+}): ApiWorker["status"] {
+  if (isTerminalWorkerStatus(current) && !isTerminalWorkerStatus(requested)) {
+    return current as ApiWorker["status"]
+  }
+  return requested
 }
 
 function json(value: unknown) {
@@ -889,9 +955,10 @@ export async function setActiveLocalCampaign({
   projectPath: string
   campaignName: string
 }) {
-  const db = await openDb(root)
-  setSetting(db, "active_project_path", projectPath)
-  setSetting(db, "active_campaign", campaignName)
+  await withResearchDbWrite(root, (db) => {
+    setSetting(db, "active_project_path", projectPath)
+    setSetting(db, "active_campaign", campaignName)
+  })
 }
 
 export async function getActiveLocalCampaignName(root: string) {
@@ -923,12 +990,12 @@ export async function createLocalCampaign({
   humanFeedback?: string | null
   promotionRefName?: string | null
 }) {
-  const db = await openDb(root)
   const id = randomUUID()
   const at = nowIso()
-  const tx = db.transaction(() => {
-    db.query(
-      `
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      db.query(
+        `
         INSERT INTO campaigns (
           id, name, description, project_path, base_commit_sha, setup_json,
           metric_name, metric_unit, metric_direction, human_feedback,
@@ -947,36 +1014,37 @@ export async function createLocalCampaign({
           status = 'active',
           updated_at = excluded.updated_at
       `
-    ).run(
-      id,
-      name,
-      description ?? null,
-      projectPath,
-      baseCommitSha,
-      json(setup),
-      metricName,
-      metricUnit ?? null,
-      metricDirection,
-      humanFeedback ?? null,
-      promotionRefName ?? null,
-      at,
-      at
-    )
-    const campaign = db
-      .query("SELECT * FROM campaigns WHERE project_path = ? AND name = ?")
-      .get(projectPath, name) as Row
-    enqueueSyncEvent({
-      db,
-      type: "campaign.upserted",
-      entityType: "campaign",
-      entityId: campaign.id as string,
-      payload: { campaign: syncCampaignPayload(campaign) },
+      ).run(
+        id,
+        name,
+        description ?? null,
+        projectPath,
+        baseCommitSha,
+        json(setup),
+        metricName,
+        metricUnit ?? null,
+        metricDirection,
+        humanFeedback ?? null,
+        promotionRefName ?? null,
+        at,
+        at
+      )
+      const campaign = db
+        .query("SELECT * FROM campaigns WHERE project_path = ? AND name = ?")
+        .get(projectPath, name) as Row
+      enqueueSyncEvent({
+        db,
+        type: "campaign.upserted",
+        entityType: "campaign",
+        entityId: campaign.id as string,
+        payload: { campaign: syncCampaignPayload(campaign) },
+      })
+      setSetting(db, "active_project_path", projectPath)
+      setSetting(db, "active_campaign", name)
+      return campaignFromRow(campaign)
     })
-    setSetting(db, "active_project_path", projectPath)
-    setSetting(db, "active_campaign", name)
-    return campaignFromRow(campaign)
+    return tx()
   })
-  return tx()
 }
 
 export async function cacheLocalCampaign({
@@ -990,10 +1058,10 @@ export async function cacheLocalCampaign({
   projectPath: string
   setup?: ResearchSetupFile | Record<string, unknown>
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  db.query(
-    `
+  await withResearchDbWrite(root, (db) => {
+    db.query(
+      `
       INSERT INTO campaigns (
         id, name, description, project_path, base_commit_sha, setup_json,
         metric_name, metric_unit, metric_direction, promotion_ref_name,
@@ -1018,25 +1086,26 @@ export async function cacheLocalCampaign({
         experiment_count = excluded.experiment_count,
         updated_at = excluded.updated_at
     `
-  ).run(
-    campaign.id,
-    campaign.name,
-    campaign.description,
-    projectPath,
-    campaign.baseCommitSha,
-    json(setup),
-    campaign.metricName,
-    campaign.metricUnit,
-    campaign.metricDirection,
-    campaign.promotionRefName,
-    campaign.projectId,
-    campaign.status ?? "active",
-    campaign.bestMetricValue,
-    campaign.bestCommitSha,
-    campaign.experimentCount,
-    at,
-    at
-  )
+    ).run(
+      campaign.id,
+      campaign.name,
+      campaign.description,
+      projectPath,
+      campaign.baseCommitSha,
+      json(setup),
+      campaign.metricName,
+      campaign.metricUnit,
+      campaign.metricDirection,
+      campaign.promotionRefName,
+      campaign.projectId,
+      campaign.status ?? "active",
+      campaign.bestMetricValue,
+      campaign.bestCommitSha,
+      campaign.experimentCount,
+      at,
+      at
+    )
+  })
   return localCampaignById(root, campaign.id)
 }
 
@@ -1047,26 +1116,27 @@ export async function completeLocalCampaign({
   root: string
   campaignId: string
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  const tx = db.transaction(() => {
-    db.query(
-      "UPDATE campaigns SET status = 'completed', updated_at = ? WHERE id = ? AND status != 'deleted'"
-    ).run(at, campaignId)
-    const row = db
-      .query("SELECT * FROM campaigns WHERE id = ?")
-      .get(campaignId) as Row | null
-    if (!row) throw new Error("Local campaign not found")
-    enqueueSyncEvent({
-      db,
-      type: "campaign.upserted",
-      entityType: "campaign",
-      entityId: campaignId,
-      payload: { campaign: syncCampaignPayload(row) },
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      db.query(
+        "UPDATE campaigns SET status = 'completed', updated_at = ? WHERE id = ? AND status != 'archived'"
+      ).run(at, campaignId)
+      const row = db
+        .query("SELECT * FROM campaigns WHERE id = ?")
+        .get(campaignId) as Row | null
+      if (!row) throw new Error("Local campaign not found")
+      enqueueSyncEvent({
+        db,
+        type: "campaign.upserted",
+        entityType: "campaign",
+        entityId: campaignId,
+        payload: { campaign: syncCampaignPayload(row) },
+      })
+      return campaignFromRow(row)
     })
-    return campaignFromRow(row)
+    return tx()
   })
-  return tx()
 }
 
 export async function localCampaignByName({
@@ -1097,7 +1167,7 @@ export async function listLocalCampaigns(root: string) {
   const db = await openDb(root)
   const rows = db
     .query(
-      "SELECT * FROM campaigns WHERE status != 'deleted' ORDER BY updated_at DESC"
+      "SELECT * FROM campaigns WHERE status != 'archived' ORDER BY updated_at DESC"
     )
     .all() as Row[]
   return rows.map((row) => campaignFromRowForDb(db, row))
@@ -1114,19 +1184,19 @@ export async function deleteLocalCampaignWithTombstone({
   name: string
   reason?: string | null
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  const tx = db.transaction(() => {
-    const campaign = db
-      .query("SELECT * FROM campaigns WHERE project_path = ? AND name = ?")
-      .get(projectPath, name) as Row | null
-    if (!campaign) throw new Error(`Local campaign ${name} not found`)
-    const campaignId = campaign.id as string
-    const experiments = db
-      .query("SELECT id, run_ref FROM experiments WHERE campaign_id = ?")
-      .all(campaignId) as Row[]
-    const insertTombstone = db.query(
-      `
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      const campaign = db
+        .query("SELECT * FROM campaigns WHERE project_path = ? AND name = ?")
+        .get(projectPath, name) as Row | null
+      if (!campaign) throw new Error(`Local campaign ${name} not found`)
+      const campaignId = campaign.id as string
+      const experiments = db
+        .query("SELECT id, run_ref FROM experiments WHERE campaign_id = ?")
+        .all(campaignId) as Row[]
+      const insertTombstone = db.query(
+        `
         INSERT INTO tombstones (
           id, entity_type, entity_id, campaign_id, name, run_ref, reason, created_at
         )
@@ -1138,48 +1208,49 @@ export async function deleteLocalCampaignWithTombstone({
           reason = excluded.reason,
           created_at = excluded.created_at
       `
-    )
-    for (const experiment of experiments) {
+      )
+      for (const experiment of experiments) {
+        insertTombstone.run(
+          `experiment:${experiment.id as string}`,
+          "experiment",
+          experiment.id as string,
+          campaignId,
+          name,
+          experiment.run_ref as string,
+          reason,
+          at
+        )
+      }
       insertTombstone.run(
-        `experiment:${experiment.id as string}`,
-        "experiment",
-        experiment.id as string,
+        `campaign:${campaignId}`,
+        "campaign",
+        campaignId,
         campaignId,
         name,
-        experiment.run_ref as string,
+        null,
         reason,
         at
       )
-    }
-    insertTombstone.run(
-      `campaign:${campaignId}`,
-      "campaign",
-      campaignId,
-      campaignId,
-      name,
-      null,
-      reason,
-      at
-    )
-    enqueueSyncEvent({
-      db,
-      type: "entity.deleted",
-      entityType: "campaign",
-      entityId: campaignId,
-      payload: {
+      enqueueSyncEvent({
+        db,
+        type: "entity.deleted",
         entityType: "campaign",
         entityId: campaignId,
-        campaignId,
-        name,
-        runRef: null,
-        deletedAt: at,
-        reason,
-      },
+        payload: {
+          entityType: "campaign",
+          entityId: campaignId,
+          campaignId,
+          name,
+          runRef: null,
+          deletedAt: at,
+          reason,
+        },
+      })
+      db.query("DELETE FROM campaigns WHERE id = ?").run(campaignId)
+      return { campaignId, deletedExperimentCount: experiments.length }
     })
-    db.query("DELETE FROM campaigns WHERE id = ?").run(campaignId)
-    return { campaignId, deletedExperimentCount: experiments.length }
+    return tx()
   })
-  return tx()
 }
 
 function defaultHypothesisName(index: number) {
@@ -1205,60 +1276,66 @@ export async function createLocalSession({
   maxIterations?: number
   endTimeMs?: number
 }) {
-  const db = await openDb(root)
   const sessionId = randomUUID()
   const at = nowIso()
-  const tx = db.transaction(() => {
-    db.query(
-      `
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      db.query(
+        `
         INSERT INTO sessions (
           id, campaign_id, name, status, worker_target, metadata_json,
           end_time_ms, max_iterations, started_at, created_at, updated_at
         )
         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
       `
-    ).run(
-      sessionId,
-      campaignId,
-      name,
-      workerTarget,
-      json(metadata),
-      endTimeMs ?? null,
-      maxIterations ?? null,
-      at,
-      at,
-      at
-    )
-    enqueueSyncEvent({
-      db,
-      type: "session.started",
-      entityType: "session",
-      entityId: sessionId,
-      payload: {
+      ).run(
+        sessionId,
+        campaignId,
+        name,
+        workerTarget,
+        json(metadata),
+        endTimeMs ?? null,
+        maxIterations ?? null,
+        at,
+        at,
+        at
+      )
+      enqueueSyncEvent({
+        db,
+        type: "session.started",
+        entityType: "session",
+        entityId: sessionId,
+        payload: {
+          session: sessionFromRow(
+            db
+              .query("SELECT * FROM sessions WHERE id = ?")
+              .get(sessionId) as Row
+          ),
+        },
+      })
+      const createdHypotheses = (hypotheses ?? []).map((plan, index) =>
+        insertLocalHypothesis(db, {
+          campaignId,
+          createdBySessionId: sessionId,
+          plan,
+          name: defaultHypothesisName(index),
+          description: plan.statement,
+          baseCommitSha: null,
+          metadata: {
+            createdBy: "onyx-research",
+            createdBySessionId: sessionId,
+          },
+        })
+      )
+      return {
         session: sessionFromRow(
           db.query("SELECT * FROM sessions WHERE id = ?").get(sessionId) as Row
         ),
-      },
+        hypotheses: createdHypotheses,
+      }
     })
-    const createdHypotheses = (hypotheses ?? []).map((plan, index) =>
-      insertLocalHypothesis(db, {
-        campaignId,
-        createdBySessionId: sessionId,
-        plan,
-        name: defaultHypothesisName(index),
-        description: plan.statement,
-        baseCommitSha: null,
-        metadata: { createdBy: "onyx-research", createdBySessionId: sessionId },
-      })
-    )
-    return {
-      session: sessionFromRow(
-        db.query("SELECT * FROM sessions WHERE id = ?").get(sessionId) as Row
-      ),
-      hypotheses: createdHypotheses,
-    }
+    return tx()
   })
-  return tx()
 }
 
 function insertLocalHypothesis(
@@ -1338,19 +1415,20 @@ export async function createLocalHypothesis({
   baseCommitSha?: string | null
   metadata?: Record<string, unknown>
 }) {
-  const db = await openDb(root)
-  const tx = db.transaction(() =>
-    insertLocalHypothesis(db, {
-      campaignId,
-      createdBySessionId,
-      plan,
-      name,
-      description,
-      baseCommitSha,
-      metadata,
-    })
-  )
-  return tx()
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() =>
+      insertLocalHypothesis(db, {
+        campaignId,
+        createdBySessionId,
+        plan,
+        name,
+        description,
+        baseCommitSha,
+        metadata,
+      })
+    )
+    return tx()
+  })
 }
 
 export async function getLocalSessionState(
@@ -1450,42 +1528,42 @@ export async function registerLocalWorker({
   runtime?: "local" | "hosted"
   metadata?: Record<string, unknown>
 }) {
-  const db = await openDb(root)
   const id = randomUUID()
   const at = nowIso()
-  const tx = db.transaction(() => {
-    if (sessionId) {
-      const session = db
-        .query("SELECT * FROM sessions WHERE id = ? AND campaign_id = ?")
-        .get(sessionId, campaignId) as Row | null
-      if (!session) throw new Error("Local research session not found")
-      if (session.status !== "running") {
-        throw new Error(`Research session ${sessionId} is ${session.status}`)
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      if (sessionId) {
+        const session = db
+          .query("SELECT * FROM sessions WHERE id = ? AND campaign_id = ?")
+          .get(sessionId, campaignId) as Row | null
+        if (!session) throw new Error("Local research session not found")
+        if (session.status !== "running") {
+          throw new Error(`Research session ${sessionId} is ${session.status}`)
+        }
+        const workers = db
+          .query("SELECT status FROM workers WHERE session_id = ?")
+          .all(sessionId) as Row[]
+        const occupied = workers.filter((worker) =>
+          activeWorkerStatus(worker.status as string)
+        ).length
+        const target = Number(session.worker_target ?? 1)
+        if (occupied >= target) {
+          throw new Error(
+            `Research session has no open worker slots (${occupied}/${target})`
+          )
+        }
       }
-      const workers = db
-        .query("SELECT status FROM workers WHERE session_id = ?")
-        .all(sessionId) as Row[]
-      const occupied = workers.filter((worker) =>
-        activeWorkerStatus(worker.status as string)
-      ).length
-      const target = Number(session.worker_target ?? 1)
-      if (occupied >= target) {
-        throw new Error(
-          `Research session has no open worker slots (${occupied}/${target})`
-        )
+
+      const hypothesis = db
+        .query("SELECT * FROM hypotheses WHERE id = ? AND campaign_id = ?")
+        .get(hypothesisId, campaignId) as Row | null
+      if (!hypothesis) throw new Error("Local research hypothesis not found")
+      if (hypothesis.status !== "active") {
+        throw new Error(`Hypothesis ${hypothesis.name} is ${hypothesis.status}`)
       }
-    }
 
-    const hypothesis = db
-      .query("SELECT * FROM hypotheses WHERE id = ? AND campaign_id = ?")
-      .get(hypothesisId, campaignId) as Row | null
-    if (!hypothesis) throw new Error("Local research hypothesis not found")
-    if (hypothesis.status !== "active") {
-      throw new Error(`Hypothesis ${hypothesis.name} is ${hypothesis.status}`)
-    }
-
-    db.query(
-      `
+      db.query(
+        `
         INSERT INTO workers (
           id, campaign_id, session_id, hypothesis_id, worker_name,
           agent_kind, runtime, status, started_at, last_seen_at,
@@ -1493,32 +1571,33 @@ export async function registerLocalWorker({
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?)
       `
-    ).run(
-      id,
-      campaignId,
-      sessionId ?? null,
-      hypothesisId,
-      workerName,
-      agentKind,
-      runtime,
-      at,
-      at,
-      json(metadata),
-      at,
-      at
-    )
-    const row = db.query("SELECT * FROM workers WHERE id = ?").get(id) as Row
-    const worker = workerFromRow(row)
-    enqueueSyncEvent({
-      db,
-      type: "worker.registered",
-      entityType: "worker",
-      entityId: id,
-      payload: { worker },
+      ).run(
+        id,
+        campaignId,
+        sessionId ?? null,
+        hypothesisId,
+        workerName,
+        agentKind,
+        runtime,
+        at,
+        at,
+        json(metadata),
+        at,
+        at
+      )
+      const row = db.query("SELECT * FROM workers WHERE id = ?").get(id) as Row
+      const worker = workerFromRow(row)
+      enqueueSyncEvent({
+        db,
+        type: "worker.registered",
+        entityType: "worker",
+        entityId: id,
+        payload: { worker },
+      })
+      return worker
     })
-    return worker
+    return tx()
   })
-  return tx()
 }
 
 export async function recordLocalWorkerHeartbeat({
@@ -1548,46 +1627,54 @@ export async function recordLocalWorkerHeartbeat({
   resourceStats?: Record<string, unknown>
   metadata?: Record<string, unknown>
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  const tx = db.transaction(() => {
-    const existing = db
-      .query("SELECT * FROM workers WHERE id = ?")
-      .get(workerId) as Row | null
-    if (!existing) throw new Error("Local worker not found")
-    const nextSessionId = sessionId ?? nullableString(existing.session_id)
-    const nextHypothesisId = hypothesisId ?? (existing.hypothesis_id as string)
-    db.query(
-      `
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      const existing = db
+        .query("SELECT * FROM workers WHERE id = ?")
+        .get(workerId) as Row | null
+      if (!existing) throw new Error("Local worker not found")
+      const nextSessionId = sessionId ?? nullableString(existing.session_id)
+      const nextHypothesisId =
+        hypothesisId ?? (existing.hypothesis_id as string)
+      const storedStatus = nextWorkerStatus({
+        current: existing.status,
+        requested: status,
+      })
+      const ignoredRegression =
+        storedStatus !== status && !isTerminalWorkerStatus(status)
+      if (ignoredRegression) {
+        return workerFromRow(existing)
+      }
+      db.query(
+        `
         UPDATE workers
         SET status = ?, session_id = ?, hypothesis_id = ?,
           current_experiment_id = ?, phase = ?, progress_message = ?,
           git_label = ?, last_seen_at = ?, updated_at = ?
         WHERE id = ?
       `
-    ).run(
-      status,
-      nextSessionId,
-      nextHypothesisId,
-      experimentId ?? null,
-      phase ?? null,
-      progressMessage ?? null,
-      gitLabel ?? null,
-      at,
-      at,
-      workerId
-    )
+      ).run(
+        storedStatus,
+        nextSessionId,
+        nextHypothesisId,
+        isTerminalWorkerStatus(storedStatus) ? null : (experimentId ?? null),
+        phase ?? null,
+        progressMessage ?? null,
+        gitLabel ?? null,
+        at,
+        at,
+        workerId
+      )
 
-    const shouldStoreHeartbeat =
-      (event !== undefined && event !== "heartbeat") ||
-      status === "completed" ||
-      status === "failed" ||
-      status === "stopped"
-    let heartbeatId: string | null = null
-    if (shouldStoreHeartbeat) {
-      heartbeatId = randomUUID()
-      db.query(
-        `
+      const shouldStoreHeartbeat =
+        (event !== undefined && event !== "heartbeat") ||
+        isTerminalWorkerStatus(storedStatus)
+      let heartbeatId: string | null = null
+      if (shouldStoreHeartbeat) {
+        heartbeatId = randomUUID()
+        db.query(
+          `
           INSERT INTO worker_heartbeats (
             id, worker_id, campaign_id, session_id, hypothesis_id, experiment_id,
             status, phase, event, progress_message, git_label,
@@ -1595,51 +1682,54 @@ export async function recordLocalWorkerHeartbeat({
           )
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
-      ).run(
-        heartbeatId,
-        workerId,
-        existing.campaign_id as string,
-        nextSessionId,
-        nextHypothesisId,
-        experimentId ?? null,
-        status,
-        phase ?? null,
-        event ?? null,
-        progressMessage ?? null,
-        gitLabel ?? null,
-        json(resourceStats),
-        json(metadata),
-        at
-      )
-      enqueueSyncEvent({
-        db,
-        type: "worker.heartbeat",
-        entityType: "worker",
-        entityId: workerId,
-        payload: {
-          workerId,
+        ).run(
           heartbeatId,
-          campaignId: existing.campaign_id,
-          sessionId: nextSessionId,
-          hypothesisId: nextHypothesisId,
-          experimentId: experimentId ?? null,
-          status,
-          phase: phase ?? null,
-          event: event ?? null,
-          progressMessage: progressMessage ?? null,
-          gitLabel: gitLabel ?? null,
-          resourceStats,
-          metadata,
-          createdAt: at,
-        },
-      })
-    }
+          workerId,
+          existing.campaign_id as string,
+          nextSessionId,
+          nextHypothesisId,
+          isTerminalWorkerStatus(storedStatus) ? null : (experimentId ?? null),
+          storedStatus,
+          phase ?? null,
+          event ?? null,
+          progressMessage ?? null,
+          gitLabel ?? null,
+          json(resourceStats),
+          json(metadata),
+          at
+        )
+        enqueueSyncEvent({
+          db,
+          type: "worker.heartbeat",
+          entityType: "worker",
+          entityId: workerId,
+          payload: {
+            workerId,
+            heartbeatId,
+            campaignId: existing.campaign_id,
+            sessionId: nextSessionId,
+            hypothesisId: nextHypothesisId,
+            experimentId: isTerminalWorkerStatus(storedStatus)
+              ? null
+              : (experimentId ?? null),
+            status: storedStatus,
+            phase: phase ?? null,
+            event: event ?? null,
+            progressMessage: progressMessage ?? null,
+            gitLabel: gitLabel ?? null,
+            resourceStats,
+            metadata,
+            createdAt: at,
+          },
+        })
+      }
 
-    return workerFromRow(
-      db.query("SELECT * FROM workers WHERE id = ?").get(workerId) as Row
-    )
+      return workerFromRow(
+        db.query("SELECT * FROM workers WHERE id = ?").get(workerId) as Row
+      )
+    })
+    return tx()
   })
-  return tx()
 }
 
 export async function stopLocalSession({
@@ -1653,32 +1743,33 @@ export async function stopLocalSession({
   status: ApiSession["status"]
   reason?: string | null
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  const tx = db.transaction(() => {
-    db.query(
-      "UPDATE sessions SET status = ?, completed_at = ?, updated_at = ? WHERE id = ?"
-    ).run(
-      status,
-      status === "stop_requested" || status === "running" ? null : at,
-      at,
-      sessionId
-    )
-    const row = db
-      .query("SELECT * FROM sessions WHERE id = ?")
-      .get(sessionId) as Row | null
-    if (!row) throw new Error("Local session not found")
-    const session = sessionFromRow(row)
-    enqueueSyncEvent({
-      db,
-      type: "session.stopped",
-      entityType: "session",
-      entityId: sessionId,
-      payload: { session, reason: reason ?? null },
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      db.query(
+        "UPDATE sessions SET status = ?, completed_at = ?, updated_at = ? WHERE id = ?"
+      ).run(
+        status,
+        status === "stop_requested" || status === "running" ? null : at,
+        at,
+        sessionId
+      )
+      const row = db
+        .query("SELECT * FROM sessions WHERE id = ?")
+        .get(sessionId) as Row | null
+      if (!row) throw new Error("Local session not found")
+      const session = sessionFromRow(row)
+      enqueueSyncEvent({
+        db,
+        type: "session.stopped",
+        entityType: "session",
+        entityId: sessionId,
+        payload: { session, reason: reason ?? null },
+      })
+      return session
     })
-    return session
+    return tx()
   })
-  return tx()
 }
 
 function isBestEligible(experiment: ApiCampaignExperiment) {
@@ -1727,7 +1818,8 @@ function bestVisibleExperimentForCampaign(
   experiments: ApiCampaignExperiment[]
 ) {
   return experiments.reduce<ApiCampaignExperiment | null>((current, next) => {
-    if (!isBestEligible(next) || next.primaryMetricValue === null) return current
+    if (!isBestEligible(next) || next.primaryMetricValue === null)
+      return current
     return isBetter(
       campaign.metricDirection,
       current?.primaryMetricValue ?? null,
@@ -1736,6 +1828,13 @@ function bestVisibleExperimentForCampaign(
       ? next
       : current
   }, null)
+}
+
+function bestVisibleExperimentForHypothesis(
+  campaign: Pick<LocalCampaign, "metricDirection">,
+  experiments: ApiCampaignExperiment[]
+) {
+  return bestVisibleExperimentForCampaign(campaign, experiments)
 }
 
 function campaignWithVisibleProjection(
@@ -1754,10 +1853,71 @@ function campaignWithVisibleProjection(
 
 function campaignFromRowForDb(db: Db, row: Row) {
   const campaign = campaignFromRow(row)
-  if (campaign.status === "deleted") return campaign
   return campaignWithVisibleProjection(
     campaign,
     listLocalExperimentsForDb(db, campaign.id)
+  )
+}
+
+function listLocalExperimentsForHypothesisForDb(
+  db: Db,
+  campaignId: string,
+  hypothesisId: string
+) {
+  const rows = db
+    .query(
+      `
+        SELECT e.*
+        FROM experiments e
+        INNER JOIN campaigns c ON c.id = e.campaign_id
+        WHERE e.campaign_id = ?
+          AND e.hypothesis_id = ?
+          AND ${visibleExperimentPredicateSql()}
+        ORDER BY e.created_at ASC
+      `
+    )
+    .all(campaignId, hypothesisId) as Row[]
+  return rows.map(experimentFromRow)
+}
+
+function recomputeLocalHypothesisProjectionForDb({
+  db,
+  campaignId,
+  hypothesisId,
+  at,
+}: {
+  db: Db
+  campaignId: string
+  hypothesisId: string | null | undefined
+  at: string
+}) {
+  if (!hypothesisId) return
+  const campaignRow = db
+    .query("SELECT * FROM campaigns WHERE id = ?")
+    .get(campaignId) as Row | null
+  if (!campaignRow) return
+  const campaign = campaignFromRow(campaignRow)
+  const experiments = listLocalExperimentsForHypothesisForDb(
+    db,
+    campaignId,
+    hypothesisId
+  )
+  const latest = experiments.at(-1)
+  const best = bestVisibleExperimentForHypothesis(campaign, experiments)
+  db.query(
+    `
+      UPDATE hypotheses
+      SET last_worked_at = ?, best_experiment_id = ?, best_metric_value = ?,
+        updated_at = ?
+      WHERE id = ? AND campaign_id = ?
+    `
+  ).run(
+    latest?.completedAt ?? latest?.createdAt ?? null,
+    best?.id ?? null,
+    best?.primaryMetricValue ?? null,
+    at,
+    hypothesisId,
+    campaignId
   )
 }
 
@@ -1768,74 +1928,74 @@ export async function logLocalExperiment({
   root: string
   record: LocalResearchCampaignExperimentLoggedRecord
 }) {
-  const db = await openDb(root)
   const id = randomUUID()
   const at = record.createdAt || nowIso()
-  const tx = db.transaction(() => {
-    const campaign = db
-      .query(
-        "SELECT * FROM campaigns WHERE project_path = ? AND name = ? AND status != 'deleted'"
-      )
-      .get(record.projectPath ?? "", record.campaignName) as Row | null
-    if (!campaign)
-      throw new Error(`Local campaign ${record.campaignName} not found`)
-    const campaignId = campaign.id as string
-    let sessionId = record.sessionId ?? null
-    let hypothesisId = record.hypothesisId ?? null
-    let workerId = record.workerId ?? null
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      const campaign = db
+        .query(
+          "SELECT * FROM campaigns WHERE project_path = ? AND name = ? AND status != 'archived'"
+        )
+        .get(record.projectPath ?? "", record.campaignName) as Row | null
+      if (!campaign)
+        throw new Error(`Local campaign ${record.campaignName} not found`)
+      const campaignId = campaign.id as string
+      let sessionId = record.sessionId ?? null
+      let hypothesisId = record.hypothesisId ?? null
+      let workerId = record.workerId ?? null
 
-    if (
-      sessionId &&
-      !db.query("SELECT id FROM sessions WHERE id = ?").get(sessionId)
-    ) {
-      db.query(
-        `
+      if (
+        sessionId &&
+        !db.query("SELECT id FROM sessions WHERE id = ?").get(sessionId)
+      ) {
+        db.query(
+          `
           INSERT INTO sessions (
             id, campaign_id, name, status, worker_target, metadata_json,
             started_at, created_at, updated_at
           )
           VALUES (?, ?, ?, 'running', 0, '{}', ?, ?, ?)
         `
-      ).run(
-        sessionId,
-        campaignId,
-        `session-${sessionId.slice(0, 8)}`,
-        at,
-        at,
-        at
-      )
-    }
+        ).run(
+          sessionId,
+          campaignId,
+          `session-${sessionId.slice(0, 8)}`,
+          at,
+          at,
+          at
+        )
+      }
 
-    if (
-      hypothesisId &&
-      !db.query("SELECT id FROM hypotheses WHERE id = ?").get(hypothesisId)
-    ) {
-      db.query(
-        `
+      if (
+        hypothesisId &&
+        !db.query("SELECT id FROM hypotheses WHERE id = ?").get(hypothesisId)
+      ) {
+        db.query(
+          `
           INSERT INTO hypotheses (
             id, campaign_id, created_by_session_id, name, description, status,
             base_commit_sha, plan_json, metadata_json, created_at, updated_at
           )
           VALUES (?, ?, ?, ?, NULL, 'active', ?, '{}', '{}', ?, ?)
         `
-      ).run(
-        hypothesisId,
-        campaignId,
-        sessionId,
-        `hypothesis-${hypothesisId.slice(0, 8)}`,
-        record.baseCommitSha,
-        at,
-        at
-      )
-    }
+        ).run(
+          hypothesisId,
+          campaignId,
+          sessionId,
+          `hypothesis-${hypothesisId.slice(0, 8)}`,
+          record.baseCommitSha,
+          at,
+          at
+        )
+      }
 
-    if (
-      workerId &&
-      hypothesisId &&
-      !db.query("SELECT id FROM workers WHERE id = ?").get(workerId)
-    ) {
-      db.query(
-        `
+      if (
+        workerId &&
+        hypothesisId &&
+        !db.query("SELECT id FROM workers WHERE id = ?").get(workerId)
+      ) {
+        db.query(
+          `
           INSERT INTO workers (
             id, campaign_id, session_id, hypothesis_id, worker_name, agent_kind,
             runtime, status, started_at, last_seen_at, metadata_json, created_at,
@@ -1843,46 +2003,57 @@ export async function logLocalExperiment({
           )
           VALUES (?, ?, ?, ?, ?, 'unknown', 'local', 'completed', ?, ?, '{}', ?, ?)
         `
-      ).run(
-        workerId,
-        campaignId,
-        sessionId,
-        hypothesisId,
-        `worker-${workerId.slice(0, 8)}`,
-        at,
-        at,
-        at,
-        at
-      )
-    }
+        ).run(
+          workerId,
+          campaignId,
+          sessionId,
+          hypothesisId,
+          `worker-${workerId.slice(0, 8)}`,
+          at,
+          at,
+          at,
+          at
+        )
+      }
 
-    if (
-      sessionId &&
-      !db.query("SELECT id FROM sessions WHERE id = ?").get(sessionId)
-    ) {
-      sessionId = null
-    }
-    if (
-      hypothesisId &&
-      !db.query("SELECT id FROM hypotheses WHERE id = ?").get(hypothesisId)
-    ) {
-      hypothesisId = null
-    }
-    if (
-      workerId &&
-      !db.query("SELECT id FROM workers WHERE id = ?").get(workerId)
-    ) {
-      workerId = null
-    }
-    const existing = db
-      .query("SELECT * FROM experiments WHERE campaign_id = ? AND run_ref = ?")
-      .get(campaignId, record.runRef) as Row | null
-    if (existing) return experimentFromRow(existing)
+      if (
+        sessionId &&
+        !db.query("SELECT id FROM sessions WHERE id = ?").get(sessionId)
+      ) {
+        sessionId = null
+      }
+      if (
+        hypothesisId &&
+        !db.query("SELECT id FROM hypotheses WHERE id = ?").get(hypothesisId)
+      ) {
+        hypothesisId = null
+      }
+      if (
+        workerId &&
+        !db.query("SELECT id FROM workers WHERE id = ?").get(workerId)
+      ) {
+        workerId = null
+      }
+      const existing = db
+        .query(
+          "SELECT * FROM experiments WHERE campaign_id = ? AND run_ref = ?"
+        )
+        .get(campaignId, record.runRef) as Row | null
+      if (existing) {
+        const experiment = experimentFromRow(existing)
+        recomputeLocalHypothesisProjectionForDb({
+          db,
+          campaignId,
+          hypothesisId: experiment.hypothesisId,
+          at,
+        })
+        return experiment
+      }
 
-    const secondaryMetrics: Record<string, unknown> = { ...record.metrics }
-    delete secondaryMetrics[record.primaryMetricName]
-    db.query(
-      `
+      const secondaryMetrics: Record<string, unknown> = { ...record.metrics }
+      delete secondaryMetrics[record.primaryMetricName]
+      db.query(
+        `
         INSERT INTO experiments (
           id, campaign_id, session_id, hypothesis_id, worker_id, name,
           description, run_ref, base_commit_sha, result_commit_sha, result_ref,
@@ -1893,105 +2064,93 @@ export async function logLocalExperiment({
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?)
       `
-    ).run(
-      id,
-      campaignId,
-      sessionId,
-      hypothesisId,
-      workerId,
-      record.name,
-      record.description ?? null,
-      record.runRef,
-      record.baseCommitSha,
-      record.resultCommitSha,
-      record.resultRef,
-      record.status,
-      json(record.setupCompliance),
-      record.primaryMetricName,
-      record.primaryMetricValue ?? null,
-      json(secondaryMetrics),
-      json(record.agentNotes),
-      record.checks ? json(record.checks) : null,
-      record.durationMs ?? null,
-      record.outputSummary ?? null,
-      record.startedAt ?? null,
-      record.completedAt ?? null,
-      at,
-      at
-    )
-    const experiment = experimentFromRow(
-      db.query("SELECT * FROM experiments WHERE id = ?").get(id) as Row
-    )
-    db.query(
-      `
+      ).run(
+        id,
+        campaignId,
+        sessionId,
+        hypothesisId,
+        workerId,
+        record.name,
+        record.description ?? null,
+        record.runRef,
+        record.baseCommitSha,
+        record.resultCommitSha,
+        record.resultRef,
+        record.status,
+        json(record.setupCompliance),
+        record.primaryMetricName,
+        record.primaryMetricValue ?? null,
+        json(secondaryMetrics),
+        json(record.agentNotes),
+        record.checks ? json(record.checks) : null,
+        record.durationMs ?? null,
+        record.outputSummary ?? null,
+        record.startedAt ?? null,
+        record.completedAt ?? null,
+        at,
+        at
+      )
+      const experiment = experimentFromRow(
+        db.query("SELECT * FROM experiments WHERE id = ?").get(id) as Row
+      )
+      db.query(
+        `
         UPDATE campaigns
         SET experiment_count = experiment_count + 1,
           last_experiment_at = ?,
           updated_at = ?
         WHERE id = ?
       `
-    ).run(record.completedAt ?? at, at, campaign.id as string)
+      ).run(record.completedAt ?? at, at, campaign.id as string)
 
-    if (
-      isBestEligible(experiment) &&
-      experiment.primaryMetricValue !== null &&
-      isBetter(
-        campaign.metric_direction as "maximize" | "minimize",
-        numberOrNull(campaign.best_metric_value),
-        experiment.primaryMetricValue
-      )
-    ) {
-      db.query(
-        `
+      if (
+        isBestEligible(experiment) &&
+        experiment.primaryMetricValue !== null &&
+        isBetter(
+          campaign.metric_direction as "maximize" | "minimize",
+          numberOrNull(campaign.best_metric_value),
+          experiment.primaryMetricValue
+        )
+      ) {
+        db.query(
+          `
           UPDATE campaigns
           SET best_experiment_id = ?, best_metric_value = ?, best_commit_sha = ?, updated_at = ?
           WHERE id = ?
         `
-      ).run(
-        experiment.id,
-        experiment.primaryMetricValue,
-        experiment.resultCommitSha,
-        at,
-        campaign.id as string
-      )
-      if (hypothesisId) {
-        db.query(
-          `
-            UPDATE hypotheses
-            SET best_experiment_id = ?, best_metric_value = ?, last_worked_at = ?, updated_at = ?
-            WHERE id = ?
-          `
         ).run(
           experiment.id,
           experiment.primaryMetricValue,
+          experiment.resultCommitSha,
           at,
-          at,
-          hypothesisId
+          campaign.id as string
         )
       }
-    }
-    enqueueSyncEvent({
-      db,
-      type: "experiment.logged",
-      entityType: "experiment",
-      entityId: experiment.id,
-      payload: {
-        experiment,
-        campaignName: record.campaignName,
-        projectPath: record.projectPath ?? "",
-        fingerprint: experimentFingerprint(experiment),
-      },
+      recomputeLocalHypothesisProjectionForDb({
+        db,
+        campaignId,
+        hypothesisId,
+        at,
+      })
+      enqueueSyncEvent({
+        db,
+        type: "experiment.logged",
+        entityType: "experiment",
+        entityId: experiment.id,
+        payload: {
+          experiment,
+          campaignName: record.campaignName,
+          projectPath: record.projectPath ?? "",
+          fingerprint: experimentFingerprint(experiment),
+        },
+      })
+      return experiment
     })
-    return experiment
+    return tx()
   })
-  return tx()
 }
 
-function listLocalExperimentsForDb(
-  db: Db,
-  campaignId: string,
-  limit?: number
-) {
+function listLocalExperimentsForDb(db: Db, campaignId: string, limit?: number) {
   const sql = `
     SELECT e.*
     FROM experiments e
@@ -2068,12 +2227,12 @@ export async function markExperimentRefsVerified({
   refs: Array<{ runRef: string; commitSha: string; ref: string }>
 }) {
   if (refs.length === 0) return
-  const db = await openDb(root)
   const at = nowIso()
-  const tx = db.transaction(() => {
-    for (const ref of refs) {
-      db.query(
-        `
+  await withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      for (const ref of refs) {
+        db.query(
+          `
           UPDATE experiments
           SET git_status = 'verified',
             git_verified_at = ?,
@@ -2083,10 +2242,11 @@ export async function markExperimentRefsVerified({
             AND result_commit_sha = ?
             AND result_ref = ?
         `
-      ).run(at, at, ref.runRef, ref.commitSha, ref.ref)
-    }
+        ).run(at, at, ref.runRef, ref.commitSha, ref.ref)
+      }
+    })
+    tx()
   })
-  tx()
 }
 
 export async function applyRemoteExperimentGitStatuses({
@@ -2097,12 +2257,12 @@ export async function applyRemoteExperimentGitStatuses({
   experiments: ApiCampaignExperiment[]
 }) {
   if (experiments.length === 0) return
-  const db = await openDb(root)
   const at = nowIso()
-  const tx = db.transaction(() => {
-    for (const experiment of experiments) {
-      db.query(
-        `
+  await withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      for (const experiment of experiments) {
+        db.query(
+          `
           UPDATE experiments
           SET git_status = ?,
             git_verified_at = ?,
@@ -2110,17 +2270,18 @@ export async function applyRemoteExperimentGitStatuses({
             updated_at = ?
           WHERE id = ? OR run_ref = ?
         `
-      ).run(
-        experiment.gitStatus,
-        experiment.gitVerifiedAt,
-        experiment.gitStatusReason,
-        at,
-        experiment.id,
-        experiment.runRef
-      )
-    }
+        ).run(
+          experiment.gitStatus,
+          experiment.gitVerifiedAt,
+          experiment.gitStatusReason,
+          at,
+          experiment.id,
+          experiment.runRef
+        )
+      }
+    })
+    tx()
   })
-  tx()
 }
 
 function attemptFromRow(row: Row): LastRunRecord {
@@ -2160,10 +2321,10 @@ export async function writeLocalAttempt({
   root: string
   record: LastRunRecord
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  db.query(
-    `
+  await withResearchDbWrite(root, (db) => {
+    db.query(
+      `
       INSERT INTO local_attempts (
         run_ref, campaign_id, campaign_name, project_path, session_id, worker_id,
         hypothesis_id, result_commit_sha, status, record_json, created_at, updated_at
@@ -2181,20 +2342,21 @@ export async function writeLocalAttempt({
         record_json = excluded.record_json,
         updated_at = excluded.updated_at
     `
-  ).run(
-    record.runRef,
-    null,
-    record.campaignName,
-    record.projectPath ?? "",
-    record.sessionId ?? null,
-    record.workerId ?? null,
-    record.hypothesisId ?? null,
-    record.resultCommitSha,
-    record.status,
-    json(record),
-    record.createdAt,
-    at
-  )
+    ).run(
+      record.runRef,
+      null,
+      record.campaignName,
+      record.projectPath ?? "",
+      record.sessionId ?? null,
+      record.workerId ?? null,
+      record.hypothesisId ?? null,
+      record.resultCommitSha,
+      record.status,
+      json(record),
+      record.createdAt,
+      at
+    )
+  })
 }
 
 export async function readLocalAttempt(
@@ -2241,17 +2403,40 @@ export async function clearLocalAttempt(
   root: string,
   selector: LastRunSelector
 ) {
-  const db = await openDb(root)
-  if (selector.runRef) {
-    db.query("DELETE FROM local_attempts WHERE run_ref = ?").run(
-      selector.runRef
-    )
-    return
-  }
-  const attempt = await readLocalAttempt(root, selector)
-  if (attempt) {
-    db.query("DELETE FROM local_attempts WHERE run_ref = ?").run(attempt.runRef)
-  }
+  await withResearchDbWrite(root, (db) => {
+    if (selector.runRef) {
+      db.query("DELETE FROM local_attempts WHERE run_ref = ?").run(
+        selector.runRef
+      )
+      return
+    }
+    const rows = db
+      .query(
+        `
+          SELECT * FROM local_attempts
+          WHERE campaign_name = ? AND project_path = ?
+          ORDER BY updated_at DESC
+        `
+      )
+      .all(selector.campaignName ?? "", selector.projectPath ?? "") as Row[]
+    const match = rows.find((row) => {
+      if (selector.sessionId && row.session_id !== selector.sessionId)
+        return false
+      if (selector.workerId && row.worker_id !== selector.workerId) return false
+      if (
+        selector.hypothesisId &&
+        row.hypothesis_id !== selector.hypothesisId
+      ) {
+        return false
+      }
+      return true
+    })
+    if (match) {
+      db.query("DELETE FROM local_attempts WHERE run_ref = ?").run(
+        match.run_ref as string
+      )
+    }
+  })
 }
 
 function workflowRunFromRow(row: Row): LocalWorkflowRun {
@@ -2288,8 +2473,7 @@ function workflowStepFromRow(row: Row): LocalWorkflowStep {
     toolId: nullableString(row.tool_id),
     status: row.status as LocalWorkflowStepStatus,
     attempt: Number(row.attempt ?? 0),
-    exitCode:
-      typeof row.exit_code === "number" ? Number(row.exit_code) : null,
+    exitCode: typeof row.exit_code === "number" ? Number(row.exit_code) : null,
     timedOut: bool(row.timed_out),
     outputSummary: nullableString(row.output_summary),
     metrics: numericRecord(parseJson(row.metrics_json, {})),
@@ -2307,10 +2491,10 @@ export async function upsertWorkflowRun({
   root: string
   run: LocalWorkflowRun
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  db.query(
-    `
+  await withResearchDbWrite(root, (db) => {
+    db.query(
+      `
       INSERT INTO workflow_runs (
         id, campaign_id, campaign_name, project_path, run_ref, base_commit_sha,
         result_commit_sha, result_ref, setup_hash, status, current_step_index,
@@ -2337,28 +2521,29 @@ export async function upsertWorkflowRun({
         worker_id = excluded.worker_id,
         hypothesis_id = excluded.hypothesis_id
     `
-  ).run(
-    run.id,
-    run.campaignId,
-    run.campaignName,
-    run.projectPath,
-    run.runRef,
-    run.baseCommitSha,
-    run.resultCommitSha,
-    run.resultRef,
-    run.setupHash,
-    run.status,
-    run.currentStepIndex,
-    json(run.metrics),
-    run.blockReason,
-    run.createdAt,
-    run.startedAt,
-    run.completedAt,
-    at,
-    run.sessionId ?? null,
-    run.workerId ?? null,
-    run.hypothesisId ?? null
-  )
+    ).run(
+      run.id,
+      run.campaignId,
+      run.campaignName,
+      run.projectPath,
+      run.runRef,
+      run.baseCommitSha,
+      run.resultCommitSha,
+      run.resultRef,
+      run.setupHash,
+      run.status,
+      run.currentStepIndex,
+      json(run.metrics),
+      run.blockReason,
+      run.createdAt,
+      run.startedAt,
+      run.completedAt,
+      at,
+      run.sessionId ?? null,
+      run.workerId ?? null,
+      run.hypothesisId ?? null
+    )
+  })
 }
 
 export async function readWorkflowRun(root: string, id: string) {
@@ -2382,7 +2567,80 @@ export async function readLatestActiveWorkflowRun({
       `
         SELECT * FROM workflow_runs
         WHERE campaign_name = ? AND project_path = ?
-          AND status IN ('running', 'paused', 'blocked')
+          AND status IN ('running', 'paused')
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `
+    )
+    .get(campaignName, projectPath) as Row | null
+  return row ? workflowRunFromRow(row) : null
+}
+
+export async function readLatestBlockedWorkflowRun({
+  root,
+  campaignName,
+  projectPath,
+}: {
+  root: string
+  campaignName: string
+  projectPath: string
+}) {
+  const row = (await openDb(root))
+    .query(
+      `
+        SELECT * FROM workflow_runs
+        WHERE campaign_name = ? AND project_path = ?
+          AND status = 'blocked'
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `
+    )
+    .get(campaignName, projectPath) as Row | null
+  return row ? workflowRunFromRow(row) : null
+}
+
+export async function abandonBlockedWorkflowRunsForSession({
+  root,
+  sessionId,
+  reason,
+}: {
+  root: string
+  sessionId: string
+  reason: string
+}) {
+  const at = nowIso()
+  await withResearchDbWrite(root, (db) => {
+    db.query(
+      `
+      UPDATE workflow_runs
+      SET
+        status = 'abandoned',
+        block_reason = CASE
+          WHEN block_reason IS NULL OR block_reason = '' THEN ?
+          ELSE block_reason || '; ' || ?
+        END,
+        completed_at = COALESCE(completed_at, ?),
+        updated_at = ?
+      WHERE session_id = ? AND status = 'blocked'
+    `
+    ).run(reason, reason, at, at, sessionId)
+  })
+}
+
+export async function readLatestWorkflowRun({
+  root,
+  campaignName,
+  projectPath,
+}: {
+  root: string
+  campaignName: string
+  projectPath: string
+}) {
+  const row = (await openDb(root))
+    .query(
+      `
+        SELECT * FROM workflow_runs
+        WHERE campaign_name = ? AND project_path = ?
         ORDER BY updated_at DESC
         LIMIT 1
       `
@@ -2398,10 +2656,10 @@ export async function upsertWorkflowStep({
   root: string
   step: LocalWorkflowStep
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  db.query(
-    `
+  await withResearchDbWrite(root, (db) => {
+    db.query(
+      `
       INSERT INTO workflow_steps (
         run_id, step_id, step_index, kind, tool_id, status, attempt, exit_code,
         timed_out, output_summary, metrics_json, log_path, started_at,
@@ -2423,23 +2681,24 @@ export async function upsertWorkflowStep({
         completed_at = excluded.completed_at,
         updated_at = excluded.updated_at
     `
-  ).run(
-    step.runId,
-    step.stepId,
-    step.stepIndex,
-    step.kind,
-    step.toolId,
-    step.status,
-    step.attempt,
-    step.exitCode,
-    step.timedOut ? 1 : 0,
-    step.outputSummary,
-    json(step.metrics),
-    step.logPath,
-    step.startedAt,
-    step.completedAt,
-    at
-  )
+    ).run(
+      step.runId,
+      step.stepId,
+      step.stepIndex,
+      step.kind,
+      step.toolId,
+      step.status,
+      step.attempt,
+      step.exitCode,
+      step.timedOut ? 1 : 0,
+      step.outputSummary,
+      json(step.metrics),
+      step.logPath,
+      step.startedAt,
+      step.completedAt,
+      at
+    )
+  })
 }
 
 export async function listWorkflowSteps(root: string, runId: string) {
@@ -2472,62 +2731,63 @@ export async function upsertLocalSummary({
   isCurrent?: boolean
   metadata?: Record<string, unknown>
 }) {
-  const db = await openDb(root)
   const id = randomUUID()
   const at = nowIso()
-  const tx = db.transaction(() => {
-    if (isCurrent) {
-      db.query(
-        `
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      if (isCurrent) {
+        db.query(
+          `
           UPDATE summaries
           SET is_current = 0, updated_at = ?
           WHERE campaign_id = ? AND summary_kind = ?
             AND COALESCE(session_id, '') = COALESCE(?, '')
             AND COALESCE(hypothesis_id, '') = COALESCE(?, '')
         `
-      ).run(
-        at,
-        campaignId,
-        summaryKind,
-        sessionId ?? null,
-        hypothesisId ?? null
-      )
-    }
-    db.query(
-      `
+        ).run(
+          at,
+          campaignId,
+          summaryKind,
+          sessionId ?? null,
+          hypothesisId ?? null
+        )
+      }
+      db.query(
+        `
         INSERT INTO summaries (
           id, campaign_id, session_id, hypothesis_id, authored_by_worker_id,
           summary_kind, title, body, is_current, metadata_json, created_at, updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
-    ).run(
-      id,
-      campaignId,
-      sessionId ?? null,
-      hypothesisId ?? null,
-      authoredByWorkerId ?? null,
-      summaryKind,
-      title,
-      body,
-      isCurrent ? 1 : 0,
-      json(metadata),
-      at,
-      at
-    )
-    const summary = summaryFromRow(
-      db.query("SELECT * FROM summaries WHERE id = ?").get(id) as Row
-    )
-    enqueueSyncEvent({
-      db,
-      type: "summary.upserted",
-      entityType: "summary",
-      entityId: id,
-      payload: { summary, metadata },
+      ).run(
+        id,
+        campaignId,
+        sessionId ?? null,
+        hypothesisId ?? null,
+        authoredByWorkerId ?? null,
+        summaryKind,
+        title,
+        body,
+        isCurrent ? 1 : 0,
+        json(metadata),
+        at,
+        at
+      )
+      const summary = summaryFromRow(
+        db.query("SELECT * FROM summaries WHERE id = ?").get(id) as Row
+      )
+      enqueueSyncEvent({
+        db,
+        type: "summary.upserted",
+        entityType: "summary",
+        entityId: id,
+        payload: { summary, metadata },
+      })
+      return summary
     })
-    return summary
+    return tx()
   })
-  return tx()
 }
 
 export async function listLocalSummaries(root: string, campaignId: string) {
@@ -2564,12 +2824,12 @@ export async function createLocalKnowledge({
   confidence?: number | null
   metadata?: Record<string, unknown>
 }) {
-  const db = await openDb(root)
   const id = randomUUID()
   const at = nowIso()
-  const tx = db.transaction(() => {
-    db.query(
-      `
+  return withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      db.query(
+        `
         INSERT INTO knowledge (
           id, campaign_id, session_id, hypothesis_id, authored_by_worker_id,
           experiment_id, kind, title, body, confidence, metadata_json,
@@ -2577,34 +2837,35 @@ export async function createLocalKnowledge({
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
-    ).run(
-      id,
-      campaignId,
-      sessionId ?? null,
-      hypothesisId ?? null,
-      authoredByWorkerId ?? null,
-      experimentId ?? null,
-      kind,
-      title,
-      body,
-      confidence ?? null,
-      json(metadata),
-      at,
-      at
-    )
-    const knowledge = knowledgeFromRow(
-      db.query("SELECT * FROM knowledge WHERE id = ?").get(id) as Row
-    )
-    enqueueSyncEvent({
-      db,
-      type: "knowledge.created",
-      entityType: "knowledge",
-      entityId: id,
-      payload: { knowledge },
+      ).run(
+        id,
+        campaignId,
+        sessionId ?? null,
+        hypothesisId ?? null,
+        authoredByWorkerId ?? null,
+        experimentId ?? null,
+        kind,
+        title,
+        body,
+        confidence ?? null,
+        json(metadata),
+        at,
+        at
+      )
+      const knowledge = knowledgeFromRow(
+        db.query("SELECT * FROM knowledge WHERE id = ?").get(id) as Row
+      )
+      enqueueSyncEvent({
+        db,
+        type: "knowledge.created",
+        entityType: "knowledge",
+        entityId: id,
+        payload: { knowledge },
+      })
+      return knowledge
     })
-    return knowledge
+    return tx()
   })
-  return tx()
 }
 
 export async function listLocalKnowledge(root: string, campaignId: string) {
@@ -2655,14 +2916,14 @@ export async function markResearchSyncAcked({
   serverEntityId?: string | null
   details?: Record<string, unknown>
 }) {
-  const db = await openDb(root)
   const at = nowIso()
-  db.transaction(() => {
-    db.query(
-      "UPDATE sync_events SET status = 'acked', updated_at = ?, acked_at = ? WHERE event_id = ?"
-    ).run(at, at, eventId)
-    db.query(
-      `
+  await withResearchDbWrite(root, (db) => {
+    db.transaction(() => {
+      db.query(
+        "UPDATE sync_events SET status = 'acked', updated_at = ?, acked_at = ? WHERE event_id = ?"
+      ).run(at, at, eventId)
+      db.query(
+        `
         INSERT INTO sync_acks (event_id, server_status, server_entity_id, acked_at, details_json)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(event_id) DO UPDATE SET
@@ -2671,8 +2932,9 @@ export async function markResearchSyncAcked({
           acked_at = excluded.acked_at,
           details_json = excluded.details_json
       `
-    ).run(eventId, serverStatus, serverEntityId ?? null, at, json(details))
-  })()
+      ).run(eventId, serverStatus, serverEntityId ?? null, at, json(details))
+    })()
+  })
 }
 
 export async function applyRemoteTombstones({
@@ -2736,35 +2998,75 @@ async function insertLocalTombstones({
   tombstones: LocalTombstoneInput[]
 }) {
   if (tombstones.length === 0) return
-  const db = await openDb(root)
-  const insert = db.query(
-    `
-      INSERT INTO tombstones (
-        id, entity_type, entity_id, campaign_id, name, run_ref, reason, created_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(entity_type, entity_id) DO UPDATE SET
-        campaign_id = excluded.campaign_id,
-        name = excluded.name,
-        run_ref = excluded.run_ref,
-        reason = excluded.reason,
-        created_at = excluded.created_at
-    `
-  )
-  db.transaction(() => {
-    for (const tombstone of tombstones) {
-      insert.run(
-        `${tombstone.entityType}:${tombstone.entityId}`,
-        tombstone.entityType,
-        tombstone.entityId,
-        tombstone.campaignId,
-        tombstone.name,
-        tombstone.runRef,
-        tombstone.reason,
-        tombstone.deletedAt
-      )
-    }
-  })()
+  await withResearchDbWrite(root, (db) => {
+    const insert = db.query(
+      `
+        INSERT INTO tombstones (
+          id, entity_type, entity_id, campaign_id, name, run_ref, reason, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+          campaign_id = excluded.campaign_id,
+          name = excluded.name,
+          run_ref = excluded.run_ref,
+          reason = excluded.reason,
+          created_at = excluded.created_at
+      `
+    )
+    db.transaction(() => {
+      const affectedHypotheses = new Map<string, Set<string>>()
+      const addAffectedHypothesis = (
+        campaignId: string | null | undefined,
+        hypothesisId: string | null | undefined
+      ) => {
+        if (!campaignId || !hypothesisId) return
+        const set = affectedHypotheses.get(campaignId) ?? new Set<string>()
+        set.add(hypothesisId)
+        affectedHypotheses.set(campaignId, set)
+      }
+      for (const tombstone of tombstones) {
+        if (tombstone.entityType === "experiment") {
+          const experiment = db
+            .query(
+              "SELECT campaign_id, hypothesis_id FROM experiments WHERE id = ? OR run_ref = ?"
+            )
+            .get(tombstone.entityId, tombstone.runRef ?? "") as Row | null
+          addAffectedHypothesis(
+            nullableString(experiment?.campaign_id),
+            nullableString(experiment?.hypothesis_id)
+          )
+        } else if (tombstone.entityType === "campaign") {
+          const hypotheses = db
+            .query("SELECT id FROM hypotheses WHERE campaign_id = ?")
+            .all(tombstone.campaignId) as Row[]
+          for (const hypothesis of hypotheses) {
+            addAffectedHypothesis(tombstone.campaignId, hypothesis.id as string)
+          }
+        }
+        insert.run(
+          `${tombstone.entityType}:${tombstone.entityId}`,
+          tombstone.entityType,
+          tombstone.entityId,
+          tombstone.campaignId,
+          tombstone.name,
+          tombstone.runRef,
+          tombstone.reason,
+          tombstone.deletedAt
+        )
+      }
+      const at = nowIso()
+      for (const [campaignId, hypothesisIds] of affectedHypotheses) {
+        for (const hypothesisId of hypothesisIds) {
+          recomputeLocalHypothesisProjectionForDb({
+            db,
+            campaignId,
+            hypothesisId,
+            at,
+          })
+        }
+      }
+    })()
+  })
 }
 
 export async function markResearchSyncError({
@@ -2777,18 +3079,19 @@ export async function markResearchSyncError({
   message: string
 }) {
   if (eventIds.length === 0) return
-  const db = await openDb(root)
   const at = nowIso()
-  const update = db.query(
-    `
-      UPDATE sync_events
-      SET attempts = attempts + 1, last_error = ?, updated_at = ?
-      WHERE event_id = ?
-    `
-  )
-  db.transaction(() => {
-    for (const eventId of eventIds) update.run(message, at, eventId)
-  })()
+  await withResearchDbWrite(root, (db) => {
+    const update = db.query(
+      `
+        UPDATE sync_events
+        SET attempts = attempts + 1, last_error = ?, updated_at = ?
+        WHERE event_id = ?
+      `
+    )
+    db.transaction(() => {
+      for (const eventId of eventIds) update.run(message, at, eventId)
+    })()
+  })
 }
 
 export async function markResearchSyncConflict({
@@ -2800,10 +3103,11 @@ export async function markResearchSyncConflict({
   eventId: string
   message: string
 }) {
-  const db = await openDb(root)
-  db.query(
-    "UPDATE sync_events SET status = 'conflict', last_error = ?, updated_at = ? WHERE event_id = ?"
-  ).run(message, nowIso(), eventId)
+  await withResearchDbWrite(root, (db) => {
+    db.query(
+      "UPDATE sync_events SET status = 'conflict', last_error = ?, updated_at = ? WHERE event_id = ?"
+    ).run(message, nowIso(), eventId)
+  })
 }
 
 export async function pendingResearchSyncCount(root: string) {
@@ -2848,17 +3152,18 @@ export async function listResearchSyncConflicts(root: string) {
 }
 
 export async function retryResearchSyncConflicts(root: string) {
-  const db = await openDb(root)
-  const result = db
-    .query(
-      `
-        UPDATE sync_events
-        SET status = 'pending', updated_at = ?, last_error = NULL
-        WHERE status = 'conflict'
-      `
-    )
-    .run(nowIso())
-  return result.changes
+  return withResearchDbWrite(root, (db) => {
+    const result = db
+      .query(
+        `
+          UPDATE sync_events
+          SET status = 'pending', updated_at = ?, last_error = NULL
+          WHERE status = 'conflict'
+        `
+      )
+      .run(nowIso())
+    return result.changes
+  })
 }
 
 export async function researchSyncStatus(root: string) {

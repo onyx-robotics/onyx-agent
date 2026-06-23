@@ -10,19 +10,28 @@ import {
   assertSetupCommitted,
   campaignStateKey,
   clientRunRef,
+  commandCampaignCreate,
   commandExpLog,
   commandExpRun,
   commandExpList,
+  commandKnowledgeAdd,
+  commandKnowledgeList,
+  commandListen,
   commandResearchFinish,
   commandResearchStart,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
   commandResearchStatus,
+  commandResearchStop,
+  commandStatus,
   commandSummaryList,
   commandSummaryUpsert,
   commandSetupInit,
   commandSetupValidate,
+  commandSync,
+  commandWorkerRun,
   commandWorkflowStatus,
+  finalizeHypothesisAttempt,
   localResearchRecordSchema,
   mergeHistory,
   main,
@@ -53,9 +62,19 @@ import {
   listLocalHypotheses,
   listLocalAttempts,
   listLocalExperimentHistory,
+  listLocalKnowledge,
+  listLocalSummaries,
+  localCampaignByName,
+  logLocalExperiment,
+  pendingResearchSyncCount,
+  readWorkflowRun,
+  registerLocalWorker,
+  recordLocalWorkerHeartbeat,
+  upsertWorkflowRun,
   writeLocalAttempt,
 } from "./lib/research-db"
 import { runProcess } from "./lib/process"
+import { writeWorkerLaunchManifest } from "./lib/worker-launcher"
 
 async function commitAll(root: string, message: string) {
   await runProcess("git", ["add", "-A"], { cwd: root })
@@ -184,6 +203,70 @@ async function writeResearchSmokeRepo() {
   })
 
   return { root, baseCommitSha, campaignId, campaignName }
+}
+
+async function addBareOrigin(root: string) {
+  const origin = await mkdtemp(join(tmpdir(), "onyx-origin-"))
+  await runProcess("git", ["init", "--bare"], { cwd: origin })
+  await runProcess("git", ["remote", "add", "origin", origin], { cwd: root })
+  return origin
+}
+
+function testCampaign({
+  campaignId,
+  campaignName,
+  baseCommitSha,
+}: {
+  campaignId: string
+  campaignName: string
+  baseCommitSha: string
+}) {
+  return {
+    id: campaignId,
+    projectId: "44444444-4444-4444-8444-444444444444",
+    name: campaignName,
+    description: "Improve score.",
+    baseCommitSha,
+    metricName: "score",
+    metricUnit: null,
+    metricDirection: "maximize" as const,
+    bestMetricValue: null,
+    bestCommitSha: null,
+    experimentCount: 0,
+    promotionRefName: null,
+  }
+}
+
+function testHypothesis({
+  campaignId,
+  baseCommitSha,
+}: {
+  campaignId: string
+  baseCommitSha: string
+}) {
+  return {
+    id: "66666666-6666-4666-8666-666666666666",
+    campaignId,
+    createdBySessionId: "22222222-2222-4222-8222-222222222222",
+    name: "hypothesis-1",
+    description: null,
+    status: "active" as const,
+    baseCommitSha,
+    bestExperimentId: null,
+    bestMetricValue: null,
+    lastWorkedAt: null,
+    plan: {
+      focus: "Scoped text tuning",
+      statement: "A small scoped change can improve the score.",
+      startingPoints: ["src/controller.txt"],
+      avoidList: ["onyx/"],
+      successSignals: ["METRIC score improves"],
+      giveUpSignals: ["No clean scoped change"],
+    },
+    metadata: {},
+    createdAt: "2026-06-20T00:00:00.000Z",
+    updatedAt: "2026-06-20T00:00:00.000Z",
+  }
 }
 
 async function withMockResearchApi(
@@ -534,8 +617,7 @@ describe("metrics", () => {
 
   test("rejects workflow metric output without the configured primary", () => {
     expect(
-      parseWorkflowMetricLines("METRIC control_effort=0.4\n", "score")
-        .error
+      parseWorkflowMetricLines("METRIC control_effort=0.4\n", "score").error
     ).toContain("without the primary metric")
   })
 
@@ -547,8 +629,9 @@ describe("metrics", () => {
   })
 
   test("rejects invalid workflow metric values", () => {
-    expect(parseWorkflowMetricLines("METRIC score=fast\n", "score").error)
-      .toBe("Invalid METRIC line: METRIC score=fast")
+    expect(parseWorkflowMetricLines("METRIC score=fast\n", "score").error).toBe(
+      "Invalid METRIC line: METRIC score=fast"
+    )
   })
 })
 
@@ -596,12 +679,238 @@ describe("exp run", () => {
         options: { resume: paused!.id, timeout: "5" },
       })
       expect(completed?.status).toBe("succeeded")
+      const latest = await commandWorkflowStatus({
+        positional: ["workflow", "status"],
+        options: { campaign: "smoke", json: "true" },
+      })
+      expect(latest?.run.id).toBe(paused.id)
+      await expect(
+        commandWorkflowStatus({
+          positional: ["workflow", "status"],
+          options: { campaign: "smoke", active: "true", json: "true" },
+        })
+      ).rejects.toThrow("No active workflow runs exist")
       const attempts = await listLocalAttempts(root)
       expect(attempts[0]?.runRef).toBe(paused?.runRef)
       expect(attempts[0]?.primaryMetricValue).toBe(1.25)
     } finally {
       process.chdir(previousCwd)
       process.exitCode = previousExitCode
+      console.log = originalLog
+    }
+  })
+
+  test("--active excludes blocked workflow runs and --blocked shows them", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await upsertWorkflowRun({
+        root,
+        run: {
+          id: "workflow-blocked",
+          campaignId,
+          campaignName,
+          projectPath: "",
+          runRef: "local/smoke/blocked",
+          baseCommitSha,
+          resultCommitSha: null,
+          resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/blocked`,
+          setupHash: setupHash(await readSetupFile(root, "")),
+          status: "blocked",
+          currentStepIndex: 0,
+          metrics: {},
+          blockReason:
+            "Workflow attempts must contain exactly one result commit over the base commit.",
+          createdAt: "2026-06-20T00:00:00.000Z",
+          startedAt: "2026-06-20T00:00:00.000Z",
+          completedAt: null,
+          updatedAt: "2026-06-20T00:00:00.000Z",
+          sessionId: "22222222-2222-4222-8222-222222222222",
+          workerId: "77777777-7777-4777-8777-777777777777",
+          hypothesisId: "66666666-6666-4666-8666-666666666666",
+        },
+      })
+
+      await expect(
+        commandWorkflowStatus({
+          positional: ["workflow", "status"],
+          options: { campaign: campaignName, active: "true", json: "true" },
+        })
+      ).rejects.toThrow("No active workflow runs exist")
+      const blocked = await commandWorkflowStatus({
+        positional: ["workflow", "status"],
+        options: { campaign: campaignName, blocked: "true", json: "true" },
+      })
+      expect(blocked?.run.id).toBe("workflow-blocked")
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+})
+
+describe("worker finalization", () => {
+  test("measures and logs exactly one unlogged worker commit", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    await addBareOrigin(root)
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate")
+      const head = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim()
+
+      const manifest = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis: testHypothesis({ campaignId, baseCommitSha }),
+        sessionId: "22222222-2222-4222-8222-222222222222",
+        workerId: "77777777-7777-4777-8777-777777777777",
+        workerBranch: "onyx/test/finalization",
+        args: { positional: ["worker", "run"], options: { offline: "true" } },
+        workerFailed: false,
+      })
+
+      expect(manifest.finalizationStatus).toBe("measured_and_logged")
+      expect(manifest.commitSha).toBe(head)
+      expect(manifest.measurementBaseCommitSha).toBe(baseCommitSha)
+      expect(manifest.unloggedCommitCount).toBe(1)
+      expect(manifest.workerBranchPushStatus).toBe("pushed")
+      const history = await listLocalExperimentHistory(root)
+      expect(history).toHaveLength(1)
+      expect(history[0]?.resultCommitSha).toBe(head)
+      expect(history[0]?.baseCommitSha).toBe(baseCommitSha)
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
+  test("treats an already logged worker HEAD as already_logged", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    await addBareOrigin(root)
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate")
+      const head = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim()
+      const hypothesis = testHypothesis({ campaignId, baseCommitSha })
+      await writeLocalAttempt({
+        root,
+        record: {
+          schemaVersion: 1,
+          createdAt: "2026-06-20T00:00:00.000Z",
+          runRef: "local/smoke/already-logged",
+          campaignName,
+          projectPath: "",
+          baseCommitSha,
+          resultCommitSha: head,
+          resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/already-logged`,
+          status: "succeeded",
+          setupCompliance: {
+            status: "passed",
+            protectedPathsChanged: [],
+            outOfScopePathsChanged: [],
+            setupPathsChanged: [],
+            notes: null,
+          },
+          primaryMetricName: "score",
+          primaryMetricValue: 1.25,
+          metrics: { score: 1.25 },
+          agentNotes: {},
+          checks: null,
+          durationMs: null,
+          startedAt: null,
+          completedAt: null,
+          outputSummary: null,
+          hypothesisId: hypothesis.id,
+          sessionId: hypothesis.createdBySessionId,
+          workerId: "77777777-7777-4777-8777-777777777777",
+        },
+      })
+
+      const manifest = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis,
+        sessionId: hypothesis.createdBySessionId,
+        workerId: "77777777-7777-4777-8777-777777777777",
+        workerBranch: "onyx/test/already-logged",
+        args: { positional: ["worker", "run"], options: { offline: "true" } },
+        workerFailed: false,
+      })
+
+      expect(manifest.finalizationStatus).toBe("already_logged")
+      expect(manifest.commitSha).toBe(head)
+      expect(manifest.unloggedCommitCount).toBe(0)
+      const attempts = await listLocalAttempts(root)
+      expect(attempts).toHaveLength(1)
+      expect(attempts[0]?.runRef).toBe("local/smoke/already-logged")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("salvages multiple unlogged commits without creating a workflow run", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    await addBareOrigin(root)
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate one")
+      await writeFile(
+        join(root, "src", "candidate-2.txt"),
+        "candidate\n",
+        "utf8"
+      )
+      await commitAll(root, "candidate two")
+
+      const manifest = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis: testHypothesis({ campaignId, baseCommitSha }),
+        sessionId: "22222222-2222-4222-8222-222222222222",
+        workerId: "77777777-7777-4777-8777-777777777777",
+        workerBranch: "onyx/test/multi-commit",
+        args: { positional: ["worker", "run"], options: { offline: "true" } },
+        workerFailed: false,
+      })
+
+      expect(manifest.finalizationStatus).toBe("salvaged_unmeasured")
+      expect(manifest.unloggedCommitCount).toBe(2)
+      expect(manifest.error).toContain("exactly one unlogged HEAD commit")
+      expect(await listLocalAttempts(root)).toHaveLength(0)
+      await expect(
+        commandWorkflowStatus({
+          positional: ["workflow", "status"],
+          options: { campaign: campaignName, active: "true", json: "true" },
+        })
+      ).rejects.toThrow("No active workflow runs exist")
+    } finally {
+      process.chdir(previousCwd)
       console.log = originalLog
     }
   })
@@ -982,6 +1291,423 @@ describe("research start", () => {
   })
 })
 
+describe("automated research smoke", () => {
+  test("exercises setup, campaign, worker, sync, status, finish, summaries, and knowledge with a mock worker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-auto-smoke-"))
+    const remote = await mkdtemp(join(tmpdir(), "onyx-auto-smoke-remote-"))
+    const projectId = "44444444-4444-4444-8444-444444444444"
+    const campaignName = "auto-smoke"
+    let campaignId = ""
+    let sessionId = ""
+    let baseCommitSha = ""
+    let campaignStatus: "active" | "completed" = "active"
+    const syncedEvents: Array<{
+      type: string
+      payload: Record<string, unknown>
+    }> = []
+    const logs: string[] = []
+    const originalLog = console.log
+    const originalWarn = console.warn
+    const previousCwd = process.cwd()
+
+    const campaignDto = (status: "active" | "completed" = campaignStatus) => ({
+      id: campaignId,
+      projectId,
+      name: campaignName,
+      description: "Improve score.",
+      baseCommitSha,
+      status,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize" as const,
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: `refs/heads/onyx/${campaignName}/best`,
+    })
+
+    const syncResponse = (body: unknown) => {
+      const events =
+        (body as { events?: Array<Record<string, unknown>> }).events ?? []
+      syncedEvents.push(
+        ...events.map((event) => ({
+          type: String(event.type),
+          payload: event.payload as Record<string, unknown>,
+        }))
+      )
+      for (const event of events) {
+        const campaign = (event.payload as { campaign?: { status?: string } })
+          .campaign
+        if (
+          event.type === "campaign.upserted" &&
+          campaign?.status === "completed"
+        ) {
+          campaignStatus = "completed"
+        }
+      }
+      return {
+        body: {
+          data: {
+            accepted: events.length,
+            duplicate: 0,
+            conflicts: 0,
+            invalid: 0,
+            acknowledgements: events.map((event) => ({
+              eventId: String(event.eventId),
+              sequence: Number(event.sequence),
+              status: "acked",
+              code: "ok",
+              entityType: String(event.entityType),
+              entityId:
+                typeof event.entityId === "string" ? event.entityId : null,
+              message: null,
+              details: {},
+            })),
+            tombstones: [],
+            projectionDeltas: {
+              campaigns: [],
+              sessions: [],
+              hypotheses: [],
+              workers: [],
+              experiments: [],
+              summaries: [],
+              knowledge: [],
+            },
+          },
+        },
+      }
+    }
+
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+    console.warn = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    try {
+      await runProcess("git", ["init"], { cwd: root })
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "README.md"), "test\n", "utf8")
+      await writeFile(join(root, "src", "controller.txt"), "base\n", "utf8")
+      process.chdir(root)
+
+      await withMockResearchApi(
+        (request) => {
+          if (
+            request.method === "POST" &&
+            request.path === "/api/v1/research/sync"
+          ) {
+            return syncResponse(request.body)
+          }
+          if (
+            campaignId &&
+            request.method === "POST" &&
+            request.path ===
+              `/api/v1/research/campaigns/${campaignId}/reconcile`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign: campaignDto(),
+                  hypotheses: [],
+                  workers: [],
+                  experiments: [],
+                  experimentsUpdated: 0,
+                },
+              },
+            }
+          }
+          if (
+            campaignId &&
+            request.method === "GET" &&
+            request.path === `/api/v1/research/campaigns/${campaignId}/overview`
+          ) {
+            return {
+              body: {
+                data: {
+                  campaign: campaignDto(),
+                  workers: [],
+                  hypotheses: [],
+                  summaries: [],
+                  knowledge: [],
+                  bestExperiment: null,
+                  latestExperiments: [],
+                  counts: {
+                    experiments: 0,
+                    hypothesisCount: 0,
+                    activeWorkers: 0,
+                  },
+                },
+              },
+            }
+          }
+          if (
+            sessionId &&
+            request.method === "POST" &&
+            request.path === `/api/v1/research/sessions/${sessionId}/stop`
+          ) {
+            const body = request.body as { campaignId: string; status?: string }
+            return {
+              body: {
+                data: {
+                  id: sessionId,
+                  campaignId: body.campaignId,
+                  name: "session",
+                  status: body.status ?? "stop_requested",
+                  workerTarget: 1,
+                  metadata: {},
+                },
+              },
+            }
+          }
+          if (
+            request.method === "GET" &&
+            request.path === `/api/v1/research/projects/${projectId}/deletions`
+          ) {
+            return { body: { data: { campaigns: [], experiments: [] } } }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        async () => {
+          await commandSetupInit({
+            positional: ["setup", "init"],
+            options: {
+              goal: "Improve score.",
+              "metric-name": "score",
+              "metric-direction": "maximize",
+              "editable-scope": "src",
+              "eval-command": "printf 'METRIC score=1.25\\n'",
+            },
+          })
+          await commandSetupValidate({
+            positional: ["setup", "validate"],
+            options: {},
+          })
+          await commitAll(root, "setup")
+          baseCommitSha = (
+            await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+          ).stdout.trim()
+          await runProcess("git", ["init", "--bare"], { cwd: remote })
+          await runProcess("git", ["remote", "add", "origin", remote], {
+            cwd: root,
+          })
+          await runProcess("git", ["push", "-u", "origin", "HEAD"], {
+            cwd: root,
+          })
+
+          await commandCampaignCreate({
+            positional: ["campaign", "setup"],
+            options: {
+              name: campaignName,
+              description: "Improve score.",
+              "require-online": "true",
+            },
+          })
+          const localCampaign = await localCampaignByName({
+            root,
+            projectPath: "",
+            name: campaignName,
+          })
+          if (!localCampaign) throw new Error("expected local campaign")
+          campaignId = localCampaign.id
+
+          const plan = {
+            focus: "Scoped text tuning",
+            statement: "A small scoped change can improve the score.",
+            startingPoints: ["src/controller.txt"],
+            avoidList: ["onyx/"],
+            successSignals: ["METRIC score improves"],
+            giveUpSignals: ["No clean scoped change"],
+          }
+          await commandResearchStart({
+            positional: ["research", "start"],
+            options: {
+              campaign: campaignName,
+              workers: "1",
+              agent: "claude",
+              hypotheses: JSON.stringify([plan]),
+              "max-iterations": "2",
+              "max-minutes": "1",
+              "require-online": "true",
+            },
+          })
+          const state = await readState(root)
+          sessionId =
+            state.campaigns?.[campaignStateKey("", campaignName)]?.sessionId ??
+            ""
+          expect(sessionId).toMatch(/^[0-9a-f-]{36}$/)
+          const [hypothesis] = await listLocalHypotheses(root, campaignId)
+          expect(hypothesis?.plan.focus).toBe("Scoped text tuning")
+
+          const workerCommand = [
+            "mkdir -p src",
+            "printf 'worker tuned\\n' >> src/controller.txt",
+            "git add src/controller.txt",
+            "git -c user.name='Onyx Test' -c user.email='onyx@example.com' commit -m 'smoke worker change'",
+            'printf \'%s\\n\' \'{"type":"assistant","message":{"content":[{"type":"text","text":"changed controller"}]}}\'',
+          ].join(" && ")
+          await commandWorkerRun({
+            positional: ["worker", "run"],
+            options: {
+              session: sessionId,
+              hypothesis: hypothesis!.id,
+              "worker-command": workerCommand,
+              "worker-timeout": "10",
+              "startup-timeout": "0",
+              "sync-interval": "60",
+              "final-sync-timeout": "10",
+              "stop-grace-seconds": "1",
+              quiet: "true",
+              project: projectId,
+              "require-online": "true",
+            },
+          })
+
+          const workflow = await commandWorkflowStatus({
+            positional: ["workflow", "status"],
+            options: { campaign: campaignName, json: "true" },
+          })
+          expect(workflow?.run.status).toBe("succeeded")
+
+          await commandResearchStatus({
+            positional: ["research", "status"],
+            options: {
+              campaign: campaignName,
+              json: "true",
+              project: projectId,
+            },
+          })
+          await commandSummaryUpsert({
+            positional: ["summary", "upsert"],
+            options: {
+              campaign: campaignName,
+              session: sessionId,
+              hypothesis: hypothesis!.id,
+              kind: "hypothesis_summary",
+              title: "Smoke summary",
+              body: "The mock worker produced a measured scoped change.",
+              project: projectId,
+              "require-online": "true",
+            },
+          })
+          await commandKnowledgeAdd({
+            positional: ["knowledge", "add"],
+            options: {
+              campaign: campaignName,
+              session: sessionId,
+              hypothesis: hypothesis!.id,
+              kind: "insight",
+              title: "Smoke insight",
+              body: "The mock path can exercise sync without model credentials.",
+              confidence: "0.8",
+              project: projectId,
+              "require-online": "true",
+            },
+          })
+          await commandSync({
+            positional: ["sync"],
+            options: { project: projectId, "require-online": "true" },
+          })
+          await commandSummaryList({
+            positional: ["summary", "list"],
+            options: { campaign: campaignName, project: projectId },
+          })
+          await commandKnowledgeList({
+            positional: ["knowledge", "list"],
+            options: { campaign: campaignName, project: projectId },
+          })
+          await commandStatus({
+            positional: ["status"],
+            options: { project: projectId, json: "true" },
+          })
+
+          const listenOutput: string[] = []
+          const originalWrite = process.stdout.write
+          process.stdout.write = ((chunk: unknown) => {
+            listenOutput.push(String(chunk))
+            return true
+          }) as typeof process.stdout.write
+          try {
+            await commandListen()
+          } finally {
+            process.stdout.write = originalWrite
+          }
+          expect(listenOutput.join("\n")).toContain(campaignName)
+
+          await commandResearchStop({
+            positional: ["research", "stop"],
+            options: {
+              session: sessionId,
+              reason: "smoke stop",
+              project: projectId,
+            },
+          })
+          await commandResearchFinish({
+            positional: ["research", "finish"],
+            options: {
+              campaign: campaignName,
+              session: sessionId,
+              project: projectId,
+              "final-sync-timeout": "10",
+              "require-online": "true",
+            },
+          })
+        }
+      )
+
+      const experiments = await listLocalExperimentHistory(root)
+      const summaries = await listLocalSummaries(root, campaignId)
+      const knowledge = await listLocalKnowledge(root, campaignId)
+      const finishedCampaign = await localCampaignByName({
+        root,
+        projectPath: "",
+        name: campaignName,
+      })
+
+      expect(
+        experiments.some((item) => item.campaignName === campaignName)
+      ).toBe(true)
+      expect(summaries.some((item) => item.title === "Smoke summary")).toBe(
+        true
+      )
+      expect(knowledge.some((item) => item.title === "Smoke insight")).toBe(
+        true
+      )
+      expect(finishedCampaign?.status).toBe("completed")
+      expect(await pendingResearchSyncCount(root)).toBe(0)
+      expect(syncedEvents.map((event) => event.type)).toEqual(
+        expect.arrayContaining([
+          "campaign.upserted",
+          "session.started",
+          "hypothesis.upserted",
+          "worker.registered",
+          "worker.heartbeat",
+          "experiment.logged",
+          "summary.upserted",
+          "knowledge.created",
+          "session.stopped",
+        ])
+      )
+      expect(
+        syncedEvents.some(
+          (event) =>
+            event.type === "campaign.upserted" &&
+            (event.payload.campaign as { status?: string } | undefined)
+              ?.status === "completed"
+        )
+      ).toBe(true)
+      expect(logs.join("\n")).toContain("final sync: accepted=")
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+      console.warn = originalWarn
+    }
+  })
+})
+
 describe("summary CLI", () => {
   test("rejects non-UUID summary identity flags locally", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
@@ -1157,6 +1883,8 @@ describe("worker output summaries", () => {
       startupTimedOut: false,
       lastOutputAt: null,
       logPath: "/tmp/worker.log",
+      activityLogPath: "/tmp/worker.activity.log",
+      cancelled: false,
     })
 
     expect(summary).toBe("clean final answer")
@@ -1258,6 +1986,349 @@ describe("research status", () => {
     }
   })
 
+  test("repairs terminal worker manifests before computing open slots", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      projectPath: "",
+      baseCommitSha,
+      setup: await readSetupFile(root, ""),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "A focused local change can improve score.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      workerName: "worker-1",
+      agentKind: "codex",
+    })
+    const manifestDir = join(
+      await onyxStateDir(root),
+      "worker-logs",
+      session.session.id
+    )
+    await writeWorkerLaunchManifest({
+      schemaVersion: 1,
+      agentKind: "codex",
+      command: "codex",
+      args: [],
+      onyxShimPath: null,
+      addedWritableRoots: [],
+      cwd: root,
+      promptPath: join(manifestDir, "prompt.md"),
+      logPath: join(manifestDir, "worker.log"),
+      activityLogPath: join(manifestDir, "worker.activity.log"),
+      manifestPath: join(manifestDir, "worker.manifest.json"),
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+      version: null,
+      startedAt: "2026-06-20T00:00:00.000Z",
+      lastOutputAt: "2026-06-20T00:00:01.000Z",
+      completedAt: "2026-06-20T00:00:02.000Z",
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+      preflight: null,
+      finalization: {
+        attempted: true,
+        salvaged: false,
+        finalizationStatus: "already_logged",
+        commitSha: baseCommitSha,
+        measurementBaseCommitSha: null,
+        unloggedCommitCount: 0,
+        workerBranchPushStatus: "pushed",
+        rootDriftStatus: "clean",
+        error: null,
+      },
+    })
+    await writeState(root, {
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          sessionId: session.session.id,
+          baseCommitSha,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          status: "running",
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const lines: string[] = []
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const output = JSON.parse(lines.join("\n")) as {
+      session: { activeWorkers: number; openSlots: number }
+      workers: Array<{ id: string; status: string }>
+    }
+    expect(output.session.activeWorkers).toBe(0)
+    expect(output.session.openSlots).toBe(1)
+    expect(output.workers.find((item) => item.id === worker.id)?.status).toBe(
+      "completed"
+    )
+  })
+
+  test("reports open slots immediately after a worker completes", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      projectPath: "",
+      baseCommitSha,
+      setup: await readSetupFile(root, ""),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "A focused local change can improve score.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      workerName: "worker-1",
+      agentKind: "codex",
+    })
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "completed",
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      event: "completed",
+    })
+    await writeState(root, {
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          sessionId: session.session.id,
+          baseCommitSha,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          status: "running",
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const lines: string[] = []
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const output = JSON.parse(lines.join("\n")) as {
+      session: { activeWorkers: number; openSlots: number }
+      workers: Array<{ id: string; status: string }>
+    }
+    expect(output.session.activeWorkers).toBe(0)
+    expect(output.session.openSlots).toBe(1)
+    expect(output.workers.find((item) => item.id === worker.id)?.status).toBe(
+      "completed"
+    )
+  })
+
+  test("emits structured launch suggestions only for unworked hypotheses", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const setup = await readSetupFile(root, "")
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      description: "Improve score.",
+      projectPath: "",
+      baseCommitSha,
+      setup,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "Try a new controller",
+          statement: "A focused controller change can improve score.",
+          startingPoints: ["src"],
+          avoidList: ["onyx/"],
+          successSignals: ["METRIC score improves"],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          projectPath: "",
+          baseCommitSha,
+          metricName: "score",
+          metricUnit: null,
+          metricDirection: "maximize",
+          sessionId: session.session.id,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          status: "running",
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+      const firstStatus = JSON.parse(logs.pop() ?? "{}") as {
+        launchSuggestions: Array<{ kind: string; hypothesisId?: string }>
+      }
+      expect(firstStatus.launchSuggestions).toEqual([
+        expect.objectContaining({
+          kind: "launch_worker",
+          hypothesisId: hypothesis.id,
+        }),
+      ])
+
+      await logLocalExperiment({
+        root,
+        record: {
+          schemaVersion: 1,
+          type: "campaign_experiment_logged",
+          createdAt: "2026-06-20T00:00:00.000Z",
+          runRef: "local/status-suggestion/1",
+          campaignName,
+          name: "worked",
+          description: null,
+          projectPath: "",
+          baseCommitSha,
+          resultCommitSha: baseCommitSha,
+          resultRef: `refs/onyx/experiments/${campaign.id}/local/status-suggestion/1`,
+          status: "succeeded",
+          setupCompliance: {
+            status: "passed",
+            protectedPathsChanged: [],
+            outOfScopePathsChanged: [],
+            setupPathsChanged: [],
+            notes: null,
+          },
+          primaryMetricName: "score",
+          primaryMetricValue: 1,
+          metrics: { score: 1 },
+          agentNotes: {},
+          checks: null,
+          hypothesisId: hypothesis.id,
+          sessionId: session.session.id,
+        },
+      })
+
+      logs.length = 0
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+      const secondStatus = JSON.parse(logs.join("\n")) as {
+        launchSuggestions: Array<{ kind: string }>
+      }
+      expect(secondStatus.launchSuggestions).toEqual([
+        expect.objectContaining({ kind: "add_hypothesis" }),
+      ])
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
   test("completed sessions refresh cached state and do not suggest workers", async () => {
     const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
     const setup = await readSetupFile(root, "")
@@ -1312,6 +2383,32 @@ describe("research status", () => {
           endTimeMs: Date.now() + 60_000,
           status: "running",
         },
+      },
+    })
+    await upsertWorkflowRun({
+      root,
+      run: {
+        id: "workflow-finish-blocked",
+        campaignId: campaign.id,
+        campaignName,
+        projectPath: "",
+        runRef: "local/smoke/finish-blocked",
+        baseCommitSha,
+        resultCommitSha: null,
+        resultRef: `refs/onyx/experiments/${campaign.id}/local/smoke/finish-blocked`,
+        setupHash: setupHash(setup),
+        status: "blocked",
+        currentStepIndex: 0,
+        metrics: {},
+        blockReason:
+          "Workflow attempts must contain exactly one result commit over the base commit.",
+        createdAt: "2026-06-20T00:00:00.000Z",
+        startedAt: "2026-06-20T00:00:00.000Z",
+        completedAt: null,
+        updatedAt: "2026-06-20T00:00:00.000Z",
+        sessionId: session.session.id,
+        workerId: "77777777-7777-4777-8777-777777777777",
+        hypothesisId: hypothesis.id,
       },
     })
 
@@ -1376,12 +2473,25 @@ describe("research status", () => {
     const status = JSON.parse(logs.join("\n")) as {
       campaign: { status: string }
       session: { status: string; openSlots: number }
-      launchSuggestions: string[]
+      launchSuggestions: Array<{ kind: string; command: string }>
     }
     expect(status.campaign.status).toBe("completed")
     expect(status.session.status).toBe("completed")
     expect(status.session.openSlots).toBe(2)
     expect(status.launchSuggestions).toEqual([])
+    const abandoned = await readWorkflowRun(root, "workflow-finish-blocked")
+    expect(abandoned?.status).toBe("abandoned")
+    await expect(
+      commandWorkflowStatus({
+        positional: ["workflow", "status"],
+        options: {
+          cwd: root,
+          campaign: campaignName,
+          active: "true",
+          json: "true",
+        },
+      })
+    ).rejects.toThrow("No active workflow runs exist")
   })
 })
 
@@ -1819,7 +2929,48 @@ describe("setup workflow", () => {
         "edit",
         "evaluate",
       ])
+      const instructions = await readFile(join(root, "onyx", "onyx.md"), "utf8")
+      expect(instructions).toContain("## Goal")
+      expect(instructions).toContain("Improve score")
+      expect(instructions).toContain("## Primary Metric")
+      expect(instructions).toContain("METRIC score=<number>")
+      expect(instructions).toContain("## Workflow Contract")
+      expect(instructions).toContain("onyx exp run")
+      expect(instructions).toContain("## First-Run Checklist")
       expect(USAGE).not.toContain("onyx setup require")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("setup init writes explicit editable scope and eval command without inference", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-setup-explicit-"))
+    const previousCwd = process.cwd()
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: {
+          goal: "Improve score",
+          "metric-name": "score",
+          "editable-scope": "src,tests/fixtures",
+          "eval-command": "printf 'METRIC score=7\\n'",
+        },
+      })
+      const setup = await readSetupFile(root, "")
+      expect(setup.scope.editable).toEqual(["src", "tests/fixtures"])
+      const evalSh = await readFile(
+        join(root, "onyx", "tools", "evaluation", "run.sh"),
+        "utf8"
+      )
+      expect(evalSh).toContain("printf 'METRIC score=7\\n'")
+      expect(evalSh).not.toContain("TODO: replace")
+      const instructions = await readFile(join(root, "onyx", "onyx.md"), "utf8")
+      expect(instructions).toContain("- src")
+      expect(instructions).toContain("- tests/fixtures")
+      expect(instructions).toContain("printf 'METRIC score=7\\n'")
+      expect(instructions).toContain("METRIC score=<number>")
     } finally {
       process.chdir(previousCwd)
     }

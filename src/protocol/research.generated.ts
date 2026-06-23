@@ -55,7 +55,7 @@ export const researchRepositorySyncStatusSchema = z.enum([
 ])
 export const researchCampaignStatusSchema = z.enum([
   "active",
-  "paused",
+  "completed",
   "archived",
 ])
 export const researchHypothesisStatusSchema = z.enum([

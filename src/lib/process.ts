@@ -8,6 +8,7 @@ export type ProcessResult = {
   stdout: string
   stderr: string
   timedOut: boolean
+  cancelled?: boolean
 }
 
 export type StreamingProcessResult = ProcessResult & {
@@ -15,6 +16,83 @@ export type StreamingProcessResult = ProcessResult & {
   startupTimedOut: boolean
   lastOutputAt: string | null
   logPath: string
+  activityLogPath: string | null
+  cancelled: boolean
+}
+
+function compact(value: string, limit = 500) {
+  const normalized = value.replace(/\s+/g, " ").trim()
+  return normalized.length > limit
+    ? `${normalized.slice(0, Math.max(0, limit - 1))}...`
+    : normalized
+}
+
+function textFromClaudeMessage(record: Record<string, unknown>) {
+  const message = record.message
+  if (!message || typeof message !== "object") return []
+  const content = (message as Record<string, unknown>).content
+  if (!Array.isArray(content)) return []
+  const lines: string[] = []
+  for (const item of content) {
+    if (!item || typeof item !== "object") continue
+    const block = item as Record<string, unknown>
+    if (block.type === "text" && typeof block.text === "string") {
+      lines.push(compact(block.text))
+    } else if (block.type === "tool_use" && typeof block.name === "string") {
+      lines.push(`tool: ${block.name}`)
+    }
+  }
+  return lines
+}
+
+function activityLinesForOutput(
+  stream: "stdout" | "stderr",
+  text: string
+): string[] {
+  const lines: string[] = []
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line) continue
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>
+      if (
+        parsed.type === "content_block_delta" &&
+        parsed.delta &&
+        typeof parsed.delta === "object" &&
+        (parsed.delta as Record<string, unknown>).type === "text_delta" &&
+        typeof (parsed.delta as Record<string, unknown>).text === "string"
+      ) {
+        lines.push(
+          compact((parsed.delta as Record<string, unknown>).text as string)
+        )
+        continue
+      }
+      if (parsed.type === "assistant") {
+        lines.push(...textFromClaudeMessage(parsed))
+        continue
+      }
+      if (parsed.type === "result" && typeof parsed.subtype === "string") {
+        lines.push(`result: ${parsed.subtype}`)
+        continue
+      }
+      if (parsed.type === "system" && typeof parsed.subtype === "string") {
+        lines.push(`system: ${parsed.subtype}`)
+        continue
+      }
+      if (typeof parsed.message === "string") {
+        lines.push(compact(parsed.message))
+        continue
+      }
+      if (typeof parsed.type === "string") {
+        lines.push(compact(`${parsed.type}`))
+        continue
+      }
+    } catch {
+      lines.push(compact(line))
+      continue
+    }
+  }
+  return lines.map((line) => `[${stream}] ${line}`)
 }
 
 export function runProcess(
@@ -73,7 +151,14 @@ export async function runStreamingProcess(
     startupTimeoutMs?: number
     killGraceMs?: number
     logPath: string
+    activityLogPath?: string
     logHeader?: string
+    cancel?: {
+      shouldCancel: () => boolean | Promise<boolean>
+      graceMs?: number
+      pollMs?: number
+      reason?: string
+    }
     onOutput?: (event: {
       stream: "stdout" | "stderr"
       at: string
@@ -82,10 +167,16 @@ export async function runStreamingProcess(
   }
 ): Promise<StreamingProcessResult> {
   await mkdir(dirname(options.logPath), { recursive: true })
+  if (options.activityLogPath) {
+    await mkdir(dirname(options.activityLogPath), { recursive: true })
+  }
 
   return new Promise((resolveProcess, reject) => {
     const useProcessGroup = process.platform !== "win32"
     const log = createWriteStream(options.logPath, { flags: "a" })
+    const activityLog = options.activityLogPath
+      ? createWriteStream(options.activityLogPath, { flags: "a" })
+      : null
     const startedAt = new Date().toISOString()
     log.write(
       [
@@ -93,6 +184,16 @@ export async function runStreamingProcess(
         `# onyx worker process started ${startedAt}`,
         `# command: ${command} ${args.join(" ")}`,
         options.cwd ? `# cwd: ${options.cwd}` : null,
+        options.logHeader ?? null,
+        "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    )
+    activityLog?.write(
+      [
+        `# onyx worker activity started ${startedAt}`,
+        `# command: ${command} ${args.join(" ")}`,
         options.logHeader ?? null,
         "",
       ]
@@ -110,8 +211,11 @@ export async function runStreamingProcess(
     const stderr: Buffer[] = []
     let timedOut = false
     let startupTimedOut = false
+    let cancelled = false
     let closed = false
     let forceKill: ReturnType<typeof setTimeout> | null = null
+    let cancelPoll: ReturnType<typeof setInterval> | null = null
+    let cancelCheckRunning = false
     let lastOutputAt: string | null = null
     let interrupted = false
 
@@ -127,14 +231,28 @@ export async function runStreamingProcess(
       child.kill(signal)
     }
 
-    const terminate = (startup: boolean) => {
+    const terminate = ({
+      startup = false,
+      markTimedOut = true,
+      markCancelled = false,
+    }: {
+      startup?: boolean
+      markTimedOut?: boolean
+      markCancelled?: boolean
+    } = {}) => {
       if (closed) return
-      timedOut = true
+      timedOut = timedOut || markTimedOut
       startupTimedOut = startupTimedOut || startup
+      cancelled = cancelled || markCancelled
       killChild("SIGTERM")
-      forceKill = setTimeout(() => {
-        if (!closed) killChild("SIGKILL")
-      }, options.killGraceMs ?? 5000)
+      forceKill = setTimeout(
+        () => {
+          if (!closed) killChild("SIGKILL")
+        },
+        markCancelled
+          ? (options.cancel?.graceMs ?? options.killGraceMs ?? 5000)
+          : (options.killGraceMs ?? 5000)
+      )
     }
 
     const signalHandlers = new Map<NodeJS.Signals, () => void>()
@@ -146,7 +264,7 @@ export async function runStreamingProcess(
           return
         }
         interrupted = true
-        terminate(false)
+        terminate()
       }
       signalHandlers.set(signal, handler)
       process.on(signal, handler)
@@ -162,13 +280,39 @@ export async function runStreamingProcess(
     const timeout =
       options.timeoutMs === undefined
         ? null
-        : setTimeout(() => terminate(false), options.timeoutMs)
+        : setTimeout(() => terminate(), options.timeoutMs)
     const startupTimeout =
       options.startupTimeoutMs === undefined || options.startupTimeoutMs <= 0
         ? null
         : setTimeout(() => {
-            if (!lastOutputAt) terminate(true)
+            if (!lastOutputAt) terminate({ startup: true })
           }, options.startupTimeoutMs)
+    if (options.cancel) {
+      cancelPoll = setInterval(() => {
+        if (closed || cancelled || cancelCheckRunning) return
+        cancelCheckRunning = true
+        Promise.resolve(options.cancel!.shouldCancel())
+          .then((shouldCancel) => {
+            if (!shouldCancel || closed || cancelled) return
+            const at = new Date().toISOString()
+            activityLog?.write(
+              `[harness ${at}] stop requested; terminating provider process after ${Math.round((options.cancel?.graceMs ?? options.killGraceMs ?? 5000) / 1000)}s grace\n`
+            )
+            terminate({ markTimedOut: false, markCancelled: true })
+          })
+          .catch((error) => {
+            const at = new Date().toISOString()
+            activityLog?.write(
+              `[harness ${at}] stop check failed: ${
+                error instanceof Error ? error.message : String(error)
+              }\n`
+            )
+          })
+          .finally(() => {
+            cancelCheckRunning = false
+          })
+      }, options.cancel.pollMs ?? 2000)
+    }
 
     if (options.stdin !== undefined) {
       child.stdin?.end(options.stdin)
@@ -182,6 +326,9 @@ export async function runStreamingProcess(
       else stderr.push(chunk)
       log.write(`\n[${stream} ${at}]\n`)
       log.write(chunk)
+      for (const line of activityLinesForOutput(stream, text)) {
+        activityLog?.write(`[${at}] ${line}\n`)
+      }
       options.onOutput?.({ stream, at, text })
     }
 
@@ -192,8 +339,12 @@ export async function runStreamingProcess(
       if (timeout) clearTimeout(timeout)
       if (startupTimeout) clearTimeout(startupTimeout)
       if (forceKill) clearTimeout(forceKill)
+      if (cancelPoll) clearInterval(cancelPoll)
       removeSignalHandlers()
       log.end(`\n# onyx worker process failed to start: ${error.message}\n`)
+      activityLog?.end(
+        `# onyx worker activity failed to start: ${error.message}\n`
+      )
       reject(error)
     })
     child.on("close", (code, signal) => {
@@ -202,6 +353,7 @@ export async function runStreamingProcess(
       if (timeout) clearTimeout(timeout)
       if (startupTimeout) clearTimeout(startupTimeout)
       if (forceKill) clearTimeout(forceKill)
+      if (cancelPoll) clearInterval(cancelPoll)
       removeSignalHandlers()
       log.end(
         [
@@ -211,6 +363,16 @@ export async function runStreamingProcess(
           `# signal: ${signal ?? "null"}`,
           `# timedOut: ${timedOut}`,
           `# startupTimedOut: ${startupTimedOut}`,
+          `# cancelled: ${cancelled}`,
+          "",
+        ].join("\n")
+      )
+      activityLog?.end(
+        [
+          `# onyx worker activity exited ${new Date().toISOString()}`,
+          `# code: ${code ?? "null"}`,
+          `# signal: ${signal ?? "null"}`,
+          `# cancelled: ${cancelled}`,
           "",
         ].join("\n")
       )
@@ -220,9 +382,11 @@ export async function runStreamingProcess(
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
         timedOut,
+        cancelled,
         startupTimedOut,
         lastOutputAt,
         logPath: options.logPath,
+        activityLogPath: options.activityLogPath ?? null,
       })
     })
   })

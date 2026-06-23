@@ -18,6 +18,7 @@ import {
   type ApiCampaign,
   type ApiHypothesis,
   type ApiSummary,
+  type ApiWorker,
 } from "../lib/api"
 import {
   readSetupFile,
@@ -38,6 +39,7 @@ import {
   type StreamingProcessResult,
 } from "../lib/process"
 import {
+  abandonBlockedWorkflowRunsForSession,
   cacheLocalCampaign,
   applyRemoteExperimentGitStatuses,
   completeLocalCampaign,
@@ -50,9 +52,11 @@ import {
   listLocalExperimentHistory,
   listLocalKnowledge,
   listLocalSummaries,
+  listResearchSyncConflicts,
   localBriefMarkdown,
   localCampaignByName,
   pendingResearchSyncCount,
+  pendingResearchSyncEvents,
   researchSyncConflictCount,
   recordLocalWorkerHeartbeat,
   registerLocalWorker,
@@ -74,6 +78,7 @@ import {
   writeWorkerOnyxShim,
   writeWorkerLaunchManifest,
   type WorkerFinalizationManifest,
+  type WorkerFinalizationStatus,
   type WorkerInvocation,
   type WorkerLaunchManifest,
   type WorkerOnyxShim,
@@ -83,6 +88,7 @@ import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
 const MAX_WORKER_SHUTDOWN_CUSHION_MS = 90_000
 const MIN_WORKER_SHUTDOWN_CUSHION_MS = 15_000
 const MAX_WORKER_HARD_STOP_GRACE_MS = 30_000
+const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
 
 function positiveIntegerOption(args: Args, name: string, fallback: number) {
   const raw = args.options[name]
@@ -366,6 +372,22 @@ const SUMMARY_KINDS = [
 
 type SummaryKind = ApiSummary["summaryKind"]
 
+type ResearchLaunchSuggestion =
+  | {
+      kind: "launch_worker"
+      command: string
+      sessionId: string
+      hypothesisId: string
+      hypothesisName: string
+      reason: string
+    }
+  | {
+      kind: "add_hypothesis"
+      command: string
+      sessionId: string
+      reason: string
+    }
+
 function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
   const kind = args.options.kind ?? fallback
   if (!SUMMARY_KINDS.includes(kind as SummaryKind)) {
@@ -374,6 +396,143 @@ function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
     )
   }
   return kind as SummaryKind
+}
+
+function workerIsActive(worker: Pick<ApiWorker, "status">) {
+  return ["idle", "running", "stale"].includes(worker.status)
+}
+
+function workerIsCompleted(worker: Pick<ApiWorker, "status">) {
+  return worker.status === "completed"
+}
+
+function terminalStatusFromManifest(
+  manifest: WorkerLaunchManifest
+): ApiWorker["status"] | null {
+  if (manifest.status === "completed") return "completed"
+  if (manifest.status === "failed") return "failed"
+  if (manifest.status === "stopped") return "stopped"
+  return null
+}
+
+async function reconcileTerminalWorkerManifests({
+  root,
+  sessionId,
+  workers,
+  manifests,
+}: {
+  root: string
+  sessionId: string
+  workers: ApiWorker[]
+  manifests: WorkerLaunchManifest[]
+}) {
+  const workersById = new Map(workers.map((worker) => [worker.id, worker]))
+  let repaired = 0
+  for (const manifest of manifests) {
+    const status = terminalStatusFromManifest(manifest)
+    if (!status) continue
+    const worker = workersById.get(manifest.workerId)
+    if (!worker || worker.sessionId !== sessionId || !workerIsActive(worker)) {
+      continue
+    }
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status,
+      sessionId,
+      hypothesisId: worker.hypothesisId,
+      phase: status,
+      event: "manifest_reconciled",
+      progressMessage: `Worker manifest shows ${status}`,
+      gitLabel:
+        manifest.finalization?.commitSha ??
+        manifest.finalization?.measurementBaseCommitSha ??
+        worker.gitLabel,
+      metadata: {
+        manifestPath: manifest.manifestPath,
+        reconciledFrom: "worker-manifest",
+      },
+    })
+    repaired += 1
+  }
+  return repaired
+}
+
+function launchSuggestionsForSession({
+  sessionId,
+  sessionStatus,
+  openSlots,
+  stopping,
+  hypotheses,
+  workers,
+}: {
+  sessionId: string | null
+  sessionStatus: string | null
+  openSlots: number | null
+  stopping: boolean
+  hypotheses: ApiHypothesis[]
+  workers: ApiWorker[]
+}): ResearchLaunchSuggestion[] {
+  if (
+    !sessionId ||
+    sessionStatus !== "running" ||
+    openSlots === null ||
+    openSlots <= 0 ||
+    stopping
+  ) {
+    return []
+  }
+
+  const activeHypotheses = hypotheses.filter(
+    (hypothesis) => hypothesis.status === "active"
+  )
+  const launchable = activeHypotheses.filter((hypothesis) => {
+    const relatedWorkers = workers.filter(
+      (worker) => worker.hypothesisId === hypothesis.id
+    )
+    return (
+      !hypothesis.lastWorkedAt &&
+      !relatedWorkers.some(workerIsActive) &&
+      !relatedWorkers.some(workerIsCompleted)
+    )
+  })
+
+  if (launchable.length > 0) {
+    return launchable.slice(0, openSlots).map((hypothesis) => ({
+      kind: "launch_worker" as const,
+      command: `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id}`,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      reason: "active hypothesis has not been worked and has no active worker",
+    }))
+  }
+
+  const allExistingWorked =
+    activeHypotheses.length > 0 &&
+    activeHypotheses.every((hypothesis) => {
+      const relatedWorkers = workers.filter(
+        (worker) => worker.hypothesisId === hypothesis.id
+      )
+      return Boolean(hypothesis.lastWorkedAt) || relatedWorkers.length > 0
+    })
+
+  if (activeHypotheses.length === 0 || allExistingWorked) {
+    return [
+      {
+        kind: "add_hypothesis" as const,
+        command:
+          "onyx research hypothesis add --campaign <name> --focus <focus> --hypothesis <statement>",
+        sessionId,
+        reason:
+          activeHypotheses.length === 0
+            ? "no active hypotheses are available for open worker slots"
+            : "open worker slots remain, but existing active hypotheses have already been worked",
+      },
+    ]
+  }
+
+  return []
 }
 
 const UUID_PATTERN =
@@ -441,6 +600,60 @@ function createSyncSupervisor({
       stopped = true
       if (timer) clearInterval(timer)
     },
+  }
+}
+
+async function drainFinalSync({
+  root,
+  args,
+  timeoutMs,
+}: {
+  root: string
+  args: Args
+  timeoutMs: number
+}) {
+  const deadline = Date.now() + timeoutMs
+  let accepted = 0
+  let offline = false
+  do {
+    const result = await flushOutbox(root, args, { quiet: true })
+    accepted += result.flushed
+    offline = offline || result.offline
+    if (result.pending === 0 || result.offline) break
+    await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
+  } while (Date.now() < deadline)
+
+  const [pending, conflicts] = await Promise.all([
+    pendingResearchSyncCount(root).catch(() => 0),
+    researchSyncConflictCount(root).catch(() => 0),
+  ])
+  const [firstConflict] = await listResearchSyncConflicts(root).catch(() => [])
+  const [firstPendingError] = (
+    await pendingResearchSyncEvents(root, 20).catch(() => [])
+  ).filter((event) => event.lastError)
+  return {
+    accepted,
+    pending,
+    conflicts,
+    offline,
+    firstFailed: firstConflict ?? firstPendingError ?? null,
+  }
+}
+
+function printFinalSyncReport(
+  report: Awaited<ReturnType<typeof drainFinalSync>>
+) {
+  console.log(
+    `final sync: accepted=${report.accepted} pending=${report.pending} conflicts=${report.conflicts}${
+      report.offline ? " offline=true" : ""
+    }`
+  )
+  if (report.firstFailed) {
+    console.warn(
+      `first failed sync event: ${report.firstFailed.type}/${report.firstFailed.entityType}/${report.firstFailed.entityId}: ${
+        report.firstFailed.lastError ?? "sync conflict"
+      }`
+    )
   }
 }
 
@@ -586,18 +799,22 @@ async function assertLocalSetupReady(root: string, projectPath: string) {
   const validation = await readValidationFile(root, projectPath)
   if (!validation) {
     throw new Error(
-      "Missing onyx/validation.json. Run `onyx setup validate` before starting research."
+      `Missing ${onyxPath(root, projectPath, "validation.json")}. Run \`onyx setup validate\` before starting research.`
     )
   }
   if (!validationMatchesSetup({ setup, validation })) {
     throw new Error(
-      "onyx/validation.json is stale for the current setup. Run `onyx setup validate`."
+      `${onyxPath(root, projectPath, "validation.json")} is stale for the current setup. Run \`onyx setup validate\`, review any blocking checks, then commit the setup surface.`
     )
   }
   const failing = validation.checks.filter((check) => check.status === "failed")
   if (failing.length > 0) {
     throw new Error(
-      `Setup check(s) are failing: ${failing.map((check) => check.id).join(", ")}. Run \`onyx setup validate\`.`
+      [
+        "Setup validation has blocking failure(s):",
+        ...failing.map((check) => `- ${check.id}: ${check.message}`),
+        "Run `onyx setup validate`, fix the listed setup files/tools, and commit the setup surface before `onyx research start`.",
+      ].join("\n")
     )
   }
   return { setup, validation }
@@ -776,35 +993,135 @@ async function commitIfNeeded(worktree: string, hypothesis: ApiHypothesis) {
   return { commitSha: await currentCommit(worktree), changed: true }
 }
 
-async function hasLocalExperimentFor({
+async function localExperimentCommitSetFor({
   root,
   campaignName,
   hypothesisId,
-  resultCommitSha,
 }: {
   root: string
   campaignName: string
   hypothesisId: string
-  resultCommitSha: string
 }) {
   const [experiments, attempts] = await Promise.all([
     listLocalExperimentHistory(root).catch(() => []),
     listLocalAttempts(root).catch(() => []),
   ])
-  return (
-    experiments.some(
-      (record) =>
-        record.campaignName === campaignName &&
-        record.hypothesisId === hypothesisId &&
-        record.resultCommitSha === resultCommitSha
-    ) ||
-    attempts.some(
-      (record) =>
-        record.campaignName === campaignName &&
-        record.hypothesisId === hypothesisId &&
-        record.resultCommitSha === resultCommitSha
-    )
+  const commits = new Set<string>()
+  for (const record of [...experiments, ...attempts]) {
+    if (
+      record.campaignName === campaignName &&
+      record.hypothesisId === hypothesisId &&
+      record.resultCommitSha
+    ) {
+      commits.add(record.resultCommitSha)
+    }
+  }
+  return commits
+}
+
+async function hasWorkerLoggedAttempt({
+  root,
+  workerId,
+}: {
+  root: string
+  workerId: string
+}) {
+  const [experiments, attempts] = await Promise.all([
+    listLocalExperimentHistory(root).catch(() => []),
+    listLocalAttempts(root).catch(() => []),
+  ])
+  return [...experiments, ...attempts].some(
+    (record) => record.workerId === workerId
   )
+}
+
+type FinalizationCommitAnalysis =
+  | {
+      kind: "already_logged"
+      unloggedCommits: string[]
+      measurementBaseCommitSha: null
+      reason: null
+    }
+  | {
+      kind: "single_unlogged_head"
+      unloggedCommits: string[]
+      measurementBaseCommitSha: string
+      reason: null
+    }
+  | {
+      kind: "salvage_only"
+      unloggedCommits: string[]
+      measurementBaseCommitSha: null
+      reason: string
+    }
+
+async function analyzeFinalizationCommits({
+  worktree,
+  baseCommitSha,
+  headCommitSha,
+  loggedCommits,
+}: {
+  worktree: string
+  baseCommitSha: string
+  headCommitSha: string
+  loggedCommits: Set<string>
+}): Promise<FinalizationCommitAnalysis> {
+  if (loggedCommits.has(headCommitSha)) {
+    return {
+      kind: "already_logged",
+      unloggedCommits: [],
+      measurementBaseCommitSha: null,
+      reason: null,
+    }
+  }
+
+  let commits: string[]
+  try {
+    commits = (await git(["rev-list", "--reverse", `${baseCommitSha}..${headCommitSha}`], worktree))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+  } catch (error) {
+    return {
+      kind: "salvage_only",
+      unloggedCommits: [headCommitSha],
+      measurementBaseCommitSha: null,
+      reason: `Unable to inspect commits between hypothesis base and worker HEAD: ${errorMessage(error)}`,
+    }
+  }
+
+  const unloggedCommits = commits.filter((commit) => !loggedCommits.has(commit))
+  if (
+    unloggedCommits.length === 1 &&
+    unloggedCommits[0] === headCommitSha
+  ) {
+    const parentLine = await git(["rev-list", "--parents", "-n", "1", headCommitSha], worktree)
+    const [, parentCommitSha] = parentLine.trim().split(/\s+/)
+    if (!parentCommitSha) {
+      return {
+        kind: "salvage_only",
+        unloggedCommits,
+        measurementBaseCommitSha: null,
+        reason: "Unable to find a parent commit for the unlogged worker HEAD.",
+      }
+    }
+    return {
+      kind: "single_unlogged_head",
+      unloggedCommits,
+      measurementBaseCommitSha: parentCommitSha,
+      reason: null,
+    }
+  }
+
+  return {
+    kind: "salvage_only",
+    unloggedCommits,
+    measurementBaseCommitSha: null,
+    reason:
+      unloggedCommits.length === 0
+        ? "Worker HEAD was not locally logged, but no unlogged commit range could be measured safely."
+        : `Worker HEAD contains ${unloggedCommits.length} unlogged commits; finalization only measures exactly one unlogged HEAD commit.`,
+  }
 }
 
 async function withoutProcessExitCode<T>(fn: () => Promise<T>) {
@@ -817,7 +1134,7 @@ async function withoutProcessExitCode<T>(fn: () => Promise<T>) {
   }
 }
 
-async function finalizeHypothesisAttempt({
+export async function finalizeHypothesisAttempt({
   root,
   worktree,
   campaign,
@@ -841,8 +1158,10 @@ async function finalizeHypothesisAttempt({
   const manifest: WorkerFinalizationManifest = {
     attempted: false,
     salvaged: workerFailed,
+    finalizationStatus: "none",
     commitSha: null,
-    experimentLogged: false,
+    measurementBaseCommitSha: null,
+    unloggedCommitCount: 0,
     workerBranchPushStatus: "not_attempted",
     rootDriftStatus: "not_checked",
     error: null,
@@ -867,14 +1186,28 @@ async function finalizeHypothesisAttempt({
     const commit = await commitIfNeeded(worktree, hypothesis)
     manifest.commitSha = commit.commitSha
 
-    if (
-      !(await hasLocalExperimentFor({
-        root,
-        campaignName: campaign.name,
-        hypothesisId: hypothesis.id,
-        resultCommitSha: commit.commitSha,
-      }))
-    ) {
+    const loggedCommits = await localExperimentCommitSetFor({
+      root,
+      campaignName: campaign.name,
+      hypothesisId: hypothesis.id,
+    })
+    const analysis = await analyzeFinalizationCommits({
+      worktree,
+      baseCommitSha: hypothesis.baseCommitSha,
+      headCommitSha: commit.commitSha,
+      loggedCommits,
+    })
+    manifest.unloggedCommitCount = analysis.unloggedCommits.length
+    manifest.measurementBaseCommitSha = analysis.measurementBaseCommitSha
+
+    if (analysis.kind === "already_logged") {
+      manifest.finalizationStatus = "already_logged"
+    } else if (analysis.kind === "salvage_only") {
+      manifest.finalizationStatus = "salvaged_unmeasured"
+      manifest.salvaged = true
+      manifest.error = analysis.reason
+    } else {
+      const measurementBaseCommitSha = analysis.measurementBaseCommitSha
       let measurementError: string | null = null
       let measuredRunRef: string | null = null
       await withoutProcessExitCode(() =>
@@ -884,7 +1217,7 @@ async function finalizeHypothesisAttempt({
             ...args.options,
             cwd: worktree,
             campaign: campaign.name,
-            base: hypothesis.baseCommitSha,
+            base: measurementBaseCommitSha,
             timeout: "120",
             "checks-timeout": "120",
           },
@@ -904,7 +1237,7 @@ async function finalizeHypothesisAttempt({
             ...args.options,
             cwd: worktree,
             campaign: campaign.name,
-            base: hypothesis.baseCommitSha,
+            base: measurementBaseCommitSha,
             hypothesis: hypothesis.id,
             session: sessionId,
             worker: workerId,
@@ -921,14 +1254,17 @@ async function finalizeHypothesisAttempt({
               workerFailed,
               measurementError,
               hypothesis: hypothesis.name,
+              measurementBaseCommitSha,
+              unloggedCommitCount: analysis.unloggedCommits.length,
             }),
           },
         })
       )
         .then(() => {
-          manifest.experimentLogged = true
+          manifest.finalizationStatus = "measured_and_logged"
         })
         .catch((error) => {
+          manifest.finalizationStatus = "failed"
           manifest.error = [
             manifest.error,
             `experiment log failed: ${errorMessage(error)}`,
@@ -965,6 +1301,7 @@ async function finalizeHypothesisAttempt({
 
     return manifest
   } catch (error) {
+    manifest.finalizationStatus = "failed"
     manifest.error = errorMessage(error)
     return manifest
   }
@@ -1057,6 +1394,35 @@ function processFailure(
   }`
 }
 
+async function harnessShouldStopSession({
+  root,
+  sessionId,
+  args,
+}: {
+  root: string
+  sessionId: string
+  args: Args
+}) {
+  const state = await readState(root).catch(() => null)
+  if (state?.sessions?.[sessionId]?.stopRequested) return true
+  const localSessionState = await getLocalSessionState(root, sessionId).catch(
+    () => null
+  )
+  if (localSessionState && localSessionState.session.status !== "running") {
+    return true
+  }
+  const remote = await getResearchSessionState(sessionId, args).catch(
+    () => null
+  )
+  return Boolean(
+    remote &&
+    (remote.session.status === "stop_requested" ||
+      remote.session.status === "stopped" ||
+      remote.session.status === "completed" ||
+      remote.session.status === "failed")
+  )
+}
+
 async function withWorkerHeartbeat<T>({
   root,
   workerId,
@@ -1065,6 +1431,8 @@ async function withWorkerHeartbeat<T>({
   phase,
   progressMessage,
   metadata,
+  quiet = false,
+  consoleEveryMs = 30_000,
   run,
 }: {
   root: string
@@ -1074,9 +1442,16 @@ async function withWorkerHeartbeat<T>({
   phase: string
   progressMessage: string | (() => string)
   metadata?: () => Record<string, unknown>
+  quiet?: boolean
+  consoleEveryMs?: number
   run: () => Promise<T>
 }): Promise<T> {
+  let lastConsoleAt = 0
   const timer = setInterval(() => {
+    const message =
+      typeof progressMessage === "function"
+        ? progressMessage()
+        : progressMessage
     const heartbeat = {
       root,
       workerId,
@@ -1085,13 +1460,14 @@ async function withWorkerHeartbeat<T>({
       hypothesisId,
       phase,
       event: "heartbeat",
-      progressMessage:
-        typeof progressMessage === "function"
-          ? progressMessage()
-          : progressMessage,
+      progressMessage: message,
       metadata: metadata?.(),
     }
     void recordLocalWorkerHeartbeat(heartbeat).catch(() => {})
+    if (!quiet && Date.now() - lastConsoleAt >= consoleEveryMs) {
+      lastConsoleAt = Date.now()
+      console.log(`worker progress: ${message}`)
+    }
   }, 10_000)
 
   try {
@@ -1109,6 +1485,25 @@ async function mainWorktreeStatus(root: string) {
   return (await git(["status", "--porcelain"], root)).trim()
 }
 
+function finalizationLoggedExperiment(status: WorkerFinalizationStatus) {
+  return status === "measured_and_logged"
+}
+
+function finalizationStatusLabel(status: WorkerFinalizationStatus) {
+  switch (status) {
+    case "none":
+      return "no result changes"
+    case "already_logged":
+      return "already logged"
+    case "measured_and_logged":
+      return "measured and logged"
+    case "salvaged_unmeasured":
+      return "salvaged without measurement"
+    case "failed":
+      return "failed"
+  }
+}
+
 async function assertMainWorktreeClean(root: string, label: string) {
   const status = await mainWorktreeStatus(root)
   if (!status) return
@@ -1120,16 +1515,20 @@ async function assertMainWorktreeClean(root: string, label: string) {
 function workerProgress({
   hypothesisName,
   logPath,
+  activityLogPath,
   lastOutputAt,
 }: {
   hypothesisName: string
   logPath: string
+  activityLogPath?: string | null
   lastOutputAt: string | null
 }) {
   const output = lastOutputAt
     ? `last output ${formatAge(lastOutputAt, Date.now())} ago`
     : "no output yet"
-  return `${hypothesisName} worker running; ${output}; log ${logPath}`
+  return `${hypothesisName} worker running; ${output}; log ${logPath}${
+    activityLogPath ? `; activity ${activityLogPath}` : ""
+  }`
 }
 
 function workerMetadata({
@@ -1142,6 +1541,7 @@ function workerMetadata({
   return {
     launcher: invocation.agentKind,
     workerLogPath: manifest.logPath,
+    workerActivityLogPath: manifest.activityLogPath,
     workerPromptPath: manifest.promptPath,
     lastOutputAt: manifest.lastOutputAt,
     version: manifest.version,
@@ -1155,7 +1555,7 @@ type HypothesisRunResult = {
   hypothesis: ApiHypothesis
   workerId?: string
   resultCommitSha?: string
-  status: "completed" | "failed"
+  status: "completed" | "failed" | "stopped"
   error?: string
 }
 
@@ -1173,6 +1573,8 @@ async function runHypothesisOnce({
   hardEndTimeMs,
   workerTimeoutMs,
   startupTimeoutMs,
+  stopGraceMs,
+  quiet,
   syncSupervisor,
   args,
 }: {
@@ -1189,6 +1591,8 @@ async function runHypothesisOnce({
   hardEndTimeMs: number
   workerTimeoutMs: number
   startupTimeoutMs: number
+  stopGraceMs: number
+  quiet: boolean
   syncSupervisor: ReturnType<typeof createSyncSupervisor>
   args: Args
 }): Promise<HypothesisRunResult> {
@@ -1220,9 +1624,9 @@ async function runHypothesisOnce({
       status: "running",
       sessionId,
       hypothesisId: hypothesis.id,
-      phase: "research",
+      phase: "preflight",
       event: "hypothesis_started",
-      progressMessage: `Running ${hypothesis.name}`,
+      progressMessage: `Preparing ${hypothesis.name} worker preflight`,
     })
 
     const { dir: worktree, branch: workerBranch } = await ensureWorktree({
@@ -1322,6 +1726,16 @@ async function runHypothesisOnce({
       prompt: prompt.markdown,
       addedWritableRoots,
     })
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "running",
+      sessionId,
+      hypothesisId: hypothesis.id,
+      phase: "reading_context",
+      event: "context_ready",
+      progressMessage: `Worker context files are ready for ${hypothesis.name}`,
+    })
     const preflight = await preflightWorkerInvocation(invocation, {
       cwd: worktree,
       env: workerRunEnv,
@@ -1345,6 +1759,7 @@ async function runHypothesisOnce({
       cwd: worktree,
       promptPath: prompt.path,
       logPath: launchPaths.logPath,
+      activityLogPath: launchPaths.activityLogPath,
       manifestPath: launchPaths.manifestPath,
       sessionId,
       hypothesisId: hypothesis.id,
@@ -1364,16 +1779,55 @@ async function runHypothesisOnce({
       finalization: null,
     }
     await writeWorkerLaunchManifest(launchManifest)
+    console.log(`worker: ${worker.id}`)
+    console.log(`hypothesis: ${hypothesis.id} ${hypothesis.name}`)
+    console.log(`worktree: ${worktree}`)
+    console.log(`manifest: ${launchPaths.manifestPath}`)
+    console.log(`raw log: ${launchPaths.logPath}`)
+    console.log(`activity log: ${launchPaths.activityLogPath}`)
+    const firstAttemptWarningMs =
+      nonnegativeNumberOption(
+        args,
+        "first-attempt-warning-seconds",
+        DEFAULT_FIRST_ATTEMPT_WARNING_MS / 1000
+      ) * 1000
+    let firstAttemptWarningTimer: ReturnType<typeof setTimeout> | null = null
+    if (firstAttemptWarningMs > 0) {
+      firstAttemptWarningTimer = setTimeout(() => {
+        void hasWorkerLoggedAttempt({ root, workerId: worker.id })
+          .then((hasAttempt) => {
+            if (hasAttempt) return
+            return recordLocalWorkerHeartbeat({
+              root,
+              workerId: worker.id,
+              status: "running",
+              sessionId,
+              hypothesisId: hypothesis.id,
+              phase: "first_attempt",
+              event: "first_attempt_delayed",
+              progressMessage:
+                "No logged workflow attempt yet; worker may still be orienting or sweeping.",
+              metadata: {
+                warningAfterSeconds: Math.round(firstAttemptWarningMs / 1000),
+              },
+            })
+          })
+          .catch(() => {})
+      }, firstAttemptWarningMs)
+      firstAttemptWarningTimer.unref?.()
+    }
     const workerResult = await withWorkerHeartbeat({
       root,
       workerId: worker.id,
       sessionId,
       hypothesisId: hypothesis.id,
-      phase: "research",
+      phase: "first_attempt",
       progressMessage: () =>
         workerProgress({
           hypothesisName: hypothesis.name,
           logPath: launchManifest?.logPath ?? launchPaths.logPath,
+          activityLogPath:
+            launchManifest?.activityLogPath ?? launchPaths.activityLogPath,
           lastOutputAt: launchManifest?.lastOutputAt ?? null,
         }),
       metadata: () =>
@@ -1390,6 +1844,7 @@ async function runHypothesisOnce({
           startupTimeoutMs,
           killGraceMs: 5000,
           logPath: launchPaths.logPath,
+          activityLogPath: launchPaths.activityLogPath,
           logHeader: [
             `# agent: ${invocation.agentKind}`,
             `# prompt: ${prompt.path}`,
@@ -1398,6 +1853,12 @@ async function runHypothesisOnce({
           ].join("\n"),
           stdin: invocation.stdin,
           env: workerRunEnv,
+          cancel: {
+            graceMs: stopGraceMs,
+            pollMs: 5000,
+            shouldCancel: () =>
+              harnessShouldStopSession({ root, sessionId, args }),
+          },
           onOutput: ({ at }) => {
             if (!launchManifest) return
             launchManifest = {
@@ -1408,12 +1869,19 @@ async function runHypothesisOnce({
             void writeWorkerLaunchManifest(launchManifest).catch(() => {})
           },
         }),
+      quiet,
     })
+    if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
+    const stoppedByHarness = workerResult.cancelled
     if (launchManifest) {
       launchManifest = {
         ...launchManifest,
         completedAt: new Date().toISOString(),
-        status: workerResult.code === 0 ? "completed" : "failed",
+        status: stoppedByHarness
+          ? "stopped"
+          : workerResult.code === 0
+            ? "completed"
+            : "failed",
         exitCode: workerResult.code,
         signal: workerResult.signal,
         timedOut: workerResult.timedOut,
@@ -1426,6 +1894,17 @@ async function runHypothesisOnce({
       workerResult,
       `Worker process for ${hypothesis.name}`
     )
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "running",
+      sessionId,
+      hypothesisId: hypothesis.id,
+      phase: "finalizing",
+      event: "finalization_started",
+      progressMessage: `Finalizing ${hypothesis.name} worker output`,
+      gitLabel: resultCommitSha ?? null,
+    })
     const finalization = await finalizeHypothesisAttempt({
       root,
       worktree,
@@ -1435,7 +1914,7 @@ async function runHypothesisOnce({
       workerId: worker.id,
       workerBranch,
       args,
-      workerFailed: Boolean(workerFailure),
+      workerFailed: Boolean(workerFailure) || stoppedByHarness,
     })
     if (finalization.commitSha) resultCommitSha = finalization.commitSha
     if (launchManifest) {
@@ -1445,7 +1924,9 @@ async function runHypothesisOnce({
       }
       await writeWorkerLaunchManifest(launchManifest)
     }
-    if (finalization.experimentLogged) syncSupervisor.request()
+    if (finalizationLoggedExperiment(finalization.finalizationStatus)) {
+      syncSupervisor.request()
+    }
     if (finalization.rootDriftStatus === "dirty") {
       throw new Error(
         finalization.error ??
@@ -1453,11 +1934,62 @@ async function runHypothesisOnce({
       )
     }
 
+    if (stoppedByHarness) {
+      await recordLocalWorkerHeartbeat({
+        root,
+        workerId: worker.id,
+        status: "stopped",
+        sessionId,
+        hypothesisId: hypothesis.id,
+        phase: "stopped",
+        event: "stop_requested",
+        progressMessage: `${hypothesis.name} stopped after session stop request`,
+        gitLabel: resultCommitSha,
+      })
+      await upsertLocalSummary({
+        root,
+        campaignId: campaign.id,
+        sessionId,
+        hypothesisId: hypothesis.id,
+        authoredByWorkerId: worker.id,
+        summaryKind: "hypothesis_summary",
+        title: `${hypothesis.name} worker stopped`,
+        body: [
+          `Outcome: stopped`,
+          `Latest commit: ${resultCommitSha ?? "n/a"}`,
+          `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
+          finalization.workerBranchPushStatus === "failed"
+            ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
+            : `Worker branch push: ${finalization.workerBranchPushStatus}`,
+          finalization.error ? `Finalization note: ${finalization.error}` : "",
+          `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
+          `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
+          `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        isCurrent: false,
+        metadata: {
+          authoredBy: "worker-harness",
+          outcome: "stopped",
+          resultCommitSha: resultCommitSha ?? null,
+          finalization,
+        },
+      })
+      await cleanupWorkerTempDir()
+      return {
+        hypothesis,
+        workerId: worker.id,
+        resultCommitSha,
+        status: "stopped",
+      }
+    }
+
     if (workerFailure) {
       throw new Error(
         `${workerFailure}. ${
           finalization.attempted
-            ? `Best-effort finalization ${finalization.experimentLogged ? "logged an experiment" : "ran"} for ${finalization.commitSha ?? "unknown commit"}. `
+            ? `Best-effort finalization ${finalizationStatusLabel(finalization.finalizationStatus)} for ${finalization.commitSha ?? "unknown commit"}. `
             : ""
         }See worker log: ${launchManifest?.logPath ?? launchPaths.logPath}`
       )
@@ -1485,19 +2017,14 @@ async function runHypothesisOnce({
       body: [
         `Outcome: completed`,
         `Latest commit: ${resultCommitSha ?? "n/a"}`,
-        `Finalization: ${
-          finalization.attempted
-            ? finalization.experimentLogged
-              ? "experiment logged"
-              : "attempted"
-            : "no result changes"
-        }`,
+        `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
         finalization.workerBranchPushStatus === "failed"
           ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
           : `Worker branch push: ${finalization.workerBranchPushStatus}`,
         finalization.error ? `Finalization note: ${finalization.error}` : "",
         `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
-        `Worker log: ${launchManifest?.logPath ?? "n/a"}`,
+        `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
+        `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
       ]
         .filter(Boolean)
         .join("\n"),
@@ -1531,6 +2058,7 @@ async function runHypothesisOnce({
       const metadata = launchManifest
         ? {
             workerLogPath: launchManifest.logPath,
+            workerActivityLogPath: launchManifest.activityLogPath,
             workerPromptPath: launchManifest.promptPath,
             lastOutputAt: launchManifest.lastOutputAt,
             launcher: launchManifest.agentKind,
@@ -1549,32 +2077,39 @@ async function runHypothesisOnce({
         metadata,
       }).catch(() => {})
     }
-    await upsertLocalSummary({
-      root,
-      campaignId: campaign.id,
-      sessionId,
-      hypothesisId: hypothesis.id,
-      authoredByWorkerId: workerId,
-      summaryKind: "hypothesis_summary",
-      title: `${hypothesis.name} worker finalization failed`,
-      body: [
-        `Outcome: failed`,
-        `Error: ${message}`,
-        resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
-        launchManifest?.manifestPath
-          ? `Worker manifest: ${launchManifest.manifestPath}`
-          : "",
-        launchManifest?.logPath ? `Worker log: ${launchManifest.logPath}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      isCurrent: false,
-      metadata: {
-        authoredBy: "worker-harness",
-        outcome: "failed",
-        resultCommitSha: resultCommitSha ?? null,
-      },
-    })
+    if (workerId) {
+      await upsertLocalSummary({
+        root,
+        campaignId: campaign.id,
+        sessionId,
+        hypothesisId: hypothesis.id,
+        authoredByWorkerId: workerId,
+        summaryKind: "hypothesis_summary",
+        title: `${hypothesis.name} worker finalization failed`,
+        body: [
+          `Outcome: failed`,
+          `Error: ${message}`,
+          resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
+          launchManifest?.manifestPath
+            ? `Worker manifest: ${launchManifest.manifestPath}`
+            : "",
+          launchManifest?.activityLogPath
+            ? `Worker activity log: ${launchManifest.activityLogPath}`
+            : "",
+          launchManifest?.logPath
+            ? `Worker raw log: ${launchManifest.logPath}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        isCurrent: false,
+        metadata: {
+          authoredBy: "worker-harness",
+          outcome: "failed",
+          resultCommitSha: resultCommitSha ?? null,
+        },
+      })
+    }
     await cleanupWorkerTempDir()
     return {
       hypothesis,
@@ -1848,9 +2383,26 @@ export async function commandResearchStatus(args: Args) {
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   const scopeAll = args.options["all-sessions"] === "true"
-  const localSessionState = activeSessionId
+  let localSessionState = activeSessionId
     ? await getLocalSessionState(root, activeSessionId).catch(() => null)
     : null
+  const manifests = activeSessionId
+    ? await readWorkerLaunchManifests(root, activeSessionId)
+    : []
+  if (activeSessionId && localSessionState) {
+    const repaired = await reconcileTerminalWorkerManifests({
+      root,
+      sessionId: activeSessionId,
+      workers: localSessionState.workers,
+      manifests,
+    })
+    if (repaired > 0) {
+      localSessionState = await getLocalSessionState(
+        root,
+        activeSessionId
+      ).catch(() => localSessionState)
+    }
+  }
   const overview = localSessionState
     ? {
         campaign: localSessionState.campaign,
@@ -1867,16 +2419,11 @@ export async function commandResearchStatus(args: Args) {
           (worker) => worker.sessionId === activeSessionId
         )
       : overview.workers
-  const manifests = activeSessionId
-    ? await readWorkerLaunchManifests(root, activeSessionId)
-    : []
   const manifestByWorker = new Map(
     manifests.map((manifest) => [manifest.workerId, manifest])
   )
   const sessionState = localSessionState
-  const activeWorkers = workers.filter((worker) =>
-    ["idle", "running", "stale"].includes(worker.status)
-  ).length
+  const activeWorkers = workers.filter(workerIsActive).length
   const target = sessionState?.session.workerTarget ?? null
   const openSlots =
     typeof target === "number" ? Math.max(0, target - activeWorkers) : null
@@ -1891,20 +2438,14 @@ export async function commandResearchStatus(args: Args) {
       : false)
   const pendingSync = await pendingResearchSyncCount(root).catch(() => 0)
   const conflicts = await researchSyncConflictCount(root).catch(() => 0)
-  const launchSuggestions =
-    activeSessionId &&
-    sessionStatus === "running" &&
-    openSlots &&
-    openSlots > 0 &&
-    !stopping
-      ? hypotheses
-          .filter((hypothesis) => hypothesis.status === "active")
-          .slice(0, openSlots)
-          .map(
-            (hypothesis) =>
-              `onyx worker run --session ${activeSessionId} --hypothesis ${hypothesis.id}`
-          )
-      : []
+  const launchSuggestions = launchSuggestionsForSession({
+    sessionId: activeSessionId ?? null,
+    sessionStatus,
+    openSlots,
+    stopping,
+    hypotheses,
+    workers,
+  })
 
   if (args.options.json === "true") {
     console.log(
@@ -1954,7 +2495,13 @@ export async function commandResearchStatus(args: Args) {
       }`
     )
     for (const suggestion of launchSuggestions) {
-      console.log(`next worker: ${suggestion}`)
+      if (suggestion.kind === "launch_worker") {
+        console.log(`next worker: ${suggestion.command} (${suggestion.reason})`)
+      } else {
+        console.log(
+          `next hypothesis: ${suggestion.command} (${suggestion.reason})`
+        )
+      }
     }
   }
   console.log(
@@ -1964,9 +2511,7 @@ export async function commandResearchStatus(args: Args) {
     const relatedWorkers = workers.filter(
       (worker) => worker.hypothesisId === hypothesis.id
     )
-    const activeWorkerCount = relatedWorkers.filter((worker) =>
-      ["idle", "running", "stale"].includes(worker.status)
-    ).length
+    const activeWorkerCount = relatedWorkers.filter(workerIsActive).length
     console.log(
       [
         `  ${hypothesis.name}: ${hypothesis.status}`,
@@ -1996,6 +2541,9 @@ export async function commandResearchStatus(args: Args) {
         `seen=${lastSeen}`,
         `lastOutput=${lastOutput}`,
         manifest?.timedOut ? "timeout=true" : null,
+        manifest?.activityLogPath
+          ? `activity=${manifest.activityLogPath}`
+          : null,
         manifest?.logPath ? `log=${manifest.logPath}` : null,
         manifestError ? `error="${manifestError}"` : null,
       ]
@@ -2337,6 +2885,11 @@ export async function commandResearchFinish(args: Args) {
       stopRequested: false,
     }
     await writeState(root, state)
+    await abandonBlockedWorkflowRunsForSession({
+      root,
+      sessionId,
+      reason: "Campaign finalized; blocked worker workflow is no longer active.",
+    }).catch(() => {})
     await stopLocalSession({
       root,
       sessionId,
@@ -2373,9 +2926,33 @@ export async function commandResearchFinish(args: Args) {
     ).catch(() => {})
   }
   if (args.options.offline !== "true") {
-    await flushOutbox(root, args, { quiet: true }).catch((error) => {
+    try {
+      const report = await drainFinalSync({
+        root,
+        args,
+        timeoutMs: positiveNumberOption(args, "final-sync-timeout", 120) * 1000,
+      })
+      printFinalSyncReport(report)
+    } catch (error) {
+      const [pending, conflicts, pendingEvents, conflictEvents] =
+        await Promise.all([
+          pendingResearchSyncCount(root).catch(() => 0),
+          researchSyncConflictCount(root).catch(() => 0),
+          pendingResearchSyncEvents(root, 20).catch(() => []),
+          listResearchSyncConflicts(root).catch(() => []),
+        ])
+      printFinalSyncReport({
+        accepted: 0,
+        pending,
+        conflicts,
+        offline: false,
+        firstFailed:
+          conflictEvents[0] ??
+          pendingEvents.find((event) => event.lastError) ??
+          null,
+      })
       if (args.options["require-online"] === "true") throw error
-    })
+    }
     await reconcileCampaignIntoLocalState({
       root,
       campaignId: campaign.id,
@@ -2649,6 +3226,8 @@ export async function commandWorkerRun(args: Args) {
     ) * 1000
   const startupTimeoutMs =
     nonnegativeNumberOption(args, "startup-timeout", 90) * 1000
+  const stopGraceMs =
+    nonnegativeNumberOption(args, "stop-grace-seconds", 30) * 1000
   const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
   const finalSyncTimeoutMs =
     positiveNumberOption(args, "final-sync-timeout", 120) * 1000
@@ -2672,9 +3251,24 @@ export async function commandWorkerRun(args: Args) {
     hardEndTimeMs: Date.now() + sessionBudgetMs + hardStopGraceMs,
     workerTimeoutMs,
     startupTimeoutMs,
+    stopGraceMs,
+    quiet: args.options.quiet === "true",
     syncSupervisor,
     args,
   })
+  if (result.workerId) {
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: result.workerId,
+      status: result.status,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      phase: "syncing",
+      event: "final_sync_started",
+      progressMessage: `Draining final sync for ${hypothesis.name}`,
+      gitLabel: result.resultCommitSha ?? null,
+    }).catch(() => {})
+  }
   const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
   if (result.status === "failed") {
     throw new Error(
@@ -2682,6 +3276,6 @@ export async function commandWorkerRun(args: Args) {
     )
   }
   console.log(
-    `Worker completed ${hypothesis.name} at ${result.resultCommitSha ?? "unknown"}; ${pending} sync record(s) pending.`
+    `Worker ${result.status} ${hypothesis.name} at ${result.resultCommitSha ?? "unknown"}; ${pending} sync record(s) pending.`
   )
 }

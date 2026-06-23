@@ -26,7 +26,7 @@ export type ApiCampaign = {
   name: string
   description: string | null
   baseCommitSha: string
-  status?: "active" | "completed" | "deleted"
+  status?: "active" | "completed" | "archived"
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"

@@ -21,6 +21,7 @@ import {
   listLocalAttempts,
   listLocalCampaigns,
   listLocalExperimentHistory,
+  listLocalSummaries,
   listResearchSyncConflicts,
   localBriefMarkdown,
   localCampaignByName,
@@ -236,6 +237,188 @@ describe("SQLite research ledger", () => {
     expect(state.workers[0]?.status).toBe("completed")
   })
 
+  test("serializes concurrent worker registration without SQLite lock errors", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "concurrent-workers",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "two-slots",
+      workerTarget: 2,
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "First focused change.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+        {
+          focus: "try another thing",
+          statement: "Second focused change.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+
+    const results = await Promise.all(
+      session.hypotheses.map((hypothesis, index) =>
+        registerLocalWorker({
+          root,
+          campaignId: campaign.id,
+          sessionId: session.session.id,
+          hypothesisId: hypothesis.id,
+          workerName: `worker-${index + 1}`,
+          agentKind: "codex",
+        })
+      )
+    )
+
+    expect(results).toHaveLength(2)
+    const state = await getLocalSessionState(root, session.session.id)
+    expect(
+      state.workers.filter((worker) => worker.status === "idle")
+    ).toHaveLength(2)
+  })
+
+  test("capacity races fail cleanly without creating summaries", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "one-slot",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "one-slot",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "First focused change.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+        {
+          focus: "try another thing",
+          statement: "Second focused change.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+
+    const results = await Promise.allSettled(
+      session.hypotheses.map((hypothesis, index) =>
+        registerLocalWorker({
+          root,
+          campaignId: campaign.id,
+          sessionId: session.session.id,
+          hypothesisId: hypothesis.id,
+          workerName: `worker-${index + 1}`,
+          agentKind: "codex",
+        })
+      )
+    )
+
+    expect(
+      results.filter((result) => result.status === "fulfilled")
+    ).toHaveLength(1)
+    expect(
+      results.filter((result) => result.status === "rejected")
+    ).toHaveLength(1)
+    const state = await getLocalSessionState(root, session.session.id)
+    expect(state.workers).toHaveLength(1)
+    expect(await listLocalSummaries(root, campaign.id)).toHaveLength(0)
+  })
+
+  test("terminal worker heartbeats do not regress to active states", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "terminal-worker",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "A focused local change can improve score.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const hypothesis = session.hypotheses[0]!
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      workerName: "worker-1",
+      agentKind: "codex",
+    })
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "completed",
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      event: "completed",
+      experimentId: "11111111-1111-4111-8111-111111111111",
+    })
+    const pendingAfterTerminal = await pendingResearchSyncCount(root)
+
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      status: "running",
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      event: "heartbeat",
+      progressMessage: "late heartbeat",
+    })
+
+    const state = await getLocalSessionState(root, session.session.id)
+    expect(state.workers[0]?.status).toBe("completed")
+    expect(state.workers[0]?.currentExperimentId).toBeNull()
+    expect(await pendingResearchSyncCount(root)).toBe(pendingAfterTerminal)
+  })
+
   test("caches server project ids with campaigns", async () => {
     const root = await fixtureRepo()
     const campaign = await cacheLocalCampaign({
@@ -414,6 +597,109 @@ describe("SQLite research ledger", () => {
     })
     expect(brief).toContain("surviving")
     expect(brief).not.toContain("deleted-best")
+  })
+
+  test("updates hypothesis projections independently of campaign best", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "hypothesis-projection",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 2,
+      hypotheses: [
+        {
+          focus: "fast controller",
+          statement: "Try aggressive tuning.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+        {
+          focus: "stable controller",
+          statement: "Try conservative tuning.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+    })
+    const [bestHypothesis, nonBestHypothesis] = session.hypotheses
+    if (!bestHypothesis || !nonBestHypothesis) {
+      throw new Error("expected hypotheses")
+    }
+
+    const campaignBest = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/hypothesis-projection/best",
+        name: "campaign-best",
+        value: 10,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        sessionId: session.session.id,
+        hypothesisId: bestHypothesis.id,
+      }),
+    })
+    const hypothesisProgress = await logLocalExperiment({
+      root,
+      record: experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: "local/hypothesis-projection/non-best",
+        name: "non-best-progress",
+        value: 2,
+        createdAt: "2026-01-02T00:00:00.000Z",
+        sessionId: session.session.id,
+        hypothesisId: nonBestHypothesis.id,
+      }),
+    })
+
+    const state = await getLocalSessionState(root, session.session.id)
+    expect(state.bestExperiment?.id).toBe(campaignBest.id)
+    const projected = state.hypotheses.find(
+      (hypothesis) => hypothesis.id === nonBestHypothesis.id
+    )
+    expect(projected?.bestExperimentId).toBe(hypothesisProgress.id)
+    expect(projected?.bestMetricValue).toBe(2)
+    expect(projected?.lastWorkedAt).toBe("2026-01-02T00:00:00.000Z")
+
+    await applyProjectDeletions({
+      root,
+      deletions: {
+        campaigns: [],
+        experiments: [
+          {
+            experimentId: hypothesisProgress.id,
+            runRef: hypothesisProgress.runRef,
+            campaignId: campaign.id,
+            campaignName: campaign.name,
+            deletedAt: "2026-01-03T00:00:00.000Z",
+          },
+        ],
+      },
+    })
+
+    const afterTombstone = await getLocalSessionState(root, session.session.id)
+    const cleared = afterTombstone.hypotheses.find(
+      (hypothesis) => hypothesis.id === nonBestHypothesis.id
+    )
+    expect(afterTombstone.bestExperiment?.id).toBe(campaignBest.id)
+    expect(cleared?.bestExperimentId).toBeNull()
+    expect(cleared?.bestMetricValue).toBeNull()
+    expect(cleared?.lastWorkedAt).toBeNull()
   })
 
   test("filters experiments that predate a campaign tombstone", async () => {
