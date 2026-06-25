@@ -80,6 +80,8 @@ Do not edit protected setup paths during Research. If setup/eval/tools need to c
 
 Your current working directory is the worker worktree. Treat \`${input.projectRoot}\` as the only project root for edits, shell commands, git commands, evals, checks, and Onyx CLI commands. Do not \`cd\` into a parent checkout or any similarly named repository outside this worktree. Context files under \`.git/onyx\` are read-only coordination files; source edits belong under \`${input.projectRoot}\`.
 
+If you need scratch scripts or generated probes, create them inside this worktree and run them from the worktree. Do not place scripts in \`/tmp\` and import project modules from there; that often breaks local resolution and hides which checkout is being exercised. Remove disposable scratch files before the final commit unless they are intentionally part of the measured change.
+
 ## Loop
 
 1. Run \`onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"\` first for current campaign memory, then read the research spec for project-specific constraints. Inspect the setup file for exact metric, editable scope, protected paths, workflow, and tool policy. Query detailed live state with \`onyx research status --json\`, \`onyx exp list --json\`, \`onyx knowledge list --json\`, and \`onyx summary list --json\` as needed before editing.

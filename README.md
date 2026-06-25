@@ -145,13 +145,19 @@ launches explicitly:
 onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --max-launches 2 --worker-command "<cmd>"
 ```
 
+For large local runs, the supervisor ramps launches in batches
+(`--launch-batch-size`, default up to 10) separated by
+`--launch-interval-seconds` (default 5), backs off briefly when provider
+startup or rate-limit failures happen, and stops launching new workers once the
+shutdown cushion begins.
+
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
 receive the worker prompt over stdin, and write raw stdout/stderr logs,
 readable `.activity.log` files, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-shared sync, coalesced presence updates, stop handling, and final sync for the
-session. `onyx worker run --session <id> --hypothesis <id>` remains available
+shared sync, adaptive coalesced presence updates, sampled durable heartbeats,
+stop handling, and final sync for the session. `onyx worker run --session <id> --hypothesis <id>` remains available
 as a low-level debugging and recovery primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest

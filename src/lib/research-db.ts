@@ -1104,9 +1104,10 @@ export async function cacheLocalCampaign({
         id, name, description, project_path, base_commit_sha, setup_json,
         metric_name, metric_unit, metric_direction, promotion_ref_name,
         server_project_id, status,
-        best_metric_value, best_commit_sha, experiment_count, created_at, updated_at
+        best_experiment_id, best_metric_value, best_commit_sha,
+        experiment_count, last_experiment_at, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         description = excluded.description,
@@ -1119,9 +1120,11 @@ export async function cacheLocalCampaign({
         promotion_ref_name = excluded.promotion_ref_name,
         server_project_id = excluded.server_project_id,
         status = excluded.status,
+        best_experiment_id = excluded.best_experiment_id,
         best_metric_value = excluded.best_metric_value,
         best_commit_sha = excluded.best_commit_sha,
         experiment_count = excluded.experiment_count,
+        last_experiment_at = excluded.last_experiment_at,
         updated_at = excluded.updated_at
     `
     ).run(
@@ -1137,11 +1140,13 @@ export async function cacheLocalCampaign({
       campaign.promotionRefName,
       campaign.projectId,
       campaign.status ?? "active",
+      campaign.bestExperimentId ?? null,
       campaign.bestMetricValue,
       campaign.bestCommitSha,
       campaign.experimentCount,
-      at,
-      at
+      campaign.lastExperimentAt ?? null,
+      campaign.createdAt ?? at,
+      campaign.updatedAt ?? at
     )
   })
   return localCampaignById(root, campaign.id)
@@ -2374,6 +2379,449 @@ export async function applyRemoteExperimentGitStatuses({
   })
 }
 
+function optionalExistingId(
+  db: Db,
+  table: "sessions" | "hypotheses" | "workers" | "experiments",
+  id: string | null | undefined
+) {
+  if (!id) return null
+  const row = db
+    .query(`SELECT id FROM ${table} WHERE id = ?`)
+    .get(id) as Row | null
+  return row ? id : null
+}
+
+function upsertRemoteCampaignForDb(
+  db: Db,
+  campaign: ApiResearchSyncResponse["projectionDeltas"]["campaigns"][number],
+  at: string
+) {
+  const existing = db
+    .query(
+      "SELECT project_path, setup_json, human_feedback FROM campaigns WHERE id = ?"
+    )
+    .get(campaign.id) as Row | null
+  db.query(
+    `
+      INSERT INTO campaigns (
+        id, name, description, project_path, base_commit_sha, setup_json,
+        metric_name, metric_unit, metric_direction, human_feedback,
+        promotion_ref_name, status, best_experiment_id, best_metric_value,
+        best_commit_sha, experiment_count, last_experiment_at,
+        server_project_id, synced_at, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        description = excluded.description,
+        base_commit_sha = excluded.base_commit_sha,
+        metric_name = excluded.metric_name,
+        metric_unit = excluded.metric_unit,
+        metric_direction = excluded.metric_direction,
+        promotion_ref_name = excluded.promotion_ref_name,
+        status = excluded.status,
+        best_experiment_id = excluded.best_experiment_id,
+        best_metric_value = excluded.best_metric_value,
+        best_commit_sha = excluded.best_commit_sha,
+        experiment_count = excluded.experiment_count,
+        last_experiment_at = excluded.last_experiment_at,
+        server_project_id = excluded.server_project_id,
+        synced_at = excluded.synced_at,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    campaign.id,
+    campaign.name,
+    campaign.description,
+    nullableString(existing?.project_path) ?? "",
+    campaign.baseCommitSha,
+    typeof existing?.setup_json === "string" ? existing.setup_json : "{}",
+    campaign.metricName,
+    campaign.metricUnit,
+    campaign.metricDirection,
+    nullableString(existing?.human_feedback),
+    campaign.promotionRefName,
+    campaign.status ?? "active",
+    campaign.bestExperimentId ?? null,
+    campaign.bestMetricValue,
+    campaign.bestCommitSha,
+    campaign.experimentCount,
+    campaign.lastExperimentAt ?? null,
+    campaign.projectId,
+    at,
+    campaign.createdAt ?? at,
+    campaign.updatedAt ?? at
+  )
+}
+
+function upsertRemoteSessionForDb(
+  db: Db,
+  session: ApiResearchSyncResponse["projectionDeltas"]["sessions"][number],
+  at: string
+) {
+  if (
+    !db.query("SELECT id FROM campaigns WHERE id = ?").get(session.campaignId)
+  )
+    return
+  db.query(
+    `
+      INSERT INTO sessions (
+        id, campaign_id, name, status, worker_target, metadata_json,
+        started_at, completed_at, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        name = excluded.name,
+        status = excluded.status,
+        worker_target = excluded.worker_target,
+        metadata_json = excluded.metadata_json,
+        completed_at = excluded.completed_at,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    session.id,
+    session.campaignId,
+    session.name,
+    session.status,
+    session.workerTarget,
+    json(session.metadata),
+    session.startedAt ?? at,
+    session.completedAt ?? null,
+    session.createdAt ?? at,
+    session.updatedAt ?? at
+  )
+}
+
+function upsertRemoteHypothesisForDb(
+  db: Db,
+  hypothesis: ApiResearchSyncResponse["projectionDeltas"]["hypotheses"][number]
+) {
+  if (
+    !db
+      .query("SELECT id FROM campaigns WHERE id = ?")
+      .get(hypothesis.campaignId)
+  ) {
+    return
+  }
+  db.query(
+    `
+      INSERT INTO hypotheses (
+        id, campaign_id, created_by_session_id, name, description, status,
+        base_commit_sha, best_experiment_id, best_metric_value, last_worked_at,
+        plan_json, metadata_json, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        created_by_session_id = excluded.created_by_session_id,
+        name = excluded.name,
+        description = excluded.description,
+        status = excluded.status,
+        base_commit_sha = excluded.base_commit_sha,
+        best_experiment_id = excluded.best_experiment_id,
+        best_metric_value = excluded.best_metric_value,
+        last_worked_at = excluded.last_worked_at,
+        plan_json = excluded.plan_json,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    hypothesis.id,
+    hypothesis.campaignId,
+    optionalExistingId(db, "sessions", hypothesis.createdBySessionId),
+    hypothesis.name,
+    hypothesis.description,
+    hypothesis.status,
+    hypothesis.baseCommitSha,
+    hypothesis.bestExperimentId,
+    hypothesis.bestMetricValue,
+    hypothesis.lastWorkedAt,
+    json(hypothesis.plan),
+    json(hypothesis.metadata),
+    hypothesis.createdAt,
+    hypothesis.updatedAt
+  )
+}
+
+function upsertRemoteWorkerForDb(
+  db: Db,
+  worker: ApiResearchSyncResponse["projectionDeltas"]["workers"][number]
+) {
+  if (!db.query("SELECT id FROM campaigns WHERE id = ?").get(worker.campaignId))
+    return
+  if (
+    !db.query("SELECT id FROM hypotheses WHERE id = ?").get(worker.hypothesisId)
+  )
+    return
+  db.query(
+    `
+      INSERT INTO workers (
+        id, campaign_id, session_id, hypothesis_id, worker_name, agent_kind,
+        runtime, status, started_at, last_seen_at, current_experiment_id, phase,
+        progress_message, git_label, metadata_json, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        session_id = excluded.session_id,
+        hypothesis_id = excluded.hypothesis_id,
+        worker_name = excluded.worker_name,
+        agent_kind = excluded.agent_kind,
+        runtime = excluded.runtime,
+        status = excluded.status,
+        last_seen_at = excluded.last_seen_at,
+        current_experiment_id = excluded.current_experiment_id,
+        phase = excluded.phase,
+        progress_message = excluded.progress_message,
+        git_label = excluded.git_label,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    worker.id,
+    worker.campaignId,
+    optionalExistingId(db, "sessions", worker.sessionId),
+    worker.hypothesisId,
+    worker.workerName,
+    worker.agentKind,
+    worker.runtime,
+    worker.status,
+    worker.startedAt,
+    worker.lastSeenAt,
+    optionalExistingId(db, "experiments", worker.currentExperimentId),
+    worker.phase,
+    worker.progressMessage,
+    worker.gitLabel,
+    json(worker.metadata),
+    worker.createdAt,
+    worker.updatedAt
+  )
+}
+
+function upsertRemoteExperimentForDb(
+  db: Db,
+  experiment: ApiCampaignExperiment
+) {
+  if (
+    !db
+      .query("SELECT id FROM campaigns WHERE id = ?")
+      .get(experiment.campaignId)
+  ) {
+    return
+  }
+  const existing = db
+    .query(
+      `
+        SELECT id FROM experiments
+        WHERE id = ? OR (campaign_id = ? AND run_ref = ?) OR
+          (campaign_id = ? AND result_ref = ?)
+        LIMIT 1
+      `
+    )
+    .get(
+      experiment.id,
+      experiment.campaignId,
+      experiment.runRef,
+      experiment.campaignId,
+      experiment.resultRef
+    ) as Row | null
+  const targetId = (existing?.id as string | undefined) ?? experiment.id
+  const values = [
+    targetId,
+    experiment.campaignId,
+    optionalExistingId(db, "sessions", experiment.sessionId),
+    optionalExistingId(db, "hypotheses", experiment.hypothesisId),
+    optionalExistingId(db, "workers", experiment.workerId),
+    experiment.name,
+    experiment.description,
+    experiment.runRef,
+    experiment.baseCommitSha,
+    experiment.resultCommitSha,
+    experiment.resultRef,
+    experiment.gitStatus,
+    experiment.gitVerifiedAt,
+    experiment.gitStatusReason,
+    experiment.status,
+    experiment.setupCompliance ? json(experiment.setupCompliance) : null,
+    experiment.primaryMetricName,
+    experiment.primaryMetricValue,
+    json(experiment.secondaryMetrics),
+    json(experiment.artifactRefs),
+    json(experiment.agentNotes),
+    experiment.checks ? json(experiment.checks) : null,
+    experiment.durationMs,
+    experiment.outputSummary,
+    experiment.startedAt,
+    experiment.completedAt,
+    experiment.createdAt,
+    experiment.updatedAt,
+  ]
+  if (existing) {
+    db.query(
+      `
+        UPDATE experiments
+        SET campaign_id = ?, session_id = ?, hypothesis_id = ?, worker_id = ?,
+          name = ?, description = ?, run_ref = ?, base_commit_sha = ?,
+          result_commit_sha = ?, result_ref = ?, git_status = ?,
+          git_verified_at = ?, git_status_reason = ?, status = ?,
+          setup_compliance_json = ?, primary_metric_name = ?,
+          primary_metric_value = ?, secondary_metrics_json = ?,
+          artifact_refs_json = ?, agent_notes_json = ?, checks_json = ?,
+          duration_ms = ?, output_summary = ?, started_at = ?,
+          completed_at = ?, created_at = ?, updated_at = ?
+        WHERE id = ?
+      `
+    ).run(...values.slice(1), targetId)
+    return
+  }
+  db.query(
+    `
+      INSERT INTO experiments (
+        id, campaign_id, session_id, hypothesis_id, worker_id, name,
+        description, run_ref, base_commit_sha, result_commit_sha, result_ref,
+        git_status, git_verified_at, git_status_reason, status,
+        setup_compliance_json, primary_metric_name, primary_metric_value,
+        secondary_metrics_json, artifact_refs_json, agent_notes_json,
+        checks_json, duration_ms, output_summary, started_at, completed_at,
+        created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `
+  ).run(...values)
+}
+
+function upsertRemoteSummaryForDb(
+  db: Db,
+  summary: ApiResearchSyncResponse["projectionDeltas"]["summaries"][number]
+) {
+  if (
+    !db.query("SELECT id FROM campaigns WHERE id = ?").get(summary.campaignId)
+  )
+    return
+  db.query(
+    `
+      INSERT INTO summaries (
+        id, campaign_id, session_id, hypothesis_id, authored_by_worker_id,
+        summary_kind, title, body, is_current, metadata_json, created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        session_id = excluded.session_id,
+        hypothesis_id = excluded.hypothesis_id,
+        authored_by_worker_id = excluded.authored_by_worker_id,
+        summary_kind = excluded.summary_kind,
+        title = excluded.title,
+        body = excluded.body,
+        is_current = excluded.is_current,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    summary.id,
+    summary.campaignId,
+    optionalExistingId(db, "sessions", summary.sessionId),
+    optionalExistingId(db, "hypotheses", summary.hypothesisId),
+    optionalExistingId(db, "workers", summary.authoredByWorkerId),
+    summary.summaryKind,
+    summary.title,
+    summary.body,
+    summary.isCurrent ? 1 : 0,
+    json(summary.metadata),
+    summary.createdAt,
+    summary.updatedAt
+  )
+}
+
+function upsertRemoteKnowledgeForDb(
+  db: Db,
+  knowledge: ApiResearchSyncResponse["projectionDeltas"]["knowledge"][number]
+) {
+  if (
+    !db.query("SELECT id FROM campaigns WHERE id = ?").get(knowledge.campaignId)
+  )
+    return
+  db.query(
+    `
+      INSERT INTO knowledge (
+        id, campaign_id, session_id, hypothesis_id, authored_by_worker_id,
+        experiment_id, kind, title, body, confidence, metadata_json,
+        created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        campaign_id = excluded.campaign_id,
+        session_id = excluded.session_id,
+        hypothesis_id = excluded.hypothesis_id,
+        authored_by_worker_id = excluded.authored_by_worker_id,
+        experiment_id = excluded.experiment_id,
+        kind = excluded.kind,
+        title = excluded.title,
+        body = excluded.body,
+        confidence = excluded.confidence,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    knowledge.id,
+    knowledge.campaignId,
+    optionalExistingId(db, "sessions", knowledge.sessionId),
+    optionalExistingId(db, "hypotheses", knowledge.hypothesisId),
+    optionalExistingId(db, "workers", knowledge.authoredByWorkerId),
+    optionalExistingId(db, "experiments", knowledge.experimentId),
+    knowledge.kind,
+    knowledge.title,
+    knowledge.body,
+    knowledge.confidence,
+    json(knowledge.metadata),
+    knowledge.createdAt,
+    knowledge.updatedAt
+  )
+}
+
+export async function applyRemoteProjectionDeltas({
+  root,
+  deltas,
+}: {
+  root: string
+  deltas: ApiResearchSyncResponse["projectionDeltas"]
+}) {
+  const total =
+    deltas.campaigns.length +
+    deltas.sessions.length +
+    deltas.hypotheses.length +
+    deltas.workers.length +
+    deltas.experiments.length +
+    deltas.summaries.length +
+    deltas.knowledge.length
+  if (total === 0) return
+  const at = nowIso()
+  await withResearchDbWrite(root, (db) => {
+    const tx = db.transaction(() => {
+      for (const campaign of deltas.campaigns) {
+        upsertRemoteCampaignForDb(db, campaign, at)
+      }
+      for (const session of deltas.sessions)
+        upsertRemoteSessionForDb(db, session, at)
+      for (const hypothesis of deltas.hypotheses) {
+        upsertRemoteHypothesisForDb(db, hypothesis)
+      }
+      for (const worker of deltas.workers) upsertRemoteWorkerForDb(db, worker)
+      for (const experiment of deltas.experiments) {
+        upsertRemoteExperimentForDb(db, experiment)
+      }
+      // Server projection fields are authoritative; local experiment upserts do
+      // not recompute campaign or hypothesis best pointers.
+      for (const summary of deltas.summaries)
+        upsertRemoteSummaryForDb(db, summary)
+      for (const item of deltas.knowledge) upsertRemoteKnowledgeForDb(db, item)
+    })
+    tx()
+  })
+}
+
 function attemptFromRow(row: Row): LastRunRecord {
   return parseJson<LastRunRecord>(row.record_json, {
     schemaVersion: 1,
@@ -3588,7 +4036,8 @@ function renderLocalResearchBrief({
   } else {
     lines.push(
       ...currentSummaries.map(
-        (summary) => `- ${summary.summaryKind}: ${summary.title}\n${summary.body}`
+        (summary) =>
+          `- ${summary.summaryKind}: ${summary.title}\n${summary.body}`
       )
     )
   }

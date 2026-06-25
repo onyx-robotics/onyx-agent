@@ -115,10 +115,30 @@ describe("SQLite sync", () => {
     const previousApiKey = process.env.ONYX_API_KEY
     process.env.ONYX_API_URL = "https://api.onyx.test"
     process.env.ONYX_API_KEY = "test-key"
+    let syncBody: {
+      pushedExperimentRefs?: Array<{
+        campaignId: string
+        runRef: string
+        resultRef: string
+        resultCommitSha: string
+      }>
+    } | null = null
     globalThis.fetch = (async (_input, init) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as {
-        events: Array<{ eventId: string; sequence: number; entityType: string; entityId: string }>
+        events: Array<{
+          eventId: string
+          sequence: number
+          entityType: string
+          entityId: string
+        }>
+        pushedExperimentRefs?: Array<{
+          campaignId: string
+          runRef: string
+          resultRef: string
+          resultCommitSha: string
+        }>
       }
+      syncBody = body
       return Response.json({
         data: {
           accepted: body.events.length,
@@ -163,6 +183,25 @@ describe("SQLite sync", () => {
     const history = await listLocalExperimentHistory(root)
     const pushed = history.find((record) => record.runRef === experiment.runRef)
     expect(pushed?.gitStatus).toBe("verified")
+    expect(
+      (
+        syncBody as {
+          pushedExperimentRefs?: Array<{
+            campaignId: string
+            runRef: string
+            resultRef: string
+            resultCommitSha: string
+          }>
+        } | null
+      )?.pushedExperimentRefs
+    ).toEqual([
+      {
+        campaignId: campaign.id,
+        runRef: experiment.runRef,
+        resultRef: experiment.resultRef,
+        resultCommitSha: experiment.resultCommitSha,
+      },
+    ])
   })
 
   test("fetches remote tombstones even when no local events are pending", async () => {
@@ -260,10 +299,14 @@ describe("SQLite sync", () => {
     try {
       const result = await flushOutbox(root, parseArgs(["sync"]))
       expect(result).toMatchObject({ flushed: 0, pending: 0, offline: false })
-      expect(paths).toEqual([`/api/v1/research/projects/${projectId}/deletions`])
+      expect(paths).toEqual([
+        `/api/v1/research/projects/${projectId}/deletions`,
+      ])
       const second = await flushOutbox(root, parseArgs(["sync"]))
       expect(second).toMatchObject({ flushed: 0, pending: 0, offline: false })
-      expect(paths).toEqual([`/api/v1/research/projects/${projectId}/deletions`])
+      expect(paths).toEqual([
+        `/api/v1/research/projects/${projectId}/deletions`,
+      ])
     } finally {
       globalThis.fetch = originalFetch
       if (previousApiUrl === undefined) delete process.env.ONYX_API_URL

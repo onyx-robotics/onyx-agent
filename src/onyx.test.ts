@@ -2161,6 +2161,7 @@ describe("automated research smoke", () => {
         "worker-command": fastWorkerCommand(),
         "worker-timeout": "20",
         "startup-timeout": "0",
+        "launch-interval-seconds": "0.01",
         "sync-interval": "60",
         "presence-interval": "60",
         "final-sync-timeout": "1",
@@ -2327,7 +2328,13 @@ describe("automated research smoke", () => {
                   hypotheses: [],
                   workers: [],
                   experiments: [],
-                  experimentsUpdated: 0,
+                  gitVerification: {
+                    checkedCount: 0,
+                    updatedCount: 0,
+                    remainingCount: 0,
+                    limit: 100,
+                    hasMore: false,
+                  },
                 },
               },
             }
@@ -3024,6 +3031,22 @@ describe("research status", () => {
           campaignName,
           campaignId: campaign.id,
           status: "running",
+          ignoredPresence: {
+            total: 2,
+            byReason: {
+              not_found: 1,
+              session_mismatch: 1,
+            },
+            lastAt: "2026-06-20T00:00:03.000Z",
+            recent: [
+              {
+                id: worker.id,
+                reason: "session_mismatch",
+                message: "Research worker belongs to a different session",
+                at: "2026-06-20T00:00:03.000Z",
+              },
+            ],
+          },
         },
       },
     })
@@ -3048,9 +3071,12 @@ describe("research status", () => {
     const output = JSON.parse(lines.join("\n")) as {
       session: { activeWorkers: number; openSlots: number }
       workers: Array<{ id: string; status: string }>
+      ignoredPresence: { total: number; byReason: Record<string, number> }
     }
     expect(output.session.activeWorkers).toBe(0)
     expect(output.session.openSlots).toBe(1)
+    expect(output.ignoredPresence.total).toBe(2)
+    expect(output.ignoredPresence.byReason.session_mismatch).toBe(1)
     expect(output.workers.find((item) => item.id === worker.id)?.status).toBe(
       "completed"
     )

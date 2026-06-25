@@ -69,6 +69,21 @@ export type CliState = {
       maxIterations?: number
       stopRequested?: boolean
       status?: string
+      ignoredPresence?: {
+        total: number
+        byReason: Record<string, number>
+        lastAt: string | null
+        recent: Array<{
+          id: string
+          reason: string
+          message?: string
+          at: string
+        }>
+      }
+      providerBackoff?: {
+        reason: string
+        until: string
+      } | null
     }
   >
 }
@@ -420,7 +435,9 @@ export async function readLastRuns(root: string): Promise<LastRunRecord[]> {
     entries
       .filter((entry) => entry.endsWith(".json"))
       .map(async (entry) => {
-        const record = await readLastRunFile(join(await lastRunsDir(root), entry))
+        const record = await readLastRunFile(
+          join(await lastRunsDir(root), entry)
+        )
         if (record) byRunRef.set(record.runRef, record)
       })
   )

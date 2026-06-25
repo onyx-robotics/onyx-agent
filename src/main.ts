@@ -28,10 +28,7 @@ import {
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
-import {
-  commandSetupInit,
-  commandSetupValidate,
-} from "./commands/setup"
+import { commandSetupInit, commandSetupValidate } from "./commands/setup"
 import { commandPush, commandStatus, commandSync } from "./commands/sync"
 import { commandToolsRun } from "./commands/tools"
 import { commandWorkflowStatus } from "./commands/workflow"
@@ -65,7 +62,7 @@ Usage:
   onyx campaign delete --name <name> [--project-path <path>]
   onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>]
       (creates an async research session and prints low-level worker launch commands)
-  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--max-launches <n>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>]
+  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--max-launches <n>] [--launch-batch-size <n>] [--launch-interval-seconds <n>] [--provider-backoff-seconds <n>] [--heartbeat-sample-interval <seconds>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>]
       (runs the local supervisor with shared sync/presence loops for parallel workers)
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]
@@ -147,9 +144,7 @@ export async function main(argv = process.argv.slice(2)) {
       command === "setup" &&
       (sub === "modules" || sub === "require" || sub === "optional")
     ) {
-      throw new Error(
-        "Setup modules were removed. Use `onyx setup validate`."
-      )
+      throw new Error("Setup modules were removed. Use `onyx setup validate`.")
     }
     if (command === "campaign" && sub === "use") return commandCampaignUse(args)
     if (command === "campaign" && sub === "status")
@@ -158,8 +153,7 @@ export async function main(argv = process.argv.slice(2)) {
       return commandCampaignDelete(args)
     if (command === "research" && sub === "start")
       return commandResearchStart(args)
-    if (command === "research" && sub === "run")
-      return commandResearchRun(args)
+    if (command === "research" && sub === "run") return commandResearchRun(args)
     if (command === "research" && sub === "hypotheses")
       return commandResearchHypotheses(args)
     if (command === "research" && sub === "lane") {
