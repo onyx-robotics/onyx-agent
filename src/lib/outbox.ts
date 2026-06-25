@@ -67,6 +67,8 @@ export type CliState = {
       campaignId?: string
       endTimeMs?: number
       maxIterations?: number
+      maxWorkerIterations?: number
+      maxExperiments?: number | null
       stopRequested?: boolean
       status?: string
       ignoredPresence?: {

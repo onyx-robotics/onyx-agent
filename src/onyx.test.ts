@@ -119,7 +119,7 @@ async function writeResearchSmokeRepo() {
     "utf8"
   )
   const setup = normalizeSetupFile({
-    schemaVersion: 1,
+    schemaVersion: 2,
     goal: "Improve score.",
     projectPath: "",
     scope: {
@@ -696,7 +696,7 @@ describe("exp run", () => {
       "utf8"
     )
     const setup = normalizeSetupFile({
-      schemaVersion: 1,
+      schemaVersion: 2,
       goal: "Improve score.",
       projectPath: "",
       scope: {
@@ -1353,7 +1353,7 @@ describe("research start", () => {
               workers: "1",
               agent: "claude",
               hypotheses: JSON.stringify([plan]),
-              "max-iterations": "3",
+              "max-worker-iterations": "3",
               "max-minutes": "10",
             },
           })
@@ -1375,7 +1375,7 @@ describe("research start", () => {
       `onyx worker run --session ${generatedSessionId} --hypothesis `
     )
     expect(workerLine).toContain(
-      "--agent claude --max-iterations 3 --max-minutes 10"
+      "--agent claude --max-worker-iterations 3 --max-minutes 10"
     )
   })
 
@@ -1959,7 +1959,7 @@ describe("automated research smoke", () => {
           resultCommitSha: experiment.resultCommitSha,
         })
       }
-      expect(schema.version).toBe(3)
+      expect(schema.version).toBe(4)
       expect(conflicts.count).toBe(0)
     } finally {
       db.close()
@@ -2450,7 +2450,7 @@ describe("automated research smoke", () => {
               workers: "1",
               agent: "claude",
               hypotheses: JSON.stringify([plan]),
-              "max-iterations": "2",
+              "max-worker-iterations": "2",
               "max-minutes": "1",
               "require-online": "true",
             },
@@ -3777,7 +3777,7 @@ describe("research hypothesis add", () => {
       "Hypothesis: Try scheduler smoothing: Try scheduler smoothing"
     )
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent claude --max-iterations 10 --max-minutes 5`
+      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent claude --max-worker-iterations 10 --max-minutes 5`
     )
     const hypotheses = await listLocalHypotheses(root, campaignId)
     const stored = hypotheses.find(
@@ -3927,7 +3927,7 @@ describe("research hypothesis add", () => {
     )
     expect(logs).toContain("Hypothesis: replacement: Replacement search")
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent codex --max-iterations 10 --max-minutes 5`
+      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent codex --max-worker-iterations 10 --max-minutes 5`
     )
   })
 })
@@ -3944,7 +3944,7 @@ describe("setup workflow", () => {
 
   test("validates the new workflow setup contract", () => {
     const setup = normalizeSetupFile({
-      schemaVersion: 1,
+      schemaVersion: 2,
       goal: "Improve the target metric.",
       projectPath: "",
       scope: {
@@ -4335,7 +4335,7 @@ describe("setup tools", () => {
       root,
       "",
       normalizeSetupFile({
-        schemaVersion: 1,
+        schemaVersion: 2,
         goal: "Improve score.",
         projectPath: "",
         scope: {

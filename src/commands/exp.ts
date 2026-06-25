@@ -7,7 +7,11 @@ import type {
   LocalResearchHistoryRecord,
 } from "../protocol"
 
-import { listProjectCampaigns, resolveProject } from "../lib/api"
+import {
+  listProjectCampaigns,
+  reserveResearchExperiment,
+  resolveProject,
+} from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
 import {
   normalizeSetupFile,
@@ -34,6 +38,7 @@ import {
   listLocalAttempts,
   listLocalExperimentHistory,
   localCampaignByName,
+  getLocalSessionState,
   logLocalExperiment,
   readLocalAttempt,
   readWorkflowRun,
@@ -626,6 +631,14 @@ async function createWorkflowRun({
     campaign.hypothesisId
   const baseCommitSha =
     args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+  await reserveExperimentSlotForSession({
+    root,
+    args,
+    sessionId,
+    runRef,
+    workerId,
+    hypothesisId,
+  })
   const run: LocalWorkflowRun = {
     id: randomUUID(),
     campaignId: campaign.campaignId,
@@ -664,6 +677,61 @@ async function createWorkflowRun({
     resultRef: run.resultRef,
   })
   return run
+}
+
+async function reserveExperimentSlotForSession({
+  root,
+  args,
+  sessionId,
+  runRef,
+  workerId,
+  hypothesisId,
+}: {
+  root: string
+  args: Args
+  sessionId?: string
+  runRef: string
+  workerId?: string
+  hypothesisId?: string | null
+}) {
+  if (!sessionId || args.options.offline === "true") return
+  const localSession = await getLocalSessionState(root, sessionId).catch(
+    () => null
+  )
+  if (!localSession || localSession.session.maxExperiments === null) return
+  try {
+    const response = await reserveResearchExperiment(
+      sessionId,
+      {
+        runRef,
+        workerId,
+        hypothesisId: hypothesisId ?? undefined,
+      },
+      args
+    )
+    if (
+      response.reservationStatus === "budget_exhausted" ||
+      response.reservationStatus === "session_terminal"
+    ) {
+      throw new Error(response.reservationStatus)
+    }
+    return response
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message === "budget_exhausted") {
+      throw new Error(
+        `Experiment budget exhausted for session ${sessionId}; the experiment was not reserved.`
+      )
+    }
+    if (message === "session_terminal") {
+      throw new Error(
+        `Research session ${sessionId} is terminal; the experiment was not reserved.`
+      )
+    }
+    throw new Error(
+      `Unable to reserve experiment slot for session ${sessionId}: ${message}`
+    )
+  }
 }
 
 async function executeWorkflow({
@@ -1225,6 +1293,14 @@ export async function commandExpLog(args: Args) {
     process.env.ONYX_SESSION_ID
   const workerId =
     args.options.worker ?? usableLastRun?.workerId ?? process.env.ONYX_WORKER_ID
+  await reserveExperimentSlotForSession({
+    root,
+    args,
+    sessionId,
+    runRef,
+    workerId,
+    hypothesisId,
+  })
   const loggedCompliance =
     usableLastRun?.setupCompliance ??
     setupCompliance({

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
@@ -35,7 +36,6 @@ import {
   git,
   gitResult,
   repoRoot,
-  repositoryUrl,
 } from "../lib/git"
 import {
   onyxStateDir,
@@ -114,8 +114,9 @@ type IgnoredPresenceReason =
 
 const PRESENCE_IGNORED_REASONS: IgnoredPresenceReason[] = [
   "not_found",
-  "project_mismatch",
   "session_mismatch",
+  "stale_sequence",
+  "unmatched_cap",
   "update_failed",
 ]
 const PRESENCE_IGNORED_RECENT_LIMIT = 20
@@ -164,9 +165,7 @@ function formatPresenceReasonCounts(byReason: Record<string, number>) {
 
 function hasPresenceMismatch(response: ApiResearchPresenceResponse) {
   return response.ignoredWorkers.some(
-    (worker) =>
-      worker.reason === "project_mismatch" ||
-      worker.reason === "session_mismatch"
+    (worker) => worker.reason === "session_mismatch"
   )
 }
 
@@ -188,6 +187,15 @@ function optionalPositiveIntegerOption(args: Args, name: string) {
     throw new Error(`--${name} must be a positive integer`)
   }
   return value
+}
+
+function maxWorkerIterationsOption(args: Args, fallback = 10): number {
+  if (args.options["max-iterations"] !== undefined) {
+    throw new Error(
+      "--max-iterations was removed. Use --max-worker-iterations for the per-worker safety cap, and --max-experiments for the global session budget."
+    )
+  }
+  return positiveIntegerOption(args, "max-worker-iterations", fallback)
 }
 
 function positiveNumberOption(args: Args, name: string, fallback: number) {
@@ -368,13 +376,13 @@ function safeFileSegment(value: string) {
 }
 
 function workerBudgetOptions({
-  maxIterations,
+  maxWorkerIterations,
   maxMinutes,
 }: {
-  maxIterations: number
+  maxWorkerIterations: number
   maxMinutes: number
 }) {
-  return ` --max-iterations ${maxIterations} --max-minutes ${maxMinutes}`
+  return ` --max-worker-iterations ${maxWorkerIterations} --max-minutes ${maxMinutes}`
 }
 
 function workerAgentOption(args: Args) {
@@ -499,7 +507,7 @@ function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
 }
 
 function workerIsActive(worker: Pick<ApiWorker, "status">) {
-  return ["idle", "running", "stale"].includes(worker.status)
+  return ["registered", "running"].includes(worker.status)
 }
 
 function workerIsCompleted(worker: Pick<ApiWorker, "status">) {
@@ -759,16 +767,16 @@ function createPresenceSupervisor({
   root,
   args,
   sessionId,
-  projectPath,
   intervalMs,
 }: {
   root: string
   args: Args
   sessionId: string
-  projectPath: string
   intervalMs: number
 }) {
   const lastSent = new Map<string, string>()
+  const supervisorRunId = randomUUID()
+  let sequence = 0
   let running: Promise<void> | null = null
   let stopped = false
   let timer: ReturnType<typeof setInterval> | null = null
@@ -808,7 +816,7 @@ function createPresenceSupervisor({
       })
       .filter((worker) => {
         const signature = JSON.stringify({ ...worker, observedAt: undefined })
-        const active = ["idle", "running", "stale"].includes(worker.status)
+        const active = ["registered", "running"].includes(worker.status)
         const changed = lastSent.get(worker.id) !== signature
         if (active || changed) {
           lastSent.set(worker.id, signature)
@@ -817,15 +825,21 @@ function createPresenceSupervisor({
         return false
       })
     if (workers.length === 0) return
+    sequence += 1
     const response = await syncResearchPresence(
       {
         siteId: await getResearchSiteId(root),
-        repositoryUrl: await repositoryUrl(
-          root,
-          args.options["repository-url"]
-        ),
-        projectPath,
+        supervisorRunId,
+        sequence,
         sessionId,
+        site: {
+          pendingSyncCount: await pendingResearchSyncCount(root).catch(() => 0),
+          pushQueueDepth: 0,
+          activeWorkerCount: workers.filter((worker) =>
+            ["registered", "running"].includes(worker.status)
+          ).length,
+          lastUploadAt: observedAt,
+        },
         workers,
       },
       args
@@ -2426,7 +2440,8 @@ export async function commandResearchStart(args: Args) {
   })
 
   const workerTargetOption = args.options.workers ?? args.options.agents
-  const maxIterations = positiveIntegerOption(args, "max-iterations", 10)
+  const maxWorkerIterations = maxWorkerIterationsOption(args, 10)
+  const maxExperiments = optionalPositiveIntegerOption(args, "max-experiments")
   const maxMinutes = positiveNumberOption(args, "max-minutes", 120)
   const hypotheses = await hypothesisPlansOption(args)
   const workerTarget =
@@ -2448,11 +2463,13 @@ export async function commandResearchStart(args: Args) {
     name: args.options.name ?? `research-${new Date().toISOString()}`,
     workerTarget,
     hypotheses,
-    maxIterations,
+    maxIterations: maxWorkerIterations,
+    maxExperiments,
     endTimeMs,
     metadata: {
       startedBy: "onyx-research",
-      maxIterations,
+      maxWorkerIterations,
+      maxExperiments,
       maxMinutes,
       agentKind: launchAgent ?? "codex",
     },
@@ -2470,7 +2487,9 @@ export async function commandResearchStart(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     endTimeMs,
-    maxIterations,
+    maxIterations: maxWorkerIterations,
+    maxWorkerIterations,
+    maxExperiments,
     status: "running",
   }
   await writeState(root, state)
@@ -2491,8 +2510,12 @@ export async function commandResearchStart(args: Args) {
   console.log(`Campaign: ${campaign.name}`)
   console.log(`Workers: 0/${workerTarget}`)
   console.log(`Hypotheses: ${result.hypotheses.length}`)
+  console.log(`Max experiments: ${maxExperiments ?? "unbounded"}`)
   const agentOption = launchAgent ? ` --agent ${launchAgent}` : ""
-  const budgetOptions = workerBudgetOptions({ maxIterations, maxMinutes })
+  const budgetOptions = workerBudgetOptions({
+    maxWorkerIterations,
+    maxMinutes,
+  })
   if (result.hypotheses.length === 0) {
     console.log(
       "No hypotheses were created. Add one with `onyx research hypothesis add --session " +
@@ -2573,10 +2596,16 @@ export async function commandResearchHypothesisAdd(args: Args) {
     },
   })
 
-  const maxIterations =
-    typeof sessionMetadata.maxIterations === "number"
-      ? sessionMetadata.maxIterations
-      : 10
+  const maxWorkerIterations =
+    typeof sessionMetadata.maxWorkerIterations === "number"
+      ? sessionMetadata.maxWorkerIterations
+      : typeof sessionMetadata.maxIterations === "number"
+        ? sessionMetadata.maxIterations
+        : 10
+  const maxExperiments =
+    typeof sessionMetadata.maxExperiments === "number"
+      ? sessionMetadata.maxExperiments
+      : state.sessions?.[sessionId ?? ""]?.maxExperiments
   const maxMinutes =
     typeof sessionMetadata.maxMinutes === "number"
       ? sessionMetadata.maxMinutes
@@ -2592,7 +2621,9 @@ export async function commandResearchHypothesisAdd(args: Args) {
       campaignName: campaign.name,
       campaignId: campaign.id,
       endTimeMs,
-      maxIterations,
+      maxIterations: maxWorkerIterations,
+      maxWorkerIterations,
+      maxExperiments,
       status: "running",
     }
   }
@@ -2616,7 +2647,10 @@ export async function commandResearchHypothesisAdd(args: Args) {
   if (sessionId) console.log(`Session: ${sessionId}`)
   console.log(`Hypothesis: ${hypothesis.name}: ${hypothesis.plan.focus}`)
   if (sessionId) {
-    const budgetOptions = workerBudgetOptions({ maxIterations, maxMinutes })
+    const budgetOptions = workerBudgetOptions({
+      maxWorkerIterations,
+      maxMinutes,
+    })
     console.log(
       `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}${budgetOptions}`
     )
@@ -2736,7 +2770,7 @@ export async function commandResearchStatus(args: Args) {
   const sessionState = localSessionState
   const activeWorkers = workers.filter(workerIsActive).length
   const terminalWorkers = workers.filter((worker) =>
-    ["completed", "failed", "stopped", "lost"].includes(worker.status)
+    ["completed", "failed", "stopped"].includes(worker.status)
   ).length
   const target = sessionState?.session.workerTarget ?? null
   const openSlots =
@@ -2763,7 +2797,7 @@ export async function commandResearchStatus(args: Args) {
   const ignoredPresence = sessionRuntimeState?.ignoredPresence ?? null
   const providerBackoff = sessionRuntimeState?.providerBackoff ?? null
   const failureSummary = workers
-    .filter((worker) => worker.status === "failed" || worker.status === "lost")
+    .filter((worker) => worker.status === "failed")
     .slice(0, 10)
     .map((worker) => {
       const manifest = manifestByWorker.get(worker.id)
@@ -3064,14 +3098,23 @@ export async function commandResearchShouldStop(args: Args) {
   if (
     iteration !== null &&
     Number.isFinite(iteration) &&
-    localSession?.maxIterations &&
-    iteration > localSession.maxIterations
+    (localSession?.maxWorkerIterations ?? localSession?.maxIterations) &&
+    iteration >
+      (localSession.maxWorkerIterations ?? localSession.maxIterations ?? 0)
   ) {
     reasons.push("iteration budget reached")
   }
 
   try {
     const remote = await getResearchSessionState(sessionId, args)
+    if (
+      remote.session.maxExperiments !== null &&
+      remote.session.reservedExperimentCount +
+        remote.session.terminalExperimentCount >=
+        remote.session.maxExperiments
+    ) {
+      reasons.push("budget_exhausted")
+    }
     if (
       remote.session.status === "stop_requested" ||
       remote.session.status === "stopped" ||
@@ -3215,7 +3258,7 @@ export async function commandResearchFinish(args: Args) {
       () => null
     )
     for (const worker of sessionState?.workers ?? []) {
-      if (["idle", "running", "stale", "lost"].includes(worker.status)) {
+      if (["registered", "running"].includes(worker.status)) {
         await recordLocalWorkerHeartbeat({
           root,
           workerId: worker.id,
@@ -3594,7 +3637,7 @@ function unresolvedReservationCount(reservations: Iterable<LaunchReservation>) {
 }
 
 function defaultPresenceIntervalSeconds(workerTarget: number) {
-  if (workerTarget > 50) return 20
+  if (workerTarget > 50) return 10
   if (workerTarget > 10) return 10
   return 5
 }
@@ -3658,13 +3701,20 @@ export async function commandResearchRun(args: Args) {
   const agentKind = workerAgentOption(args)
   const sessionAgentKind = args.options["worker-command"] ? "custom" : agentKind
   const sessionMetadata = sessionState?.session.metadata ?? {}
-  const maxIterations = positiveIntegerOption(
+  const maxWorkerIterations = maxWorkerIterationsOption(
     args,
-    "max-iterations",
-    typeof sessionMetadata.maxIterations === "number"
-      ? sessionMetadata.maxIterations
-      : 10
+    typeof sessionMetadata.maxWorkerIterations === "number"
+      ? sessionMetadata.maxWorkerIterations
+      : typeof sessionMetadata.maxIterations === "number"
+        ? sessionMetadata.maxIterations
+        : 10
   )
+  const maxExperiments =
+    optionalPositiveIntegerOption(args, "max-experiments") ??
+    sessionState?.session.maxExperiments ??
+    (typeof sessionMetadata.maxExperiments === "number"
+      ? sessionMetadata.maxExperiments
+      : null)
   const maxMinutes = positiveNumberOption(
     args,
     "max-minutes",
@@ -3747,11 +3797,13 @@ export async function commandResearchRun(args: Args) {
       name: args.options.name ?? `research-${new Date().toISOString()}`,
       workerTarget,
       hypotheses,
-      maxIterations,
+      maxIterations: maxWorkerIterations,
+      maxExperiments,
       endTimeMs,
       metadata: {
         startedBy: "onyx-research-supervisor",
-        maxIterations,
+        maxWorkerIterations,
+        maxExperiments,
         maxMinutes,
         agentKind: sessionAgentKind,
         maxConcurrency,
@@ -3779,7 +3831,9 @@ export async function commandResearchRun(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     endTimeMs,
-    maxIterations,
+    maxIterations: maxWorkerIterations,
+    maxWorkerIterations,
+    maxExperiments,
     status: "running",
   }
   await writeState(root, nextState)
@@ -3801,7 +3855,6 @@ export async function commandResearchRun(args: Args) {
     root,
     args,
     sessionId,
-    projectPath: effectiveProjectPath,
     intervalMs: presenceIntervalMs,
   })
   syncSupervisor.request()
@@ -3938,7 +3991,7 @@ export async function commandResearchRun(args: Args) {
           hypothesis,
           workerCommand: args.options["worker-command"],
           agentKind,
-          maxIterations,
+          maxIterations: maxWorkerIterations,
           endTimeMs,
           hardEndTimeMs,
           workerTimeoutMs,
@@ -4130,12 +4183,13 @@ export async function commandWorkerRun(args: Args) {
   }
 
   const sessionMetadata = sessionState.session.metadata
-  const maxIterations = positiveIntegerOption(
+  const maxWorkerIterations = maxWorkerIterationsOption(
     args,
-    "max-iterations",
-    typeof sessionMetadata.maxIterations === "number"
-      ? sessionMetadata.maxIterations
-      : 10
+    typeof sessionMetadata.maxWorkerIterations === "number"
+      ? sessionMetadata.maxWorkerIterations
+      : typeof sessionMetadata.maxIterations === "number"
+        ? sessionMetadata.maxIterations
+        : 10
   )
   const maxMinutes = positiveNumberOption(
     args,
@@ -4175,7 +4229,7 @@ export async function commandWorkerRun(args: Args) {
     hypothesis,
     workerCommand: args.options["worker-command"],
     agentKind: args.options.agent ?? "codex",
-    maxIterations,
+    maxIterations: maxWorkerIterations,
     endTimeMs: Date.now() + sessionBudgetMs,
     hardEndTimeMs: Date.now() + sessionBudgetMs + hardStopGraceMs,
     workerTimeoutMs,

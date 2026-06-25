@@ -45,7 +45,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "- Final shutdown deadline: 2026-06-20T14:10:00.000Z"
     )
-    expect(prompt).toContain("- Iteration cap: 8 maximum")
+    expect(prompt).toContain("- Per-worker iteration cap: 8 maximum")
     expect(prompt).toContain(
       "- Worktree root: /repo/.git/onyx/worktrees/session-hypothesis"
     )
@@ -79,6 +79,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("onyx exp list --json")
     expect(prompt).toContain("onyx knowledge list --json")
     expect(prompt).toContain("onyx summary list --json")
+    expect(prompt).toContain("In `single_candidate` mode")
     expect(prompt).toContain(
       'onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
     )

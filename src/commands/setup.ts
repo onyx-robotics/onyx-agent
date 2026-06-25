@@ -75,7 +75,7 @@ function defaultSetupFile(projectPath: string, args: Args): ResearchSetupFile {
   const metricName = args.options["metric-name"] ?? "score"
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     goal:
       args.options.goal ??
       "Improve the target metric without changing protected setup files.",
@@ -88,6 +88,10 @@ function defaultSetupFile(projectPath: string, args: Args): ResearchSetupFile {
       name: metricName,
       unit: args.options["metric-unit"] ?? null,
       direction: metricDirection,
+    },
+    experimentPolicy: {
+      mode: "single_candidate",
+      maxDiagnosticSeconds: 30,
     },
     resources: {},
     tools: {

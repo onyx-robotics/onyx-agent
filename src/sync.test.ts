@@ -33,7 +33,7 @@ async function fixtureRepo() {
 
 function setup() {
   return normalizeSetupFile({
-    schemaVersion: 1,
+    schemaVersion: 2,
     goal: "Improve score.",
     projectPath: "",
     scope: { editable: ["src"], protected: [] },

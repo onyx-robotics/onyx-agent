@@ -55,7 +55,7 @@ async function fixtureRepo() {
 
 function setup() {
   return normalizeSetupFile({
-    schemaVersion: 1,
+    schemaVersion: 2,
     goal: "Improve score.",
     projectPath: "",
     scope: { editable: ["src"], protected: [] },
@@ -135,7 +135,7 @@ describe("SQLite research ledger", () => {
     const root = await fixtureRepo()
     const doctor = await researchDbDoctor(root)
     expect(doctor.ok).toBe(true)
-    expect(doctor.schemaVersion).toBe(3)
+    expect(doctor.schemaVersion).toBe(4)
     const localDb = new Database(await researchDbPath(root))
     try {
       const launchTable = localDb
@@ -302,7 +302,7 @@ describe("SQLite research ledger", () => {
     expect(results).toHaveLength(2)
     const state = await getLocalSessionState(root, session.session.id)
     expect(
-      state.workers.filter((worker) => worker.status === "idle")
+      state.workers.filter((worker) => worker.status === "registered")
     ).toHaveLength(2)
   })
 

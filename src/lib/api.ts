@@ -82,6 +82,15 @@ export type ApiSession = {
   name: string
   status: "running" | "stop_requested" | "completed" | "failed" | "stopped"
   workerTarget: number | null
+  maxExperiments: number | null
+  reservedExperimentCount: number
+  terminalExperimentCount: number
+  finalizationStatus:
+    | "not_started"
+    | "running"
+    | "complete"
+    | "incomplete"
+    | "failed"
   metadata: Record<string, unknown>
   startedAt?: string
   completedAt?: string | null
@@ -98,13 +107,12 @@ export type ApiWorker = {
   agentKind: string
   runtime: "local" | "hosted"
   status:
-    | "idle"
+    | "registered"
     | "running"
-    | "stale"
-    | "lost"
     | "completed"
     | "failed"
     | "stopped"
+  liveness?: "active" | "stale" | "lost" | "unknown" | "terminal"
   currentExperimentId: string | null
   phase: string | null
   progressMessage: string | null
@@ -270,24 +278,27 @@ export type ApiResearchSyncResponse = {
 }
 
 export type ApiResearchPresenceResponse = {
-  workers: ApiWorker[]
   ignoredWorkers: Array<{
     id: string
     reason:
       | "not_found"
-      | "project_mismatch"
       | "session_mismatch"
+      | "stale_sequence"
+      | "unmatched_cap"
       | "update_failed"
     message: string
   }>
   ignoredByReason: {
     notFound: number
-    projectMismatch: number
     sessionMismatch: number
+    staleSequence: number
+    unmatchedCap: number
     updateFailed: number
   }
-  updatedCount: number
+  acceptedCount: number
   ignoredCount: number
+  unmatchedCount: number
+  siteAccepted: boolean
 }
 
 export type ApiReconcileCampaignResponse = {
@@ -556,6 +567,7 @@ export async function createCampaignSession(
     workerTarget?: number
     hypotheses?: ResearchHypothesisPlan[]
     metadata?: Record<string, unknown>
+    maxExperiments?: number
   },
   args?: Args
 ): Promise<{ session: ApiSession; hypotheses: ApiHypothesis[] }> {
@@ -698,10 +710,8 @@ export async function heartbeatWorker(
   workerId: string,
   body: {
     status?:
-      | "idle"
+      | "registered"
       | "running"
-      | "stale"
-      | "lost"
       | "completed"
       | "failed"
       | "stopped"
@@ -841,16 +851,28 @@ export async function syncResearchEvents(
 export async function syncResearchPresence(
   body: {
     siteId: string
-    repositoryUrl: string
-    projectPath: string
+    supervisorRunId: string
+    sequence: number
     sessionId: string
+    site?: {
+      providerBackoff?: Record<string, unknown> | null
+      syncLagMs?: number | null
+      pendingSyncCount?: number
+      pushQueueDepth?: number
+      ignoredPresence?: Record<string, unknown>
+      activeWorkerCount?: number
+      lastUploadAt?: string | null
+      metadata?: Record<string, unknown>
+    }
     workers: Array<{
       id: string
       status: ApiWorker["status"]
       phase?: string | null
       progressMessage?: string | null
       gitLabel?: string | null
+      currentExperimentId?: string | null
       lastOutputAt?: string | null
+      activitySummary?: Record<string, unknown>
       metadata?: Record<string, unknown>
       observedAt: string
     }>
@@ -859,6 +881,45 @@ export async function syncResearchPresence(
 ): Promise<ApiResearchPresenceResponse> {
   return apiData<ApiResearchPresenceResponse>(
     await callApi("POST", "/api/v1/research/presence", body, args)
+  )
+}
+
+export async function reserveResearchExperiment(
+  sessionId: string,
+  body: {
+    runRef: string
+    workerId?: string
+    hypothesisId?: string
+    ttlSeconds?: number
+  },
+  args?: Args
+): Promise<{
+  reservationStatus:
+    | "reserved"
+    | "duplicate"
+    | "renewed"
+    | "budget_exhausted"
+    | "session_terminal"
+  reservation: {
+    id: string
+    runRef: string
+    status: "reserved" | "consumed" | "released" | "expired"
+    expiresAt: string
+  } | null
+  budget: {
+    maxExperiments: number | null
+    reservedCount: number
+    terminalCount: number
+    remainingCount: number | null
+  }
+}> {
+  return apiData(
+    await callApi(
+      "POST",
+      `/api/v1/research/sessions/${sessionId}/experiment-reservations`,
+      body,
+      args
+    )
   )
 }
 

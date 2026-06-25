@@ -145,12 +145,11 @@ type LocalTombstoneInput = {
 }
 
 const dbCache = new Map<string, Database>()
-const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 3
+const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 4
 const TERMINAL_WORKER_STATUSES = new Set([
   "completed",
   "failed",
   "stopped",
-  "lost",
 ])
 
 function nowIso() {
@@ -386,6 +385,10 @@ function applyMigrations(db: Db) {
       metadata_json TEXT NOT NULL DEFAULT '{}',
       end_time_ms INTEGER,
       max_iterations INTEGER,
+      max_experiments INTEGER,
+      reserved_experiment_count INTEGER NOT NULL DEFAULT 0,
+      terminal_experiment_count INTEGER NOT NULL DEFAULT 0,
+      finalization_status TEXT NOT NULL DEFAULT 'not_started',
       started_at TEXT NOT NULL,
       completed_at TEXT,
       created_at TEXT NOT NULL,
@@ -422,7 +425,7 @@ function applyMigrations(db: Db) {
       worker_name TEXT NOT NULL,
       agent_kind TEXT NOT NULL,
       runtime TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'idle',
+      status TEXT NOT NULL DEFAULT 'registered',
       started_at TEXT NOT NULL,
       last_seen_at TEXT NOT NULL,
       current_experiment_id TEXT,
@@ -732,6 +735,28 @@ function applyMigrations(db: Db) {
       db.run("PRAGMA user_version = 3")
     })()
   }
+
+  if (currentVersion < 4) {
+    db.transaction(() => {
+      for (const statement of [
+        "ALTER TABLE sessions ADD COLUMN max_experiments INTEGER",
+        "ALTER TABLE sessions ADD COLUMN reserved_experiment_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN terminal_experiment_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN finalization_status TEXT NOT NULL DEFAULT 'not_started'",
+      ]) {
+        try {
+          db.run(statement)
+        } catch (error) {
+          if (!/duplicate column name/i.test(String(error))) throw error
+        }
+      }
+      db.run("UPDATE workers SET status = 'registered' WHERE status = 'idle'")
+      db.query(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
+      ).run(4, nowIso())
+      db.run("PRAGMA user_version = 4")
+    })()
+  }
 }
 
 function setting(db: Db, key: string) {
@@ -863,6 +888,12 @@ function sessionFromRow(row: Row): ApiSession {
     name: row.name as string,
     status: row.status as ApiSession["status"],
     workerTarget: numberOrNull(row.worker_target),
+    maxExperiments: numberOrNull(row.max_experiments),
+    reservedExperimentCount: Number(row.reserved_experiment_count ?? 0),
+    terminalExperimentCount: Number(row.terminal_experiment_count ?? 0),
+    finalizationStatus:
+      (row.finalization_status as ApiSession["finalizationStatus"]) ??
+      "not_started",
     metadata: parseJson(row.metadata_json, {}),
   }
 }
@@ -902,7 +933,11 @@ function workerFromRow(row: Row): ApiWorker {
     workerName: row.worker_name as string,
     agentKind: row.agent_kind as string,
     runtime: row.runtime as ApiWorker["runtime"],
-    status: row.status as ApiWorker["status"],
+    status:
+      row.status === "idle" ? "registered" : (row.status as ApiWorker["status"]),
+    liveness: ["completed", "failed", "stopped"].includes(String(row.status))
+      ? "terminal"
+      : "unknown",
     currentExperimentId: nullableString(row.current_experiment_id),
     phase: nullableString(row.phase),
     progressMessage: nullableString(row.progress_message),
@@ -1310,6 +1345,7 @@ export async function createLocalSession({
   hypotheses,
   metadata = {},
   maxIterations,
+  maxExperiments,
   endTimeMs,
 }: {
   root: string
@@ -1319,6 +1355,7 @@ export async function createLocalSession({
   hypotheses?: ResearchHypothesisPlan[]
   metadata?: Record<string, unknown>
   maxIterations?: number
+  maxExperiments?: number | null
   endTimeMs?: number
 }) {
   const sessionId = randomUUID()
@@ -1329,9 +1366,10 @@ export async function createLocalSession({
         `
         INSERT INTO sessions (
           id, campaign_id, name, status, worker_target, metadata_json,
-          end_time_ms, max_iterations, started_at, created_at, updated_at
+          end_time_ms, max_iterations, max_experiments, finalization_status,
+          started_at, created_at, updated_at
         )
-        VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, 'running', ?, ?, ?)
       `
       ).run(
         sessionId,
@@ -1341,6 +1379,7 @@ export async function createLocalSession({
         json(metadata),
         endTimeMs ?? null,
         maxIterations ?? null,
+        maxExperiments ?? null,
         at,
         at,
         at
@@ -1551,7 +1590,7 @@ export async function listLocalHypotheses(root: string, campaignId: string) {
 }
 
 function activeWorkerStatus(status: string) {
-  return status === "idle" || status === "running" || status === "stale"
+  return status === "registered" || status === "running" || status === "idle"
 }
 
 export async function registerLocalWorker({
@@ -1614,7 +1653,7 @@ export async function registerLocalWorker({
           agent_kind, runtime, status, started_at, last_seen_at,
           metadata_json, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'registered', ?, ?, ?, ?, ?)
       `
       ).run(
         id,
@@ -2467,15 +2506,20 @@ function upsertRemoteSessionForDb(
     `
       INSERT INTO sessions (
         id, campaign_id, name, status, worker_target, metadata_json,
-        started_at, completed_at, created_at, updated_at
+        max_experiments, reserved_experiment_count, terminal_experiment_count,
+        finalization_status, started_at, completed_at, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         campaign_id = excluded.campaign_id,
         name = excluded.name,
         status = excluded.status,
         worker_target = excluded.worker_target,
         metadata_json = excluded.metadata_json,
+        max_experiments = excluded.max_experiments,
+        reserved_experiment_count = excluded.reserved_experiment_count,
+        terminal_experiment_count = excluded.terminal_experiment_count,
+        finalization_status = excluded.finalization_status,
         completed_at = excluded.completed_at,
         updated_at = excluded.updated_at
     `
@@ -2486,6 +2530,10 @@ function upsertRemoteSessionForDb(
     session.status,
     session.workerTarget,
     json(session.metadata),
+    session.maxExperiments ?? null,
+    session.reservedExperimentCount ?? 0,
+    session.terminalExperimentCount ?? 0,
+    session.finalizationStatus ?? "not_started",
     session.startedAt ?? at,
     session.completedAt ?? null,
     session.createdAt ?? at,
