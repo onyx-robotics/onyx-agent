@@ -23,6 +23,7 @@ export type ApiProject = {
 export type ApiCampaign = {
   id: string
   projectId: string
+  parentCampaignId?: string | null
   name: string
   description: string | null
   baseCommitSha: string
@@ -30,10 +31,14 @@ export type ApiCampaign = {
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
+  bestExperimentId?: string | null
   bestMetricValue: number | null
   bestCommitSha: string | null
   experimentCount: number
+  lastExperimentAt?: string | null
   promotionRefName: string | null
+  createdAt?: string
+  updatedAt?: string
 }
 
 export type ApiCampaignExperiment = {
@@ -78,6 +83,10 @@ export type ApiSession = {
   status: "running" | "stop_requested" | "completed" | "failed" | "stopped"
   workerTarget: number | null
   metadata: Record<string, unknown>
+  startedAt?: string
+  completedAt?: string | null
+  createdAt?: string
+  updatedAt?: string
 }
 
 export type ApiWorker = {
@@ -200,18 +209,6 @@ export type ApiCampaignUpsertResult = {
   campaign: ApiCampaign
 }
 
-export type ApiBrief = {
-  campaign: ApiCampaign
-  bestExperiment: ApiCampaignExperiment | null
-  recentExperiments: ApiCampaignExperiment[]
-  hypotheses: ApiHypothesis[]
-  workers: ApiWorker[]
-  summaries: ApiSummary[]
-  knowledge: ApiKnowledge[]
-  recommendedContext: string[]
-  markdown: string
-}
-
 export type ApiProjectDeletions = {
   campaigns: Array<{
     campaignId: string
@@ -274,6 +271,23 @@ export type ApiResearchSyncResponse = {
 
 export type ApiResearchPresenceResponse = {
   workers: ApiWorker[]
+  ignoredWorkers: Array<{
+    id: string
+    reason:
+      | "not_found"
+      | "project_mismatch"
+      | "session_mismatch"
+      | "update_failed"
+    message: string
+  }>
+  ignoredByReason: {
+    notFound: number
+    projectMismatch: number
+    sessionMismatch: number
+    updateFailed: number
+  }
+  updatedCount: number
+  ignoredCount: number
 }
 
 export type ApiReconcileCampaignResponse = {
@@ -281,7 +295,13 @@ export type ApiReconcileCampaignResponse = {
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
   experiments: ApiCampaignExperiment[]
-  experimentsUpdated: number
+  gitVerification: {
+    checkedCount: number
+    updatedCount: number
+    remainingCount: number
+    limit: number
+    hasMore: boolean
+  }
 }
 
 export async function callApi(
@@ -775,20 +795,6 @@ export async function listCampaignKnowledge(
   )
 }
 
-export async function getCampaignBrief(
-  campaignId: string,
-  args?: Args
-): Promise<ApiBrief> {
-  return apiData<ApiBrief>(
-    await callApi(
-      "GET",
-      `/api/v1/research/campaigns/${campaignId}/brief`,
-      undefined,
-      args
-    )
-  )
-}
-
 export async function requestProjectSync(projectId: string, args?: Args) {
   await callApi(
     "POST",
@@ -817,6 +823,12 @@ export async function syncResearchEvents(
     siteId: string
     repositoryUrl: string
     projectPath: string
+    pushedExperimentRefs?: Array<{
+      campaignId: string
+      runRef: string
+      resultRef: string
+      resultCommitSha: string
+    }>
     events: ApiResearchSyncEvent[]
   },
   args?: Args

@@ -715,9 +715,29 @@ export const syncResearchPresenceRequestSchema = z.object({
   workers: z.array(researchPresenceWorkerSnapshotSchema).min(1).max(500),
 })
 
+export const researchPresenceIgnoredWorkerSchema = z.object({
+  id: z.uuid(),
+  reason: z.enum([
+    "not_found",
+    "project_mismatch",
+    "session_mismatch",
+    "update_failed",
+  ]),
+  message: z.string().trim().min(1),
+})
+
 export const syncResearchPresenceResponseSchema = z.object({
   data: z.object({
     workers: z.array(researchWorkerSchema),
+    ignoredWorkers: z.array(researchPresenceIgnoredWorkerSchema).default([]),
+    ignoredByReason: z.object({
+      notFound: z.number().int().nonnegative(),
+      projectMismatch: z.number().int().nonnegative(),
+      sessionMismatch: z.number().int().nonnegative(),
+      updateFailed: z.number().int().nonnegative(),
+    }),
+    updatedCount: z.number().int().nonnegative(),
+    ignoredCount: z.number().int().nonnegative(),
   }),
 })
 
@@ -1069,6 +1089,19 @@ export const syncResearchRequestSchema = z.object({
   siteId: z.uuid(),
   repositoryUrl: z.string().trim().min(1).max(2000),
   projectPath: projectPathSchema.default(""),
+  pushedExperimentRefs: z
+    .array(
+      z
+        .object({
+          campaignId: z.uuid(),
+          runRef: z.string().trim().min(1).max(500),
+          resultRef: z.string().trim().min(1).max(500),
+          resultCommitSha: gitShaSchema,
+        })
+        .strict()
+    )
+    .max(500)
+    .default([]),
   events: z.array(researchSyncEventSchema).min(1).max(500),
 })
 
@@ -1412,22 +1445,6 @@ export const upsertResearchSummaryResponseSchema = z.object({
   data: researchSummarySchema,
 })
 
-export const researchBriefSchema = z.object({
-  campaign: researchCampaignSchema,
-  bestExperiment: researchCampaignExperimentSchema.nullable(),
-  recentExperiments: z.array(researchCampaignExperimentSchema),
-  hypotheses: z.array(researchHypothesisSchema),
-  workers: z.array(researchWorkerSchema),
-  summaries: z.array(researchSummarySchema),
-  knowledge: z.array(researchKnowledgeSchema),
-  recommendedContext: z.array(z.string()),
-  markdown: z.string(),
-})
-
-export const researchBriefResponseSchema = z.object({
-  data: researchBriefSchema,
-})
-
 export const researchFileTreeNodeSchema = z.object({
   id: z.string().min(1),
   path: z.string(),
@@ -1542,13 +1559,23 @@ export const researchCampaignGraphResponseSchema = z.object({
   }),
 })
 
+export const reconcileResearchCampaignQuerySchema = z.object({
+  gitVerifyLimit: z.coerce.number().int().min(1).max(500).default(100),
+})
+
 export const reconcileResearchCampaignResponseSchema = z.object({
   data: z.object({
     campaign: researchCampaignSchema,
     hypotheses: z.array(researchHypothesisSchema),
     workers: z.array(researchWorkerSchema),
     experiments: z.array(researchCampaignExperimentSchema),
-    experimentsUpdated: z.number().int().nonnegative(),
+    gitVerification: z.object({
+      checkedCount: z.number().int().nonnegative(),
+      updatedCount: z.number().int().nonnegative(),
+      remainingCount: z.number().int().nonnegative(),
+      limit: z.number().int().positive(),
+      hasMore: z.boolean(),
+    }),
   }),
 })
 
@@ -1770,8 +1797,6 @@ export type UpsertResearchSummaryRequest = z.infer<
 export type UpsertResearchSummaryResponse = z.infer<
   typeof upsertResearchSummaryResponseSchema
 >
-export type ResearchBrief = z.infer<typeof researchBriefSchema>
-export type ResearchBriefResponse = z.infer<typeof researchBriefResponseSchema>
 export type ResearchWorker = z.infer<typeof researchWorkerSchema>
 export type RegisterResearchWorkerRequest = z.infer<
   typeof registerResearchWorkerRequestSchema
@@ -1790,6 +1815,9 @@ export type ResearchWorkerHeartbeatResponse = z.infer<
 >
 export type ResearchPresenceWorkerSnapshot = z.infer<
   typeof researchPresenceWorkerSnapshotSchema
+>
+export type ResearchPresenceIgnoredWorker = z.infer<
+  typeof researchPresenceIgnoredWorkerSchema
 >
 export type SyncResearchPresenceRequest = z.infer<
   typeof syncResearchPresenceRequestSchema
@@ -1816,6 +1844,9 @@ export type ResearchCampaignExperimentCodeResponse = z.infer<
 >
 export type ResearchCampaignGraphResponse = z.infer<
   typeof researchCampaignGraphResponseSchema
+>
+export type ReconcileResearchCampaignQuery = z.infer<
+  typeof reconcileResearchCampaignQuerySchema
 >
 export type ReconcileResearchCampaignResponse = z.infer<
   typeof reconcileResearchCampaignResponseSchema

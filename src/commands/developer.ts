@@ -16,10 +16,9 @@ import {
 } from "../lib/config"
 import { pathExists } from "../lib/process"
 import {
-  defaultSkillInstallRoot,
+  defaultSkillInstallTargets,
   installDeveloperSkill,
   installReleaseSkill,
-  skillInstallTarget,
 } from "../lib/skill"
 
 export const DEVELOPER_USAGE = `Usage:
@@ -244,14 +243,15 @@ export async function commandDeveloper(args: Args) {
   if (sub === "status") {
     const current = await readDeveloperConfig()
     const target = await apiTarget(args)
-    const skillTarget = skillInstallTarget(defaultSkillInstallRoot())
+    const skillTargets = defaultSkillInstallTargets()
     if (args.options.json === "true") {
       console.log(
         JSON.stringify(
           {
             mode: current.mode,
             apiTarget: target ? describeApiTarget(target) : null,
-            skillTarget,
+            skillTarget: skillTargets[0]?.target ?? null,
+            skillTargets,
             checkout: current.checkout ?? null,
           },
           null,
@@ -264,7 +264,10 @@ export async function commandDeveloper(args: Args) {
     console.log(
       `API target: ${target ? describeApiTarget(target) : "not configured (run `onyx login`)"}`
     )
-    console.log(`Skill target: ${skillTarget}`)
+    console.log("Skill targets:")
+    for (const skillTarget of skillTargets) {
+      console.log(`  ${skillTarget.label}: ${skillTarget.target}`)
+    }
     if (current.checkout) {
       console.log(`Developer checkout: ${current.checkout.root}`)
       console.log(`Developer CLI: ${current.checkout.binPath}`)

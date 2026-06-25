@@ -14,6 +14,7 @@ import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
 import {
   commandResearchFinish,
+  commandResearchBrief,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
   commandResearchRun,
@@ -27,10 +28,7 @@ import {
   commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
-import {
-  commandSetupInit,
-  commandSetupValidate,
-} from "./commands/setup"
+import { commandSetupInit, commandSetupValidate } from "./commands/setup"
 import { commandPush, commandStatus, commandSync } from "./commands/sync"
 import { commandToolsRun } from "./commands/tools"
 import { commandWorkflowStatus } from "./commands/workflow"
@@ -58,12 +56,13 @@ Usage:
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
   onyx setup init [--project-path <path>] [--goal <text>] [--metric-name <name>] [--metric-unit <unit>] [--metric-direction maximize|minimize] [--editable-scope <paths>] [--eval-command <cmd>]
   onyx setup validate [--project-path <path>]
+      (executes the required metric tool once and records setup readiness)
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
   onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>]
       (creates an async research session and prints low-level worker launch commands)
-  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--max-launches <n>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>]
+  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--max-launches <n>] [--launch-batch-size <n>] [--launch-interval-seconds <n>] [--provider-backoff-seconds <n>] [--heartbeat-sample-interval <seconds>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>]
       (runs the local supervisor with shared sync/presence loops for parallel workers)
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]
@@ -71,6 +70,7 @@ Usage:
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>] [--final-sync-timeout <seconds>] [--require-online]
+  onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text>
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
@@ -144,9 +144,7 @@ export async function main(argv = process.argv.slice(2)) {
       command === "setup" &&
       (sub === "modules" || sub === "require" || sub === "optional")
     ) {
-      throw new Error(
-        "Setup modules were removed. Use `onyx setup validate`."
-      )
+      throw new Error("Setup modules were removed. Use `onyx setup validate`.")
     }
     if (command === "campaign" && sub === "use") return commandCampaignUse(args)
     if (command === "campaign" && sub === "status")
@@ -155,8 +153,7 @@ export async function main(argv = process.argv.slice(2)) {
       return commandCampaignDelete(args)
     if (command === "research" && sub === "start")
       return commandResearchStart(args)
-    if (command === "research" && sub === "run")
-      return commandResearchRun(args)
+    if (command === "research" && sub === "run") return commandResearchRun(args)
     if (command === "research" && sub === "hypotheses")
       return commandResearchHypotheses(args)
     if (command === "research" && sub === "lane") {
@@ -176,6 +173,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandResearchStop(args)
     if (command === "research" && sub === "finish")
       return commandResearchFinish(args)
+    if (command === "research" && sub === "brief")
+      return commandResearchBrief(args)
     if (command === "research" && sub === "status")
       return commandResearchStatus(args)
     if (command === "summary" && sub === "upsert")

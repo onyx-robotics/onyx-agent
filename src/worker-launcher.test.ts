@@ -7,7 +7,7 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 
 import { describe, expect, test } from "bun:test"
 
@@ -65,6 +65,10 @@ async function writeFakeOnyx(path: string) {
       'if [[ "${1:-}" == "status" ]]; then',
       '  echo "{\\"apiTarget\\":\\"http://localhost:3000\\",\\"project\\":null}"',
       "  exit 0",
+      "fi",
+      'if [[ "${1:-}" == "tools" && "${2:-}" == "run" ]]; then',
+      '  echo "unexpected tools run: $*" >&2',
+      "  exit 99",
       "fi",
       'for arg in "$@"; do',
       '  if [[ "$arg" == "--help" ]]; then',
@@ -272,6 +276,35 @@ describe("worker launchers", () => {
     expect(preflight.version).toContain("claude fake 2.0")
   })
 
+  test("preflight does not run the evaluation tool before worker launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-no-eval-"))
+    const bin = join(root, "bin")
+    const worktree = join(root, "worktree")
+    await mkdir(bin)
+    await mkdir(worktree)
+    await runProcess("git", ["init"], { cwd: worktree })
+    await writeFakeAgent(join(bin, "codex"), "codex fake 1.0")
+    await writeFakeOnyx(join(bin, "onyx"))
+
+    const invocation = buildWorkerInvocation({
+      agentKind: "codex",
+      worktree,
+      prompt: "do useful work",
+    })
+    const preflight = await preflightWorkerInvocation(invocation, {
+      cwd: worktree,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+      },
+      campaignName: "smoke",
+    })
+
+    expect(preflight.checks.map((item) => item.name)).not.toContain(
+      "onyx evaluation tool"
+    )
+  })
+
   test("writes launch manifests after creating parent directories", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-manifest-"))
     const manifestPath = join(root, "missing", "worker.manifest.json")
@@ -399,6 +432,48 @@ describe("worker launchers", () => {
       })
       expect(help.code).toBe(0)
       expect(help.stdout).toContain("onyx research run")
+    } finally {
+      if (previousConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME
+      } else {
+        process.env.XDG_CONFIG_HOME = previousConfigHome
+      }
+      if (previousPath === undefined) {
+        delete process.env.PATH
+      } else {
+        process.env.PATH = previousPath
+      }
+    }
+  })
+
+  test("onyx shim prefers the source checkout over an installed onyx", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-source-first-"))
+    const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-source-first-config-"))
+    const bin = join(root, "bin")
+    await mkdir(bin)
+    await writeFakeOnyx(join(bin, "onyx"))
+    await runProcess("git", ["init"], { cwd: root })
+    const previousConfigHome = process.env.XDG_CONFIG_HOME
+    const previousPath = process.env.PATH
+    process.env.XDG_CONFIG_HOME = configHome
+    process.env.PATH = [bin, previousPath ?? ""].filter(Boolean).join(delimiter)
+
+    try {
+      await writeConfig({
+        currentProfile: "",
+        profiles: {},
+        developer: { mode: "release" },
+      })
+
+      const shim = await writeWorkerOnyxShim({ root, sessionId: "session" })
+      expect(shim.mode).toBe("source")
+      expect(shim.target).toContain("/bin/onyx.js")
+
+      const help = await runProcess(shim.onyxPath, ["--help"], {
+        timeoutMs: 5000,
+      })
+      expect(help.code).toBe(0)
+      expect(help.stdout).toContain("onyx research brief")
     } finally {
       if (previousConfigHome === undefined) {
         delete process.env.XDG_CONFIG_HOME

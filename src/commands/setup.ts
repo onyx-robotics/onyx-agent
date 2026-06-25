@@ -14,6 +14,8 @@ import {
 import { repoRoot } from "../lib/git"
 import { onyxPath, resolveProjectPath } from "../lib/project"
 import { pathExists } from "../lib/process"
+import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
+import { runToolCommand, type ToolRunResult } from "../lib/tools"
 
 const PROTECTED_SETUP_PATHS = [
   "onyx/setup.json",
@@ -178,7 +180,7 @@ function placeholderEvalScript(setup: ResearchSetupFile) {
     "#!/usr/bin/env bash",
     "set -euo pipefail",
     `echo ${shellQuote(`TODO: replace onyx/tools/evaluation/run.sh with a real eval that emits METRIC ${setup.metric.name}=<number>`)} >&2`,
-    'echo "Setup validation is static; configure this tool before running a workflow." >&2',
+    'echo "Setup validation executes this tool; configure it before starting research." >&2',
     "exit 1",
     "",
   ].join("\n")
@@ -215,7 +217,7 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
   })
 
   return [
-    "# Onyx Worker Instructions",
+    "# Onyx Research Spec",
     "",
     "## Goal",
     "",
@@ -227,12 +229,13 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
     `- Direction: ${setup.metric.direction}`,
     "- Required output: the evaluation workflow must emit exactly one primary metric line shaped as `METRIC " +
       `${setup.metric.name}=<number>\`.`,
+    "- Interpretation notes: describe what metric movement means for this project, including noise, tradeoffs, and anti-gaming constraints.",
     "",
     "## Editable Scope",
     "",
     markdownList(editable, "No editable scope configured yet."),
     "",
-    "Workers may edit only the scoped project files above. They must not edit protected setup files during Research.",
+    "Research changes should stay inside the editable scope above. Setup and tool changes require a new setup version.",
     "",
     "## Protected Setup Surface",
     "",
@@ -242,24 +245,31 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
     "",
     `- Canonical tool: evaluation.run`,
     `- Command configured from setup init: ${evalCommand}`,
-    "- Preflight before committing setup: `onyx tools run evaluation.run`",
+    "- Preflight before committing setup: `onyx setup validate` executes the required metric tool and records readiness evidence.",
+    "- Caveats: document simulator assumptions, hardware limits, flaky checks, required services, and invalid shortcuts here.",
     "",
-    "## Workflow Contract",
+    "## Workflow And Tools",
     "",
     workflow.join("\n"),
     "",
-    "Every experiment attempt should start with `onyx exp run`, pause at the agent step, make exactly one clean result commit, resume the workflow, then log the terminal attempt with `onyx exp log`.",
+    "The Onyx CLI enforces the workflow contract during research attempts.",
     "",
-    "## Tools",
+    "## Declared Tools",
     "",
     markdownList(toolIds, "No tools configured."),
     "",
-    "## First-Run Checklist",
+    "## Project Guidance",
+    "",
+    "- Known risky areas: add files, subsystems, or behaviors that require extra care.",
+    "- Useful starting points: add source paths, tests, dashboards, traces, or papers worth checking first.",
+    "- Preserve: add product, safety, reliability, or interface constraints that metric wins must not break.",
+    "- Avoid: add project-specific shortcuts, hacks, or previously failed ideas.",
+    "",
+    "## Setup Checklist",
     "",
     "- Confirm the editable scope is complete and narrow.",
     "- Replace the evaluation tool if the scaffolded script is still a TODO.",
-    "- Run `onyx setup validate` and fix failed checks.",
-    "- Run `onyx tools run evaluation.run` and confirm it emits the primary metric.",
+    "- Run `onyx setup validate` and fix failed checks, including metric readiness.",
     "- Commit `onyx/setup.json`, `onyx/validation.json`, `onyx/onyx.md`, and `onyx/tools/*` before campaign setup or research start.",
     "",
   ].join("\n")
@@ -269,10 +279,12 @@ async function buildValidation({
   root,
   projectPath,
   setup,
+  executeMetricTool,
 }: {
   root: string
   projectPath: string
   setup: ResearchSetupFile
+  executeMetricTool: boolean
 }): Promise<ResearchSetupValidationFile> {
   const checks: ResearchSetupValidationCheck[] = []
 
@@ -291,19 +303,21 @@ async function buildValidation({
 
   const instructionsPath = onyxPath(root, projectPath, "onyx.md")
   if (!(await pathExists(instructionsPath))) {
-    checks.push(check("agent_context", "failed", "onyx/onyx.md is missing."))
+    checks.push(check("research_spec", "failed", "onyx/onyx.md is missing."))
   } else {
     const text = await readFile(instructionsPath, "utf8")
     const hasContext = text.trim().length >= 40
     checks.push(
       hasContext
-        ? check("agent_context", "passed", "onyx/onyx.md contains context.")
-        : check("agent_context", "failed", "onyx/onyx.md is too sparse.")
+        ? check("research_spec", "passed", "onyx/onyx.md contains research spec context.")
+        : check("research_spec", "failed", "onyx/onyx.md research spec is too sparse.")
     )
     if (hasContext) {
       const missingHints = [
         text.includes(setup.metric.name) ? null : setup.metric.name,
-        text.includes("onyx exp run") ? null : "onyx exp run",
+        text.includes("Evaluation") || text.includes("evaluation")
+          ? null
+          : "evaluation guidance",
         text.includes("editable") || text.includes("Editable")
           ? null
           : "editable scope",
@@ -311,9 +325,9 @@ async function buildValidation({
       if (missingHints.length > 0) {
         checks.push(
           check(
-            "agent_context_quality",
+            "research_spec_quality",
             "warning",
-            `onyx/onyx.md is present but should mention ${missingHints.join(", ")} for first-run workers.`
+            `onyx/onyx.md is present but should mention ${missingHints.join(", ")} for research workers.`
           )
         )
       }
@@ -334,6 +348,117 @@ async function buildValidation({
           `Workflow must include one required metric step for ${setup.metric.name}.`
         )
   )
+  if (metricStep?.run) {
+    if (!executeMetricTool) {
+      checks.push(
+        check(
+          "metric_tool_readiness",
+          "failed",
+          `Run \`onyx setup validate\` after configuring ${metricStep.run}; it must emit exactly one primary METRIC ${setup.metric.name}=<number> line before research can start.`,
+          {
+            toolId: metricStep.run,
+            exitCode: null,
+            timedOut: false,
+            primaryMetric: null,
+            secondaryMetricNames: [],
+            outputSummary: null,
+            checkedAt: new Date().toISOString(),
+            error: "metric tool has not been executed by setup validation",
+          }
+        )
+      )
+    } else {
+      let result: ToolRunResult | null = null
+      let parsed: ReturnType<typeof parseWorkflowMetricLines> = {
+        metrics: {},
+        error: null,
+      }
+      try {
+        result = await runToolCommand({
+          root,
+          projectPath,
+          name: metricStep.run,
+        })
+        parsed = parseWorkflowMetricLines(result.stdout, setup.metric.name)
+      } catch (error) {
+        checks.push(
+          check(
+            "metric_tool_readiness",
+            "failed",
+            `Metric tool ${metricStep.run} could not be executed: ${error instanceof Error ? error.message : String(error)}`,
+            {
+              toolId: metricStep.run,
+              exitCode: null,
+              timedOut: false,
+              primaryMetric: null,
+              secondaryMetricNames: [],
+              outputSummary: null,
+              checkedAt: new Date().toISOString(),
+              error: error instanceof Error ? error.message : String(error),
+            }
+          )
+        )
+        parsed = { metrics: {}, error: null }
+      }
+      if (result) {
+        const primaryMetricValue = parsed.metrics[setup.metric.name] ?? null
+        const secondaryMetricNames = Object.keys(parsed.metrics)
+          .filter((name) => name !== setup.metric.name)
+          .sort()
+        const failed =
+          result.timedOut || result.code !== 0 || parsed.error !== null
+        checks.push(
+          failed
+            ? check(
+                "metric_tool_readiness",
+                "failed",
+                [
+                  result.timedOut
+                    ? `Metric tool ${metricStep.run} timed out.`
+                    : result.code !== 0
+                      ? `Metric tool ${metricStep.run} exited with code ${result.code}.`
+                      : null,
+                  parsed.error,
+                ]
+                  .filter(Boolean)
+                  .join(" ") ||
+                  `Metric tool ${metricStep.run} did not prove readiness.`,
+                {
+                  toolId: metricStep.run,
+                  exitCode: result.code,
+                  timedOut: result.timedOut,
+                  primaryMetric:
+                    primaryMetricValue === null
+                      ? null
+                      : { name: setup.metric.name, value: primaryMetricValue },
+                  secondaryMetricNames,
+                  outputSummary: summarizeOutput(result.stdout, result.stderr),
+                  checkedAt: new Date().toISOString(),
+                  error: parsed.error,
+                }
+              )
+            : check(
+                "metric_tool_readiness",
+                "passed",
+                `Metric tool ${metricStep.run} emitted primary METRIC ${setup.metric.name}=${primaryMetricValue}.`,
+                {
+                  toolId: metricStep.run,
+                  exitCode: result.code,
+                  timedOut: result.timedOut,
+                  primaryMetric: {
+                    name: setup.metric.name,
+                    value: primaryMetricValue,
+                  },
+                  secondaryMetricNames,
+                  outputSummary: summarizeOutput(result.stdout, result.stderr),
+                  checkedAt: new Date().toISOString(),
+                  error: null,
+                }
+              )
+        )
+      }
+    }
+  }
 
   for (const path of [
     "onyx/setup.json",
@@ -424,9 +549,22 @@ async function buildValidation({
   }
 }
 
-async function validateAndWrite(root: string, projectPath: string) {
+async function validateAndWrite({
+  root,
+  projectPath,
+  executeMetricTool,
+}: {
+  root: string
+  projectPath: string
+  executeMetricTool: boolean
+}) {
   const setup = await readSetupFile(root, projectPath)
-  const validation = await buildValidation({ root, projectPath, setup })
+  const validation = await buildValidation({
+    root,
+    projectPath,
+    setup,
+    executeMetricTool,
+  })
   await writeValidationFile(root, projectPath, validation)
   return validation
 }
@@ -453,7 +591,11 @@ export async function commandSetupInit(args: Args) {
     defaultEvalScript(setupFile, args),
     0o755
   )
-  const validation = await validateAndWrite(root, projectPath)
+  const validation = await validateAndWrite({
+    root,
+    projectPath,
+    executeMetricTool: false,
+  })
 
   console.log(`setup: ${dir}`)
   console.log(wroteSetup ? "created onyx/setup.json" : "kept onyx/setup.json")
@@ -471,7 +613,7 @@ export async function commandSetupInit(args: Args) {
     )
   }
   console.log(
-    "next: edit onyx/setup.json, onyx/onyx.md, and onyx/tools/* for this repository, then run `onyx tools run evaluation.run` for a transient eval preflight."
+    "next: edit onyx/setup.json, onyx/onyx.md, and onyx/tools/* for this repository, then run `onyx setup validate` to execute the metric tool and prove readiness."
   )
 }
 
@@ -483,7 +625,11 @@ export async function commandSetupValidate(args: Args) {
   }
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
-  const validation = await validateAndWrite(root, projectPath)
+  const validation = await validateAndWrite({
+    root,
+    projectPath,
+    executeMetricTool: true,
+  })
 
   console.log(`setup validation: ${validation.status}`)
   const groups = [
@@ -500,6 +646,6 @@ export async function commandSetupValidate(args: Args) {
   }
   console.log(`wrote ${validationPath(root, projectPath)}`)
   console.log(
-    "preflight: run `onyx tools run evaluation.run` to execute the eval tool; setup validation is static."
+    "metric readiness: `onyx setup validate` executed the canonical metric tool and recorded readiness evidence in validation.json."
   )
 }

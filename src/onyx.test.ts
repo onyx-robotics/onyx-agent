@@ -18,6 +18,7 @@ import {
   commandKnowledgeAdd,
   commandKnowledgeList,
   commandListen,
+  commandResearchBrief,
   commandResearchFinish,
   commandResearchStart,
   commandResearchHypothesisAdd,
@@ -61,6 +62,7 @@ import {
 } from "./onyx"
 import {
   createLocalCampaign,
+  createLocalKnowledge,
   createLocalSession,
   getLocalSessionState,
   listLocalHypotheses,
@@ -75,6 +77,7 @@ import {
   researchDbPath,
   registerLocalWorker,
   recordLocalWorkerHeartbeat,
+  upsertLocalSummary,
   upsertWorkflowRun,
   writeLocalAttempt,
 } from "./lib/research-db"
@@ -174,6 +177,21 @@ async function writeResearchSmokeRepo() {
           status: "passed",
           message: "metric ok",
           evidence: {},
+        },
+        {
+          id: "metric_tool_readiness",
+          status: "passed",
+          message: "metric tool ok",
+          evidence: {
+            toolId: "evaluation.run",
+            exitCode: 0,
+            timedOut: false,
+            primaryMetric: { name: "score", value: 1.25 },
+            secondaryMetricNames: [],
+            outputSummary: "METRIC score=1.25",
+            checkedAt: now,
+            error: null,
+          },
         },
       ],
     })
@@ -655,6 +673,130 @@ describe("exp run", () => {
           options: { "no-log": "true", timeout: "5" },
         })
       ).rejects.toThrow("onyx tools run <tool-id>")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("requires setup in the selected base commit instead of falling back to the working tree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-exp-base-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeFile(join(root, "README.md"), "base\n", "utf8")
+    await commitAll(root, "base without setup")
+    const baseWithoutSetup = (
+      await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+    ).stdout.trim()
+
+    await mkdir(join(root, "onyx", "tools", "evaluation"), {
+      recursive: true,
+    })
+    await writeFile(
+      join(root, "onyx", "onyx.md"),
+      "Use the configured eval command and keep changes small.\n",
+      "utf8"
+    )
+    const setup = normalizeSetupFile({
+      schemaVersion: 1,
+      goal: "Improve score.",
+      projectPath: "",
+      scope: {
+        editable: ["src"],
+        protected: [
+          "onyx/setup.json",
+          "onyx/validation.json",
+          "onyx/onyx.md",
+          "onyx/tools/",
+        ],
+      },
+      metric: { name: "score", unit: null, direction: "maximize" },
+      resources: {},
+      tools: {
+        "evaluation.run": {
+          command: "printf 'METRIC score=1.25\\n'",
+          args: [],
+          shell: true,
+          cwd: "project",
+          env: {},
+          resources: [],
+          timeoutSeconds: 5,
+          leaseTimeoutSeconds: 5,
+          outputLimitBytes: 4000,
+        },
+      },
+      workflow: [
+        {
+          id: "edit",
+          agent: "Make one scoped code change, commit it, then resume.",
+        },
+        { id: "evaluate", run: "evaluation.run", metric: true },
+      ],
+    })
+    await writeSetupFile(root, "", setup)
+    const now = new Date().toISOString()
+    await writeValidationFile(
+      root,
+      "",
+      normalizeValidationFile({
+        schemaVersion: 1,
+        status: "passed",
+        setupHash: setupHash(setup),
+        generatedAt: now,
+        summary: null,
+        checks: [
+          {
+            id: "setup_schema",
+            status: "passed",
+            message: "setup ok",
+            evidence: {},
+          },
+          {
+            id: "metric_capture",
+            status: "passed",
+            message: "metric ok",
+            evidence: {},
+          },
+          {
+            id: "metric_tool_readiness",
+            status: "passed",
+            message: "metric tool ok",
+            evidence: {
+              toolId: "evaluation.run",
+              exitCode: 0,
+              timedOut: false,
+              primaryMetric: { name: "score", value: 1.25 },
+              secondaryMetricNames: [],
+              outputSummary: "METRIC score=1.25",
+              checkedAt: now,
+              error: null,
+            },
+          },
+        ],
+      })
+    )
+    await commitAll(root, "add setup")
+    await createLocalCampaign({
+      root,
+      name: "smoke",
+      description: "Improve score.",
+      projectPath: "",
+      baseCommitSha: (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim(),
+      setup,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandExpRun({
+          positional: ["exp", "run"],
+          options: { campaign: "smoke", base: baseWithoutSetup, timeout: "5" },
+        })
+      ).rejects.toThrow("does not contain a valid Onyx setup")
     } finally {
       process.chdir(previousCwd)
     }
@@ -1174,26 +1316,6 @@ describe("research start", () => {
           }
           if (
             request.method === "GET" &&
-            request.path === `/api/v1/research/campaigns/${campaignId}/brief`
-          ) {
-            return {
-              body: {
-                data: {
-                  campaign,
-                  bestExperiment: null,
-                  recentExperiments: [],
-                  hypotheses: [],
-                  workers: [],
-                  summaries: [],
-                  knowledge: [],
-                  recommendedContext: [],
-                  markdown: "brief",
-                },
-              },
-            }
-          }
-          if (
-            request.method === "GET" &&
             request.path === `/api/v1/research/sessions/${sessionId}/state`
           ) {
             return {
@@ -1379,12 +1501,329 @@ describe("automated research smoke", () => {
 
   function fastWorkerCommand() {
     return [
+      "test -n \"$ONYX_SETUP_FILE\"",
+      "test -n \"$ONYX_VALIDATION_FILE\"",
+      "test -n \"$ONYX_RESEARCH_SPEC_FILE\"",
+      "test -z \"${ONYX_BRIEF_FILE:-}\"",
+      "test -z \"${ONYX_SESSION_STATE_FILE:-}\"",
+      "onyx research brief --campaign \"$ONYX_CAMPAIGN_NAME\" --session \"$ONYX_SESSION_ID\" --hypothesis \"$ONYX_HYPOTHESIS_ID\" --json >/dev/null",
       "printf \"worker $ONYX_WORKER_ID\\n\" >> src/controller.txt",
       "git add src/controller.txt",
       "git -c user.name='Onyx Test' -c user.email='onyx@example.com' commit -m \"smoke worker $ONYX_WORKER_ID\"",
       "printf 'fast worker done\\n'",
     ].join(" && ")
   }
+
+  test("research run blocks when metric readiness validation is missing", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "missing-readiness"
+    await createSupervisorRunCampaign({ root, baseCommitSha, campaignName })
+    const setup = await readSetupFile(root, "")
+    await writeValidationFile(
+      root,
+      "",
+      normalizeValidationFile({
+        schemaVersion: 1,
+        status: "passed",
+        setupHash: setupHash(setup),
+        generatedAt: new Date().toISOString(),
+        summary: null,
+        checks: [
+          {
+            id: "setup_schema",
+            status: "passed",
+            message: "setup ok",
+            evidence: {},
+          },
+          {
+            id: "metric_capture",
+            status: "passed",
+            message: "metric ok",
+            evidence: {},
+          },
+        ],
+      })
+    )
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            workers: "1",
+            "worker-command": fastWorkerCommand(),
+            hypotheses: JSON.stringify(supervisorPlans(1)),
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow("has not proven metric tool readiness")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("research run blocks when metric readiness validation failed", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "failed-readiness"
+    await createSupervisorRunCampaign({ root, baseCommitSha, campaignName })
+    const setup = await readSetupFile(root, "")
+    await writeValidationFile(
+      root,
+      "",
+      normalizeValidationFile({
+        schemaVersion: 1,
+        status: "failed",
+        setupHash: setupHash(setup),
+        generatedAt: new Date().toISOString(),
+        summary: null,
+        checks: [
+          {
+            id: "setup_schema",
+            status: "passed",
+            message: "setup ok",
+            evidence: {},
+          },
+          {
+            id: "metric_capture",
+            status: "passed",
+            message: "metric ok",
+            evidence: {},
+          },
+          {
+            id: "metric_tool_readiness",
+            status: "failed",
+            message: "metric not ready",
+            evidence: {},
+          },
+        ],
+      })
+    )
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            workers: "1",
+            "worker-command": fastWorkerCommand(),
+            hypotheses: JSON.stringify(supervisorPlans(1)),
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow("metric_tool_readiness")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("research run accepts passed metric readiness before later clean-tree checks", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "passed-readiness"
+    await createSupervisorRunCampaign({ root, baseCommitSha, campaignName })
+    await writeFile(join(root, "scratch.txt"), "dirty\n", "utf8")
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            workers: "1",
+            "worker-command": fastWorkerCommand(),
+            hypotheses: JSON.stringify(supervisorPlans(1)),
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow("Main checkout must be clean before running research")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("research brief renders live local campaign memory as markdown and json", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "brief-smoke"
+    const campaign = await createSupervisorRunCampaign({
+      root,
+      baseCommitSha,
+      campaignName,
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "brief-session",
+      workerTarget: 1,
+      hypotheses: supervisorPlans(1),
+      maxIterations: 3,
+    })
+    const hypothesis = session.hypotheses[0]!
+    const worker = await registerLocalWorker({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      workerName: "brief-worker",
+      agentKind: "custom",
+    })
+    await recordLocalWorkerHeartbeat({
+      root,
+      workerId: worker.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      status: "running",
+      phase: "measuring",
+      progressMessage: "testing current digest",
+    })
+    await logLocalExperiment({
+      root,
+      record: {
+        schemaVersion: 1,
+        type: "campaign_experiment_logged",
+        campaignName,
+        sessionId: session.session.id,
+        hypothesisId: hypothesis.id,
+        workerId: worker.id,
+        runRef: "local/brief-smoke/live",
+        projectPath: "",
+        baseCommitSha,
+        resultCommitSha: "bbbbbbb",
+        resultRef: `refs/onyx/experiments/${campaign.id}/local/brief-smoke/live`,
+        status: "succeeded",
+        setupCompliance: {
+          status: "passed",
+          protectedPathsChanged: [],
+          outOfScopePathsChanged: [],
+          setupPathsChanged: [],
+          notes: null,
+        },
+        name: "live-improvement",
+        description: "Improved score",
+        primaryMetricName: "score",
+        primaryMetricValue: 2.5,
+        metrics: { score: 2.5 },
+        agentNotes: {},
+        checks: null,
+        createdAt: "2026-06-20T00:00:00.000Z",
+      },
+    })
+    await upsertLocalSummary({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      authoredByWorkerId: worker.id,
+      summaryKind: "hypothesis_summary",
+      title: "Controller summary",
+      body: "Scoped controller edits are promising.",
+    })
+    await createLocalKnowledge({
+      root,
+      campaignId: campaign.id,
+      sessionId: session.session.id,
+      hypothesisId: hypothesis.id,
+      authoredByWorkerId: worker.id,
+      kind: "insight",
+      title: "Tune lightly",
+      body: "Small scoped edits are outperforming broad rewrites.",
+    })
+    const state = await readState(root)
+    const key = campaignStateKey("", campaignName)
+    state.campaigns = state.campaigns ?? {}
+    state.campaigns[key] = {
+      ...(state.campaigns[key] ?? {}),
+      campaignId: campaign.id,
+      projectPath: "",
+      sessionId: session.session.id,
+    }
+    state.sessions = state.sessions ?? {}
+    state.sessions[session.session.id] = {
+      campaignName,
+      campaignId: campaign.id,
+      status: "running",
+    }
+    await writeState(root, state)
+
+    const previousCwd = process.cwd()
+    const previousSession = process.env.ONYX_SESSION_ID
+    const previousHypothesis = process.env.ONYX_HYPOTHESIS_ID
+    const logs: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      process.env.ONYX_SESSION_ID = session.session.id
+      process.env.ONYX_HYPOTHESIS_ID = hypothesis.id
+      await commandResearchBrief({
+        positional: ["research", "brief"],
+        options: {},
+      })
+      const markdown = logs.join("\n")
+      expect(markdown).toContain("# Onyx Research Brief: brief-smoke")
+      expect(markdown).toContain("Goal: Improve score.")
+      expect(markdown).toContain("Metric: score, maximize")
+      expect(markdown).toContain(`Session: ${session.session.id} (running)`)
+      expect(markdown).toContain(`Hypothesis: ${hypothesis.name}`)
+      expect(markdown).toContain("live-improvement")
+      expect(markdown).toContain("Controller summary")
+      expect(markdown).toContain("Tune lightly")
+      expect(markdown).toContain("brief-worker: running")
+
+      logs.length = 0
+      await commandResearchBrief({
+        positional: ["research", "brief"],
+        options: { json: "true" },
+      })
+      const json = JSON.parse(logs.join("\n")) as {
+        campaign: { name: string }
+        currentHypothesis: { id: string } | null
+        recentExperiments: Array<{ name: string }>
+        summaries: Array<{ title: string }>
+        knowledge: Array<{ title: string }>
+        workers: Array<{ workerName: string }>
+        markdown: string
+      }
+      expect(json.campaign.name).toBe(campaignName)
+      expect(json.currentHypothesis?.id).toBe(hypothesis.id)
+      expect(json.recentExperiments[0]?.name).toBe("live-improvement")
+      expect(json.summaries[0]?.title).toBe("Controller summary")
+      expect(json.knowledge[0]?.title).toBe("Tune lightly")
+      expect(json.workers[0]?.workerName).toBe("brief-worker")
+      expect(json.markdown).toContain("live-improvement")
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+      if (previousSession === undefined) delete process.env.ONYX_SESSION_ID
+      else process.env.ONYX_SESSION_ID = previousSession
+      if (previousHypothesis === undefined) delete process.env.ONYX_HYPOTHESIS_ID
+      else process.env.ONYX_HYPOTHESIS_ID = previousHypothesis
+    }
+  })
+
+  test("research brief fails clearly when local campaign is missing", async () => {
+    const { root } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchBrief({
+          positional: ["research", "brief"],
+          options: { campaign: "missing" },
+        })
+      ).rejects.toThrow("Local campaign missing was not found")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
 
   test("research run caps fast custom workers and reserves unique hypotheses", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
@@ -1428,6 +1867,10 @@ describe("automated research smoke", () => {
     if (!sessionId) throw new Error("expected session id")
     const sessionState = await getLocalSessionState(root, sessionId)
     expect(sessionState.session.status).toBe("completed")
+    await expect(
+      stat(join(await onyxStateDir(root), "session-state"))
+    ).rejects.toThrow()
+    await expect(stat(join(await onyxStateDir(root), "briefs"))).rejects.toThrow()
     expect(sessionState.session.metadata).toMatchObject({
       agentKind: "custom",
       maxConcurrency: 5,
@@ -1718,6 +2161,7 @@ describe("automated research smoke", () => {
         "worker-command": fastWorkerCommand(),
         "worker-timeout": "20",
         "startup-timeout": "0",
+        "launch-interval-seconds": "0.01",
         "sync-interval": "60",
         "presence-interval": "60",
         "final-sync-timeout": "1",
@@ -1884,7 +2328,13 @@ describe("automated research smoke", () => {
                   hypotheses: [],
                   workers: [],
                   experiments: [],
-                  experimentsUpdated: 0,
+                  gitVerification: {
+                    checkedCount: 0,
+                    updatedCount: 0,
+                    remainingCount: 0,
+                    limit: 100,
+                    hasMore: false,
+                  },
                 },
               },
             }
@@ -2581,6 +3031,22 @@ describe("research status", () => {
           campaignName,
           campaignId: campaign.id,
           status: "running",
+          ignoredPresence: {
+            total: 2,
+            byReason: {
+              not_found: 1,
+              session_mismatch: 1,
+            },
+            lastAt: "2026-06-20T00:00:03.000Z",
+            recent: [
+              {
+                id: worker.id,
+                reason: "session_mismatch",
+                message: "Research worker belongs to a different session",
+                at: "2026-06-20T00:00:03.000Z",
+              },
+            ],
+          },
         },
       },
     })
@@ -2605,9 +3071,12 @@ describe("research status", () => {
     const output = JSON.parse(lines.join("\n")) as {
       session: { activeWorkers: number; openSlots: number }
       workers: Array<{ id: string; status: string }>
+      ignoredPresence: { total: number; byReason: Record<string, number> }
     }
     expect(output.session.activeWorkers).toBe(0)
     expect(output.session.openSlots).toBe(1)
+    expect(output.ignoredPresence.total).toBe(2)
+    expect(output.ignoredPresence.byReason.session_mismatch).toBe(1)
     expect(output.workers.find((item) => item.id === worker.id)?.status).toBe(
       "completed"
     )
@@ -2912,32 +3381,6 @@ describe("research status", () => {
       },
     })
 
-    const sessionStateDir = join(
-      await onyxStateDir(root),
-      "session-state",
-      session.session.id
-    )
-    await mkdir(sessionStateDir, { recursive: true })
-    await writeFile(
-      join(sessionStateDir, `${hypothesis.id}.json`),
-      `${JSON.stringify(
-        {
-          session: { ...session.session, status: "running" },
-          campaign,
-          latestExperiments: [],
-          bestExperiment: null,
-          hypotheses: session.hypotheses,
-          workers: [],
-          summaries: [],
-          knowledge: [],
-          updatedAt: "2026-06-20T00:00:00.000Z",
-        },
-        null,
-        2
-      )}\n`,
-      "utf8"
-    )
-
     const previousCwd = process.cwd()
     const logs: string[] = []
     const originalLog = console.log
@@ -2955,10 +3398,8 @@ describe("research status", () => {
         },
       })
 
-      const cached = JSON.parse(
-        await readFile(join(sessionStateDir, `${hypothesis.id}.json`), "utf8")
-      ) as { session: { status: string } }
-      expect(cached.session.status).toBe("completed")
+      const localSession = await getLocalSessionState(root, session.session.id)
+      expect(localSession.session.status).toBe("completed")
 
       logs.length = 0
       await commandResearchStatus({
@@ -3295,26 +3736,6 @@ describe("research hypothesis add", () => {
               },
             }
           }
-          if (
-            request.method === "GET" &&
-            request.path === `/api/v1/research/campaigns/${campaignId}/brief`
-          ) {
-            return {
-              body: {
-                data: {
-                  campaign,
-                  bestExperiment: null,
-                  recentExperiments: [],
-                  hypotheses: [],
-                  workers: [],
-                  summaries: [],
-                  knowledge: [],
-                  recommendedContext: [],
-                  markdown: "brief",
-                },
-              },
-            }
-          }
           throw new Error(
             `Unexpected API call ${request.method} ${request.path}`
           )
@@ -3474,26 +3895,6 @@ describe("research hypothesis add", () => {
               },
             }
           }
-          if (
-            request.method === "GET" &&
-            request.path === `/api/v1/research/campaigns/${campaignId}/brief`
-          ) {
-            return {
-              body: {
-                data: {
-                  campaign,
-                  bestExperiment: null,
-                  recentExperiments: [],
-                  hypotheses: [],
-                  workers: [],
-                  summaries: [],
-                  knowledge: [],
-                  recommendedContext: [],
-                  markdown: "brief",
-                },
-              },
-            }
-          }
           throw new Error(
             `Unexpected API call ${request.method} ${request.path}`
           )
@@ -3607,13 +4008,16 @@ describe("setup workflow", () => {
         "evaluate",
       ])
       const instructions = await readFile(join(root, "onyx", "onyx.md"), "utf8")
+      expect(instructions).toContain("# Onyx Research Spec")
       expect(instructions).toContain("## Goal")
       expect(instructions).toContain("Improve score")
       expect(instructions).toContain("## Primary Metric")
       expect(instructions).toContain("METRIC score=<number>")
-      expect(instructions).toContain("## Workflow Contract")
-      expect(instructions).toContain("onyx exp run")
-      expect(instructions).toContain("## First-Run Checklist")
+      expect(instructions).toContain("## Workflow And Tools")
+      expect(instructions).toContain("The Onyx CLI enforces the workflow contract")
+      expect(instructions).toContain("## Project Guidance")
+      expect(instructions).toContain("## Setup Checklist")
+      expect(instructions).not.toContain("onyx exp run")
       expect(USAGE).not.toContain("onyx setup require")
     } finally {
       process.chdir(previousCwd)
@@ -3688,8 +4092,32 @@ describe("setup workflow", () => {
     }
   })
 
-  test("setup validation is static and does not execute eval", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-validate-"))
+  test("setup init writes failed metric readiness without executing eval", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-validate-init-"))
+    const previousCwd = process.cwd()
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: { goal: "Improve score", "metric-name": "score" },
+      })
+
+      const validation = await readValidationFile(root, "")
+      const readiness = validation?.checks.find(
+        (item) => item.id === "metric_tool_readiness"
+      )
+      expect(validation?.status).toBe("failed")
+      expect(readiness?.status).toBe("failed")
+      expect(readiness?.evidence.toolId).toBe("evaluation.run")
+      expect(readiness?.message).toContain("Run `onyx setup validate`")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("setup validate fails when eval exits nonzero", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-validate-exit-"))
     const previousCwd = process.cwd()
     await runProcess("git", ["init"], { cwd: root })
     try {
@@ -3700,7 +4128,7 @@ describe("setup workflow", () => {
       })
       await writeFile(
         join(root, "onyx", "tools", "evaluation", "run.sh"),
-        ["#!/usr/bin/env bash", "exit 42", ""].join("\n"),
+        ["#!/usr/bin/env bash", "echo nope", "exit 42", ""].join("\n"),
         "utf8"
       )
       await commandSetupValidate({
@@ -3709,10 +4137,123 @@ describe("setup workflow", () => {
       })
 
       const validation = await readValidationFile(root, "")
-      expect(validation?.status).toBe("warning")
-      expect(
-        validation?.checks.find((item) => item.id === "metric_capture")?.status
-      ).toBe("passed")
+      const readiness = validation?.checks.find(
+        (item) => item.id === "metric_tool_readiness"
+      )
+      expect(validation?.status).toBe("failed")
+      expect(readiness?.status).toBe("failed")
+      expect(readiness?.message).toContain("exited with code 42")
+      expect(readiness?.evidence.exitCode).toBe(42)
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("setup validate fails when eval emits no primary metric", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-validate-no-metric-"))
+    const previousCwd = process.cwd()
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: { goal: "Improve score", "metric-name": "score" },
+      })
+      await writeFile(
+        join(root, "onyx", "tools", "evaluation", "run.sh"),
+        ["#!/usr/bin/env bash", "echo no metric here", ""].join("\n"),
+        "utf8"
+      )
+      await commandSetupValidate({
+        positional: ["setup", "validate"],
+        options: {},
+      })
+
+      const validation = await readValidationFile(root, "")
+      const readiness = validation?.checks.find(
+        (item) => item.id === "metric_tool_readiness"
+      )
+      expect(validation?.status).toBe("failed")
+      expect(readiness?.status).toBe("failed")
+      expect(readiness?.message).toContain("found none")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("setup validate fails when eval emits duplicate primary metrics", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-validate-duplicates-"))
+    const previousCwd = process.cwd()
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: { goal: "Improve score", "metric-name": "score" },
+      })
+      await writeFile(
+        join(root, "onyx", "tools", "evaluation", "run.sh"),
+        [
+          "#!/usr/bin/env bash",
+          "printf 'METRIC score=1\\nMETRIC score=2\\n'",
+          "",
+        ].join("\n"),
+        "utf8"
+      )
+      await commandSetupValidate({
+        positional: ["setup", "validate"],
+        options: {},
+      })
+
+      const validation = await readValidationFile(root, "")
+      const readiness = validation?.checks.find(
+        (item) => item.id === "metric_tool_readiness"
+      )
+      expect(validation?.status).toBe("failed")
+      expect(readiness?.status).toBe("failed")
+      expect(readiness?.message).toContain("Duplicate METRIC score")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("setup validate passes with one primary metric and secondary metrics", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-validate-ready-"))
+    const previousCwd = process.cwd()
+    await runProcess("git", ["init"], { cwd: root })
+    try {
+      process.chdir(root)
+      await commandSetupInit({
+        positional: ["setup", "init"],
+        options: { goal: "Improve score", "metric-name": "score" },
+      })
+      await writeFile(
+        join(root, "onyx", "tools", "evaluation", "run.sh"),
+        [
+          "#!/usr/bin/env bash",
+          "printf 'METRIC score=2\\nMETRIC control_effort=0.4\\n'",
+          "",
+        ].join("\n"),
+        "utf8"
+      )
+      await commandSetupValidate({
+        positional: ["setup", "validate"],
+        options: {},
+      })
+
+      const validation = await readValidationFile(root, "")
+      const readiness = validation?.checks.find(
+        (item) => item.id === "metric_tool_readiness"
+      )
+      expect(readiness?.status).toBe("passed")
+      expect(readiness?.evidence.primaryMetric).toEqual({
+        name: "score",
+        value: 2,
+      })
+      expect(readiness?.evidence.secondaryMetricNames).toEqual([
+        "control_effort",
+      ])
+      expect(readiness?.evidence.outputSummary).toContain("METRIC score=2")
     } finally {
       process.chdir(previousCwd)
     }

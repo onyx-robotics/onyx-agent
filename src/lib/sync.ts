@@ -6,6 +6,7 @@ import { resolveProjectPath } from "./project"
 import {
   getResearchSiteId,
   applyProjectDeletions,
+  applyRemoteProjectionDeltas,
   applyRemoteTombstones,
   markExperimentRefsVerified,
   markResearchSyncAcked,
@@ -35,16 +36,18 @@ function eventExperimentRef(event: {
   if (!experiment || typeof experiment !== "object") return null
   const record = experiment as Record<string, unknown>
   const runRef = record.runRef
-  const commitSha = record.resultCommitSha
-  const ref = record.resultRef
+  const campaignId = record.campaignId
+  const resultCommitSha = record.resultCommitSha
+  const resultRef = record.resultRef
   if (
+    typeof campaignId !== "string" ||
     typeof runRef !== "string" ||
-    typeof commitSha !== "string" ||
-    typeof ref !== "string"
+    typeof resultCommitSha !== "string" ||
+    typeof resultRef !== "string"
   ) {
     return null
   }
-  return { runRef, commitSha, ref }
+  return { campaignId, runRef, resultCommitSha, resultRef }
 }
 
 async function resolveProjectIdForDeletionFeed(root: string, args: Args) {
@@ -130,14 +133,29 @@ async function flushResearchDbEvents(
   const eventIds = events.map((event) => event.eventId)
   try {
     const refs = events.map(eventExperimentRef).filter(Boolean) as Array<{
+      campaignId: string
       runRef: string
-      commitSha: string
-      ref: string
+      resultCommitSha: string
+      resultRef: string
     }>
     for (let index = 0; index < refs.length; index += 20) {
-      await pushRefs(root, refs.slice(index, index + 20))
+      await pushRefs(
+        root,
+        refs.slice(index, index + 20).map((ref) => ({
+          runRef: ref.runRef,
+          commitSha: ref.resultCommitSha,
+          ref: ref.resultRef,
+        }))
+      )
     }
-    await markExperimentRefsVerified({ root, refs })
+    await markExperimentRefsVerified({
+      root,
+      refs: refs.map((ref) => ({
+        runRef: ref.runRef,
+        commitSha: ref.resultCommitSha,
+        ref: ref.resultRef,
+      })),
+    })
 
     const response = await syncResearchEvents(
       {
@@ -147,6 +165,7 @@ async function flushResearchDbEvents(
           args.options["repository-url"]
         ),
         projectPath: await resolveProjectPath(root, args),
+        pushedExperimentRefs: refs,
         events: events.map((event) => ({
           eventId: event.eventId,
           sequence: event.sequence,
@@ -162,6 +181,10 @@ async function flushResearchDbEvents(
     await applyRemoteTombstones({
       root,
       tombstones: response.tombstones,
+    })
+    await applyRemoteProjectionDeltas({
+      root,
+      deltas: response.projectionDeltas,
     })
 
     let flushed = 0

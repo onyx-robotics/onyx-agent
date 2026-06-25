@@ -50,9 +50,12 @@ CLI targets.
 
 ## Agent Skill
 
-The installer installs the bundled skill automatically to Claude Code's
-personal skill directory at `~/.claude/skills/onyx/SKILL.md`. To install it
-manually:
+The installer installs the bundled skill automatically for Claude Code and
+Codex. It writes Claude's personal skill file at
+`~/.claude/skills/onyx/SKILL.md`, Codex's user skill file at
+`~/.agents/skills/onyx/SKILL.md`, and the Codex home skill file at
+`${CODEX_HOME:-~/.codex}/skills/onyx/SKILL.md` for Codex builds that discover
+skills from `CODEX_HOME`. To install it manually:
 
 ```bash
 onyx agent install-skill
@@ -74,7 +77,6 @@ git add onyx
 git commit -m "Add Onyx setup"
 git push origin HEAD
 onyx campaign setup --name fast-eval --description "Improve score"
-onyx tools run evaluation.run
 onyx research run --campaign fast-eval --workers 4
 onyx push
 ```
@@ -87,16 +89,19 @@ setup tools without creating workflow or measured-attempt state.
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
 `onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
 and `onyx/tools/*`; designs the linear workflow and declared tools; validates
-the setup hash and static checks; then creates an async research session with
-deliberate hypothesis plans. Runtime rigor remains in `onyx exp run`, which
+the setup hash and executes the canonical metric tool once to prove readiness;
+then creates an async research session with deliberate hypothesis plans.
+Runtime rigor remains in `onyx exp run`, which
 pauses for the agent edit, requires exactly one clean result commit, executes
 workflow command steps, parses the primary metric, and records setup compliance.
 `onyx setup init` stays explicit: `--editable-scope` and `--eval-command` write
 only the caller-provided values, and the default eval tool keeps failing until
-the orchestrator deliberately configures it. The generated `onyx/onyx.md`
-still includes the supplied goal, metric contract, editable scope, evaluation
-command, workflow contract, and first-run checklist so workers have useful
-initial context before project-specific edits.
+the orchestrator deliberately configures it. Slow eval cost is paid during
+`onyx setup validate`, not before every worker loop. The generated `onyx/onyx.md`
+is a research spec for durable project guidance: goal, metric interpretation,
+editable scope, evaluation caveats, declared tools, and project-specific
+constraints. Workers use CLI commands for live structured state instead of
+generated per-worker state files.
 
 Local research state is SQLite-first. The agent stores campaigns, sessions,
 hypotheses, workers, experiments, summaries, knowledge, resource leases, and
@@ -140,13 +145,19 @@ launches explicitly:
 onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --max-launches 2 --worker-command "<cmd>"
 ```
 
+For large local runs, the supervisor ramps launches in batches
+(`--launch-batch-size`, default up to 10) separated by
+`--launch-interval-seconds` (default 5), backs off briefly when provider
+startup or rate-limit failures happen, and stops launching new workers once the
+shutdown cushion begins.
+
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
 receive the worker prompt over stdin, and write raw stdout/stderr logs,
 readable `.activity.log` files, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-shared sync, coalesced presence updates, stop handling, and final sync for the
-session. `onyx worker run --session <id> --hypothesis <id>` remains available
+shared sync, adaptive coalesced presence updates, sampled durable heartbeats,
+stop handling, and final sync for the session. `onyx worker run --session <id> --hypothesis <id>` remains available
 as a low-level debugging and recovery primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
@@ -159,8 +170,8 @@ diagnostics.
 
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
 and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
-each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
-`onyx research should-stop`, run the setup workflow through `onyx exp run
+worker prompts and logs live under `.git/onyx/`. Workers run `onyx research brief`
+for current campaign memory, poll `onyx research should-stop`, run the setup workflow through `onyx exp run
 --campaign <name> --base <sha> --auto` and `onyx exp run --resume <id> --auto`,
 push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment
 with setup/session/hypothesis/worker context. `onyx research hypothesis add`
@@ -221,8 +232,8 @@ onyx developer use dev
 ```
 
 Developer mode runs source through Bun and replaces
-`~/.claude/skills/onyx/SKILL.md` with a symlink to this checkout's
-`skills/onyx/SKILL.md`, so Claude Code sees skill edits from local source.
+the managed Claude and Codex skill files with symlinks to this checkout's
+`skills/onyx/SKILL.md`, so active agents see skill edits from local source.
 Return to the installed release with:
 
 ```bash

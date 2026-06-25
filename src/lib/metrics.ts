@@ -18,6 +18,46 @@ export function parseMetricLines(stdout: string, fallbackName = "score") {
   return metrics
 }
 
+export function parseWorkflowMetricLines(
+  stdout: string,
+  metricName: string
+): { metrics: Record<string, number>; error: string | null } {
+  const metricLines = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("METRIC "))
+  if (metricLines.length === 0) {
+    return {
+      metrics: {},
+      error: `Expected one primary METRIC ${metricName}=<number> line; found none.`,
+    }
+  }
+  const metrics: Record<string, number> = {}
+  for (const line of metricLines) {
+    const match = line.match(
+      /^METRIC\s+([A-Za-z0-9_.:-]+)=(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i
+    )
+    if (!match) {
+      return { metrics: {}, error: `Invalid METRIC line: ${line}` }
+    }
+    const name = match[1]!
+    if (Object.hasOwn(metrics, name)) {
+      return {
+        metrics: {},
+        error: `Duplicate METRIC ${name}=<number> line.`,
+      }
+    }
+    metrics[name] = Number(match[2])
+  }
+  if (!Object.hasOwn(metrics, metricName)) {
+    return {
+      metrics: {},
+      error: `Expected one primary METRIC ${metricName}=<number> line; found ${metricLines.length} metric line(s) without the primary metric.`,
+    }
+  }
+  return { metrics, error: null }
+}
+
 export function summarizeOutput(stdout: string, stderr: string) {
   return [stdout.trim(), stderr.trim()]
     .filter(Boolean)

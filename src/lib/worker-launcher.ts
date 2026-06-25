@@ -157,23 +157,8 @@ export async function writeWorkerOnyxShim({
       "",
     ].join("\n")
   } else {
-    const resolved = await runProcess("sh", ["-lc", "command -v onyx"], {
-      timeoutMs: 5000,
-    })
-    const resolvedPath = resolved.stdout.trim().split("\n")[0]
-    const sourceBinPath =
-      resolved.code === 0 && resolvedPath
-        ? null
-        : await sourceCheckoutOnyxBin()
-    if (resolved.code === 0 && resolvedPath) {
-      target = resolvedPath
-      script = [
-        "#!/usr/bin/env sh",
-        "set -eu",
-        `exec env ${ONYX_LAUNCHER_BYPASS}=1 ${shellQuote(target)} "$@"`,
-        "",
-      ].join("\n")
-    } else if (sourceBinPath) {
+    const sourceBinPath = await sourceCheckoutOnyxBin()
+    if (sourceBinPath) {
       mode = "source"
       target = sourceBinPath
       script = [
@@ -183,9 +168,23 @@ export async function writeWorkerOnyxShim({
         "",
       ].join("\n")
     } else {
-      throw new Error(
-        "Unable to resolve the Onyx CLI on PATH for worker launch. Install `onyx`, run from an Onyx agent source checkout, or use developer mode with `onyx developer link <path>`."
-      )
+      const resolved = await runProcess("sh", ["-lc", "command -v onyx"], {
+        timeoutMs: 5000,
+      })
+      const resolvedPath = resolved.stdout.trim().split("\n")[0]
+      if (resolved.code === 0 && resolvedPath) {
+        target = resolvedPath
+        script = [
+          "#!/usr/bin/env sh",
+          "set -eu",
+          `exec env ${ONYX_LAUNCHER_BYPASS}=1 ${shellQuote(target)} "$@"`,
+          "",
+        ].join("\n")
+      } else {
+        throw new Error(
+          "Unable to resolve the Onyx CLI on PATH for worker launch. Install `onyx`, run from an Onyx agent source checkout, or use developer mode with `onyx developer link <path>`."
+        )
+      }
     }
   }
 
@@ -465,15 +464,6 @@ export async function preflightWorkerInvocation(
         "--json",
       ],
       { allowExitCodes: [0] }
-    )
-  }
-
-  if (options.campaignName) {
-    await runCheck(
-      "onyx evaluation tool",
-      "onyx",
-      ["tools", "run", "evaluation.run", "--timeout", "120"],
-      { allowExitCodes: [0, 1] }
     )
   }
 
