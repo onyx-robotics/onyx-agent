@@ -66,6 +66,10 @@ async function writeFakeOnyx(path: string) {
       '  echo "{\\"apiTarget\\":\\"http://localhost:3000\\",\\"project\\":null}"',
       "  exit 0",
       "fi",
+      'if [[ "${1:-}" == "tools" && "${2:-}" == "run" ]]; then',
+      '  echo "unexpected tools run: $*" >&2',
+      "  exit 99",
+      "fi",
       'for arg in "$@"; do',
       '  if [[ "$arg" == "--help" ]]; then',
       '    echo "onyx fake command help: $*"',
@@ -270,6 +274,35 @@ describe("worker launchers", () => {
     })
 
     expect(preflight.version).toContain("claude fake 2.0")
+  })
+
+  test("preflight does not run the evaluation tool before worker launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-no-eval-"))
+    const bin = join(root, "bin")
+    const worktree = join(root, "worktree")
+    await mkdir(bin)
+    await mkdir(worktree)
+    await runProcess("git", ["init"], { cwd: worktree })
+    await writeFakeAgent(join(bin, "codex"), "codex fake 1.0")
+    await writeFakeOnyx(join(bin, "onyx"))
+
+    const invocation = buildWorkerInvocation({
+      agentKind: "codex",
+      worktree,
+      prompt: "do useful work",
+    })
+    const preflight = await preflightWorkerInvocation(invocation, {
+      cwd: worktree,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+      },
+      campaignName: "smoke",
+    })
+
+    expect(preflight.checks.map((item) => item.name)).not.toContain(
+      "onyx evaluation tool"
+    )
   })
 
   test("writes launch manifests after creating parent directories", async () => {

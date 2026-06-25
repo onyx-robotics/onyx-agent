@@ -74,7 +74,6 @@ git add onyx
 git commit -m "Add Onyx setup"
 git push origin HEAD
 onyx campaign setup --name fast-eval --description "Improve score"
-onyx tools run evaluation.run
 onyx research run --campaign fast-eval --workers 4
 onyx push
 ```
@@ -87,13 +86,15 @@ setup tools without creating workflow or measured-attempt state.
 The bundled `/onyx` skill is the preferred user-facing orchestrator. It creates
 `onyx/setup.json`, `onyx/validation.json`, generated `onyx/onyx.md`,
 and `onyx/tools/*`; designs the linear workflow and declared tools; validates
-the setup hash and static checks; then creates an async research session with
-deliberate hypothesis plans. Runtime rigor remains in `onyx exp run`, which
+the setup hash and executes the canonical metric tool once to prove readiness;
+then creates an async research session with deliberate hypothesis plans.
+Runtime rigor remains in `onyx exp run`, which
 pauses for the agent edit, requires exactly one clean result commit, executes
 workflow command steps, parses the primary metric, and records setup compliance.
 `onyx setup init` stays explicit: `--editable-scope` and `--eval-command` write
 only the caller-provided values, and the default eval tool keeps failing until
-the orchestrator deliberately configures it. The generated `onyx/onyx.md`
+the orchestrator deliberately configures it. Slow eval cost is paid during
+`onyx setup validate`, not before every worker loop. The generated `onyx/onyx.md`
 is a research spec for durable project guidance: goal, metric interpretation,
 editable scope, evaluation caveats, declared tools, and project-specific
 constraints. Workers use CLI commands for live structured state instead of

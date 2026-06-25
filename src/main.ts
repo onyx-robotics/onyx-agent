@@ -59,6 +59,7 @@ Usage:
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
   onyx setup init [--project-path <path>] [--goal <text>] [--metric-name <name>] [--metric-unit <unit>] [--metric-direction maximize|minimize] [--editable-scope <paths>] [--eval-command <cmd>]
   onyx setup validate [--project-path <path>]
+      (executes the required metric tool once and records setup readiness)
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]

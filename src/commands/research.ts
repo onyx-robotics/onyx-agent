@@ -1015,6 +1015,17 @@ async function assertLocalSetupReady(root: string, projectPath: string) {
       ].join("\n")
     )
   }
+  const metricReadiness = validation.checks.find(
+    (check) => check.id === "metric_tool_readiness"
+  )
+  if (metricReadiness?.status !== "passed") {
+    throw new Error(
+      [
+        "Setup validation has not proven metric tool readiness.",
+        "Run `onyx setup validate` after configuring the canonical metric tool, review the metric_tool_readiness check, then commit the setup surface before starting research.",
+      ].join("\n")
+    )
+  }
   return { setup, validation }
 }
 
@@ -3499,7 +3510,6 @@ export async function commandResearchRun(args: Args) {
     positiveNumberOption(args, "final-sync-timeout", 120) * 1000
 
   let sessionId = requestedSessionId
-  let initialHypotheses = sessionState?.hypotheses ?? []
   if (!sessionId) {
     const result = await createLocalSession({
       root,
@@ -3521,7 +3531,6 @@ export async function commandResearchRun(args: Args) {
       },
     })
     sessionId = result.session.id
-    initialHypotheses = result.hypotheses
   }
 
   const nextState = await readState(root)

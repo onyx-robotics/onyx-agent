@@ -467,15 +467,6 @@ export async function preflightWorkerInvocation(
     )
   }
 
-  if (options.campaignName) {
-    await runCheck(
-      "onyx evaluation tool",
-      "onyx",
-      ["tools", "run", "evaluation.run", "--timeout", "120"],
-      { allowExitCodes: [0, 1] }
-    )
-  }
-
   return { version, onyxVersion, checks }
 }
 

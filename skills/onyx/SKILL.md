@@ -12,7 +12,7 @@ You are the main-thread Onyx orchestrator. The user talks to you. You keep the h
 1. Ask for or deliberately choose goal, metric/unit/direction, repo scope, constraints, budget, agent count, resources, reset/readiness needs, evaluation commands, and guardrail checks. Do not rely on `onyx setup init` to infer repository details automatically.
 2. Create the local setup surface with `onyx setup init`; pass `--editable-scope` or `--eval-command` only when you want those exact caller-provided values written into the scaffold. Then edit `onyx/setup.json`, `onyx/onyx.md`, and `onyx/tools/*` as needed. The default eval tool is `onyx/tools/evaluation/run.sh` and remains failing until deliberately configured.
 3. Encode reset, readiness, safety, reliability, and hardware/service work as declared `setup.tools` entries and linear `workflow` command steps. Keep exactly one leading agent step and exactly one required `metric: true` command step.
-4. Run `onyx setup validate`. Setup validation is static and does not execute eval, reset, check, or hardware commands. Failed or stale validation blocks campaign setup and research run; warning checks do not.
+4. Run `onyx setup validate`. Setup validation executes the required metric tool once, requires exactly one primary `METRIC <name>=<number>` line, and records readiness evidence in `onyx/validation.json`. Review the `metric_tool_readiness` check before committing. Failed or stale validation blocks campaign setup and research run; warning checks do not.
 5. Commit the setup surface with `git add <setup-dir> && git commit -m "Add Onyx setup"` where `<setup-dir>` is `onyx` at repo root or `<projectPath>/onyx` in a monorepo; `onyx campaign setup` and `onyx research run` require the committed campaign base to contain the setup files.
 6. Push the setup base commit to the repository remote with `git push origin HEAD` before campaign sync. The generic CLI warns instead of auto-pushing, but this orchestrated skill should push so GitHub-backed campaign creation can verify the base commit.
 7. Run `onyx campaign setup --name <slug> --description <goal>`, then `onyx sync` if needed.
@@ -25,7 +25,7 @@ You are the main-thread Onyx orchestrator. The user talks to you. You keep the h
 
 `onyx/setup.json` declares goal, metric, project path, editable scope, protected paths, resources, declared tools, and the linear experiment workflow. It is the only setup policy file.
 
-`onyx/validation.json` is the latest local validation report. It stores a setup hash and static checks. It is evidence, not security. Research run blocks when validation is stale or any check failed.
+`onyx/validation.json` is the latest local validation report. It stores a setup hash, setup checks, and metric-tool readiness evidence. It is evidence, not security. Research run blocks when validation is stale, any check failed, or `metric_tool_readiness` is missing.
 
 The setup surface must be committed before campaign creation and session start. This makes every worker worktree start from a campaign base that contains the same frozen setup, validation report, research spec, and workflow tools.
 

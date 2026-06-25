@@ -18,7 +18,7 @@ import {
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, repoRoot } from "../lib/git"
-import { summarizeOutput } from "../lib/metrics"
+import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
 import {
   clientRunRef,
   onyxStateDir,
@@ -456,43 +456,6 @@ async function writeWorkflowStepLog({
     "utf8"
   )
   return path
-}
-
-export function parseWorkflowMetricLines(stdout: string, metricName: string) {
-  const metricLines = stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("METRIC "))
-  if (metricLines.length === 0) {
-    return {
-      metrics: {},
-      error: `Expected one primary METRIC ${metricName}=<number> line; found none.`,
-    }
-  }
-  const metrics: Record<string, number> = {}
-  for (const line of metricLines) {
-    const match = line.match(
-      /^METRIC\s+([A-Za-z0-9_.:-]+)=(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i
-    )
-    if (!match) {
-      return { metrics: {}, error: `Invalid METRIC line: ${line}` }
-    }
-    const name = match[1]!
-    if (Object.hasOwn(metrics, name)) {
-      return {
-        metrics: {},
-        error: `Duplicate METRIC ${name}=<number> line.`,
-      }
-    }
-    metrics[name] = Number(match[2])
-  }
-  if (!Object.hasOwn(metrics, metricName)) {
-    return {
-      metrics: {},
-      error: `Expected one primary METRIC ${metricName}=<number> line; found ${metricLines.length} metric line(s) without the primary metric.`,
-    }
-  }
-  return { metrics, error: null }
 }
 
 function checksRecordForSteps(
@@ -1100,11 +1063,23 @@ export async function commandExpRun(args: Args) {
     })
     const baseCommitSha =
       args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
-    setup = await readSetupFileFromCommit({
-      root,
-      projectPath,
-      commitSha: baseCommitSha,
-    }).catch(async () => readSetupFile(root, projectPath))
+    try {
+      setup = await readSetupFileFromCommit({
+        root,
+        projectPath,
+        commitSha: baseCommitSha,
+      })
+    } catch (error) {
+      throw new Error(
+        [
+          `Experiment base ${baseCommitSha} does not contain a valid Onyx setup file for projectPath "${projectPath}".`,
+          "Commit the setup surface, then create a new campaign or update/recreate the campaign base before running experiments.",
+          error instanceof Error ? `Original error: ${error.message}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n")
+      )
+    }
     if (setup.projectPath !== projectPath) {
       throw new Error(
         `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`

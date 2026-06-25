@@ -1,7 +1,12 @@
 // Public surface barrel: keeps the `onyx` bin and tests importing from "./onyx"
 // while the implementation lives in focused modules under lib/ and commands/.
 export { parseArgs, type Args } from "./lib/args"
-export { parseMetricLines, primaryMetric, summarizeOutput } from "./lib/metrics"
+export {
+  parseMetricLines,
+  parseWorkflowMetricLines,
+  primaryMetric,
+  summarizeOutput,
+} from "./lib/metrics"
 export {
   campaignStateKey,
   normalizeProjectPath,
@@ -122,7 +127,6 @@ export {
   commandExpList,
   commandExpLog,
   commandExpRun,
-  parseWorkflowMetricLines,
 } from "./commands/exp"
 export { commandListen } from "./commands/listen"
 export { commandPush, commandStatus, commandSync } from "./commands/sync"
