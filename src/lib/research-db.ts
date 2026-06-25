@@ -3512,66 +3512,212 @@ export async function localBriefMarkdown({
   sessionId?: string
   hypothesisId?: string
 }) {
+  const brief = await localResearchBrief({
+    root,
+    campaignId,
+    sessionId,
+    hypothesisId,
+  })
+  return brief.markdown
+}
+
+export type LocalResearchBrief = {
+  campaign: ApiCampaign
+  session: ApiSession | null
+  currentHypothesis: ApiHypothesis | null
+  bestExperiment: ApiCampaignExperiment | null
+  recentExperiments: ApiCampaignExperiment[]
+  hypotheses: ApiHypothesis[]
+  workers: ApiWorker[]
+  summaries: ApiSummary[]
+  knowledge: ApiKnowledge[]
+  updatedAt: string
+  markdown: string
+}
+
+function renderLocalResearchBrief({
+  campaign,
+  session,
+  currentHypothesis,
+  bestExperiment,
+  recentExperiments,
+  hypotheses,
+  workers,
+  summaries,
+  knowledge,
+}: Omit<LocalResearchBrief, "markdown" | "updatedAt">) {
+  const lines = [
+    `# Onyx Research Brief: ${campaign.name}`,
+    "",
+    `Goal: ${campaign.description ?? "Not specified"}`,
+    `Metric: ${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
+    `Base commit: ${campaign.baseCommitSha}`,
+    session ? `Session: ${session.id} (${session.status})` : null,
+    currentHypothesis ? `Hypothesis: ${currentHypothesis.name}` : null,
+    currentHypothesis ? `Focus: ${currentHypothesis.plan.focus}` : null,
+    currentHypothesis ? `Statement: ${currentHypothesis.plan.statement}` : null,
+  ].filter((line) => line !== null)
+
+  lines.push("", "## Best Result")
+  lines.push(
+    bestExperiment
+      ? `${bestExperiment.name}: ${bestExperiment.primaryMetricName}=${bestExperiment.primaryMetricValue ?? "null"} (${bestExperiment.status}) ${bestExperiment.resultCommitSha.slice(0, 7)}`
+      : "- none yet"
+  )
+
+  lines.push("", "## Recent Experiments")
+  if (recentExperiments.length === 0) {
+    lines.push("- none yet")
+  } else {
+    lines.push(
+      ...recentExperiments
+        .slice(0, 10)
+        .map(
+          (experiment) =>
+            `- ${experiment.name}: ${experiment.primaryMetricName}=${experiment.primaryMetricValue ?? "null"} (${experiment.status}) ${experiment.resultCommitSha.slice(0, 7)}`
+        )
+    )
+  }
+
+  lines.push("", "## Current Summaries")
+  const currentSummaries = summaries
+    .filter((summary) => summary.isCurrent)
+    .slice(0, 10)
+  if (currentSummaries.length === 0) {
+    lines.push("- none yet")
+  } else {
+    lines.push(
+      ...currentSummaries.map(
+        (summary) => `- ${summary.summaryKind}: ${summary.title}\n${summary.body}`
+      )
+    )
+  }
+
+  lines.push("", "## Shared Knowledge")
+  if (knowledge.length === 0) {
+    lines.push("- none yet")
+  } else {
+    lines.push(
+      ...knowledge
+        .slice(0, 20)
+        .map(
+          (item) => `- ${item.kind}: ${item.title} - ${item.body.slice(0, 240)}`
+        )
+    )
+  }
+
+  lines.push("", "## Hypotheses")
+  if (hypotheses.length === 0) {
+    lines.push("- none yet")
+  } else {
+    lines.push(
+      ...hypotheses.map(
+        (hypothesis) =>
+          `- ${hypothesis.name}: ${hypothesis.status}, base ${hypothesis.baseCommitSha}${hypothesis.lastWorkedAt ? `, last worked ${hypothesis.lastWorkedAt}` : ""}\n  Focus: ${hypothesis.plan.focus}\n  Statement: ${hypothesis.plan.statement}`
+      )
+    )
+  }
+
+  lines.push("", "## Workers")
+  if (workers.length === 0) {
+    lines.push("- none yet")
+  } else {
+    lines.push(
+      ...workers.map(
+        (worker) =>
+          `- ${worker.workerName}: ${worker.status}${worker.hypothesisId ? ` on hypothesis ${worker.hypothesisId}` : ""}${worker.progressMessage ? ` - ${worker.progressMessage}` : ""}`
+      )
+    )
+  }
+
+  return lines.join("\n")
+}
+
+export async function localResearchBrief({
+  root,
+  campaignId,
+  sessionId,
+  hypothesisId,
+}: {
+  root: string
+  campaignId: string
+  sessionId?: string
+  hypothesisId?: string
+}): Promise<LocalResearchBrief> {
   const db = await openDb(root)
   const campaignRow = db
     .query("SELECT * FROM campaigns WHERE id = ?")
     .get(campaignId) as Row | null
   if (!campaignRow) throw new Error("Local campaign not found")
   const visibleExperiments = listLocalExperimentsForDb(db, campaignId)
-  const campaign = campaignWithVisibleProjection(
+  let session: ApiSession | null = null
+  let campaign: ApiCampaign = campaignWithVisibleProjection(
     campaignFromRow(campaignRow),
     visibleExperiments
   )
-  const state = sessionId
-    ? await getLocalSessionState(root, sessionId)
-    : {
-        latestExperiments: visibleExperiments.slice(0, 20),
-        hypotheses: [],
-        workers: [],
-        summaries: await listLocalSummaries(root, campaignId),
-        knowledge: await listLocalKnowledge(root, campaignId),
-      }
-  const hypothesis =
-    "hypotheses" in state
-      ? state.hypotheses.find((item) => item.id === hypothesisId)
-      : null
-  return [
-    `# Onyx Research Brief: ${campaign.name}`,
-    "",
-    `Metric: ${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
-    `Base commit: ${campaign.baseCommitSha}`,
-    hypothesis ? `Hypothesis: ${hypothesis.name}` : null,
-    hypothesis ? `Focus: ${hypothesis.plan.focus}` : null,
-    hypothesis ? `Statement: ${hypothesis.plan.statement}` : null,
-    "",
-    "## Recent Experiments",
-    ...state.latestExperiments
-      .slice(0, 10)
-      .map(
-        (experiment) =>
-          `- ${experiment.name}: ${experiment.primaryMetricName}=${experiment.primaryMetricValue ?? "null"} (${experiment.status}) ${experiment.resultCommitSha.slice(0, 7)}`
-      ),
-    state.latestExperiments.length === 0 ? "- none yet" : null,
-    "",
-    "## Shared Knowledge",
-    ...state.knowledge
-      .slice(0, 20)
-      .map(
-        (item) => `- ${item.kind}: ${item.title} - ${item.body.slice(0, 240)}`
-      ),
-    state.knowledge.length === 0 ? "- none yet" : null,
-    "",
-    "## Current Summaries",
-    ...state.summaries
-      .filter((summary) => summary.isCurrent)
-      .slice(0, 10)
-      .map(
-        (summary) =>
-          `- ${summary.summaryKind}: ${summary.title}\n${summary.body}`
-      ),
-  ]
-    .filter((line) => line !== null)
-    .join("\n")
+  let recentExperiments = visibleExperiments.slice(0, 20)
+  let bestExperiment = bestVisibleExperimentForCampaign(
+    campaign,
+    visibleExperiments
+  )
+  let hypotheses = (
+    db
+      .query(
+        "SELECT * FROM hypotheses WHERE campaign_id = ? ORDER BY created_at ASC"
+      )
+      .all(campaignId) as Row[]
+  ).map(hypothesisFromRow)
+  let workers = (
+    db
+      .query(
+        "SELECT * FROM workers WHERE campaign_id = ? ORDER BY last_seen_at DESC"
+      )
+      .all(campaignId) as Row[]
+  ).map(workerFromRow)
+  let summaries = await listLocalSummaries(root, campaignId)
+  let knowledge = await listLocalKnowledge(root, campaignId)
+
+  if (sessionId) {
+    const state = await getLocalSessionState(root, sessionId)
+    if (state.campaign.id !== campaignId) {
+      throw new Error(
+        `Local research session ${sessionId} belongs to campaign ${state.campaign.name}, not ${campaign.name}`
+      )
+    }
+    session = state.session
+    campaign = state.campaign
+    recentExperiments = state.latestExperiments
+    bestExperiment = state.bestExperiment
+    hypotheses = state.hypotheses
+    workers = state.workers
+    summaries = state.summaries
+    knowledge = state.knowledge
+  }
+
+  const currentHypothesis = hypothesisId
+    ? (hypotheses.find((item) => item.id === hypothesisId) ?? null)
+    : null
+  if (hypothesisId && !currentHypothesis) {
+    throw new Error(
+      `Local hypothesis ${hypothesisId} was not found for campaign ${campaign.name}`
+    )
+  }
+
+  const brief = {
+    campaign,
+    session,
+    currentHypothesis,
+    bestExperiment,
+    recentExperiments,
+    hypotheses,
+    workers,
+    summaries,
+    knowledge,
+    updatedAt: nowIso(),
+    markdown: "",
+  }
+  brief.markdown = renderLocalResearchBrief(brief)
+  return brief
 }
 
 export async function campaignRecordToLocal(

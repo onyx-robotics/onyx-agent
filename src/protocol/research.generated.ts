@@ -1412,22 +1412,6 @@ export const upsertResearchSummaryResponseSchema = z.object({
   data: researchSummarySchema,
 })
 
-export const researchBriefSchema = z.object({
-  campaign: researchCampaignSchema,
-  bestExperiment: researchCampaignExperimentSchema.nullable(),
-  recentExperiments: z.array(researchCampaignExperimentSchema),
-  hypotheses: z.array(researchHypothesisSchema),
-  workers: z.array(researchWorkerSchema),
-  summaries: z.array(researchSummarySchema),
-  knowledge: z.array(researchKnowledgeSchema),
-  recommendedContext: z.array(z.string()),
-  markdown: z.string(),
-})
-
-export const researchBriefResponseSchema = z.object({
-  data: researchBriefSchema,
-})
-
 export const researchFileTreeNodeSchema = z.object({
   id: z.string().min(1),
   path: z.string(),
@@ -1770,8 +1754,6 @@ export type UpsertResearchSummaryRequest = z.infer<
 export type UpsertResearchSummaryResponse = z.infer<
   typeof upsertResearchSummaryResponseSchema
 >
-export type ResearchBrief = z.infer<typeof researchBriefSchema>
-export type ResearchBriefResponse = z.infer<typeof researchBriefResponseSchema>
 export type ResearchWorker = z.infer<typeof researchWorkerSchema>
 export type RegisterResearchWorkerRequest = z.infer<
   typeof registerResearchWorkerRequestSchema

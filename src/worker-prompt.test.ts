@@ -3,7 +3,6 @@ import { describe, expect, test } from "bun:test"
 import { renderHypothesisWorkerPrompt } from "./lib/worker-prompt"
 
 const baseInput = {
-  briefPath: "/repo/.git/onyx/briefs/session/hypothesis.md",
   campaignName: "drone-controller",
   goal: "Minimize drone tracking error",
   hypothesisId: "hypothesis_123",
@@ -30,7 +29,6 @@ const baseInput = {
     "/repo/.git/onyx/worktrees/session-hypothesis/onyx/validation.json",
   researchSpecPath: "/repo/.git/onyx/worktrees/session-hypothesis/onyx/onyx.md",
   sessionId: "session_123",
-  sessionStatePath: null,
   worktreeRoot: "/repo/.git/onyx/worktrees/session-hypothesis",
 }
 
@@ -58,16 +56,29 @@ describe("hypothesis worker prompt", () => {
       "- Setup file: /repo/.git/onyx/worktrees/session-hypothesis/onyx/setup.json"
     )
     expect(prompt).toContain(
-      "- Validation report: /repo/.git/onyx/worktrees/session-hypothesis/onyx/validation.json"
+      "- Validation report (diagnostics only): /repo/.git/onyx/worktrees/session-hypothesis/onyx/validation.json"
     )
     expect(prompt).not.toContain(
-      "- Validation report: /repo/onyx/validation.json"
+      "- Validation report (diagnostics only): /repo/onyx/validation.json"
     )
     expect(prompt).not.toContain("- Setup file: /repo/onyx/setup.json")
+    expect(prompt).toContain(
+      "- Research spec: /repo/.git/onyx/worktrees/session-hypothesis/onyx/onyx.md"
+    )
     expect(prompt).toContain("- Focus: Reduce controller overshoot")
     expect(prompt).toContain(
       "Treat `/repo/.git/onyx/worktrees/session-hypothesis` as the only project root"
     )
+    expect(prompt).toContain(
+      'Campaign brief command: `onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"`'
+    )
+    expect(prompt).toContain(
+      'Run `onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"` first'
+    )
+    expect(prompt).toContain("onyx research status --json")
+    expect(prompt).toContain("onyx exp list --json")
+    expect(prompt).toContain("onyx knowledge list --json")
+    expect(prompt).toContain("onyx summary list --json")
     expect(prompt).toContain(
       'onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
     )
@@ -97,17 +108,9 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("Primary metric is king")
     expect(prompt).toContain("Do not ask whether to continue")
     expect(prompt).not.toContain("Peer hypothesis state")
-  })
-
-  test("includes peer session state when present", () => {
-    const prompt = renderHypothesisWorkerPrompt({
-      ...baseInput,
-      sessionStatePath:
-        "/repo/.git/onyx/session-state/session_123/hypothesis-1.json",
-    })
-
-    expect(prompt).toContain(
-      "- Peer hypothesis state: /repo/.git/onyx/session-state/session_123/hypothesis-1.json"
-    )
+    expect(prompt).not.toContain("ONYX_BRIEF_FILE")
+    expect(prompt).not.toContain(".git/onyx/briefs")
+    expect(prompt).not.toContain("ONYX_SESSION_STATE_FILE")
+    expect(prompt).not.toContain("session-state")
   })
 })

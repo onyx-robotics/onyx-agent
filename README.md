@@ -94,9 +94,10 @@ workflow command steps, parses the primary metric, and records setup compliance.
 `onyx setup init` stays explicit: `--editable-scope` and `--eval-command` write
 only the caller-provided values, and the default eval tool keeps failing until
 the orchestrator deliberately configures it. The generated `onyx/onyx.md`
-still includes the supplied goal, metric contract, editable scope, evaluation
-command, workflow contract, and first-run checklist so workers have useful
-initial context before project-specific edits.
+is a research spec for durable project guidance: goal, metric interpretation,
+editable scope, evaluation caveats, declared tools, and project-specific
+constraints. Workers use CLI commands for live structured state instead of
+generated per-worker state files.
 
 Local research state is SQLite-first. The agent stores campaigns, sessions,
 hypotheses, workers, experiments, summaries, knowledge, resource leases, and
@@ -159,8 +160,8 @@ diagnostics.
 
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
 and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
-each hypothesis gets a generated brief and worker prompt under `.git/onyx/`. Workers poll
-`onyx research should-stop`, run the setup workflow through `onyx exp run
+worker prompts and logs live under `.git/onyx/`. Workers run `onyx research brief`
+for current campaign memory, poll `onyx research should-stop`, run the setup workflow through `onyx exp run
 --campaign <name> --base <sha> --auto` and `onyx exp run --resume <id> --auto`,
 push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment
 with setup/session/hypothesis/worker context. `onyx research hypothesis add`

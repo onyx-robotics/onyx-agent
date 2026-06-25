@@ -14,6 +14,7 @@ import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
 import {
   commandResearchFinish,
+  commandResearchBrief,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
   commandResearchRun,
@@ -71,6 +72,7 @@ Usage:
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>] [--final-sync-timeout <seconds>] [--require-online]
+  onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text>
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
@@ -176,6 +178,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandResearchStop(args)
     if (command === "research" && sub === "finish")
       return commandResearchFinish(args)
+    if (command === "research" && sub === "brief")
+      return commandResearchBrief(args)
     if (command === "research" && sub === "status")
       return commandResearchStatus(args)
     if (command === "summary" && sub === "upsert")

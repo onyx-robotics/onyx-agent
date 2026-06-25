@@ -128,6 +128,7 @@ export { commandListen } from "./commands/listen"
 export { commandPush, commandStatus, commandSync } from "./commands/sync"
 export { commandToolsRun } from "./commands/tools"
 export {
+  commandResearchBrief,
   commandResearchFinish,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,

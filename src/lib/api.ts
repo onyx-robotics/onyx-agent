@@ -200,18 +200,6 @@ export type ApiCampaignUpsertResult = {
   campaign: ApiCampaign
 }
 
-export type ApiBrief = {
-  campaign: ApiCampaign
-  bestExperiment: ApiCampaignExperiment | null
-  recentExperiments: ApiCampaignExperiment[]
-  hypotheses: ApiHypothesis[]
-  workers: ApiWorker[]
-  summaries: ApiSummary[]
-  knowledge: ApiKnowledge[]
-  recommendedContext: string[]
-  markdown: string
-}
-
 export type ApiProjectDeletions = {
   campaigns: Array<{
     campaignId: string
@@ -769,20 +757,6 @@ export async function listCampaignKnowledge(
     await callApi(
       "GET",
       `/api/v1/research/campaigns/${campaignId}/knowledge`,
-      undefined,
-      args
-    )
-  )
-}
-
-export async function getCampaignBrief(
-  campaignId: string,
-  args?: Args
-): Promise<ApiBrief> {
-  return apiData<ApiBrief>(
-    await callApi(
-      "GET",
-      `/api/v1/research/campaigns/${campaignId}/brief`,
       undefined,
       args
     )

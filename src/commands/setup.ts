@@ -215,7 +215,7 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
   })
 
   return [
-    "# Onyx Worker Instructions",
+    "# Onyx Research Spec",
     "",
     "## Goal",
     "",
@@ -227,12 +227,13 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
     `- Direction: ${setup.metric.direction}`,
     "- Required output: the evaluation workflow must emit exactly one primary metric line shaped as `METRIC " +
       `${setup.metric.name}=<number>\`.`,
+    "- Interpretation notes: describe what metric movement means for this project, including noise, tradeoffs, and anti-gaming constraints.",
     "",
     "## Editable Scope",
     "",
     markdownList(editable, "No editable scope configured yet."),
     "",
-    "Workers may edit only the scoped project files above. They must not edit protected setup files during Research.",
+    "Research changes should stay inside the editable scope above. Setup and tool changes require a new setup version.",
     "",
     "## Protected Setup Surface",
     "",
@@ -243,18 +244,26 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
     `- Canonical tool: evaluation.run`,
     `- Command configured from setup init: ${evalCommand}`,
     "- Preflight before committing setup: `onyx tools run evaluation.run`",
+    "- Caveats: document simulator assumptions, hardware limits, flaky checks, required services, and invalid shortcuts here.",
     "",
-    "## Workflow Contract",
+    "## Workflow And Tools",
     "",
     workflow.join("\n"),
     "",
-    "Every experiment attempt should start with `onyx exp run`, pause at the agent step, make exactly one clean result commit, resume the workflow, then log the terminal attempt with `onyx exp log`.",
+    "The Onyx CLI enforces the workflow contract during research attempts.",
     "",
-    "## Tools",
+    "## Declared Tools",
     "",
     markdownList(toolIds, "No tools configured."),
     "",
-    "## First-Run Checklist",
+    "## Project Guidance",
+    "",
+    "- Known risky areas: add files, subsystems, or behaviors that require extra care.",
+    "- Useful starting points: add source paths, tests, dashboards, traces, or papers worth checking first.",
+    "- Preserve: add product, safety, reliability, or interface constraints that metric wins must not break.",
+    "- Avoid: add project-specific shortcuts, hacks, or previously failed ideas.",
+    "",
+    "## Setup Checklist",
     "",
     "- Confirm the editable scope is complete and narrow.",
     "- Replace the evaluation tool if the scaffolded script is still a TODO.",
@@ -291,19 +300,21 @@ async function buildValidation({
 
   const instructionsPath = onyxPath(root, projectPath, "onyx.md")
   if (!(await pathExists(instructionsPath))) {
-    checks.push(check("agent_context", "failed", "onyx/onyx.md is missing."))
+    checks.push(check("research_spec", "failed", "onyx/onyx.md is missing."))
   } else {
     const text = await readFile(instructionsPath, "utf8")
     const hasContext = text.trim().length >= 40
     checks.push(
       hasContext
-        ? check("agent_context", "passed", "onyx/onyx.md contains context.")
-        : check("agent_context", "failed", "onyx/onyx.md is too sparse.")
+        ? check("research_spec", "passed", "onyx/onyx.md contains research spec context.")
+        : check("research_spec", "failed", "onyx/onyx.md research spec is too sparse.")
     )
     if (hasContext) {
       const missingHints = [
         text.includes(setup.metric.name) ? null : setup.metric.name,
-        text.includes("onyx exp run") ? null : "onyx exp run",
+        text.includes("Evaluation") || text.includes("evaluation")
+          ? null
+          : "evaluation guidance",
         text.includes("editable") || text.includes("Editable")
           ? null
           : "editable scope",
@@ -311,9 +322,9 @@ async function buildValidation({
       if (missingHints.length > 0) {
         checks.push(
           check(
-            "agent_context_quality",
+            "research_spec_quality",
             "warning",
-            `onyx/onyx.md is present but should mention ${missingHints.join(", ")} for first-run workers.`
+            `onyx/onyx.md is present but should mention ${missingHints.join(", ")} for research workers.`
           )
         )
       }

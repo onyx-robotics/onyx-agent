@@ -8,7 +8,6 @@ import {
 import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
-  getCampaignBrief,
   getCampaignOverview,
   getResearchSessionState,
   listProjectCampaigns,
@@ -54,7 +53,7 @@ import {
   listLocalKnowledge,
   listLocalSummaries,
   listResearchSyncConflicts,
-  localBriefMarkdown,
+  localResearchBrief,
   localCampaignByName,
   pendingResearchSyncCount,
   pendingResearchSyncEvents,
@@ -1054,85 +1053,6 @@ async function recheckCheapSetupReadiness({
   return failures
 }
 
-async function writeBrief({
-  root,
-  campaignId,
-  sessionId,
-  hypothesis,
-  workerId,
-  args,
-}: {
-  root: string
-  campaignId: string
-  sessionId: string
-  hypothesis: ApiHypothesis
-  workerId?: string
-  args: Args
-}) {
-  const markdown =
-    (await localBriefMarkdown({
-      root,
-      campaignId,
-      sessionId,
-      hypothesisId: hypothesis.id,
-    }).catch(() => null)) ??
-    (await getCampaignBrief(campaignId, args).then((brief) => brief.markdown))
-  const dir = join(await onyxStateDir(root), "briefs", sessionId)
-  await mkdir(dir, { recursive: true })
-  const suffix = workerId
-    ? `${safeFileSegment(workerId).slice(0, 12)}`
-    : safeFileSegment(hypothesis.id).slice(0, 12)
-  const path = join(dir, `${safeFileSegment(hypothesis.name)}-${suffix}.md`)
-  await writeFile(path, `${markdown}\n`, "utf8")
-  return path
-}
-
-async function writeSessionState({
-  root,
-  sessionId,
-  hypothesis,
-  args,
-}: {
-  root: string
-  sessionId: string
-  hypothesis: ApiHypothesis
-  args: Args
-}) {
-  const dir = join(await onyxStateDir(root), "session-state", sessionId)
-  await mkdir(dir, { recursive: true })
-  const path = join(dir, `${hypothesis.id}.json`)
-  const state = await getLocalSessionState(root, sessionId).catch(() =>
-    getResearchSessionState(sessionId, args)
-  )
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, "utf8")
-  return path
-}
-
-async function refreshSessionStateFiles({
-  root,
-  sessionId,
-  args,
-}: {
-  root: string
-  sessionId: string
-  args: Args
-}) {
-  const state = await getLocalSessionState(root, sessionId).catch(() =>
-    getResearchSessionState(sessionId, args)
-  )
-  const dir = join(await onyxStateDir(root), "session-state", sessionId)
-  await mkdir(dir, { recursive: true })
-  await Promise.all(
-    state.hypotheses.map((hypothesis) =>
-      writeFile(
-        join(dir, `${hypothesis.id}.json`),
-        `${JSON.stringify(state, null, 2)}\n`,
-        "utf8"
-      )
-    )
-  )
-}
-
 async function ensureWorktree({
   root,
   hypothesis,
@@ -1518,8 +1438,6 @@ async function writeWorkerPrompt({
   hypothesis,
   workerId,
   workerBranch,
-  briefPath,
-  sessionStatePath,
   maxIterations,
   endTimeMs,
 }: {
@@ -1532,8 +1450,6 @@ async function writeWorkerPrompt({
   hypothesis: ApiHypothesis
   workerId: string
   workerBranch: string
-  briefPath: string
-  sessionStatePath: string | null
   maxIterations: number
   endTimeMs: number
 }) {
@@ -1551,7 +1467,6 @@ async function writeWorkerPrompt({
   const shutdownDeadlineMs = Math.max(nowMs, endTimeMs)
   const minutesRemaining = Math.max(0, Math.ceil(budgetRemainingMs / 60_000))
   const markdown = renderHypothesisWorkerPrompt({
-    briefPath,
     campaignName: campaign.name,
     goal: setup.goal ?? campaign.description ?? "not specified",
     hypothesisId: hypothesis.id,
@@ -1569,7 +1484,6 @@ async function writeWorkerPrompt({
     validationFilePath: validationPath(worktree, projectPath),
     researchSpecPath: onyxPath(worktree, projectPath, "onyx.md"),
     sessionId,
-    sessionStatePath,
     worktreeRoot: worktree,
     workerBranch,
   })
@@ -1907,19 +1821,6 @@ async function runHypothesisOnce({
       message: hypothesis.name,
     })
 
-    const [briefPath, sessionStatePath] = await Promise.all([
-      writeBrief({
-        root,
-        campaignId: campaign.id,
-        sessionId,
-        hypothesis,
-        workerId: worker.id,
-        args,
-      }),
-      writeSessionState({ root, sessionId, hypothesis, args }).catch(
-        () => null
-      ),
-    ])
     const prompt = await writeWorkerPrompt({
       root,
       worktree,
@@ -1930,8 +1831,6 @@ async function runHypothesisOnce({
       hypothesis,
       workerId: worker.id,
       workerBranch,
-      briefPath,
-      sessionStatePath,
       maxIterations,
       endTimeMs,
     })
@@ -1955,7 +1854,6 @@ async function runHypothesisOnce({
       ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
       ONYX_RESEARCH_DB: await researchDbPath(root),
-      ONYX_BRIEF_FILE: briefPath,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
       ONYX_PROJECT_ROOT: projectPath ? join(worktree, projectPath) : worktree,
@@ -1974,9 +1872,6 @@ async function runHypothesisOnce({
       ONYX_SHUTDOWN_CUSHION_SECONDS: String(
         Math.ceil(prompt.shutdownCushionMs / 1000)
       ),
-      ...(sessionStatePath
-        ? { ONYX_SESSION_STATE_FILE: sessionStatePath }
-        : {}),
     }
     const addedWritableRoots = workerCommand
       ? []
@@ -2457,26 +2352,6 @@ export async function commandResearchStart(args: Args) {
     })
   }
 
-  await Promise.all(
-    result.hypotheses.map(async (hypothesis) => {
-      await Promise.all([
-        writeBrief({
-          root,
-          campaignId: campaign.id,
-          sessionId: result.session.id,
-          hypothesis,
-          args,
-        }),
-        writeSessionState({
-          root,
-          sessionId: result.session.id,
-          hypothesis,
-          args,
-        }).catch(() => null),
-      ])
-    })
-  )
-
   console.log(`Research session: ${result.session.id}`)
   console.log(`Campaign: ${campaign.name}`)
   console.log(`Workers: 0/${workerTarget}`)
@@ -2601,20 +2476,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
   await writeState(root, state)
 
   const hypothesis = createdHypothesis
-  if (sessionId) {
-    await Promise.all([
-      writeBrief({
-        root,
-        campaignId: campaign.id,
-        sessionId,
-        hypothesis,
-        args,
-      }),
-      writeSessionState({ root, sessionId, hypothesis, args }).catch(
-        () => null
-      ),
-    ])
-  }
 
   console.log(`Research hypothesis: ${hypothesis.id}`)
   if (sessionId) console.log(`Session: ${sessionId}`)
@@ -2627,6 +2488,55 @@ export async function commandResearchHypothesisAdd(args: Args) {
   } else {
     console.log("Start or choose a research session before launching a worker.")
   }
+}
+
+export async function commandResearchBrief(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const campaignName =
+    args.options.campaign ??
+    state.activeCampaign ??
+    (await getActiveLocalCampaignName(root))
+  if (!campaignName) {
+    throw new Error(
+      "Pass --campaign <name>, run `onyx campaign use --name <name>`, or sync/start a local campaign first."
+    )
+  }
+
+  const campaign = await localCampaignByName({
+    root,
+    projectPath,
+    name: campaignName,
+  })
+  if (!campaign) {
+    throw new Error(
+      `Local campaign ${campaignName} was not found. Run \`onyx sync\` or start/select a campaign first.`
+    )
+  }
+
+  const sessionId =
+    args.options.session ??
+    process.env.ONYX_SESSION_ID ??
+    activeSessionIdFromState({
+      state,
+      projectPath,
+      campaignName: campaign.name,
+    })
+  const hypothesisId =
+    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID ?? undefined
+  const brief = await localResearchBrief({
+    root,
+    campaignId: campaign.id,
+    sessionId,
+    hypothesisId,
+  })
+
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(brief, null, 2))
+    return
+  }
+  console.log(brief.markdown)
 }
 
 export async function commandResearchStatus(args: Args) {
@@ -3037,7 +2947,6 @@ export async function commandResearchStop(args: Args) {
       status: "stop_requested",
       reason: args.options.reason ?? "stop requested",
     }).catch(() => {})
-    await refreshSessionStateFiles({ root, sessionId, args }).catch(() => {})
     if (args.options.offline !== "true") {
       await flushOutbox(root, args, { quiet: true }).catch(() => {})
       await reconcileCampaignIntoLocalState({
@@ -3180,7 +3089,6 @@ export async function commandResearchFinish(args: Args) {
         }).catch(() => {})
       }
     }
-    await refreshSessionStateFiles({ root, sessionId, args }).catch(() => {})
     await stopCampaignSession(
       sessionId,
       {
@@ -3635,23 +3543,6 @@ export async function commandResearchRun(args: Args) {
   }
   await writeState(root, nextState)
 
-  await Promise.all(
-    initialHypotheses.map((hypothesis) =>
-      Promise.all([
-        writeBrief({
-          root,
-          campaignId: campaign.id,
-          sessionId,
-          hypothesis,
-          args,
-        }),
-        writeSessionState({ root, sessionId, hypothesis, args }).catch(
-          () => null
-        ),
-      ])
-    )
-  )
-
   await emitEvent(root, {
     type: "research_started",
     campaignName: campaign.name,
@@ -3877,7 +3768,6 @@ export async function commandResearchRun(args: Args) {
     status: finalStatus,
     reason: explicitStop ? "stop requested" : "research run completed",
   }).catch(() => {})
-  await refreshSessionStateFiles({ root, sessionId, args }).catch(() => {})
   presenceSupervisor.request()
   await presenceSupervisor.stop()
   const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
