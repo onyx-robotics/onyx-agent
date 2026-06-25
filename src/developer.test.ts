@@ -16,6 +16,7 @@ import { beforeEach, describe, expect, test } from "bun:test"
 import {
   ONYX_LAUNCHER_BYPASS,
   commandDeveloper,
+  defaultSkillInstallTargets,
   detectDeveloperCheckout,
   runLauncher,
   skillInstallTarget,
@@ -224,6 +225,46 @@ describe("developer mode", () => {
     }
   })
 
+  test("use dev syncs managed Claude and Codex skill targets by default", async () => {
+    const previousHome = process.env.HOME
+    const previousCodexHome = process.env.CODEX_HOME
+    const root = await mkdtemp(join(tmpdir(), "onyx-agent-managed-skill-"))
+    const checkoutRoot = join(root, "checkout")
+    process.env.HOME = join(root, "home")
+    process.env.CODEX_HOME = join(root, "codex-home")
+    try {
+      await writeStandaloneCheckout(checkoutRoot)
+      const checkoutRealRoot = await realpath(checkoutRoot)
+      await commandDeveloper({
+        positional: ["developer", "link", checkoutRoot],
+        options: { quiet: "true" },
+      })
+
+      await commandDeveloper({
+        positional: ["developer", "use", "dev"],
+        options: { quiet: "true" },
+      })
+
+      const source = join(checkoutRealRoot, "skills", "onyx", "SKILL.md")
+      for (const target of defaultSkillInstallTargets()) {
+        expect((await lstat(target.target)).isSymbolicLink()).toBe(true)
+        expect(await readlink(target.target)).toBe(source)
+      }
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      if (previousCodexHome === undefined) {
+        delete process.env.CODEX_HOME
+      } else {
+        process.env.CODEX_HOME = previousCodexHome
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("unlink restores release mode and clears dev state", async () => {
     const checkoutRoot = await mkdtemp(join(tmpdir(), "onyx-agent-unlink-"))
     const skillRoot = await mkdtemp(join(tmpdir(), "onyx-agent-unlink-skill-"))
@@ -273,7 +314,7 @@ describe("developer mode", () => {
 
       expect(output).toContain("Mode: release")
       expect(output).toContain(`Developer checkout: ${checkoutRealRoot}`)
-      expect(output).toContain("Skill target:")
+      expect(output).toContain("Skill targets:")
     } finally {
       await rm(checkoutRoot, { recursive: true, force: true })
     }

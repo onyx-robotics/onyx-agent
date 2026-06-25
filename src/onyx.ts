@@ -92,7 +92,11 @@ export {
   type WorkerLaunchManifest,
 } from "./lib/worker-launcher"
 export {
+  claudeSkillInstallRoot,
+  codexHomeSkillInstallRoot,
+  codexUserSkillInstallRoot,
   defaultSkillInstallRoot,
+  defaultSkillInstallTargets,
   displaySkillPath,
   installDeveloperSkill,
   installOnyxSkill,

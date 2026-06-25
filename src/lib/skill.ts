@@ -14,12 +14,85 @@ import { ONYX_SKILL_MARKDOWN } from "./skill-content"
 
 export const ONYX_SKILL_NAME = "onyx"
 
+export type ManagedSkillInstallTarget = {
+  agent: "claude" | "codex" | "codex-home" | "custom"
+  label: string
+  root: string
+  target: string
+}
+
 export function defaultSkillInstallRoot() {
-  return join(homedir(), ".claude", "skills")
+  return claudeSkillInstallRoot()
+}
+
+function userHomeDir() {
+  return process.env.HOME?.trim() || homedir()
+}
+
+export function claudeSkillInstallRoot() {
+  return join(userHomeDir(), ".claude", "skills")
+}
+
+export function codexUserSkillInstallRoot() {
+  return join(userHomeDir(), ".agents", "skills")
+}
+
+export function codexHomeSkillInstallRoot() {
+  return join(
+    process.env.CODEX_HOME?.trim() || join(userHomeDir(), ".codex"),
+    "skills"
+  )
 }
 
 export function skillInstallTarget(root = defaultSkillInstallRoot()) {
   return join(root, ONYX_SKILL_NAME, "SKILL.md")
+}
+
+function uniqueInstallTargets(
+  targets: ManagedSkillInstallTarget[]
+): ManagedSkillInstallTarget[] {
+  const seen = new Set<string>()
+  const unique: ManagedSkillInstallTarget[] = []
+  for (const target of targets) {
+    if (seen.has(target.target)) {
+      continue
+    }
+    seen.add(target.target)
+    unique.push(target)
+  }
+  return unique
+}
+
+export function defaultSkillInstallTargets(): ManagedSkillInstallTarget[] {
+  return uniqueInstallTargets([
+    {
+      agent: "claude",
+      label: "Claude",
+      root: claudeSkillInstallRoot(),
+      target: skillInstallTarget(claudeSkillInstallRoot()),
+    },
+    {
+      agent: "codex",
+      label: "Codex",
+      root: codexUserSkillInstallRoot(),
+      target: skillInstallTarget(codexUserSkillInstallRoot()),
+    },
+    {
+      agent: "codex-home",
+      label: "Codex (CODEX_HOME)",
+      root: codexHomeSkillInstallRoot(),
+      target: skillInstallTarget(codexHomeSkillInstallRoot()),
+    },
+  ])
+}
+
+function customSkillInstallTarget(root: string): ManagedSkillInstallTarget {
+  return {
+    agent: "custom",
+    label: "custom",
+    root,
+    target: skillInstallTarget(root),
+  }
 }
 
 export function packagedSkillPath() {
@@ -47,6 +120,21 @@ async function replaceSkillTarget(target: string) {
   await rm(target, { force: true })
 }
 
+async function writeReleaseSkillTarget(
+  target: ManagedSkillInstallTarget,
+  quiet: boolean,
+  message: string
+) {
+  await mkdir(dirname(target.target), { recursive: true })
+  await replaceSkillTarget(target.target)
+  await writeFile(target.target, await readPackagedSkill(), "utf8")
+  if (!quiet) {
+    const suffix = target.label === "custom" ? "" : ` for ${target.label}`
+    console.log(`${message}${suffix} to ${target.target}`)
+  }
+  return target.target
+}
+
 export async function installOnyxSkill({
   dir,
   quiet = false,
@@ -54,15 +142,16 @@ export async function installOnyxSkill({
   dir?: string
   quiet?: boolean
 } = {}) {
-  const root = dir ?? defaultSkillInstallRoot()
-  const target = skillInstallTarget(root)
-  await mkdir(dirname(target), { recursive: true })
-  await replaceSkillTarget(target)
-  await writeFile(target, await readPackagedSkill(), "utf8")
-  if (!quiet) {
-    console.log(`Installed Onyx agent skill to ${target}`)
+  const targets = dir
+    ? [customSkillInstallTarget(dir)]
+    : defaultSkillInstallTargets()
+  const installed: string[] = []
+  for (const target of targets) {
+    installed.push(
+      await writeReleaseSkillTarget(target, quiet, "Installed Onyx agent skill")
+    )
   }
-  return target
+  return installed
 }
 
 export async function installReleaseSkill({
@@ -72,14 +161,20 @@ export async function installReleaseSkill({
   dir?: string
   quiet?: boolean
 } = {}) {
-  const target = skillInstallTarget(dir)
-  await mkdir(dirname(target), { recursive: true })
-  await replaceSkillTarget(target)
-  await writeFile(target, await readPackagedSkill(), "utf8")
-  if (!quiet) {
-    console.log(`Installed release Onyx agent skill to ${target}`)
+  const targets = dir
+    ? [customSkillInstallTarget(dir)]
+    : defaultSkillInstallTargets()
+  const installed: string[] = []
+  for (const target of targets) {
+    installed.push(
+      await writeReleaseSkillTarget(
+        target,
+        quiet,
+        "Installed release Onyx agent skill"
+      )
+    )
   }
-  return target
+  return installed
 }
 
 export async function installDeveloperSkill({
@@ -91,24 +186,34 @@ export async function installDeveloperSkill({
   dir?: string
   quiet?: boolean
 }) {
-  const target = skillInstallTarget(dir)
-  await mkdir(dirname(target), { recursive: true })
-  await replaceSkillTarget(target)
-  try {
-    await symlink(source, target)
-    if (!quiet) {
-      console.log(`Linked developer Onyx agent skill to ${target}`)
+  const targets = dir
+    ? [customSkillInstallTarget(dir)]
+    : defaultSkillInstallTargets()
+  const installed: Array<{ target: string; linked: boolean }> = []
+  for (const target of targets) {
+    await mkdir(dirname(target.target), { recursive: true })
+    await replaceSkillTarget(target.target)
+    const suffix = target.label === "custom" ? "" : ` for ${target.label}`
+    try {
+      await symlink(source, target.target)
+      if (!quiet) {
+        console.log(
+          `Linked developer Onyx agent skill${suffix} to ${target.target}`
+        )
+      }
+      installed.push({ target: target.target, linked: true })
+      continue
+    } catch {
+      await writeFile(target.target, await readFile(source, "utf8"), "utf8")
+      if (!quiet) {
+        console.warn(
+          `Copied developer Onyx agent skill${suffix} to ${target.target}; rerun \`onyx developer sync-skill\` after editing the source skill.`
+        )
+      }
+      installed.push({ target: target.target, linked: false })
     }
-    return { target, linked: true }
-  } catch {
-    await writeFile(target, await readFile(source, "utf8"), "utf8")
-    if (!quiet) {
-      console.warn(
-        `Copied developer Onyx agent skill to ${target}; rerun \`onyx developer sync-skill\` after editing the source skill.`
-      )
-    }
-    return { target, linked: false }
   }
+  return installed
 }
 
 export async function displaySkillPath() {

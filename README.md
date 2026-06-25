@@ -50,9 +50,12 @@ CLI targets.
 
 ## Agent Skill
 
-The installer installs the bundled skill automatically to Claude Code's
-personal skill directory at `~/.claude/skills/onyx/SKILL.md`. To install it
-manually:
+The installer installs the bundled skill automatically for Claude Code and
+Codex. It writes Claude's personal skill file at
+`~/.claude/skills/onyx/SKILL.md`, Codex's user skill file at
+`~/.agents/skills/onyx/SKILL.md`, and the Codex home skill file at
+`${CODEX_HOME:-~/.codex}/skills/onyx/SKILL.md` for Codex builds that discover
+skills from `CODEX_HOME`. To install it manually:
 
 ```bash
 onyx agent install-skill
@@ -223,8 +226,8 @@ onyx developer use dev
 ```
 
 Developer mode runs source through Bun and replaces
-`~/.claude/skills/onyx/SKILL.md` with a symlink to this checkout's
-`skills/onyx/SKILL.md`, so Claude Code sees skill edits from local source.
+the managed Claude and Codex skill files with symlinks to this checkout's
+`skills/onyx/SKILL.md`, so active agents see skill edits from local source.
 Return to the installed release with:
 
 ```bash
