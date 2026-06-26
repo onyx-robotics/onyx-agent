@@ -79,7 +79,7 @@ Usage:
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
-  onyx exp run (--campaign <name> [--base <sha>] | --resume <workflowRunId>) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
+  onyx exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
   onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
