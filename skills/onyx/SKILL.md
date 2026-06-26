@@ -25,7 +25,7 @@ The setup phase is a one-time critical process for a research campaign where you
    - **Agent worker count**
    - **Budget**
    - **Hypotheses** (if the user has any)
-2. Create the local setup surface with `onyx setup init`; pass `--editable-scope` or `--eval-command` only when you want those exact caller-provided values written into the scaffold. Then edit `onyx/setup.json`, `onyx/onyx.md`, and `onyx/tools/*` as needed. The default eval tool is `onyx/tools/evaluation/run.sh` and remains failing until deliberately configured.
+2. Create the local setup surface with `onyx setup init`; pass `--editable-scope` or `--eval-command` only when you want those exact caller-provided values written into the scaffold. Then edit `onyx/setup.json`, `onyx/onyx.md`, and `onyx/tools/*` as needed. The default eval tool is `onyx/tools/evaluation/run.sh` and remains failing until deliberately configured. See the Setup Surface section below for more information before making edits.
 3. Encode reset, readiness, safety, reliability, and hardware/service work as declared `setup.tools` entries and linear `workflow` command steps. Keep exactly one leading agent step and exactly one required `metric: true` command step.
 4. Run `onyx setup validate`. Setup validation executes the required metric tool once, requires exactly one primary `METRIC <name>=<number>` line, and records readiness evidence in `onyx/validation.json`. Review the `metric_tool_readiness` check before committing. Failed or stale validation blocks campaign setup and research run; warning checks do not.
 5. Commit the setup surface with `git add <setup-dir> && git commit -m "Add Onyx setup"` where `<setup-dir>` is `onyx` at repo root or `<projectPath>/onyx` in a monorepo; `onyx campaign setup` and `onyx research run` require the committed campaign base to contain the setup files.
@@ -38,6 +38,8 @@ The setup phase is a one-time critical process for a research campaign where you
 `onyx/setup.json` declares goal, metric, project path, editable scope, protected paths, resources, declared tools, and the linear experiment workflow. It is the only setup policy file.
 
 `onyx/validation.json` is the latest local validation report. It stores a setup hash, setup checks, and metric-tool readiness evidence. It is evidence, not security. Research run blocks when validation is stale, any check failed, or `metric_tool_readiness` is missing.
+
+`onyx/onyx.md` is a markdown file intended to provide the worker agent with the research spec and specific notes on the project/setup. The worker agent will already have instructions on how to conduct its auto research, editable/protected scope, git/onyx rules, campaign related inputs/id/names, and how to use the CLI tools. The `onyx/onyx.md` should cover more specific insights on this specific project and setup that are more nuanced.
 
 The setup surface must be committed before campaign creation and session start. This makes every worker worktree start from a campaign base that contains the same frozen setup, validation report, research spec, and workflow tools.
 

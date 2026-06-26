@@ -245,8 +245,7 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
     "",
     `- Canonical tool: evaluation.run`,
     `- Command configured from setup init: ${evalCommand}`,
-    "- Preflight before committing setup: `onyx setup validate` executes the required metric tool and records readiness evidence.",
-    "- Caveats: document simulator assumptions, hardware limits, flaky checks, required services, and invalid shortcuts here.",
+    "- Caveats: document project-specific assumptions, hardware limits, flaky checks, required services, and invalid shortcuts here.",
     "",
     "## Workflow And Tools",
     "",
@@ -264,13 +263,6 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
     "- Useful starting points: add source paths, tests, dashboards, traces, or papers worth checking first.",
     "- Preserve: add product, safety, reliability, or interface constraints that metric wins must not break.",
     "- Avoid: add project-specific shortcuts, hacks, or previously failed ideas.",
-    "",
-    "## Setup Checklist",
-    "",
-    "- Confirm the editable scope is complete and narrow.",
-    "- Replace the evaluation tool if the scaffolded script is still a TODO.",
-    "- Run `onyx setup validate` and fix failed checks, including metric readiness.",
-    "- Commit `onyx/setup.json`, `onyx/validation.json`, `onyx/onyx.md`, and `onyx/tools/*` before campaign setup or research start.",
     "",
   ].join("\n")
 }
