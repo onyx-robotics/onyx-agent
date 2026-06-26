@@ -80,6 +80,8 @@ export type WorkerLaunchManifest = {
   promptPath: string
   logPath: string
   activityLogPath: string
+  activityJsonlPath: string
+  latestStatePath: string
   manifestPath: string
   sessionId: string
   hypothesisId: string
@@ -495,6 +497,8 @@ export async function workerLaunchPaths({
     dir,
     logPath: join(dir, `${base}.log`),
     activityLogPath: join(dir, `${base}.activity.log`),
+    activityJsonlPath: join(dir, `${base}.activity.jsonl`),
+    latestStatePath: join(dir, `${base}.latest.json`),
     manifestPath: join(dir, `${base}.manifest.json`),
   }
 }

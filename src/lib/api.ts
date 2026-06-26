@@ -106,12 +106,7 @@ export type ApiWorker = {
   workerName: string
   agentKind: string
   runtime: "local" | "hosted"
-  status:
-    | "registered"
-    | "running"
-    | "completed"
-    | "failed"
-    | "stopped"
+  status: "registered" | "running" | "completed" | "failed" | "stopped"
   liveness?: "active" | "stale" | "lost" | "unknown" | "terminal"
   currentExperimentId: string | null
   phase: string | null
@@ -193,6 +188,7 @@ export type ApiCampaignTimeline = {
 export type ApiCampaignOverview = ApiCampaignTimeline & {
   bestExperiment: ApiCampaignExperiment | null
   latestExperiments: ApiCampaignExperiment[]
+  sessions: ApiSession[]
   counts: {
     experiments: number
     hypothesisCount: number
@@ -209,6 +205,66 @@ export type ApiSessionState = {
   workers: ApiWorker[]
   summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
+  updatedAt: string
+}
+
+export type ApiSessionLive = {
+  session: ApiSession
+  campaign: ApiCampaign
+  budget: {
+    maxExperiments: number | null
+    reservedCount: number
+    terminalCount: number
+    remainingCount: number | null
+    openReservationCount: number
+    expiredReservationCount: number
+  }
+  livenessCounts: Record<string, number>
+  phaseCounts: Record<string, number>
+  workers: Array<{
+    id: string
+    status: ApiWorker["status"]
+    liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
+    phase: string | null
+    progressMessage: string | null
+    gitLabel: string | null
+    lastOutputAt: string | null
+    activitySummary: Record<string, unknown>
+    receivedAt: string
+    matched: boolean
+  }>
+  sites: Array<{
+    siteId: string
+    supervisorRunId: string | null
+    liveness: "active" | "stale" | "lost"
+    lastSequence: number
+    pendingSyncCount: number
+    pushQueueDepth: number
+    activeWorkerCount: number
+    syncLagMs: number | null
+    providerBackoff: Record<string, unknown> | null
+    ignoredPresence: Record<string, unknown>
+    lastUploadAt: string | null
+    receivedAt: string
+  }>
+  unmatchedPresenceCount: number
+  ignoredPresence: Record<string, unknown>
+  syncLagMs: number | null
+  providerBackoff: Record<string, unknown> | null
+  recentExperiments: ApiCampaignExperiment[]
+  recentTerminalWorkers: Array<{
+    id: string
+    status: ApiWorker["status"]
+    liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
+    phase: string | null
+    progressMessage: string | null
+    gitLabel: string | null
+    lastOutputAt: string | null
+    activitySummary: Record<string, unknown>
+    receivedAt: string
+    matched: boolean
+  }>
+  liveWatermark: string
   updatedAt: string
 }
 
@@ -641,6 +697,7 @@ export async function stopCampaignSession(
   body: {
     campaignId: string
     status?: "stop_requested" | "completed" | "failed" | "stopped"
+    finalizationStatus?: ApiSession["finalizationStatus"]
     reason?: string
     metadata?: Record<string, unknown>
   },
@@ -664,6 +721,20 @@ export async function getResearchSessionState(
     await callApi(
       "GET",
       `/api/v1/research/sessions/${sessionId}/state`,
+      undefined,
+      args
+    )
+  )
+}
+
+export async function getResearchSessionLive(
+  sessionId: string,
+  args?: Args
+): Promise<ApiSessionLive> {
+  return apiData<ApiSessionLive>(
+    await callApi(
+      "GET",
+      `/api/v1/research/sessions/${sessionId}/live`,
       undefined,
       args
     )
@@ -709,12 +780,7 @@ export async function registerCampaignWorker(
 export async function heartbeatWorker(
   workerId: string,
   body: {
-    status?:
-      | "registered"
-      | "running"
-      | "completed"
-      | "failed"
-      | "stopped"
+    status?: "registered" | "running" | "completed" | "failed" | "stopped"
     sessionId?: string
     hypothesisId?: string
     experimentId?: string | null

@@ -237,6 +237,20 @@ async function addBareOrigin(root: string) {
   return origin
 }
 
+async function pushWorkerBranchDirect({
+  cwd,
+  sourceRef,
+  targetRef,
+}: {
+  cwd: string
+  sourceRef: string
+  targetRef: string
+}) {
+  return runProcess("git", ["push", "origin", `${sourceRef}:${targetRef}`], {
+    cwd,
+  })
+}
+
 function testCampaign({
   campaignId,
   campaignName,
@@ -919,6 +933,7 @@ describe("worker finalization", () => {
       const head = (
         await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
       ).stdout.trim()
+      const pushedRefs: string[] = []
 
       const manifest = await finalizeHypothesisAttempt({
         root,
@@ -930,6 +945,10 @@ describe("worker finalization", () => {
         workerBranch: "onyx/test/finalization",
         args: { positional: ["worker", "run"], options: { offline: "true" } },
         workerFailed: false,
+        pushWorkerBranch: async (input) => {
+          pushedRefs.push(input.targetRef)
+          return pushWorkerBranchDirect(input)
+        },
       })
 
       expect(manifest.finalizationStatus).toBe("measured_and_logged")
@@ -937,6 +956,7 @@ describe("worker finalization", () => {
       expect(manifest.measurementBaseCommitSha).toBe(baseCommitSha)
       expect(manifest.unloggedCommitCount).toBe(1)
       expect(manifest.workerBranchPushStatus).toBe("pushed")
+      expect(pushedRefs).toEqual(["refs/heads/onyx/test/finalization"])
       const history = await listLocalExperimentHistory(root)
       expect(history).toHaveLength(1)
       expect(history[0]?.resultCommitSha).toBe(head)
@@ -1005,6 +1025,7 @@ describe("worker finalization", () => {
         workerBranch: "onyx/test/already-logged",
         args: { positional: ["worker", "run"], options: { offline: "true" } },
         workerFailed: false,
+        pushWorkerBranch: pushWorkerBranchDirect,
       })
 
       expect(manifest.finalizationStatus).toBe("already_logged")
@@ -1047,6 +1068,7 @@ describe("worker finalization", () => {
         workerBranch: "onyx/test/multi-commit",
         args: { positional: ["worker", "run"], options: { offline: "true" } },
         workerFailed: false,
+        pushWorkerBranch: pushWorkerBranchDirect,
       })
 
       expect(manifest.finalizationStatus).toBe("salvaged_unmeasured")
@@ -1186,7 +1208,9 @@ describe("exp log", () => {
       process.chdir(previousCwd)
       console.log = originalLog
     }
-    const listed = JSON.parse(listLogs.join("\n")) as LocalResearchHistoryRecord[]
+    const listed = JSON.parse(
+      listLogs.join("\n")
+    ) as LocalResearchHistoryRecord[]
     expect(
       listed.filter((record) => record.runRef === workerTwo.runRef)
     ).toHaveLength(1)
@@ -1501,13 +1525,13 @@ describe("automated research smoke", () => {
 
   function fastWorkerCommand() {
     return [
-      "test -n \"$ONYX_SETUP_FILE\"",
-      "test -n \"$ONYX_VALIDATION_FILE\"",
-      "test -n \"$ONYX_RESEARCH_SPEC_FILE\"",
-      "test -z \"${ONYX_BRIEF_FILE:-}\"",
-      "test -z \"${ONYX_SESSION_STATE_FILE:-}\"",
-      "onyx research brief --campaign \"$ONYX_CAMPAIGN_NAME\" --session \"$ONYX_SESSION_ID\" --hypothesis \"$ONYX_HYPOTHESIS_ID\" --json >/dev/null",
-      "printf \"worker $ONYX_WORKER_ID\\n\" >> src/controller.txt",
+      'test -n "$ONYX_SETUP_FILE"',
+      'test -n "$ONYX_VALIDATION_FILE"',
+      'test -n "$ONYX_RESEARCH_SPEC_FILE"',
+      'test -z "${ONYX_BRIEF_FILE:-}"',
+      'test -z "${ONYX_SESSION_STATE_FILE:-}"',
+      'onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID" --json >/dev/null',
+      'printf "worker $ONYX_WORKER_ID\\n" >> src/controller.txt',
       "git add src/controller.txt",
       "git -c user.name='Onyx Test' -c user.email='onyx@example.com' commit -m \"smoke worker $ONYX_WORKER_ID\"",
       "printf 'fast worker done\\n'",
@@ -1804,7 +1828,8 @@ describe("automated research smoke", () => {
       console.log = originalLog
       if (previousSession === undefined) delete process.env.ONYX_SESSION_ID
       else process.env.ONYX_SESSION_ID = previousSession
-      if (previousHypothesis === undefined) delete process.env.ONYX_HYPOTHESIS_ID
+      if (previousHypothesis === undefined)
+        delete process.env.ONYX_HYPOTHESIS_ID
       else process.env.ONYX_HYPOTHESIS_ID = previousHypothesis
     }
   })
@@ -1832,7 +1857,12 @@ describe("automated research smoke", () => {
     await createSupervisorRunCampaign({ root, baseCommitSha, campaignName })
     const previousCwd = process.cwd()
     const originalLog = console.log
+    const originalWarn = console.warn
+    const warnings: string[] = []
     console.log = () => {}
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "))
+    }
 
     try {
       process.chdir(root)
@@ -1859,6 +1889,7 @@ describe("automated research smoke", () => {
     } finally {
       process.chdir(previousCwd)
       console.log = originalLog
+      console.warn = originalWarn
     }
 
     const state = await readState(root)
@@ -1870,7 +1901,9 @@ describe("automated research smoke", () => {
     await expect(
       stat(join(await onyxStateDir(root), "session-state"))
     ).rejects.toThrow()
-    await expect(stat(join(await onyxStateDir(root), "briefs"))).rejects.toThrow()
+    await expect(
+      stat(join(await onyxStateDir(root), "briefs"))
+    ).rejects.toThrow()
     expect(sessionState.session.metadata).toMatchObject({
       agentKind: "custom",
       maxConcurrency: 5,
@@ -1896,7 +1929,34 @@ describe("automated research smoke", () => {
       expect(manifest.finalization?.finalizationStatus).toBe(
         "measured_and_logged"
       )
+      const latest = JSON.parse(
+        await readFile(manifest.latestStatePath, "utf8")
+      )
+      expect(latest).toMatchObject({
+        schemaVersion: 1,
+        sessionId,
+        workerId: manifest.workerId,
+        status: "running",
+      })
     }
+    expect(warnings.join("\n")).not.toContain("unlogged or salvaged work")
+    const activityEvents = (
+      await readFile(manifests[0]!.activityJsonlPath, "utf8")
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string })
+    expect(activityEvents.map((event) => event.type)).toEqual(
+      expect.arrayContaining([
+        "process_start",
+        "phase_change",
+        "process_exit",
+        "metrics",
+        "push_result",
+        "finalization_result",
+        "sync_result",
+      ])
+    )
 
     const experiments = (await listLocalExperimentHistory(root)).filter(
       (experiment) => experiment.campaignName === campaignName
@@ -1964,7 +2024,7 @@ describe("automated research smoke", () => {
     } finally {
       db.close()
     }
-  })
+  }, 30_000)
 
   test("max-launches one stops a two-slot supervisor after one worker", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
@@ -2017,7 +2077,7 @@ describe("automated research smoke", () => {
       "Workers: target=2 concurrency=2 maxLaunches=1"
     )
     expect(logs.join("\n")).toContain("launched=1/1")
-  })
+  }, 30_000)
 
   test("max-launches caps only the current existing-session run", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
@@ -2100,7 +2160,7 @@ describe("automated research smoke", () => {
     expect(
       sessionState.workers.every((worker) => worker.status === "completed")
     ).toBe(true)
-  })
+  }, 30_000)
 
   test("omitting max-launches preserves slot maintenance until stopped", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
@@ -2201,11 +2261,14 @@ describe("automated research smoke", () => {
     }
     if (runError) throw runError
 
-    const finalSessionState = await getLocalSessionState(root, session.session.id)
+    const finalSessionState = await getLocalSessionState(
+      root,
+      session.session.id
+    )
     expect(finalSessionState.workers.length).toBeGreaterThanOrEqual(2)
     expect(logs.join("\n")).toContain("Workers: target=1 concurrency=1")
     expect(logs.join("\n")).not.toContain("maxLaunches=")
-  })
+  }, 30_000)
 
   test("exercises setup, campaign, worker, sync, status, finish, summaries, and knowledge with a mock worker", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-auto-smoke-"))
@@ -2988,6 +3051,8 @@ describe("research status", () => {
       promptPath: join(manifestDir, "prompt.md"),
       logPath: join(manifestDir, "worker.log"),
       activityLogPath: join(manifestDir, "worker.activity.log"),
+      activityJsonlPath: join(manifestDir, "worker.activity.jsonl"),
+      latestStatePath: join(manifestDir, "worker.latest.json"),
       manifestPath: join(manifestDir, "worker.manifest.json"),
       sessionId: session.session.id,
       hypothesisId: hypothesis.id,
@@ -4014,7 +4079,9 @@ describe("setup workflow", () => {
       expect(instructions).toContain("## Primary Metric")
       expect(instructions).toContain("METRIC score=<number>")
       expect(instructions).toContain("## Workflow And Tools")
-      expect(instructions).toContain("The Onyx CLI enforces the workflow contract")
+      expect(instructions).toContain(
+        "The Onyx CLI enforces the workflow contract"
+      )
       expect(instructions).toContain("## Project Guidance")
       expect(instructions).toContain("## Setup Checklist")
       expect(instructions).not.toContain("onyx exp run")

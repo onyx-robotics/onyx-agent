@@ -751,6 +751,7 @@ function applyMigrations(db: Db) {
         }
       }
       db.run("UPDATE workers SET status = 'registered' WHERE status = 'idle'")
+      db.run("UPDATE workers SET status = 'running' WHERE status IN ('stale', 'lost')")
       db.query(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
       ).run(4, nowIso())
@@ -1820,20 +1821,23 @@ export async function stopLocalSession({
   root,
   sessionId,
   status,
+  finalizationStatus,
   reason,
 }: {
   root: string
   sessionId: string
   status: ApiSession["status"]
+  finalizationStatus?: ApiSession["finalizationStatus"] | null
   reason?: string | null
 }) {
   const at = nowIso()
   return withResearchDbWrite(root, (db) => {
     const tx = db.transaction(() => {
       db.query(
-        "UPDATE sessions SET status = ?, completed_at = ?, updated_at = ? WHERE id = ?"
+        "UPDATE sessions SET status = ?, finalization_status = COALESCE(?, finalization_status), completed_at = ?, updated_at = ? WHERE id = ?"
       ).run(
         status,
+        finalizationStatus ?? null,
         status === "stop_requested" || status === "running" ? null : at,
         at,
         sessionId

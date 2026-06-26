@@ -762,7 +762,7 @@ export const syncResearchPresenceRequestSchema = z.object({
     activeWorkerCount: 0,
     metadata: {},
   }),
-  workers: z.array(researchPresenceWorkerSnapshotSchema).min(1).max(500),
+  workers: z.array(researchPresenceWorkerSnapshotSchema).max(500),
 })
 
 export const researchPresenceIgnoredWorkerSchema = z.object({
@@ -1223,6 +1223,7 @@ export const stopResearchSessionRequestSchema = z.object({
   status: z
     .enum(["stop_requested", "completed", "failed", "stopped"])
     .default("stop_requested"),
+  finalizationStatus: researchFinalizationStatusSchema.optional(),
   reason: z.string().trim().max(1000).optional(),
   metadata: metadataSchema.default({}),
 })
@@ -1286,6 +1287,7 @@ export const researchCampaignOverviewResponseSchema = z.object({
     campaign: researchCampaignSchema,
     bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
     latestExperiments: z.array(researchCampaignExperimentSummarySchema),
+    sessions: z.array(researchSessionSchema),
     workers: z.array(researchWorkerSchema),
     hypotheses: z.array(researchHypothesisSchema),
     summaries: z.array(researchSummarySchema),

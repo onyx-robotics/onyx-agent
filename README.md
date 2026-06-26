@@ -133,7 +133,7 @@ repo-level supervisor with a built-in agent launcher:
 
 ```bash
 plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
-onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --max-iterations 5
+onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --max-experiments 20 --max-worker-iterations 5
 onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 
@@ -154,15 +154,18 @@ shutdown cushion begins.
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
 receive the worker prompt over stdin, and write raw stdout/stderr logs,
-readable `.activity.log` files, and launch manifests under
+readable `.activity.log` files, structured `.activity.jsonl` files,
+per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-shared sync, adaptive coalesced presence updates, sampled durable heartbeats,
-stop handling, and final sync for the session. `onyx worker run --session <id> --hypothesis <id>` remains available
+the supervisor-owned push/sync queue with default concurrency 4, adaptive
+coalesced presence updates, sampled durable heartbeats, stop handling, and
+final sync for the session. `onyx worker run --session <id> --hypothesis <id>` remains available
 as a low-level debugging and recovery primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
-errors when local manifests are available. `--max-iterations` is a cap, not a
-target count. `--max-launches` caps only new workers launched by the current
+errors when local manifests are available. `--max-experiments` is the global
+attempt budget and `--max-worker-iterations` is a per-worker safety cap.
+`--max-launches` caps only new workers launched by the current
 supervisor invocation and does not change the session's active slot target.
 `onyx workflow status --active` shows only actionable running or paused
 workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked

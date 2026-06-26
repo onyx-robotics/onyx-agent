@@ -71,6 +71,12 @@ export type CliState = {
       maxExperiments?: number | null
       stopRequested?: boolean
       status?: string
+      finalizationStatus?:
+        | "not_started"
+        | "running"
+        | "complete"
+        | "incomplete"
+        | "failed"
       ignoredPresence?: {
         total: number
         byReason: Record<string, number>

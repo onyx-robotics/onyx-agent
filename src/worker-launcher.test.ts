@@ -320,6 +320,8 @@ describe("worker launchers", () => {
       promptPath: join(root, "prompt.md"),
       logPath: join(root, "worker.log"),
       activityLogPath: join(root, "worker.activity.log"),
+      activityJsonlPath: join(root, "worker.activity.jsonl"),
+      latestStatePath: join(root, "worker.latest.json"),
       manifestPath,
       sessionId: "session",
       hypothesisId: "hypothesis",
@@ -408,7 +410,9 @@ describe("worker launchers", () => {
 
   test("onyx shim falls back to the source checkout when PATH has no onyx", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-source-shim-"))
-    const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-source-config-"))
+    const configHome = await mkdtemp(
+      join(tmpdir(), "onyx-worker-source-config-")
+    )
     await runProcess("git", ["init"], { cwd: root })
     const previousConfigHome = process.env.XDG_CONFIG_HOME
     const previousPath = process.env.PATH
@@ -448,7 +452,9 @@ describe("worker launchers", () => {
 
   test("onyx shim prefers the source checkout over an installed onyx", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-source-first-"))
-    const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-source-first-config-"))
+    const configHome = await mkdtemp(
+      join(tmpdir(), "onyx-worker-source-first-config-")
+    )
     const bin = join(root, "bin")
     await mkdir(bin)
     await writeFakeOnyx(join(bin, "onyx"))

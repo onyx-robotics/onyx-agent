@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto"
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
-import { join } from "node:path"
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises"
+import { dirname, join } from "node:path"
 
 import {
   researchHypothesisPlanSchema,
@@ -10,6 +17,7 @@ import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
   getCampaignOverview,
+  getResearchSessionLive,
   getResearchSessionState,
   listProjectCampaigns,
   reconcileCampaign,
@@ -19,6 +27,8 @@ import {
   type ApiCampaign,
   type ApiHypothesis,
   type ApiResearchPresenceResponse,
+  type ApiSession,
+  type ApiSessionLive,
   type ApiSummary,
   type ApiWorker,
 } from "../lib/api"
@@ -31,12 +41,7 @@ import {
   type ResearchSetupFile,
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
-import {
-  currentCommit,
-  git,
-  gitResult,
-  repoRoot,
-} from "../lib/git"
+import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import {
   onyxStateDir,
   readState,
@@ -103,8 +108,12 @@ import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
 const MAX_WORKER_SHUTDOWN_CUSHION_MS = 90_000
 const MIN_WORKER_SHUTDOWN_CUSHION_MS = 15_000
 const MAX_WORKER_HARD_STOP_GRACE_MS = 30_000
+const BUILTIN_AGENT_MIN_USEFUL_LAUNCH_MS = 5 * 60_000
+const CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS = 30_000
 const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
 const MAX_LOCAL_SUPERVISOR_WORKERS = 100
+const DEFAULT_SYNC_QUEUE_CONCURRENCY = 4
+const MAX_SYNC_QUEUE_DEPTH = 500
 
 type IgnoredPresenceState = NonNullable<
   NonNullable<CliState["sessions"]>[string]["ignoredPresence"]
@@ -120,6 +129,127 @@ const PRESENCE_IGNORED_REASONS: IgnoredPresenceReason[] = [
   "update_failed",
 ]
 const PRESENCE_IGNORED_RECENT_LIMIT = 20
+
+type SessionFinalizationStatus = ApiSession["finalizationStatus"]
+
+type WorkerActivityEvent = {
+  type: string
+  phase?: string
+  summary?: string
+  metadata?: Record<string, unknown>
+}
+
+type WorkerLatestState = {
+  schemaVersion: 1
+  at: string
+  sessionId: string
+  workerId: string
+  hypothesisId: string
+  status: ApiWorker["status"]
+  phase: string
+  progressMessage: string
+  metadata?: Record<string, unknown>
+}
+
+type SyncQueueFlushJob = {
+  kind: "flush"
+  reason: string
+  manifest?: WorkerLaunchManifest | null
+}
+
+type SyncQueuePushRefJob = {
+  kind: "push-ref"
+  reason: string
+  cwd: string
+  sourceRef: string
+  targetRef: string
+  manifest?: WorkerLaunchManifest | null
+  resolve: (result: ProcessResult) => void
+}
+
+type SyncQueueJob = SyncQueueFlushJob | SyncQueuePushRefJob
+
+type WorkerBranchPusher = (input: {
+  cwd: string
+  sourceRef: string
+  targetRef: string
+  reason: string
+  manifest?: WorkerLaunchManifest | null
+}) => Promise<ProcessResult>
+
+async function appendWorkerActivityEvent(
+  manifest: WorkerLaunchManifest,
+  event: WorkerActivityEvent
+) {
+  const record = {
+    schemaVersion: 1,
+    at: new Date().toISOString(),
+    sessionId: manifest.sessionId,
+    workerId: manifest.workerId,
+    hypothesisId: manifest.hypothesisId,
+    hypothesisName: manifest.hypothesisName,
+    type: event.type,
+    ...(event.phase ? { phase: event.phase } : {}),
+    ...(event.summary ? { summary: event.summary } : {}),
+    ...(event.metadata ? { metadata: event.metadata } : {}),
+  }
+  await appendFile(
+    manifest.activityJsonlPath,
+    `${JSON.stringify(record)}\n`,
+    "utf8"
+  ).catch(() => {})
+}
+
+async function writeWorkerLatestState(
+  latestStatePath: string,
+  state: WorkerLatestState
+) {
+  await mkdir(dirname(latestStatePath), { recursive: true })
+  const tmp = `${latestStatePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
+  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8")
+  await rename(tmp, latestStatePath)
+}
+
+async function readWorkerLatestState(
+  manifest: WorkerLaunchManifest
+): Promise<WorkerLatestState | null> {
+  try {
+    const parsed = JSON.parse(await readFile(manifest.latestStatePath, "utf8"))
+    if (
+      parsed?.schemaVersion === 1 &&
+      parsed.sessionId === manifest.sessionId &&
+      parsed.workerId === manifest.workerId &&
+      parsed.hypothesisId === manifest.hypothesisId &&
+      typeof parsed.at === "string" &&
+      typeof parsed.phase === "string" &&
+      typeof parsed.progressMessage === "string"
+    ) {
+      return parsed as WorkerLatestState
+    }
+  } catch {
+    // Latest-state snapshots are best-effort live telemetry.
+  }
+  return null
+}
+
+function activitySummaryForManifest(
+  manifest: WorkerLaunchManifest,
+  latest?: WorkerLatestState | null
+) {
+  return {
+    status: manifest.status,
+    startedAt: manifest.startedAt,
+    completedAt: manifest.completedAt,
+    latestAt: latest?.at ?? null,
+    latestPhase: latest?.phase ?? null,
+    exitCode: manifest.exitCode,
+    signal: manifest.signal,
+    timedOut: manifest.timedOut,
+    startupTimedOut: manifest.startupTimedOut,
+    finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
+    finalizationError: manifest.finalization?.error ?? manifest.error ?? null,
+  }
+}
 
 function mergeIgnoredPresence(
   current: IgnoredPresenceState | undefined,
@@ -233,6 +363,29 @@ function workerHardStopGraceMs(shutdownCushionMs: number) {
     MAX_WORKER_HARD_STOP_GRACE_MS,
     Math.floor(shutdownCushionMs / 2)
   )
+}
+
+export function minimumUsefulLaunchMs(
+  agentKind: "codex" | "claude" | "custom"
+) {
+  return agentKind === "custom"
+    ? CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS
+    : BUILTIN_AGENT_MIN_USEFUL_LAUNCH_MS
+}
+
+export function canLaunchWorkerBeforeDeadline({
+  now,
+  endTimeMs,
+  shutdownCushionMs,
+  agentKind,
+}: {
+  now: number
+  endTimeMs: number
+  shutdownCushionMs: number
+  agentKind: "codex" | "claude" | "custom"
+}) {
+  const usefulMs = endTimeMs - shutdownCushionMs - now
+  return usefulMs >= minimumUsefulLaunchMs(agentKind)
 }
 
 async function hypothesisPlansOption(args: Args) {
@@ -715,41 +868,176 @@ function createSyncSupervisor({
   args: Args
   intervalMs: number
 }) {
-  let running: Promise<void> | null = null
+  const maxConcurrency = positiveIntegerOption(
+    args,
+    "sync-concurrency",
+    DEFAULT_SYNC_QUEUE_CONCURRENCY
+  )
+  const queue: SyncQueueJob[] = []
+  const idleWaiters = new Set<() => void>()
+  let active = 0
   let stopped = false
   let timer: ReturnType<typeof setInterval> | null = null
 
-  const run = () => {
-    if (running) return running
-    running = flushOutbox(root, args, { quiet: true })
-      .then(() => undefined)
+  const depth = () => queue.length + active
+  const notifyIdle = () => {
+    if (depth() > 0) return
+    for (const resolve of idleWaiters) resolve()
+    idleWaiters.clear()
+  }
+  const emitJobEvent = async (
+    job: SyncQueueJob,
+    type: "push_result" | "sync_result",
+    summary: string,
+    metadata: Record<string, unknown>
+  ) => {
+    if (!job.manifest) return
+    await appendWorkerActivityEvent(job.manifest, {
+      type,
+      phase: "syncing",
+      summary,
+      metadata: {
+        reason: job.reason,
+        ...metadata,
+      },
+    })
+  }
+  const failedProcessResult = (message: string): ProcessResult => ({
+    code: 1,
+    stdout: "",
+    stderr: message,
+    timedOut: false,
+  })
+  const runFlushJob = async (job: SyncQueueFlushJob) => {
+    await flushOutbox(root, args, { quiet: true })
+      .then(async (result) => {
+        await emitJobEvent(job, "push_result", "Experiment refs pushed", {
+          flushed: result.flushed,
+          pending: result.pending,
+          offline: result.offline,
+          conflicts: result.conflicts,
+          skippedDeleted: result.skippedDeleted,
+        })
+        await emitJobEvent(job, "sync_result", "SQLite sync flushed", {
+          flushed: result.flushed,
+          pending: result.pending,
+          offline: result.offline,
+          conflicts: result.conflicts,
+          skippedDeleted: result.skippedDeleted,
+        })
+      })
       .catch((error) => {
+        void emitJobEvent(job, "sync_result", "SQLite sync failed", {
+          error: error instanceof Error ? error.message : String(error),
+        })
         console.warn(
           `Background sync skipped: ${
             error instanceof Error ? error.message : String(error)
           }`
         )
       })
-      .finally(() => {
-        running = null
+  }
+  const runPushRefJob = async (job: SyncQueuePushRefJob) => {
+    try {
+      const result = await gitResult(
+        ["push", "origin", `${job.sourceRef}:${job.targetRef}`],
+        job.cwd
+      )
+      job.resolve(result)
+    } catch (error) {
+      job.resolve(failedProcessResult(errorMessage(error)))
+    }
+  }
+  const runJob = async (job: SyncQueueJob) => {
+    await (
+      job.kind === "push-ref" ? runPushRefJob(job) : runFlushJob(job)
+    ).finally(() => {
+      active -= 1
+      pump()
+      notifyIdle()
+    })
+  }
+  const pump = () => {
+    while (active < maxConcurrency && queue.length > 0) {
+      const job = queue.shift()!
+      active += 1
+      void runJob(job)
+    }
+  }
+  const enqueue = (job: SyncQueueJob, options: { force?: boolean } = {}) => {
+    if (stopped && !options.force) return null
+    if (depth() >= MAX_SYNC_QUEUE_DEPTH) return null
+    queue.push(job)
+    pump()
+    return depth()
+  }
+  const waitForIdle = async (timeoutMs: number) => {
+    const deadline = Date.now() + timeoutMs
+    while (depth() > 0 && Date.now() < deadline) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, Math.max(1, deadline - Date.now()))
+        idleWaiters.add(() => {
+          clearTimeout(timer)
+          resolve()
+        })
       })
-    return running
+    }
+    return depth()
   }
 
   timer = setInterval(() => {
-    if (!stopped) void run()
+    if (!stopped && depth() === 0)
+      enqueue({ kind: "flush", reason: "interval" })
   }, intervalMs)
 
   return {
-    request() {
-      if (!stopped) void run()
+    request(job: Partial<SyncQueueJob> = {}) {
+      return (
+        enqueue({
+          kind: "flush",
+          reason: job.reason ?? "requested",
+          manifest: job.manifest,
+        }) ?? depth()
+      )
     },
+    pushRef({
+      cwd,
+      sourceRef,
+      targetRef,
+      reason,
+      manifest,
+    }: {
+      cwd: string
+      sourceRef: string
+      targetRef: string
+      reason: string
+      manifest?: WorkerLaunchManifest | null
+    }) {
+      return new Promise<ProcessResult>((resolve) => {
+        const accepted = enqueue({
+          kind: "push-ref",
+          reason,
+          cwd,
+          sourceRef,
+          targetRef,
+          manifest,
+          resolve,
+        })
+        if (accepted === null) {
+          resolve(failedProcessResult("sync queue rejected push job"))
+        }
+      })
+    },
+    depth,
+    waitForIdle,
     async drain(timeoutMs: number) {
       stopped = true
       if (timer) clearInterval(timer)
       const deadline = Date.now() + timeoutMs
       do {
-        await run()
+        if (depth() === 0)
+          enqueue({ kind: "flush", reason: "final-drain" }, { force: true })
+        await waitForIdle(Math.max(1, deadline - Date.now()))
         const pending = await pendingResearchSyncCount(root)
         if (pending === 0) return 0
         await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
@@ -768,11 +1056,13 @@ function createPresenceSupervisor({
   args,
   sessionId,
   intervalMs,
+  syncQueueDepth,
 }: {
   root: string
   args: Args
   sessionId: string
   intervalMs: number
+  syncQueueDepth?: () => number
 }) {
   const lastSent = new Map<string, string>()
   const supervisorRunId = randomUUID()
@@ -784,32 +1074,55 @@ function createPresenceSupervisor({
   const snapshot = async () => {
     if (args.options.offline === "true") return
     const state = await getLocalSessionState(root, sessionId)
+    const cliState = await readState(root).catch(() => null)
     const manifests = await readWorkerLaunchManifests(root, sessionId)
     const manifestByWorker = new Map(
       manifests.map((manifest) => [manifest.workerId, manifest])
     )
+    const latestByWorker = new Map(
+      await Promise.all(
+        manifests.map(
+          async (manifest) =>
+            [manifest.workerId, await readWorkerLatestState(manifest)] as const
+        )
+      )
+    )
     const observedAt = new Date().toISOString()
+    const pendingSyncCount = await pendingResearchSyncCount(root).catch(() => 0)
+    const activeWorkerCount = state.workers.filter(
+      (worker) =>
+        worker.sessionId === sessionId &&
+        ["registered", "running"].includes(worker.status)
+    ).length
     const workers = state.workers
       .filter((worker) => worker.sessionId === sessionId)
       .map((worker) => {
         const manifest = manifestByWorker.get(worker.id)
+        const latest = manifest ? latestByWorker.get(worker.id) : null
         const metadata = manifest
           ? {
+              ...(latest?.metadata ?? {}),
               workerLogPath: manifest.logPath,
               workerActivityLogPath: manifest.activityLogPath,
+              workerActivityJsonlPath: manifest.activityJsonlPath,
               workerPromptPath: manifest.promptPath,
+              latestStatePath: manifest.latestStatePath,
               manifestPath: manifest.manifestPath,
+              latestObservedAt: latest?.at ?? null,
               finalizationStatus:
                 manifest.finalization?.finalizationStatus ?? null,
             }
           : {}
         return {
           id: worker.id,
-          status: worker.status,
-          phase: worker.phase,
-          progressMessage: worker.progressMessage,
+          status: latest?.status ?? worker.status,
+          phase: latest?.phase ?? worker.phase,
+          progressMessage: latest?.progressMessage ?? worker.progressMessage,
           gitLabel: worker.gitLabel,
           lastOutputAt: manifest?.lastOutputAt ?? null,
+          activitySummary: manifest
+            ? activitySummaryForManifest(manifest, latest)
+            : undefined,
           metadata,
           observedAt,
         }
@@ -824,7 +1137,6 @@ function createPresenceSupervisor({
         }
         return false
       })
-    if (workers.length === 0) return
     sequence += 1
     const response = await syncResearchPresence(
       {
@@ -833,11 +1145,13 @@ function createPresenceSupervisor({
         sequence,
         sessionId,
         site: {
-          pendingSyncCount: await pendingResearchSyncCount(root).catch(() => 0),
-          pushQueueDepth: 0,
-          activeWorkerCount: workers.filter((worker) =>
-            ["registered", "running"].includes(worker.status)
-          ).length,
+          pendingSyncCount,
+          pushQueueDepth: syncQueueDepth?.() ?? 0,
+          activeWorkerCount,
+          providerBackoff:
+            cliState?.sessions?.[sessionId]?.providerBackoff ?? null,
+          ignoredPresence:
+            cliState?.sessions?.[sessionId]?.ignoredPresence ?? {},
           lastUploadAt: observedAt,
         },
         workers,
@@ -963,6 +1277,151 @@ function printFinalSyncReport(
         report.firstFailed.lastError ?? "sync conflict"
       }`
     )
+  }
+}
+
+type SessionFinalizationComputation = {
+  status: SessionFinalizationStatus
+  reasons: string[]
+  live: ApiSessionLive | null
+  pendingSyncCount: number
+  conflictCount: number
+}
+
+function finalizationIsBudgetedSession(
+  local: Awaited<ReturnType<typeof getLocalSessionState>> | null,
+  cliState: CliState,
+  sessionId: string
+) {
+  const localMax = local?.session.maxExperiments
+  if (localMax !== undefined) return localMax !== null
+  const cachedMax = cliState.sessions?.[sessionId]?.maxExperiments
+  return cachedMax !== undefined && cachedMax !== null
+}
+
+async function computeSessionFinalizationStatus({
+  root,
+  args,
+  sessionId,
+  pendingSyncCount,
+  launchReservationDebt,
+}: {
+  root: string
+  args: Args
+  sessionId: string
+  pendingSyncCount: number
+  launchReservationDebt: number
+}): Promise<SessionFinalizationComputation> {
+  const failedReasons: string[] = []
+  const incompleteReasons: string[] = []
+  const [conflictCount, manifests, cliState, localState] = await Promise.all([
+    researchSyncConflictCount(root).catch(() => 0),
+    readWorkerLaunchManifests(root, sessionId).catch(() => []),
+    readState(root).catch(() => ({}) as CliState),
+    getLocalSessionState(root, sessionId).catch(() => null),
+  ])
+
+  if (pendingSyncCount > 0) {
+    const message = `${pendingSyncCount} pending sync event(s)`
+    if (args.options["require-online"] === "true") failedReasons.push(message)
+    else incompleteReasons.push(message)
+  }
+  if (conflictCount > 0) {
+    incompleteReasons.push(`${conflictCount} sync conflict(s)`)
+  }
+  if (launchReservationDebt > 0) {
+    incompleteReasons.push(
+      `${launchReservationDebt} unresolved launch reservation(s)`
+    )
+  }
+
+  for (const manifest of manifests) {
+    if (manifest.status === "starting" || manifest.status === "running") {
+      incompleteReasons.push(
+        `worker ${manifest.workerId} still ${manifest.status}`
+      )
+    }
+    const finalization = manifest.finalization
+    if (!finalization) {
+      if (
+        manifest.status === "completed" ||
+        manifest.status === "failed" ||
+        manifest.status === "stopped"
+      ) {
+        incompleteReasons.push(
+          `worker ${manifest.workerId} has no finalization result`
+        )
+      }
+      continue
+    }
+    if (finalization.finalizationStatus === "failed") {
+      failedReasons.push(
+        `worker ${manifest.workerId} finalization failed${
+          finalization.error ? `: ${finalization.error}` : ""
+        }`
+      )
+      continue
+    }
+    const hasUnresolvedSalvage =
+      finalization.finalizationStatus === "salvaged_unmeasured" ||
+      (finalization.finalizationStatus !== "measured_and_logged" &&
+        (finalization.salvaged || finalization.unloggedCommitCount > 0))
+    if (hasUnresolvedSalvage) {
+      incompleteReasons.push(
+        `worker ${manifest.workerId} has unlogged or salvaged work`
+      )
+    }
+    if (finalization.workerBranchPushStatus === "failed") {
+      incompleteReasons.push(`worker ${manifest.workerId} branch push failed`)
+    }
+    if (finalization.rootDriftStatus === "dirty") {
+      incompleteReasons.push(`worker ${manifest.workerId} detected root drift`)
+    }
+  }
+
+  let live: ApiSessionLive | null = null
+  const budgetedSession = finalizationIsBudgetedSession(
+    localState,
+    cliState,
+    sessionId
+  )
+  if (budgetedSession) {
+    if (args.options.offline === "true") {
+      incompleteReasons.push("remote reservation debt was not verified offline")
+    } else {
+      try {
+        live = await getResearchSessionLive(sessionId, args)
+        if (live.budget.openReservationCount > 0) {
+          incompleteReasons.push(
+            `${live.budget.openReservationCount} open reservation(s)`
+          )
+        }
+        if (live.budget.expiredReservationCount > 0) {
+          incompleteReasons.push(
+            `${live.budget.expiredReservationCount} expired reservation(s)`
+          )
+        }
+      } catch (error) {
+        const message = `remote reservation debt check failed: ${errorMessage(error)}`
+        if (args.options["require-online"] === "true")
+          failedReasons.push(message)
+        else incompleteReasons.push(message)
+      }
+    }
+  }
+
+  const reasons = failedReasons.length > 0 ? failedReasons : incompleteReasons
+  return {
+    status:
+      failedReasons.length > 0
+        ? "failed"
+        : incompleteReasons.length > 0
+          ? "incomplete"
+          : "complete",
+    reasons,
+    live,
+    pendingSyncCount,
+    conflictCount,
   }
 }
 
@@ -1395,8 +1854,10 @@ export async function finalizeHypothesisAttempt({
   sessionId,
   workerId,
   workerBranch,
+  activityManifest,
   args,
   workerFailed,
+  pushWorkerBranch,
 }: {
   root: string
   worktree: string
@@ -1405,8 +1866,10 @@ export async function finalizeHypothesisAttempt({
   sessionId: string
   workerId: string
   workerBranch: string
+  activityManifest?: WorkerLaunchManifest | null
   args: Args
   workerFailed: boolean
+  pushWorkerBranch: WorkerBranchPusher
 }): Promise<WorkerFinalizationManifest> {
   const manifest: WorkerFinalizationManifest = {
     attempted: false,
@@ -1516,8 +1979,24 @@ export async function finalizeHypothesisAttempt({
           },
         })
       )
-        .then(() => {
+        .then(async (record) => {
           manifest.finalizationStatus = "measured_and_logged"
+          if (record && activityManifest) {
+            await appendWorkerActivityEvent(activityManifest, {
+              type: "metrics",
+              phase: "measured",
+              summary: `${record.primaryMetricName}=${record.primaryMetricValue ?? "null"}`,
+              metadata: {
+                runRef: record.runRef,
+                status: record.status,
+                primaryMetricName: record.primaryMetricName,
+                primaryMetricValue: record.primaryMetricValue,
+                metrics: record.metrics,
+                resultCommitSha: record.resultCommitSha,
+                resultRef: record.resultRef,
+              },
+            })
+          }
         })
         .catch((error) => {
           manifest.finalizationStatus = "failed"
@@ -1530,18 +2009,44 @@ export async function finalizeHypothesisAttempt({
         })
     }
 
-    const workerBranchPush = await gitResult(
-      ["push", "origin", `HEAD:refs/heads/${workerBranch}`],
-      worktree
-    )
+    const workerBranchPush = await pushWorkerBranch({
+      cwd: worktree,
+      sourceRef: "HEAD",
+      targetRef: `refs/heads/${workerBranch}`,
+      reason: "worker-branch-finalization",
+      manifest: activityManifest,
+    })
     if (workerBranchPush.code === 0 && !workerBranchPush.timedOut) {
       manifest.workerBranchPushStatus = "pushed"
+      if (activityManifest) {
+        await appendWorkerActivityEvent(activityManifest, {
+          type: "push_result",
+          phase: "pushing",
+          summary: "Worker branch pushed",
+          metadata: {
+            ref: `refs/heads/${workerBranch}`,
+            commitSha: manifest.commitSha,
+          },
+        })
+      }
     } else {
       manifest.workerBranchPushStatus = "failed"
       manifest.error =
         workerBranchPush.stderr.trim() ||
         workerBranchPush.stdout.trim() ||
         "worker branch push failed"
+      if (activityManifest) {
+        await appendWorkerActivityEvent(activityManifest, {
+          type: "push_result",
+          phase: "pushing",
+          summary: "Worker branch push failed",
+          metadata: {
+            ref: `refs/heads/${workerBranch}`,
+            commitSha: manifest.commitSha,
+            error: manifest.error,
+          },
+        })
+      }
     }
 
     const rootStatus = await mainWorktreeStatus(root)
@@ -1678,6 +2183,7 @@ async function withWorkerHeartbeat<T>({
   workerId,
   sessionId,
   hypothesisId,
+  latestStatePath,
   phase,
   progressMessage,
   metadata,
@@ -1690,6 +2196,7 @@ async function withWorkerHeartbeat<T>({
   workerId: string
   sessionId: string
   hypothesisId: string
+  latestStatePath?: string | null
   phase: string
   progressMessage: string | (() => string)
   metadata?: () => Record<string, unknown>
@@ -1700,31 +2207,54 @@ async function withWorkerHeartbeat<T>({
 }): Promise<T> {
   let lastConsoleAt = 0
   let lastSampleAt = Date.now()
-  const timer = setInterval(() => {
+  const publishProgress = async (sample: boolean) => {
     const now = Date.now()
     const message =
       typeof progressMessage === "function"
         ? progressMessage()
         : progressMessage
     const shouldSample =
-      heartbeatSampleEveryMs > 0 && now - lastSampleAt >= heartbeatSampleEveryMs
+      sample &&
+      heartbeatSampleEveryMs > 0 &&
+      now - lastSampleAt >= heartbeatSampleEveryMs
     if (shouldSample) lastSampleAt = now
-    const heartbeat = {
-      root,
-      workerId,
-      status: "running" as const,
-      sessionId,
-      hypothesisId,
-      phase,
-      event: shouldSample ? "heartbeat_sampled" : "heartbeat",
-      progressMessage: message,
-      metadata: metadata?.(),
+    const snapshotMetadata = metadata?.()
+    let latestWrite: Promise<void> = Promise.resolve()
+    if (latestStatePath) {
+      latestWrite = writeWorkerLatestState(latestStatePath, {
+        schemaVersion: 1,
+        at: new Date(now).toISOString(),
+        sessionId,
+        workerId,
+        hypothesisId,
+        status: "running",
+        phase,
+        progressMessage: message,
+        metadata: snapshotMetadata,
+      }).catch(() => {})
     }
-    void recordLocalWorkerHeartbeat(heartbeat).catch(() => {})
+    if (shouldSample) {
+      void recordLocalWorkerHeartbeat({
+        root,
+        workerId,
+        status: "running",
+        sessionId,
+        hypothesisId,
+        phase,
+        event: "heartbeat_sampled",
+        progressMessage: message,
+        metadata: snapshotMetadata,
+      }).catch(() => {})
+    }
     if (!quiet && now - lastConsoleAt >= consoleEveryMs) {
       lastConsoleAt = now
       console.log(`worker progress: ${message}`)
     }
+    await latestWrite
+  }
+  await publishProgress(false)
+  const timer = setInterval(() => {
+    void publishProgress(true)
   }, 10_000)
 
   try {
@@ -1799,6 +2329,8 @@ function workerMetadata({
     launcher: invocation.agentKind,
     workerLogPath: manifest.logPath,
     workerActivityLogPath: manifest.activityLogPath,
+    workerActivityJsonlPath: manifest.activityJsonlPath,
+    workerLatestStatePath: manifest.latestStatePath,
     workerPromptPath: manifest.promptPath,
     lastOutputAt: manifest.lastOutputAt,
     version: manifest.version,
@@ -1843,6 +2375,7 @@ async function persistWorkerLaunchState({
         command: manifest.command,
         args: manifest.args,
         onyxShimPath: manifest.onyxShimPath,
+        latestStatePath: manifest.latestStatePath,
         addedWritableRoots: manifest.addedWritableRoots,
       },
       startedAt: manifest.startedAt,
@@ -2060,6 +2593,8 @@ async function runHypothesisOnce({
       promptPath: prompt.path,
       logPath: launchPaths.logPath,
       activityLogPath: launchPaths.activityLogPath,
+      activityJsonlPath: launchPaths.activityJsonlPath,
+      latestStatePath: launchPaths.latestStatePath,
       manifestPath: launchPaths.manifestPath,
       sessionId,
       hypothesisId: hypothesis.id,
@@ -2086,6 +2621,22 @@ async function runHypothesisOnce({
     console.log(`manifest: ${launchPaths.manifestPath}`)
     console.log(`raw log: ${launchPaths.logPath}`)
     console.log(`activity log: ${launchPaths.activityLogPath}`)
+    console.log(`activity events: ${launchPaths.activityJsonlPath}`)
+    await appendWorkerActivityEvent(launchManifest, {
+      type: "process_start",
+      phase: "starting",
+      summary: `Starting ${invocation.agentKind} worker for ${hypothesis.name}`,
+      metadata: {
+        command: invocation.command,
+        args: invocation.redactedArgs,
+        workerBranch,
+      },
+    })
+    await appendWorkerActivityEvent(launchManifest, {
+      type: "phase_change",
+      phase: "orienting",
+      summary: "Worker context files are ready",
+    })
     const firstAttemptWarningMs =
       nonnegativeNumberOption(
         args,
@@ -2119,11 +2670,18 @@ async function runHypothesisOnce({
       }, firstAttemptWarningMs)
       firstAttemptWarningTimer.unref?.()
     }
+    await appendWorkerActivityEvent(launchManifest, {
+      type: "phase_change",
+      phase: "running",
+      summary: "Provider process started",
+    })
     const workerResult = await withWorkerHeartbeat({
       root,
       workerId: worker.id,
       sessionId,
       hypothesisId: hypothesis.id,
+      latestStatePath:
+        launchManifest?.latestStatePath ?? launchPaths.latestStatePath,
       phase: "running",
       progressMessage: () =>
         workerProgress({
@@ -2193,6 +2751,18 @@ async function runHypothesisOnce({
         lastOutputAt: workerResult.lastOutputAt,
       }
       await persistLaunchManifest(launchManifest)
+      await appendWorkerActivityEvent(launchManifest, {
+        type: "process_exit",
+        phase: launchManifest.status,
+        summary: `${invocation.agentKind} exited with code ${workerResult.code ?? "null"}`,
+        metadata: {
+          exitCode: workerResult.code,
+          signal: workerResult.signal,
+          timedOut: workerResult.timedOut,
+          startupTimedOut: workerResult.startupTimedOut,
+          cancelled: stoppedByHarness,
+        },
+      })
     }
     const workerFailure = processFailure(
       workerResult,
@@ -2209,6 +2779,13 @@ async function runHypothesisOnce({
       progressMessage: `Finalizing ${hypothesis.name} worker output`,
       gitLabel: resultCommitSha ?? null,
     })
+    if (launchManifest) {
+      await appendWorkerActivityEvent(launchManifest, {
+        type: "phase_change",
+        phase: "finalizing",
+        summary: "Finalizing worker output",
+      })
+    }
     const finalization = await finalizeHypothesisAttempt({
       root,
       worktree,
@@ -2217,8 +2794,10 @@ async function runHypothesisOnce({
       sessionId,
       workerId: worker.id,
       workerBranch,
+      activityManifest: launchManifest,
       args,
       workerFailed: Boolean(workerFailure) || stoppedByHarness,
+      pushWorkerBranch: syncSupervisor.pushRef,
     })
     if (finalization.commitSha) resultCommitSha = finalization.commitSha
     if (launchManifest) {
@@ -2227,9 +2806,25 @@ async function runHypothesisOnce({
         finalization,
       }
       await persistLaunchManifest(launchManifest)
+      await appendWorkerActivityEvent(launchManifest, {
+        type: "finalization_result",
+        phase: "finalizing",
+        summary: finalizationStatusLabel(finalization.finalizationStatus),
+        metadata: {
+          finalizationStatus: finalization.finalizationStatus,
+          commitSha: finalization.commitSha,
+          unloggedCommitCount: finalization.unloggedCommitCount,
+          workerBranchPushStatus: finalization.workerBranchPushStatus,
+          rootDriftStatus: finalization.rootDriftStatus,
+          error: finalization.error,
+        },
+      })
     }
     if (finalizationLoggedExperiment(finalization.finalizationStatus)) {
-      syncSupervisor.request()
+      syncSupervisor.request({
+        reason: "worker-finalization",
+        manifest: launchManifest,
+      })
     }
     if (finalization.rootDriftStatus === "dirty") {
       throw new Error(
@@ -2239,6 +2834,13 @@ async function runHypothesisOnce({
     }
 
     if (stoppedByHarness) {
+      if (launchManifest) {
+        await appendWorkerActivityEvent(launchManifest, {
+          type: "stop",
+          phase: "stopped",
+          summary: "Worker stopped after session stop request",
+        })
+      }
       await recordLocalWorkerHeartbeat({
         root,
         workerId: worker.id,
@@ -3072,16 +3674,22 @@ export async function commandResearchShouldStop(args: Args) {
   const iteration =
     args.options.iteration === undefined ? null : Number(args.options.iteration)
   const reasons: string[] = []
-  if (localSession?.stopRequested) reasons.push("stop requested")
+  const reasonCodes = new Set<string>()
+  const addStopReason = (code: string, reason: string) => {
+    reasonCodes.add(code)
+    if (!reasons.includes(reason)) reasons.push(reason)
+  }
+  if (localSession?.stopRequested) {
+    addStopReason("stop_requested", "stop requested")
+  }
   const localDbSession = await getLocalSessionState(root, sessionId).catch(
     () => null
   )
-  if (
-    localDbSession &&
-    localDbSession.session.status !== "running" &&
-    !reasons.includes(`local session ${localDbSession.session.status}`)
-  ) {
-    reasons.push(`local session ${localDbSession.session.status}`)
+  if (localDbSession && localDbSession.session.status !== "running") {
+    addStopReason(
+      "session_terminal",
+      `local session ${localDbSession.session.status}`
+    )
   }
   const workerResearchDeadline = process.env.ONYX_RESEARCH_DEADLINE_AT
     ? Date.parse(process.env.ONYX_RESEARCH_DEADLINE_AT)
@@ -3090,10 +3698,10 @@ export async function commandResearchShouldStop(args: Args) {
     Number.isFinite(workerResearchDeadline) &&
     Date.now() >= workerResearchDeadline
   ) {
-    reasons.push("worker shutdown cushion reached")
+    addStopReason("deadline_reached", "worker shutdown cushion reached")
   }
   if (localSession?.endTimeMs && Date.now() >= localSession.endTimeMs) {
-    reasons.push("time budget reached")
+    addStopReason("time_budget_reached", "time budget reached")
   }
   if (
     iteration !== null &&
@@ -3102,7 +3710,7 @@ export async function commandResearchShouldStop(args: Args) {
     iteration >
       (localSession.maxWorkerIterations ?? localSession.maxIterations ?? 0)
   ) {
-    reasons.push("iteration budget reached")
+    addStopReason("iteration_budget_reached", "iteration budget reached")
   }
 
   try {
@@ -3113,7 +3721,20 @@ export async function commandResearchShouldStop(args: Args) {
         remote.session.terminalExperimentCount >=
         remote.session.maxExperiments
     ) {
-      reasons.push("budget_exhausted")
+      addStopReason("budget_exhausted", "experiment budget exhausted")
+    }
+    if (remote.session.maxExperiments !== null) {
+      try {
+        const live = await getResearchSessionLive(sessionId, args)
+        if (live.budget.expiredReservationCount > 0) {
+          addStopReason(
+            "reservation_expired",
+            `${live.budget.expiredReservationCount} experiment reservation(s) expired`
+          )
+        }
+      } catch {
+        // State checks still provide the normal budget stop signal.
+      }
     }
     if (
       remote.session.status === "stop_requested" ||
@@ -3121,7 +3742,10 @@ export async function commandResearchShouldStop(args: Args) {
       remote.session.status === "completed" ||
       remote.session.status === "failed"
     ) {
-      reasons.push(`remote session ${remote.session.status}`)
+      addStopReason(
+        "session_terminal",
+        `remote session ${remote.session.status}`
+      )
     }
   } catch {
     // Local state is enough for offline stop checks.
@@ -3129,7 +3753,13 @@ export async function commandResearchShouldStop(args: Args) {
 
   const shouldStop = reasons.length > 0
   if (args.options.json === "true") {
-    console.log(JSON.stringify({ shouldStop, sessionId, reasons }, null, 2))
+    console.log(
+      JSON.stringify(
+        { shouldStop, sessionId, reasonCodes: [...reasonCodes], reasons },
+        null,
+        2
+      )
+    )
   } else {
     console.log(
       shouldStop
@@ -3638,7 +4268,6 @@ function unresolvedReservationCount(reservations: Iterable<LaunchReservation>) {
 
 function defaultPresenceIntervalSeconds(workerTarget: number) {
   if (workerTarget > 50) return 10
-  if (workerTarget > 10) return 10
   return 5
 }
 
@@ -3856,8 +4485,9 @@ export async function commandResearchRun(args: Args) {
     args,
     sessionId,
     intervalMs: presenceIntervalMs,
+    syncQueueDepth: syncSupervisor.depth,
   })
-  syncSupervisor.request()
+  syncSupervisor.request({ reason: "startup" })
   presenceSupervisor.request()
 
   const activeRuns = new Map<string, Promise<HypothesisRunResult>>()
@@ -3895,7 +4525,12 @@ export async function commandResearchRun(args: Args) {
         sessionId,
         args,
       }).catch(() => false)
-      const launchCutoffReached = loopNow >= endTimeMs - shutdownCushionMs
+      const launchCutoffReached = !canLaunchWorkerBeforeDeadline({
+        now: loopNow,
+        endTimeMs,
+        shutdownCushionMs,
+        agentKind: sessionAgentKind,
+      })
       const launchLimitReached = maxLaunches !== null && launched >= maxLaunches
       if (shouldStop || launchCutoffReached || launchLimitReached) {
         if (activeRuns.size === 0) break
@@ -3948,7 +4583,15 @@ export async function commandResearchRun(args: Args) {
       }
 
       for (let index = 0; index < launchSlots; index += 1) {
-        if (Date.now() >= endTimeMs - shutdownCushionMs) break
+        if (
+          !canLaunchWorkerBeforeDeadline({
+            now: Date.now(),
+            endTimeMs,
+            shutdownCushionMs,
+            agentKind: sessionAgentKind,
+          })
+        )
+          break
         const refreshed = await getLocalSessionState(root, sessionId).catch(
           () => getResearchSessionState(sessionId, args)
         )
@@ -4031,6 +4674,26 @@ export async function commandResearchRun(args: Args) {
               providerBackoffReason = backoffReason
               providerBackoffUntil = Date.now() + providerBackoffMs
               providerBackoffLogged = false
+              if (result.workerId) {
+                const manifest = (
+                  await readWorkerLaunchManifests(root, sessionId).catch(
+                    () => []
+                  )
+                ).find((manifest) => manifest.workerId === result.workerId)
+                if (manifest) {
+                  await appendWorkerActivityEvent(manifest, {
+                    type:
+                      backoffReason === "rate_limit"
+                        ? "rate_limit"
+                        : "provider_backoff",
+                    phase: "backoff",
+                    summary: backoffReason,
+                    metadata: {
+                      until: new Date(providerBackoffUntil).toISOString(),
+                    },
+                  })
+                }
+              }
               const state = await readState(root).catch(() => null)
               if (state) {
                 state.sessions = state.sessions ?? {}
@@ -4063,7 +4726,7 @@ export async function commandResearchRun(args: Args) {
           .finally(() => {
             activeRuns.delete(runKey)
             launchReservations.delete(runKey)
-            syncSupervisor.request()
+            syncSupervisor.request({ reason: "worker-finished" })
             presenceSupervisor.request()
           })
         activeRuns.set(runKey, run)
@@ -4106,6 +4769,7 @@ export async function commandResearchRun(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     status: finalStatus,
+    finalizationStatus: "running",
     stopRequested: false,
     providerBackoff: null,
   }
@@ -4114,16 +4778,93 @@ export async function commandResearchRun(args: Args) {
     root,
     sessionId,
     status: finalStatus,
+    finalizationStatus: "running",
     reason: explicitStop ? "stop requested" : "research run completed",
   }).catch(() => {})
-  presenceSupervisor.request()
-  await presenceSupervisor.stop()
-  const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
+  await syncSupervisor.drain(finalSyncTimeoutMs)
+  const preFinalizationSync = await drainFinalSync({
+    root,
+    args,
+    timeoutMs: finalSyncTimeoutMs,
+  })
+  printFinalSyncReport(preFinalizationSync)
+  const finalization = await computeSessionFinalizationStatus({
+    root,
+    args,
+    sessionId,
+    pendingSyncCount: preFinalizationSync.pending,
+    launchReservationDebt: launchReservations.size,
+  })
+  if (finalization.reasons.length > 0) {
+    console.warn(
+      `finalization ${finalization.status}: ${finalization.reasons
+        .slice(0, 5)
+        .join("; ")}`
+    )
+  }
+  const finalSessionState = await readState(root)
+  finalSessionState.sessions = finalSessionState.sessions ?? {}
+  finalSessionState.sessions[sessionId] = {
+    ...(finalSessionState.sessions[sessionId] ?? {}),
+    campaignName: campaign.name,
+    campaignId: campaign.id,
+    status: finalStatus,
+    finalizationStatus: finalization.status,
+    stopRequested: false,
+    providerBackoff: null,
+  }
+  await writeState(root, finalSessionState)
+  await stopLocalSession({
+    root,
+    sessionId,
+    status: finalStatus,
+    finalizationStatus: finalization.status,
+    reason:
+      finalization.reasons.length > 0
+        ? finalization.reasons.slice(0, 5).join("; ")
+        : explicitStop
+          ? "stop requested"
+          : "research run completed",
+  }).catch(() => {})
+  const finalSync = await drainFinalSync({
+    root,
+    args,
+    timeoutMs: finalSyncTimeoutMs,
+  })
+  printFinalSyncReport(finalSync)
+  let reportedFinalizationStatus = finalization.status
+  const finalSyncHasDebt =
+    finalSync.pending > 0 || finalSync.conflicts > 0 || finalSync.offline
+  if (
+    finalSyncHasDebt &&
+    (reportedFinalizationStatus === "complete" ||
+      args.options["require-online"] === "true")
+  ) {
+    reportedFinalizationStatus =
+      args.options["require-online"] === "true" ? "failed" : "incomplete"
+    const adjustedState = await readState(root)
+    adjustedState.sessions = adjustedState.sessions ?? {}
+    adjustedState.sessions[sessionId] = {
+      ...(adjustedState.sessions[sessionId] ?? {}),
+      finalizationStatus: reportedFinalizationStatus,
+    }
+    await writeState(root, adjustedState)
+    await stopLocalSession({
+      root,
+      sessionId,
+      status: finalStatus,
+      finalizationStatus: reportedFinalizationStatus,
+      reason:
+        args.options["require-online"] === "true"
+          ? "final session sync failed with --require-online"
+          : "final session sync remains pending",
+    }).catch(() => {})
+  }
 
   console.log(
     `Research run ${finalStatus}: launched=${launched}${
       maxLaunches ? `/${maxLaunches}` : ""
-    } completed=${completed} failed=${failed} stopped=${stopped}; ${pending} sync record(s) pending.`
+    } completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}; ${finalSync.pending} sync record(s) pending.`
   )
 }
 
