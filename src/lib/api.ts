@@ -216,6 +216,9 @@ export type ApiSessionLive = {
     reservedCount: number
     terminalCount: number
     remainingCount: number | null
+    terminalRemainingCount: number | null
+    budgetSaturated: boolean
+    budgetExhausted: boolean
     openReservationCount: number
     expiredReservationCount: number
     warning?: string | null
@@ -318,6 +321,9 @@ export type ApiSessionControlState = {
     reservedCount: number
     terminalCount: number
     remainingCount: number | null
+    terminalRemainingCount: number | null
+    budgetSaturated: boolean
+    budgetExhausted: boolean
     openReservationCount: number
     expiredReservationCount: number
   }
@@ -1076,12 +1082,59 @@ export async function reserveResearchExperiment(
     reservedCount: number
     terminalCount: number
     remainingCount: number | null
+    terminalRemainingCount: number | null
+    budgetSaturated: boolean
+    budgetExhausted: boolean
   }
 }> {
   return apiData(
     await callApi(
       "POST",
       `/api/v1/research/sessions/${sessionId}/experiment-reservations`,
+      body,
+      args
+    )
+  )
+}
+
+export async function releaseResearchExperimentReservations(
+  sessionId: string,
+  body: {
+    runRefs: string[]
+    reason?: string
+  },
+  args?: Args
+): Promise<{
+  releasedCount: number
+  reservations: Array<{
+    runRef: string
+    releaseStatus:
+      | "released"
+      | "already_released"
+      | "consumed"
+      | "expired"
+      | "missing"
+    reservation: {
+      id: string
+      runRef: string
+      status: "reserved" | "consumed" | "released" | "expired"
+      expiresAt: string
+    } | null
+  }>
+  budget: {
+    maxExperiments: number | null
+    reservedCount: number
+    terminalCount: number
+    remainingCount: number | null
+    terminalRemainingCount: number | null
+    budgetSaturated: boolean
+    budgetExhausted: boolean
+  }
+}> {
+  return apiData(
+    await callApi(
+      "POST",
+      `/api/v1/research/sessions/${sessionId}/experiment-reservations/release`,
       body,
       args
     )

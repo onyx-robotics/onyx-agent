@@ -17,6 +17,7 @@ import {
   getResearchSessionLive,
   getResearchSessionState,
   listProjectCampaigns,
+  releaseResearchExperimentReservations,
   reconcileCampaign,
   stopCampaignSession,
   syncResearchPresence,
@@ -1057,6 +1058,7 @@ function createSyncSupervisor({
   let lastSyncDurationMs: number | null = null
   let lastSyncError: string | null = null
   let lastSyncOffline = false
+  let flushActive = false
 
   const depth = () => queue.length + active
   const syncTelemetry = () => ({
@@ -1096,6 +1098,7 @@ function createSyncSupervisor({
     timedOut: false,
   })
   const runFlushJob = async (job: SyncQueueFlushJob) => {
+    flushActive = true
     await flushOutbox(root, args, {
       quiet: true,
       maxBatches: maxBatchesPerFlush,
@@ -1127,11 +1130,19 @@ function createSyncSupervisor({
         })
       })
       .catch((error) => {
-        lastSyncError = error instanceof Error ? error.message : String(error)
+        const message = error instanceof Error ? error.message : String(error)
+        const lockContention = /Timed out waiting for local Onyx research-sync lock/i.test(
+          message
+        )
+        if (!lockContention) lastSyncError = message
         void emitJobEvent(job, "sync_result", "SQLite sync failed", {
-          error: lastSyncError,
+          error: message,
+          lockContention,
         })
-        console.warn(`Background sync skipped: ${lastSyncError}`)
+        if (!lockContention) console.warn(`Background sync skipped: ${message}`)
+      })
+      .finally(() => {
+        flushActive = false
       })
   }
   const runPushRefJob = async (job: SyncQueuePushRefJob) => {
@@ -1163,6 +1174,12 @@ function createSyncSupervisor({
   }
   const enqueue = (job: SyncQueueJob, options: { force?: boolean } = {}) => {
     if (stopped && !options.force) return null
+    if (
+      job.kind === "flush" &&
+      (flushActive || queue.some((item) => item.kind === "flush"))
+    ) {
+      return depth()
+    }
     if (depth() >= MAX_SYNC_QUEUE_DEPTH) return null
     queue.push(job)
     pump()
@@ -1604,6 +1621,39 @@ async function drainFinalSync({
     lastDurationMs,
     lastError,
     firstFailed: firstConflict ?? firstPendingError ?? null,
+  }
+}
+
+async function releaseUnloggedExperimentReservations({
+  root,
+  args,
+  sessionId,
+  runRefs,
+  reason,
+}: {
+  root: string
+  args: Args
+  sessionId: string
+  runRefs: string[]
+  reason: string
+}) {
+  const uniqueRunRefs = [...new Set(runRefs.filter(Boolean))]
+  if (uniqueRunRefs.length === 0 || args.options.offline === "true") return
+  const logged = await listLocalExperimentHistory(root).catch(() => [])
+  const loggedRunRefs = new Set(logged.map((record) => record.runRef))
+  const releasable = uniqueRunRefs.filter((runRef) => !loggedRunRefs.has(runRef))
+  if (releasable.length === 0) return
+  try {
+    await releaseResearchExperimentReservations(
+      sessionId,
+      { runRefs: releasable, reason },
+      args
+    )
+  } catch (error) {
+    if (args.options["require-online"] === "true") throw error
+    console.warn(
+      `Reservation release skipped: ${error instanceof Error ? error.message : String(error)}`
+    )
   }
 }
 
@@ -2342,6 +2392,7 @@ export async function finalizeHypothesisAttempt({
               hypothesis: hypothesis.id,
               session: sessionId,
               worker: workerId,
+              "defer-sync": "true",
               ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
               ...(measurementError
                 ? { status: "failed", "allow-unmeasured": "true" }
@@ -2390,6 +2441,23 @@ export async function finalizeHypothesisAttempt({
               .join("; ")
           })
       }
+    }
+
+    if (manifest.finalizationStatus.startsWith("salvaged_unmeasured")) {
+      const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
+        root,
+        sessionId,
+        workerId,
+        hypothesisId: hypothesis.id,
+        reason: `Worker finalization ${manifest.finalizationStatus}; reservation no longer represents a loggable attempt.`,
+      }).catch(() => [])
+      await releaseUnloggedExperimentReservations({
+        root,
+        args,
+        sessionId,
+        runRefs: abandonedRunRefs,
+        reason: `worker finalization ${manifest.finalizationStatus}`,
+      })
     }
 
     const workerBranchPush = await pushWorkerBranch({
@@ -2581,6 +2649,8 @@ export type ResearchStopCheck = {
   sessionId: string
   reasonCodes: ResearchStopReasonCode[]
   reasons: string[]
+  budgetSaturated: boolean
+  budgetExhausted: boolean
 }
 
 type ResearchStopControlStateCache = {
@@ -2663,6 +2733,8 @@ export async function collectResearchStopReasons({
 }): Promise<ResearchStopCheck> {
   const reasons: string[] = []
   const reasonCodes = new Set<ResearchStopReasonCode>()
+  let budgetSaturated = false
+  let budgetExhausted = false
   const addStopReason = (code: ResearchStopReasonCode, reason: string) =>
     addResearchStopReason(reasonCodes, reasons, code, reason)
 
@@ -2710,10 +2782,13 @@ export async function collectResearchStopReasons({
       controlStateCache,
       controlStateTtlMs,
     })
-    if (
-      remote.budget.remainingCount !== null &&
-      remote.budget.remainingCount <= 0
-    ) {
+    budgetSaturated = Boolean(remote.budget.budgetSaturated)
+    budgetExhausted =
+      remote.budget.budgetExhausted ??
+      (remote.budget.remainingCount !== null &&
+        remote.budget.remainingCount <= 0 &&
+        remote.budget.reservedCount === 0)
+    if (budgetExhausted) {
       addStopReason("budget_exhausted", "experiment budget exhausted")
     }
     if (remote.budget.expiredReservationCount > 0) {
@@ -2739,6 +2814,8 @@ export async function collectResearchStopReasons({
     sessionId,
     reasonCodes: [...reasonCodes],
     reasons,
+    budgetSaturated,
+    budgetExhausted,
   }
 }
 
@@ -3143,6 +3220,7 @@ async function runHypothesisOnce({
       ONYX_HYPOTHESIS_NAME: hypothesis.name,
       ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
+      ONYX_DEFER_EXP_LOG_SYNC: "1",
       ONYX_RESEARCH_DB: await researchDbPath(root),
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
@@ -4455,6 +4533,8 @@ export async function commandResearchShouldStop(args: Args) {
           sessionId,
           reasonCodes: result.reasonCodes,
           reasons: result.reasons,
+          budgetSaturated: result.budgetSaturated,
+          budgetExhausted: result.budgetExhausted,
         },
         null,
         2
@@ -4572,12 +4652,19 @@ export async function commandResearchFinish(args: Args) {
       providerBackoff: null,
     }
     await writeState(root, state)
-    await abandonBlockedWorkflowRunsForSession({
+    const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
       root,
       sessionId,
       reason:
         "Campaign finalized; blocked worker workflow is no longer active.",
-    }).catch(() => {})
+    }).catch(() => [])
+    await releaseUnloggedExperimentReservations({
+      root,
+      args,
+      sessionId,
+      runRefs: abandonedRunRefs,
+      reason: "blocked workflows abandoned during campaign finish",
+    })
     await stopLocalSession({
       root,
       sessionId,
@@ -5651,6 +5738,8 @@ export async function commandResearchRun(args: Args) {
         sessionId,
         reasonCodes: [],
         reasons: [],
+        budgetSaturated: false,
+        budgetExhausted: false,
       }
       try {
         stopCheck = await sessionStopChecker.check({ nowMs: loopNow })
@@ -5704,6 +5793,8 @@ export async function commandResearchRun(args: Args) {
       const launchCapSlots =
         maxLaunches === null ? Number.POSITIVE_INFINITY : maxLaunches - launched
       const providerBackoffActive = Date.now() < providerBackoffUntil
+      const budgetSaturated =
+        stopCheck.budgetSaturated && !stopCheck.budgetExhausted
       if (
         providerBackoffActive &&
         activeRuns.size === 0 &&
@@ -5722,7 +5813,7 @@ export async function commandResearchRun(args: Args) {
         lastLaunchBatchAt > 0 &&
         Date.now() - lastLaunchBatchAt < launchIntervalMs
       const launchSlots =
-        providerBackoffActive || rampWaiting
+        providerBackoffActive || rampWaiting || budgetSaturated
           ? 0
           : Math.min(
               openSlots,
@@ -5738,6 +5829,12 @@ export async function commandResearchRun(args: Args) {
           `Provider backoff active (${providerBackoffReason ?? "startup failure"}); pausing launches for ${Math.ceil(
             (providerBackoffUntil - Date.now()) / 1000
           )}s.`
+        )
+      }
+      if (budgetSaturated && activeRuns.size === 0 && !waitingLogged) {
+        waitingLogged = true
+        console.log(
+          "Supervisor waiting for experiment reservations to resolve before launching more workers."
         )
       }
 

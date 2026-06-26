@@ -3202,14 +3202,30 @@ export async function readLatestBlockedWorkflowRun({
 export async function abandonBlockedWorkflowRunsForSession({
   root,
   sessionId,
+  workerId = null,
+  hypothesisId = null,
   reason,
 }: {
   root: string
   sessionId: string
+  workerId?: string | null
+  hypothesisId?: string | null
   reason: string
-}) {
+}): Promise<string[]> {
   const at = nowIso()
-  await withResearchDbWrite(root, (db) => {
+  return withResearchDbWrite(root, (db) => {
+    const rows = db
+      .query(
+        `
+        SELECT run_ref AS runRef FROM workflow_runs
+        WHERE session_id = ? AND status = 'blocked'
+          AND (? IS NULL OR worker_id = ?)
+          AND (? IS NULL OR hypothesis_id = ?)
+      `
+      )
+      .all(sessionId, workerId, workerId, hypothesisId, hypothesisId) as Array<{
+      runRef: string
+    }>
     db.query(
       `
       UPDATE workflow_runs
@@ -3222,8 +3238,21 @@ export async function abandonBlockedWorkflowRunsForSession({
         completed_at = COALESCE(completed_at, ?),
         updated_at = ?
       WHERE session_id = ? AND status = 'blocked'
+        AND (? IS NULL OR worker_id = ?)
+        AND (? IS NULL OR hypothesis_id = ?)
     `
-    ).run(reason, reason, at, at, sessionId)
+    ).run(
+      reason,
+      reason,
+      at,
+      at,
+      sessionId,
+      workerId,
+      workerId,
+      hypothesisId,
+      hypothesisId
+    )
+    return rows.map((row) => row.runRef)
   })
 }
 

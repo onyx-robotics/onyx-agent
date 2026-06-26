@@ -130,6 +130,40 @@ function compactPreflightOutput(value: string, limit = 2048) {
     : compacted
 }
 
+function opencodeModelIds(output: string) {
+  return [
+    ...new Set(
+      output
+        .match(/\b[A-Za-z0-9_.-]+\/[A-Za-z0-9_.:/@+-]+\b/g)
+        ?.filter((value) => !value.startsWith("http")) ?? []
+    ),
+  ].sort()
+}
+
+function modelSimilarity(left: string, right: string) {
+  const leftParts = new Set(left.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))
+  const rightParts = new Set(
+    right.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+  )
+  let overlap = 0
+  for (const part of leftParts) {
+    if (rightParts.has(part)) overlap += 1
+  }
+  return overlap
+}
+
+function closestModelIds(requested: string, candidates: string[]) {
+  return candidates
+    .map((candidate) => ({
+      candidate,
+      score: modelSimilarity(requested, candidate),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 5)
+    .map((item) => item.candidate)
+}
+
 async function sourceCheckoutOnyxBin() {
   const binPath = fileURLToPath(new URL("../../bin/onyx.js", import.meta.url))
   return (await pathExists(binPath)) ? binPath : null
@@ -391,6 +425,41 @@ export async function preflightWorkerInvocation(
     )
   }
 
+  const checks: WorkerPreflightCheck[] = []
+
+  if (invocation.agentKind === "opencode" && invocation.workerModel) {
+    const modelsResult = await runProcess(invocation.command, ["models"], {
+      cwd: options.cwd,
+      env: options.env,
+      timeoutMs: options.timeoutMs ?? 10_000,
+    })
+    const output = [modelsResult.stdout.trim(), modelsResult.stderr.trim()]
+      .filter(Boolean)
+      .join("\n")
+    const unavailable =
+      modelsResult.timedOut ||
+      modelsResult.code !== 0 ||
+      /Unknown command|not found/i.test(output)
+    if (!unavailable) {
+      const models = opencodeModelIds(output)
+      if (models.length > 0 && !models.includes(invocation.workerModel)) {
+        const suggestions = closestModelIds(invocation.workerModel, models)
+        const suggestionText =
+          suggestions.length > 0
+            ? ` Nearby model id(s): ${suggestions.join(", ")}.`
+            : ""
+        throw new Error(
+          `OpenCode model "${invocation.workerModel}" was not found in \`opencode models\`.${suggestionText} Run \`opencode models\` to choose an exact provider/model id.`
+        )
+      }
+      checks.push({
+        name: "opencode model",
+        status: "passed",
+        output: null,
+      })
+    }
+  }
+
   if (invocation.preflightArgs) {
     const result = await runProcess(
       invocation.command,
@@ -412,7 +481,6 @@ export async function preflightWorkerInvocation(
     }
   }
 
-  const checks: WorkerPreflightCheck[] = []
   let onyxVersion: string | null = null
   const runCheck = async (
     name: string,

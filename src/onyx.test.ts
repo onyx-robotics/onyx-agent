@@ -1230,10 +1230,13 @@ describe("worker finalization", () => {
                   finalizationStatus: "running",
                   budget: {
                     maxExperiments: 1,
-                    reservedCount: 1,
-                    terminalCount: 0,
+                    reservedCount: 0,
+                    terminalCount: 1,
                     remainingCount: 0,
-                    openReservationCount: 1,
+                    terminalRemainingCount: 0,
+                    budgetSaturated: true,
+                    budgetExhausted: true,
+                    openReservationCount: 0,
                     expiredReservationCount: 0,
                   },
                   finalization: {
@@ -1286,7 +1289,7 @@ describe("worker finalization", () => {
 })
 
 describe("exp log", () => {
-  test("preserves explicit scoped run attempts and logs each run ref once", async () => {
+  test("logs explicit scoped run attempts once and clears local duplicates", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
       await writeResearchSmokeRepo()
     const sessionId = "22222222-2222-4222-8222-222222222222"
@@ -1388,7 +1391,7 @@ describe("exp log", () => {
     ).toHaveLength(1)
     const remainingRuns = await listLocalAttempts(root)
     expect(new Set(remainingRuns.map((run) => run.runRef))).toEqual(
-      new Set([workerOne.runRef, workerTwo.runRef])
+      new Set([workerOne.runRef])
     )
 
     const listLogs: string[] = []
@@ -2393,7 +2396,6 @@ describe("automated research smoke", () => {
         "metrics",
         "push_result",
         "finalization_result",
-        "sync_result",
       ])
     )
 
