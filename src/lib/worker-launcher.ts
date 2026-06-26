@@ -55,6 +55,7 @@ export type WorkerFinalizationStatus =
   | "already_logged"
   | "measured_and_logged"
   | "salvaged_unmeasured"
+  | "salvaged_unmeasured_budget_exhausted"
   | "failed"
 
 export type WorkerFinalizationManifest = {
@@ -67,6 +68,7 @@ export type WorkerFinalizationManifest = {
   workerBranchPushStatus: "not_attempted" | "pushed" | "failed"
   rootDriftStatus: "not_checked" | "clean" | "dirty"
   error: string | null
+  warnings?: string[]
 }
 
 export type WorkerLaunchManifest = {
@@ -98,6 +100,7 @@ export type WorkerLaunchManifest = {
   timedOut: boolean
   startupTimedOut: boolean
   error: string | null
+  warnings?: string[]
   preflight: WorkerPreflightResult | null
   finalization: WorkerFinalizationManifest | null
 }

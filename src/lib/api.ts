@@ -218,6 +218,15 @@ export type ApiSessionLive = {
     remainingCount: number | null
     openReservationCount: number
     expiredReservationCount: number
+    warning?: string | null
+  }
+  sync?: {
+    oldestPendingAgeMs: number | null
+    lastDurationMs: number | null
+    lastError: string | null
+  }
+  finalization?: {
+    unmeasuredSalvageCount: number
   }
   livenessCounts: Record<string, number>
   phaseCounts: Record<string, number>
@@ -241,6 +250,8 @@ export type ApiSessionLive = {
     pendingSyncCount: number
     pushQueueDepth: number
     activeWorkerCount: number
+    uploadedWorkerCount?: number
+    droppedOrDeferredWorkerCount?: number
     syncLagMs: number | null
     providerBackoff: Record<string, unknown> | null
     ignoredPresence: Record<string, unknown>
@@ -342,6 +353,7 @@ export type ApiResearchPresenceResponse = {
       | "stale_sequence"
       | "unmatched_cap"
       | "update_failed"
+      | "session_not_found"
     message: string
   }>
   ignoredByReason: {
@@ -350,10 +362,14 @@ export type ApiResearchPresenceResponse = {
     staleSequence: number
     unmatchedCap: number
     updateFailed: number
+    sessionNotFound: number
   }
   acceptedCount: number
   ignoredCount: number
   unmatchedCount: number
+  uploadedWorkerCount: number
+  droppedOrDeferredWorkerCount: number
+  splitCount: number
   siteAccepted: boolean
 }
 
@@ -377,7 +393,7 @@ export async function callApi(
   body?: unknown,
   args?: Args
 ) {
-  const timeoutMs = Number(args?.options["api-timeout"] ?? 30_000)
+  const timeoutMs = Number(args?.options["api-timeout"] ?? 120_000)
   const signal =
     Number.isFinite(timeoutMs) && timeoutMs > 0
       ? AbortSignal.timeout(timeoutMs)
@@ -923,10 +939,16 @@ export async function syncResearchPresence(
     site?: {
       providerBackoff?: Record<string, unknown> | null
       syncLagMs?: number | null
+      oldestPendingAgeMs?: number | null
+      lastSyncDurationMs?: number | null
+      lastSyncError?: string | null
       pendingSyncCount?: number
       pushQueueDepth?: number
       ignoredPresence?: Record<string, unknown>
       activeWorkerCount?: number
+      uploadedWorkerCount?: number
+      droppedOrDeferredWorkerCount?: number
+      unmeasuredSalvageCount?: number
       lastUploadAt?: string | null
       metadata?: Record<string, unknown>
     }

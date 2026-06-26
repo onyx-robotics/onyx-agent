@@ -93,7 +93,45 @@ export type CliState = {
         until: string
         attempt?: number
         delayMs?: number
+        recentFailures?: Array<{
+          at: string
+          reason: string
+          workerId: string | null
+          hypothesisId: string
+          error: string | null
+        }>
       } | null
+      supervisor?: {
+        pid?: number | null
+        logPath?: string | null
+        activeProcessCount?: number
+        launchRate?: {
+          batchSize: number | null
+          intervalSeconds: number | null
+        } | null
+        providerBackoff?: {
+          reason: string
+          until: string
+          attempt?: number
+          delayMs?: number
+          recentFailures?: Array<{
+            at: string
+            reason: string
+            workerId: string | null
+            hypothesisId: string
+            error: string | null
+          }>
+        } | null
+        recentFailedLaunches?: Array<{
+          at: string
+          reason: string
+          workerId: string | null
+          hypothesisId: string
+          error: string | null
+        }>
+        status?: string
+        updatedAt?: string
+      }
     }
   >
 }

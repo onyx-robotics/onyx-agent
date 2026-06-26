@@ -742,10 +742,16 @@ export const researchPresenceWorkerSnapshotSchema = z.object({
 export const researchPresenceSiteSnapshotSchema = z.object({
   providerBackoff: metadataSchema.nullable().optional(),
   syncLagMs: z.number().int().nonnegative().nullable().optional(),
+  oldestPendingAgeMs: z.number().int().nonnegative().nullable().optional(),
+  lastSyncDurationMs: z.number().int().nonnegative().nullable().optional(),
+  lastSyncError: z.string().trim().max(1000).nullable().optional(),
   pendingSyncCount: z.number().int().nonnegative().default(0),
   pushQueueDepth: z.number().int().nonnegative().default(0),
   ignoredPresence: metadataSchema.default({}),
   activeWorkerCount: z.number().int().nonnegative().default(0),
+  uploadedWorkerCount: z.number().int().nonnegative().default(0),
+  droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
+  unmeasuredSalvageCount: z.number().int().nonnegative().default(0),
   lastUploadAt: z.iso.datetime().nullable().optional(),
   metadata: metadataSchema.default({}),
 })
@@ -760,9 +766,12 @@ export const syncResearchPresenceRequestSchema = z.object({
     pushQueueDepth: 0,
     ignoredPresence: {},
     activeWorkerCount: 0,
+    uploadedWorkerCount: 0,
+    droppedOrDeferredWorkerCount: 0,
+    unmeasuredSalvageCount: 0,
     metadata: {},
   }),
-  workers: z.array(researchPresenceWorkerSnapshotSchema).max(500),
+  workers: z.array(researchPresenceWorkerSnapshotSchema).max(250),
 })
 
 export const researchPresenceIgnoredWorkerSchema = z.object({
@@ -773,6 +782,7 @@ export const researchPresenceIgnoredWorkerSchema = z.object({
     "stale_sequence",
     "unmatched_cap",
     "update_failed",
+    "session_not_found",
   ]),
   message: z.string().trim().min(1),
 })
@@ -786,10 +796,14 @@ export const syncResearchPresenceResponseSchema = z.object({
       staleSequence: z.number().int().nonnegative(),
       unmatchedCap: z.number().int().nonnegative(),
       updateFailed: z.number().int().nonnegative(),
+      sessionNotFound: z.number().int().nonnegative(),
     }),
     acceptedCount: z.number().int().nonnegative(),
     ignoredCount: z.number().int().nonnegative(),
     unmatchedCount: z.number().int().nonnegative(),
+    uploadedWorkerCount: z.number().int().nonnegative().default(0),
+    droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
+    splitCount: z.number().int().nonnegative().default(1),
     siteAccepted: z.boolean(),
   }),
 })
@@ -1476,6 +1490,8 @@ export const researchSessionSiteSchema = z.object({
   pushQueueDepth: z.number().int().nonnegative(),
   ignoredPresence: metadataSchema,
   activeWorkerCount: z.number().int().nonnegative(),
+  uploadedWorkerCount: z.number().int().nonnegative().default(0),
+  droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
   lastUploadAt: z.iso.datetime().nullable(),
   lastSequence: z.number().int().nonnegative(),
   metadata: metadataSchema,
@@ -1557,7 +1573,20 @@ export const researchSessionLiveResponseSchema = z.object({
       remainingCount: z.number().int().nonnegative().nullable(),
       openReservationCount: z.number().int().nonnegative(),
       expiredReservationCount: z.number().int().nonnegative(),
+      warning: z.string().nullable().optional(),
     }),
+    sync: z
+      .object({
+        oldestPendingAgeMs: z.number().int().nonnegative().nullable(),
+        lastDurationMs: z.number().int().nonnegative().nullable(),
+        lastError: z.string().nullable(),
+      })
+      .optional(),
+    finalization: z
+      .object({
+        unmeasuredSalvageCount: z.number().int().nonnegative(),
+      })
+      .optional(),
     livenessCounts: z.record(researchWorkerLivenessSchema, z.number().int()),
     phaseCounts: z.record(z.string(), z.number().int().nonnegative()),
     workers: z.array(researchLiveWorkerSummarySchema),

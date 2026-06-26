@@ -317,4 +317,94 @@ describe("SQLite sync", () => {
 
     expect(await listLocalExperimentHistory(root)).toEqual([])
   })
+
+  test("flushes 250+ pending events in bounded sync batches", async () => {
+    const root = await fixtureRepo()
+    const remote = await mkdtemp(join(tmpdir(), "onyx-sync-remote-"))
+    await runProcess("git", ["init", "--bare"], { cwd: remote })
+    await runProcess("git", ["remote", "add", "origin", remote], {
+      cwd: root,
+    })
+    const head = (
+      await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+    ).stdout.trim()
+    for (let index = 0; index < 251; index += 1) {
+      await createLocalCampaign({
+        root,
+        name: `many-pending-${index}`,
+        projectPath: "",
+        baseCommitSha: head,
+        setup: setup(),
+        metricName: "score",
+        metricUnit: null,
+        metricDirection: "maximize",
+      })
+    }
+
+    expect(await pendingResearchSyncCount(root)).toBe(251)
+    const originalFetch = globalThis.fetch
+    const previousApiUrl = process.env.ONYX_API_URL
+    const previousApiKey = process.env.ONYX_API_KEY
+    process.env.ONYX_API_URL = "https://api.onyx.test"
+    process.env.ONYX_API_KEY = "test-key"
+    const batchSizes: number[] = []
+    globalThis.fetch = (async (_input, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        events: Array<{
+          eventId: string
+          sequence: number
+          entityType: string
+          entityId: string
+        }>
+      }
+      batchSizes.push(body.events.length)
+      return Response.json({
+        data: {
+          accepted: body.events.length,
+          duplicate: 0,
+          conflicts: 0,
+          invalid: 0,
+          acknowledgements: body.events.map((event) => ({
+            eventId: event.eventId,
+            sequence: event.sequence,
+            status: "acked",
+            code: "accepted",
+            entityType: event.entityType,
+            entityId: event.entityId,
+            message: null,
+            details: {},
+          })),
+          tombstones: [],
+          projectionDeltas: {
+            campaigns: [],
+            sessions: [],
+            hypotheses: [],
+            workers: [],
+            experiments: [],
+            summaries: [],
+            knowledge: [],
+          },
+        },
+      })
+    }) as typeof fetch
+
+    try {
+      const result = await flushOutbox(
+        root,
+        parseArgs(["sync", "--sync-batch-size", "50"])
+      )
+      expect(result.offline).toBe(false)
+      expect(result.batches).toBe(6)
+      expect(result.pending).toBe(0)
+    } finally {
+      globalThis.fetch = originalFetch
+      if (previousApiUrl === undefined) delete process.env.ONYX_API_URL
+      else process.env.ONYX_API_URL = previousApiUrl
+      if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
+      else process.env.ONYX_API_KEY = previousApiKey
+    }
+
+    expect(batchSizes).toEqual([50, 50, 50, 50, 50, 1])
+    expect(await pendingResearchSyncCount(root)).toBe(0)
+  }, 20_000)
 })

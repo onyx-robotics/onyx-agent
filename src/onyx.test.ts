@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
 
+import type { WorkerLaunchManifest } from "./onyx"
 import type { LocalResearchHistoryRecord } from "./protocol"
 import {
   appendOutbox,
@@ -34,6 +35,7 @@ import {
   commandSync,
   commandWorkerRun,
   commandWorkflowStatus,
+  finalizationStatusLabel,
   finalizeHypothesisAttempt,
   localResearchRecordSchema,
   mergeHistory,
@@ -918,6 +920,106 @@ describe("exp run", () => {
 })
 
 describe("worker finalization", () => {
+  test("formats all finalization labels", () => {
+    expect(finalizationStatusLabel("none")).toBe("no result changes")
+    expect(finalizationStatusLabel("already_logged")).toBe("already logged")
+    expect(finalizationStatusLabel("measured_and_logged")).toBe(
+      "measured and logged"
+    )
+    expect(finalizationStatusLabel("salvaged_unmeasured")).toBe(
+      "salvaged without measurement"
+    )
+    expect(
+      finalizationStatusLabel("salvaged_unmeasured_budget_exhausted")
+    ).toBe("salvaged without measurement after budget exhaustion")
+    expect(finalizationStatusLabel("failed")).toBe("failed")
+  })
+
+  test("records harness warnings for piped mutation commands", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const workerLogDir = join(root, ".git", "onyx", "worker-logs", "audit")
+    await mkdir(workerLogDir, { recursive: true })
+    const workerId = "77777777-7777-4777-8777-777777777777"
+    const hypothesis = testHypothesis({ campaignId, baseCommitSha })
+    const manifest: WorkerLaunchManifest = {
+      schemaVersion: 1,
+      agentKind: "codex",
+      command: "codex",
+      args: [],
+      onyxShimPath: null,
+      addedWritableRoots: [],
+      cwd: root,
+      promptPath: join(workerLogDir, "prompt.md"),
+      logPath: join(workerLogDir, "raw.log"),
+      activityLogPath: join(workerLogDir, "activity.log"),
+      activityJsonlPath: join(workerLogDir, "activity.jsonl"),
+      latestStatePath: join(workerLogDir, "latest.json"),
+      manifestPath: join(workerLogDir, "manifest.json"),
+      sessionId: hypothesis.createdBySessionId,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId,
+      workerName: "worker-audit",
+      version: null,
+      startedAt: new Date().toISOString(),
+      lastOutputAt: null,
+      completedAt: null,
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+      preflight: null,
+      finalization: null,
+    }
+    await writeFile(
+      manifest.logPath,
+      [
+        "onyx exp run --campaign smoke | tee run.log",
+        "onyx exp log --campaign smoke | tail -n 1",
+        "onyx sync | cat",
+        "onyx push | cat",
+      ].join("\n"),
+      "utf8"
+    )
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      const finalization = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis,
+        sessionId: hypothesis.createdBySessionId,
+        workerId,
+        workerBranch: "onyx/test/audit",
+        activityManifest: manifest,
+        args: { positional: ["worker", "run"], options: { offline: "true" } },
+        workerFailed: false,
+        pushWorkerBranch: pushWorkerBranchDirect,
+      })
+
+      expect(finalization.finalizationStatus).toBe("none")
+      expect(manifest.warnings).toHaveLength(4)
+      expect(manifest.warnings?.join("\n")).toContain("onyx exp run")
+      expect(manifest.warnings?.join("\n")).toContain("onyx push")
+      expect(await readFile(manifest.activityLogPath, "utf8")).toContain(
+        "[warning] piped Onyx mutation command detected"
+      )
+      const activityEvents = await readFile(
+        manifest.activityJsonlPath,
+        "utf8"
+      )
+      expect(activityEvents).toContain('"type":"warning"')
+      expect(activityEvents).toContain("piped_onyx_mutation_command")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
   test("measures and logs exactly one unlogged worker commit", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
       await writeResearchSmokeRepo()
@@ -1081,6 +1183,100 @@ describe("worker finalization", () => {
           options: { campaign: campaignName, active: "true", json: "true" },
         })
       ).rejects.toThrow("No active workflow runs exist")
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
+  test("salvages a single unlogged commit without measuring after budget exhaustion", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    await addBareOrigin(root)
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await mkdir(join(root, "src"), { recursive: true })
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate")
+      const head = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim()
+      const hypothesis = testHypothesis({ campaignId, baseCommitSha })
+
+      await withMockResearchApi(
+        (request) => {
+          if (
+            request.method === "GET" &&
+            request.path ===
+              `/api/v1/research/sessions/${hypothesis.createdBySessionId}/state`
+          ) {
+            return {
+              body: {
+                data: {
+                  session: {
+                    id: hypothesis.createdBySessionId,
+                    campaignId,
+                    name: "session",
+                    status: "running",
+                    workerTarget: 1,
+                    maxExperiments: 1,
+                    reservedExperimentCount: 1,
+                    terminalExperimentCount: 0,
+                    finalizationStatus: "running",
+                    metadata: {},
+                    startedAt: "2026-06-20T00:00:00.000Z",
+                    completedAt: null,
+                    createdAt: "2026-06-20T00:00:00.000Z",
+                    updatedAt: "2026-06-20T00:00:00.000Z",
+                  },
+                  campaign: testCampaign({
+                    campaignId,
+                    campaignName,
+                    baseCommitSha,
+                  }),
+                  latestExperiments: [],
+                  bestExperiment: null,
+                  hypotheses: [hypothesis],
+                  workers: [],
+                  summaries: [],
+                  knowledge: [],
+                  updatedAt: "2026-06-20T00:00:00.000Z",
+                },
+              },
+            }
+          }
+          throw new Error(
+            `Unexpected API call ${request.method} ${request.path}`
+          )
+        },
+        async () => {
+          const manifest = await finalizeHypothesisAttempt({
+            root,
+            worktree: root,
+            campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+            hypothesis,
+            sessionId: hypothesis.createdBySessionId,
+            workerId: "77777777-7777-4777-8777-777777777777",
+            workerBranch: "onyx/test/budget-exhausted",
+            args: { positional: ["worker", "run"], options: {} },
+            workerFailed: false,
+            pushWorkerBranch: pushWorkerBranchDirect,
+          })
+
+          expect(manifest.finalizationStatus).toBe(
+            "salvaged_unmeasured_budget_exhausted"
+          )
+          expect(manifest.commitSha).toBe(head)
+          expect(manifest.unloggedCommitCount).toBe(1)
+          expect(manifest.workerBranchPushStatus).toBe("pushed")
+          expect(manifest.error).toContain("budget exhausted")
+        }
+      )
+
+      expect(await listLocalAttempts(root)).toHaveLength(0)
     } finally {
       process.chdir(previousCwd)
       console.log = originalLog
@@ -1538,6 +1734,97 @@ describe("automated research smoke", () => {
     ].join(" && ")
   }
 
+  test("research run starts a detached supervisor by default", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "detached-smoke"
+    await createSupervisorRunCampaign({ root, baseCommitSha, campaignName })
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    let sessionId = ""
+    try {
+      process.chdir(root)
+      const startedAt = Date.now()
+      await commandResearchRun({
+        positional: ["research", "run"],
+        options: {
+          campaign: campaignName,
+          workers: "1",
+          "max-minutes": "0.05",
+          offline: "true",
+          quiet: "true",
+          json: "true",
+        },
+      })
+      expect(Date.now() - startedAt).toBeLessThan(5_000)
+
+      const first = JSON.parse(logs.join("\n")) as {
+        sessionId: string
+        pid: number | null
+        logPath: string
+        statusCommand: string
+        listenCommand: string
+        alreadyRunning: boolean
+      }
+      sessionId = first.sessionId
+      expect(first.alreadyRunning).toBe(false)
+      expect(first.pid).toBeGreaterThan(0)
+      expect(first.logPath).toContain("supervisor-logs")
+      expect(first.statusCommand).toBe(
+        `onyx research status --campaign ${campaignName} --json`
+      )
+      expect(first.listenCommand).toBe("onyx listen")
+
+      const state = await readState(root)
+      expect(state.sessions?.[sessionId]?.supervisor).toMatchObject({
+        pid: first.pid,
+        logPath: first.logPath,
+        activeProcessCount: 0,
+        status: "running",
+      })
+
+      logs.length = 0
+      await commandResearchRun({
+        positional: ["research", "run"],
+        options: {
+          campaign: campaignName,
+          session: sessionId,
+          workers: "1",
+          "max-minutes": "0.05",
+          offline: "true",
+          quiet: "true",
+          json: "true",
+        },
+      })
+      const second = JSON.parse(logs.join("\n")) as {
+        sessionId: string
+        pid: number | null
+        alreadyRunning: boolean
+      }
+      expect(second.sessionId).toBe(sessionId)
+      expect(second.pid).toBe(first.pid)
+      expect(second.alreadyRunning).toBe(true)
+    } finally {
+      if (sessionId) {
+        await commandResearchStop({
+          positional: ["research", "stop"],
+          options: {
+            session: sessionId,
+            offline: "true",
+            quiet: "true",
+            cwd: root,
+          },
+        }).catch(() => {})
+      }
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
   test("research run blocks when metric readiness validation is missing", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
     const campaignName = "missing-readiness"
@@ -1884,6 +2171,7 @@ describe("automated research smoke", () => {
           "stop-grace-seconds": "1",
           offline: "true",
           quiet: "true",
+          foreground: "true",
         },
       })
     } finally {
@@ -2058,6 +2346,7 @@ describe("automated research smoke", () => {
           "stop-grace-seconds": "1",
           offline: "true",
           quiet: "true",
+          foreground: "true",
         },
       })
     } finally {
@@ -2144,6 +2433,7 @@ describe("automated research smoke", () => {
           "stop-grace-seconds": "1",
           offline: "true",
           quiet: "true",
+          foreground: "true",
         },
       })
     } finally {
@@ -2228,6 +2518,7 @@ describe("automated research smoke", () => {
         "stop-grace-seconds": "1",
         offline: "true",
         quiet: "true",
+        foreground: "true",
         cwd: root,
       },
     }).catch((error) => {
@@ -3145,6 +3436,123 @@ describe("research status", () => {
     expect(output.workers.find((item) => item.id === worker.id)?.status).toBe(
       "completed"
     )
+  })
+
+  test("uses fresh supervisor telemetry for active process status", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      projectPath: "",
+      baseCommitSha,
+      setup: await readSetupFile(root, ""),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 3,
+      endTimeMs: Date.now() + 60_000,
+      metadata: {
+        launchBatchSize: 3,
+        launchIntervalSeconds: 5,
+      },
+    })
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: campaignName,
+      campaigns: {
+        [campaignStateKey("", campaignName)]: {
+          campaignId: campaign.id,
+          projectPath: "",
+          baseCommitSha,
+          sessionId: session.session.id,
+        },
+      },
+      sessions: {
+        [session.session.id]: {
+          campaignName,
+          campaignId: campaign.id,
+          status: "running",
+          supervisor: {
+            pid: 12345,
+            logPath: "/tmp/onyx-supervisor.log",
+            activeProcessCount: 7,
+            launchRate: { batchSize: 3, intervalSeconds: 5 },
+            providerBackoff: {
+              reason: "rate_limit",
+              until: new Date(Date.now() + 60_000).toISOString(),
+              attempt: 2,
+            },
+            recentFailedLaunches: [
+              {
+                at: new Date().toISOString(),
+                reason: "rate_limit",
+                workerId: null,
+                hypothesisId: "hypothesis-1",
+                error: "429",
+              },
+            ],
+            status: "running",
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const lines: string[] = []
+    const readStatus = async () => {
+      lines.length = 0
+      await commandResearchStatus({
+        positional: ["research", "status"],
+        options: { campaign: campaignName, json: "true" },
+      })
+      return JSON.parse(lines.join("\n")) as {
+        session: {
+          activeProcessCount: number
+          launchRate: {
+            batchSize: number | null
+            intervalSeconds: number | null
+          }
+          supervisor: { pid: number | null; logPath: string | null } | null
+        }
+        providerBackoff: { reason: string } | null
+        recentFailedLaunches: Array<{ reason: string }>
+      }
+    }
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      const fresh = await readStatus()
+      expect(fresh.session.activeProcessCount).toBe(7)
+      expect(fresh.session.launchRate).toEqual({
+        batchSize: 3,
+        intervalSeconds: 5,
+      })
+      expect(fresh.session.supervisor?.pid).toBe(12345)
+      expect(fresh.providerBackoff?.reason).toBe("rate_limit")
+      expect(fresh.recentFailedLaunches[0]?.reason).toBe("rate_limit")
+
+      const state = await readState(root)
+      state.sessions![session.session.id]!.supervisor!.updatedAt = new Date(
+        Date.now() - 120_000
+      ).toISOString()
+      await writeState(root, state)
+
+      const stale = await readStatus()
+      expect(stale.session.activeProcessCount).toBe(0)
+      expect(stale.session.supervisor).toBeNull()
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
   })
 
   test("reports open slots immediately after a worker completes", async () => {

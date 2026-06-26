@@ -63,6 +63,9 @@ export function activitySummaryForManifest(
     signal: manifest.signal,
     timedOut: manifest.timedOut,
     startupTimedOut: manifest.startupTimedOut,
+    warningCount:
+      (manifest.warnings?.length ?? 0) +
+      (manifest.finalization?.warnings?.length ?? 0),
     finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
     finalizationError: manifest.finalization?.error ?? manifest.error ?? null,
   }

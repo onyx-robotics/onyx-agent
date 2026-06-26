@@ -1,12 +1,9 @@
 import { randomUUID } from "node:crypto"
-import {
-  appendFile,
-  mkdir,
-  readFile,
-  rm,
-  writeFile,
-} from "node:fs/promises"
+import { closeSync, openSync } from "node:fs"
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { spawn } from "node:child_process"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import {
   researchHypothesisPlanSchema,
@@ -44,6 +41,7 @@ import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import {
   onyxStateDir,
   readState,
+  updateState,
   withOnyxLock,
   writeState,
   type CliState,
@@ -115,9 +113,12 @@ const MAX_WORKER_HARD_STOP_GRACE_MS = 30_000
 const BUILTIN_AGENT_MIN_USEFUL_LAUNCH_MS = 5 * 60_000
 const CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS = 30_000
 const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
-const MAX_LOCAL_SUPERVISOR_WORKERS = 100
+const MAX_LOCAL_SUPERVISOR_WORKERS = 250
 const DEFAULT_SYNC_QUEUE_CONCURRENCY = 4
+const DEFAULT_SYNC_DRAIN_BATCHES_PER_INTERVAL = 4
 const MAX_SYNC_QUEUE_DEPTH = 500
+const SUPERVISOR_TELEMETRY_STALE_MS = 45_000
+const SUPERVISOR_LOG_DIR = "supervisor-logs"
 
 type IgnoredPresenceState = NonNullable<
   NonNullable<CliState["sessions"]>[string]["ignoredPresence"]
@@ -131,10 +132,21 @@ const PRESENCE_IGNORED_REASONS: IgnoredPresenceReason[] = [
   "stale_sequence",
   "unmatched_cap",
   "update_failed",
+  "session_not_found",
 ]
 const PRESENCE_IGNORED_RECENT_LIMIT = 20
 
 type SessionFinalizationStatus = ApiSession["finalizationStatus"]
+type ProviderLaunchFailure = {
+  at: string
+  reason: string
+  workerId: string | null
+  hypothesisId: string
+  error: string | null
+}
+type SupervisorRuntimeTelemetry = NonNullable<
+  NonNullable<CliState["sessions"]>[string]["supervisor"]
+>
 
 type WorkerActivityEvent = {
   type: string
@@ -192,6 +204,41 @@ async function appendWorkerActivityEvent(
   ).catch(() => {})
 }
 
+const PIPED_ONYX_MUTATION_COMMAND =
+  /\bonyx\s+(?:exp\s+run|exp\s+log|sync|push)\b[^\n|]*\|/i
+
+async function recordWorkerHarnessWarnings(
+  manifest: WorkerLaunchManifest | null | undefined
+) {
+  if (!manifest) return []
+  const log = await readFile(manifest.logPath, "utf8").catch(() => "")
+  const warnings = log
+    .split(/\r?\n/)
+    .filter((line) => PIPED_ONYX_MUTATION_COMMAND.test(line))
+    .slice(0, 20)
+    .map(
+      (line) => `piped Onyx mutation command detected: ${line.slice(0, 240)}`
+    )
+  if (warnings.length === 0) return []
+  const existing = new Set(manifest.warnings ?? [])
+  for (const warning of warnings) existing.add(warning)
+  manifest.warnings = [...existing]
+  await appendFile(
+    manifest.activityLogPath,
+    warnings.map((warning) => `[warning] ${warning}\n`).join(""),
+    "utf8"
+  ).catch(() => {})
+  for (const warning of warnings) {
+    await appendWorkerActivityEvent(manifest, {
+      type: "warning",
+      phase: "audit",
+      summary: warning,
+      metadata: { detector: "piped_onyx_mutation_command" },
+    })
+  }
+  return warnings
+}
+
 function mergeIgnoredPresence(
   current: IgnoredPresenceState | undefined,
   response: ApiResearchPresenceResponse,
@@ -232,6 +279,32 @@ function formatPresenceReasonCounts(byReason: Record<string, number>) {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([reason, count]) => `${reason}=${count}`)
   return parts.length ? parts.join(", ") : "none"
+}
+
+function emptyPresenceReasonCounts() {
+  return {
+    notFound: 0,
+    sessionMismatch: 0,
+    staleSequence: 0,
+    unmatchedCap: 0,
+    updateFailed: 0,
+    sessionNotFound: 0,
+  }
+}
+
+function mergePresenceReasonCounts(
+  responses: ApiResearchPresenceResponse[]
+): ApiResearchPresenceResponse["ignoredByReason"] {
+  const counts = emptyPresenceReasonCounts()
+  for (const response of responses) {
+    counts.notFound += response.ignoredByReason.notFound
+    counts.sessionMismatch += response.ignoredByReason.sessionMismatch
+    counts.staleSequence += response.ignoredByReason.staleSequence
+    counts.unmatchedCap += response.ignoredByReason.unmatchedCap
+    counts.updateFailed += response.ignoredByReason.updateFailed
+    counts.sessionNotFound += response.ignoredByReason.sessionNotFound
+  }
+  return counts
 }
 
 function hasPresenceMismatch(response: ApiResearchPresenceResponse) {
@@ -814,13 +887,31 @@ function createSyncSupervisor({
     "sync-concurrency",
     DEFAULT_SYNC_QUEUE_CONCURRENCY
   )
+  const maxBatchesPerFlush = positiveIntegerOption(
+    args,
+    "sync-drain-batches",
+    DEFAULT_SYNC_DRAIN_BATCHES_PER_INTERVAL
+  )
   const queue: SyncQueueJob[] = []
   const idleWaiters = new Set<() => void>()
   let active = 0
   let stopped = false
   let timer: ReturnType<typeof setInterval> | null = null
+  let lastPendingSyncCount = 0
+  let lastOldestPendingAgeMs: number | null = null
+  let lastSyncDurationMs: number | null = null
+  let lastSyncError: string | null = null
+  let lastSyncOffline = false
 
   const depth = () => queue.length + active
+  const syncTelemetry = () => ({
+    pendingSyncCount: lastPendingSyncCount,
+    oldestPendingAgeMs: lastOldestPendingAgeMs,
+    lastDurationMs: lastSyncDurationMs,
+    lastError: lastSyncError,
+    offline: lastSyncOffline,
+    queueDepth: depth(),
+  })
   const notifyIdle = () => {
     if (depth() > 0) return
     for (const resolve of idleWaiters) resolve()
@@ -850,14 +941,23 @@ function createSyncSupervisor({
     timedOut: false,
   })
   const runFlushJob = async (job: SyncQueueFlushJob) => {
-    await flushOutbox(root, args, { quiet: true })
+    await flushOutbox(root, args, {
+      quiet: true,
+      maxBatches: maxBatchesPerFlush,
+    })
       .then(async (result) => {
+        lastPendingSyncCount = result.pending
+        lastOldestPendingAgeMs = result.oldestPendingAgeMs
+        lastSyncDurationMs = result.lastDurationMs
+        lastSyncError = result.lastError
+        lastSyncOffline = result.offline
         await emitJobEvent(job, "push_result", "Experiment refs pushed", {
           flushed: result.flushed,
           pending: result.pending,
           offline: result.offline,
           conflicts: result.conflicts,
           skippedDeleted: result.skippedDeleted,
+          batches: result.batches,
         })
         await emitJobEvent(job, "sync_result", "SQLite sync flushed", {
           flushed: result.flushed,
@@ -865,17 +965,18 @@ function createSyncSupervisor({
           offline: result.offline,
           conflicts: result.conflicts,
           skippedDeleted: result.skippedDeleted,
+          batches: result.batches,
+          lastDurationMs: result.lastDurationMs,
+          oldestPendingAgeMs: result.oldestPendingAgeMs,
+          lastError: result.lastError,
         })
       })
       .catch((error) => {
+        lastSyncError = error instanceof Error ? error.message : String(error)
         void emitJobEvent(job, "sync_result", "SQLite sync failed", {
-          error: error instanceof Error ? error.message : String(error),
+          error: lastSyncError,
         })
-        console.warn(
-          `Background sync skipped: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
+        console.warn(`Background sync skipped: ${lastSyncError}`)
       })
   }
   const runPushRefJob = async (job: SyncQueuePushRefJob) => {
@@ -970,10 +1071,18 @@ function createSyncSupervisor({
       })
     },
     depth,
+    telemetry: syncTelemetry,
     waitForIdle,
     async drain(timeoutMs: number) {
       stopped = true
       if (timer) clearInterval(timer)
+      if (args.options.offline === "true") {
+        await waitForIdle(timeoutMs)
+        const pending = await pendingResearchSyncCount(root)
+        lastPendingSyncCount = pending
+        lastSyncOffline = true
+        return pending
+      }
       const deadline = Date.now() + timeoutMs
       do {
         if (depth() === 0)
@@ -998,21 +1107,31 @@ function createPresenceSupervisor({
   sessionId,
   intervalMs,
   syncQueueDepth,
+  syncTelemetry,
 }: {
   root: string
   args: Args
   sessionId: string
   intervalMs: number
   syncQueueDepth?: () => number
+  syncTelemetry?: () => {
+    pendingSyncCount: number
+    oldestPendingAgeMs: number | null
+    lastDurationMs: number | null
+    lastError: string | null
+    offline: boolean
+    queueDepth: number
+  }
 }) {
   const lastSent = new Map<string, string>()
   const supervisorRunId = randomUUID()
   let sequence = 0
+  let lastFullSnapshotAt = 0
   let running: Promise<void> | null = null
   let stopped = false
   let timer: ReturnType<typeof setInterval> | null = null
 
-  const snapshot = async () => {
+  const snapshot = async (forceFull = false) => {
     if (args.options.offline === "true") return
     const state = await getLocalSessionState(root, sessionId)
     const cliState = await readState(root).catch(() => null)
@@ -1029,13 +1148,23 @@ function createPresenceSupervisor({
       )
     )
     const observedAt = new Date().toISOString()
-    const pendingSyncCount = await pendingResearchSyncCount(root).catch(() => 0)
+    const sync = syncTelemetry?.()
+    const pendingSyncCount =
+      sync?.pendingSyncCount ??
+      (await pendingResearchSyncCount(root).catch(() => 0))
     const activeWorkerCount = state.workers.filter(
       (worker) =>
         worker.sessionId === sessionId &&
         ["registered", "running"].includes(worker.status)
     ).length
-    const workers = state.workers
+    const unmeasuredSalvageCount = manifests.filter(
+      (manifest) =>
+        manifest.finalization?.salvaged &&
+        manifest.finalization.finalizationStatus.startsWith(
+          "salvaged_unmeasured"
+        )
+    ).length
+    const workerSnapshots = state.workers
       .filter((worker) => worker.sessionId === sessionId)
       .map((worker) => {
         const manifest = manifestByWorker.get(worker.id)
@@ -1050,11 +1179,12 @@ function createPresenceSupervisor({
               latestStatePath: manifest.latestStatePath,
               manifestPath: manifest.manifestPath,
               latestObservedAt: latest?.at ?? null,
+              warnings: manifest.warnings ?? [],
               finalizationStatus:
                 manifest.finalization?.finalizationStatus ?? null,
             }
           : {}
-        return {
+        const snapshot = {
           id: worker.id,
           status: latest?.status ?? worker.status,
           phase: latest?.phase ?? worker.phase,
@@ -1067,43 +1197,96 @@ function createPresenceSupervisor({
           metadata,
           observedAt,
         }
-      })
-      .filter((worker) => {
-        const signature = JSON.stringify({ ...worker, observedAt: undefined })
-        const active = ["registered", "running"].includes(worker.status)
-        const changed = lastSent.get(worker.id) !== signature
-        if (active || changed) {
-          lastSent.set(worker.id, signature)
-          return true
+        return {
+          snapshot,
+          signature: JSON.stringify({ ...snapshot, observedAt: undefined }),
         }
-        return false
       })
-    sequence += 1
-    const response = await syncResearchPresence(
-      {
-        siteId: await getResearchSiteId(root),
-        supervisorRunId,
-        sequence,
-        sessionId,
-        site: {
-          pendingSyncCount,
-          pushQueueDepth: syncQueueDepth?.() ?? 0,
-          activeWorkerCount,
-          providerBackoff:
-            cliState?.sessions?.[sessionId]?.providerBackoff ?? null,
-          ignoredPresence:
-            cliState?.sessions?.[sessionId]?.ignoredPresence ?? {},
-          lastUploadAt: observedAt,
-        },
-        workers,
-      },
-      args
+    const shouldSendFull =
+      forceFull || Date.now() - lastFullSnapshotAt >= 60_000
+    const selectedWorkers = workerSnapshots.filter(
+      (worker) =>
+        shouldSendFull || lastSent.get(worker.snapshot.id) !== worker.signature
     )
-    if (response.ignoredCount > 0) {
+    const splitCount = Math.max(1, Math.ceil(selectedWorkers.length / 250))
+    const chunks =
+      selectedWorkers.length === 0
+        ? [[]]
+        : Array.from({ length: splitCount }, (_, index) =>
+            selectedWorkers.slice(index * 250, index * 250 + 250)
+          )
+    const responses: ApiResearchPresenceResponse[] = []
+    const siteId = await getResearchSiteId(root)
+    const droppedOrDeferredWorkerCount = Math.max(
+      0,
+      workerSnapshots.length - selectedWorkers.length
+    )
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index] ?? []
+      sequence += 1
+      const response = await syncResearchPresence(
+        {
+          siteId,
+          supervisorRunId,
+          sequence,
+          sessionId,
+          site: {
+            pendingSyncCount,
+            pushQueueDepth: sync?.queueDepth ?? syncQueueDepth?.() ?? 0,
+            activeWorkerCount,
+            oldestPendingAgeMs: sync?.oldestPendingAgeMs ?? null,
+            lastSyncDurationMs: sync?.lastDurationMs ?? null,
+            lastSyncError: sync?.lastError ?? null,
+            uploadedWorkerCount: selectedWorkers.length,
+            droppedOrDeferredWorkerCount,
+            unmeasuredSalvageCount,
+            providerBackoff:
+              cliState?.sessions?.[sessionId]?.providerBackoff ?? null,
+            ignoredPresence:
+              cliState?.sessions?.[sessionId]?.ignoredPresence ?? {},
+            lastUploadAt: observedAt,
+            metadata: {
+              splitIndex: index + 1,
+              splitCount,
+              syncOffline: sync?.offline ?? false,
+            },
+          },
+          workers: chunk.map((worker) => worker.snapshot),
+        },
+        args
+      )
+      responses.push(response)
+      for (const worker of chunk) {
+        lastSent.set(worker.snapshot.id, worker.signature)
+      }
+    }
+    if (shouldSendFull) lastFullSnapshotAt = Date.now()
+    const ignoredCount = responses.reduce(
+      (total, response) => total + response.ignoredCount,
+      0
+    )
+    const aggregateResponse: ApiResearchPresenceResponse = {
+      ignoredWorkers: responses.flatMap((response) => response.ignoredWorkers),
+      ignoredByReason: mergePresenceReasonCounts(responses),
+      acceptedCount: responses.reduce(
+        (total, response) => total + response.acceptedCount,
+        0
+      ),
+      ignoredCount,
+      unmatchedCount: responses.reduce(
+        (total, response) => Math.max(total, response.unmatchedCount),
+        0
+      ),
+      uploadedWorkerCount: selectedWorkers.length,
+      droppedOrDeferredWorkerCount,
+      splitCount,
+      siteAccepted: responses.some((response) => response.siteAccepted),
+    }
+    if (ignoredCount > 0) {
       const observedAt = new Date().toISOString()
       let ignoredPresence = mergeIgnoredPresence(
         undefined,
-        response,
+        aggregateResponse,
         observedAt
       )
       const state = await readState(root).catch(() => null)
@@ -1112,7 +1295,7 @@ function createPresenceSupervisor({
         const current = state.sessions[sessionId] ?? {}
         ignoredPresence = mergeIgnoredPresence(
           current.ignoredPresence,
-          response,
+          aggregateResponse,
           observedAt
         )
         state.sessions[sessionId] = {
@@ -1123,9 +1306,9 @@ function createPresenceSupervisor({
       }
       const reasonSummary = formatPresenceReasonCounts(ignoredPresence.byReason)
       console.warn(
-        `Presence sync ignored ${response.ignoredCount} worker update(s): ${reasonSummary}.`
+        `Presence sync ignored ${aggregateResponse.ignoredCount} worker update(s): ${reasonSummary}.`
       )
-      if (hasPresenceMismatch(response)) {
+      if (responses.some(hasPresenceMismatch)) {
         console.warn(
           "Presence sync saw project_mismatch or session_mismatch; check worker/session wiring."
         )
@@ -1133,9 +1316,9 @@ function createPresenceSupervisor({
     }
   }
 
-  const run = () => {
+  const run = (forceFull = false) => {
     if (running) return running
-    running = snapshot()
+    running = snapshot(forceFull)
       .catch((error) => {
         if (!stopped) {
           console.warn(
@@ -1162,7 +1345,7 @@ function createPresenceSupervisor({
     async stop() {
       stopped = true
       if (timer) clearInterval(timer)
-      await run().catch(() => {})
+      await run(true).catch(() => {})
     },
   }
 }
@@ -1179,10 +1362,24 @@ async function drainFinalSync({
   const deadline = Date.now() + timeoutMs
   let accepted = 0
   let offline = false
+  let batches = 0
+  let lastDurationMs: number | null = null
+  let lastError: string | null = null
   do {
-    const result = await flushOutbox(root, args, { quiet: true })
+    const result = await flushOutbox(root, args, {
+      quiet: true,
+      maxBatches: 1,
+    })
     accepted += result.flushed
     offline = offline || result.offline
+    batches += result.batches
+    lastDurationMs = result.lastDurationMs
+    lastError = result.lastError
+    if (result.batches > 0) {
+      console.log(
+        `final sync batch ${batches}: accepted=${accepted} pending=${result.pending}${result.offline ? " offline=true" : ""}`
+      )
+    }
     if (result.pending === 0 || result.offline) break
     await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
   } while (Date.now() < deadline)
@@ -1200,6 +1397,9 @@ async function drainFinalSync({
     pending,
     conflicts,
     offline,
+    batches,
+    lastDurationMs,
+    lastError,
     firstFailed: firstConflict ?? firstPendingError ?? null,
   }
 }
@@ -1208,7 +1408,7 @@ function printFinalSyncReport(
   report: Awaited<ReturnType<typeof drainFinalSync>>
 ) {
   console.log(
-    `final sync: accepted=${report.accepted} pending=${report.pending} conflicts=${report.conflicts}${
+    `final sync: accepted=${report.accepted} pending=${report.pending} conflicts=${report.conflicts} batches=${report.batches}${
       report.offline ? " offline=true" : ""
     }`
   )
@@ -1276,47 +1476,57 @@ async function computeSessionFinalizationStatus({
     )
   }
 
-  for (const manifest of manifests) {
-    if (manifest.status === "starting" || manifest.status === "running") {
-      incompleteReasons.push(
-        `worker ${manifest.workerId} still ${manifest.status}`
+  for (let index = 0; index < manifests.length; index += 25) {
+    const batch = manifests.slice(index, index + 25)
+    if (manifests.length > 25) {
+      console.log(
+        `finalization check: workers ${index + 1}-${index + batch.length}/${manifests.length}`
       )
     }
-    const finalization = manifest.finalization
-    if (!finalization) {
-      if (
-        manifest.status === "completed" ||
-        manifest.status === "failed" ||
-        manifest.status === "stopped"
-      ) {
+    for (const manifest of batch) {
+      if (manifest.status === "starting" || manifest.status === "running") {
         incompleteReasons.push(
-          `worker ${manifest.workerId} has no finalization result`
+          `worker ${manifest.workerId} still ${manifest.status}`
         )
       }
-      continue
-    }
-    if (finalization.finalizationStatus === "failed") {
-      failedReasons.push(
-        `worker ${manifest.workerId} finalization failed${
-          finalization.error ? `: ${finalization.error}` : ""
-        }`
-      )
-      continue
-    }
-    const hasUnresolvedSalvage =
-      finalization.finalizationStatus === "salvaged_unmeasured" ||
-      (finalization.finalizationStatus !== "measured_and_logged" &&
-        (finalization.salvaged || finalization.unloggedCommitCount > 0))
-    if (hasUnresolvedSalvage) {
-      incompleteReasons.push(
-        `worker ${manifest.workerId} has unlogged or salvaged work`
-      )
-    }
-    if (finalization.workerBranchPushStatus === "failed") {
-      incompleteReasons.push(`worker ${manifest.workerId} branch push failed`)
-    }
-    if (finalization.rootDriftStatus === "dirty") {
-      incompleteReasons.push(`worker ${manifest.workerId} detected root drift`)
+      const finalization = manifest.finalization
+      if (!finalization) {
+        if (
+          manifest.status === "completed" ||
+          manifest.status === "failed" ||
+          manifest.status === "stopped"
+        ) {
+          incompleteReasons.push(
+            `worker ${manifest.workerId} has no finalization result`
+          )
+        }
+        continue
+      }
+      if (finalization.finalizationStatus === "failed") {
+        failedReasons.push(
+          `worker ${manifest.workerId} finalization failed${
+            finalization.error ? `: ${finalization.error}` : ""
+          }`
+        )
+        continue
+      }
+      const hasUnresolvedSalvage =
+        finalization.finalizationStatus.startsWith("salvaged_unmeasured") ||
+        (finalization.finalizationStatus !== "measured_and_logged" &&
+          (finalization.salvaged || finalization.unloggedCommitCount > 0))
+      if (hasUnresolvedSalvage) {
+        incompleteReasons.push(
+          `worker ${manifest.workerId} has unlogged or salvaged work`
+        )
+      }
+      if (finalization.workerBranchPushStatus === "failed") {
+        incompleteReasons.push(`worker ${manifest.workerId} branch push failed`)
+      }
+      if (finalization.rootDriftStatus === "dirty") {
+        incompleteReasons.push(
+          `worker ${manifest.workerId} detected root drift`
+        )
+      }
     }
   }
 
@@ -1825,6 +2035,8 @@ export async function finalizeHypothesisAttempt({
   }
 
   try {
+    const warnings = await recordWorkerHarnessWarnings(activityManifest)
+    if (warnings.length > 0) manifest.warnings = warnings
     const headBefore = await currentCommit(worktree)
     const dirty = (await git(["status", "--porcelain"], worktree)).trim()
     const hasResult =
@@ -1865,89 +2077,114 @@ export async function finalizeHypothesisAttempt({
       manifest.error = analysis.reason
     } else {
       const measurementBaseCommitSha = analysis.measurementBaseCommitSha
-      let measurementError: string | null = null
-      let measuredRunRef: string | null = null
-      await withoutProcessExitCode(() =>
-        commandExpRun({
-          positional: ["exp", "run"],
-          options: {
-            ...args.options,
-            cwd: worktree,
-            campaign: campaign.name,
-            base: measurementBaseCommitSha,
-            hypothesis: hypothesis.id,
-            session: sessionId,
-            worker: workerId,
-            timeout: "120",
-            "checks-timeout": "120",
-          },
-        })
-      )
-        .then((result) => {
-          measuredRunRef = result?.runRef ?? null
-        })
-        .catch((error) => {
-          measurementError = errorMessage(error)
-          manifest.error = measurementError
-        })
-      await withoutProcessExitCode(() =>
-        commandExpLog({
-          positional: ["exp", "log"],
-          options: {
-            ...args.options,
-            cwd: worktree,
-            campaign: campaign.name,
-            base: measurementBaseCommitSha,
-            hypothesis: hypothesis.id,
-            session: sessionId,
-            worker: workerId,
-            ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
-            ...(measurementError
-              ? { status: "failed", "allow-unmeasured": "true" }
-              : {}),
-            name: `${hypothesis.name}-final-${commit.commitSha.slice(0, 7)}`,
-            description: workerFailed
-              ? `Best-effort salvage from ${hypothesis.name} after worker process failure.`
-              : `Final ${hypothesis.name} worker result.`,
-            "agent-notes": JSON.stringify({
-              finalizedBy: "onyx worker harness",
-              workerFailed,
-              measurementError,
-              hypothesis: hypothesis.name,
+      const stopCheck = await collectResearchStopReasons({
+        root,
+        sessionId,
+        args,
+      }).catch(() => null)
+      if (stopCheck?.reasonCodes.includes("budget_exhausted")) {
+        manifest.finalizationStatus = "salvaged_unmeasured_budget_exhausted"
+        manifest.salvaged = true
+        manifest.error =
+          "Experiment budget exhausted before worker harness finalization; pushed salvage branch without logging a measured attempt."
+        if (activityManifest) {
+          await appendWorkerActivityEvent(activityManifest, {
+            type: "finalization",
+            phase: "salvaged",
+            summary: "Budget exhausted before final measurement",
+            metadata: {
+              finalizationStatus: manifest.finalizationStatus,
               measurementBaseCommitSha,
               unloggedCommitCount: analysis.unloggedCommits.length,
-            }),
-          },
-        })
-      )
-        .then(async (record) => {
-          manifest.finalizationStatus = "measured_and_logged"
-          if (record && activityManifest) {
-            await appendWorkerActivityEvent(activityManifest, {
-              type: "metrics",
-              phase: "measured",
-              summary: `${record.primaryMetricName}=${record.primaryMetricValue ?? "null"}`,
-              metadata: {
-                runRef: record.runRef,
-                status: record.status,
-                primaryMetricName: record.primaryMetricName,
-                primaryMetricValue: record.primaryMetricValue,
-                metrics: record.metrics,
-                resultCommitSha: record.resultCommitSha,
-                resultRef: record.resultRef,
-              },
-            })
-          }
-        })
-        .catch((error) => {
-          manifest.finalizationStatus = "failed"
-          manifest.error = [
-            manifest.error,
-            `experiment log failed: ${errorMessage(error)}`,
-          ]
-            .filter(Boolean)
-            .join("; ")
-        })
+              stopReasons: stopCheck.reasons,
+            },
+          })
+        }
+      } else {
+        let measurementError: string | null = null
+        let measuredRunRef: string | null = null
+        await withoutProcessExitCode(() =>
+          commandExpRun({
+            positional: ["exp", "run"],
+            options: {
+              ...args.options,
+              cwd: worktree,
+              campaign: campaign.name,
+              base: measurementBaseCommitSha,
+              hypothesis: hypothesis.id,
+              session: sessionId,
+              worker: workerId,
+              timeout: "120",
+              "checks-timeout": "120",
+            },
+          })
+        )
+          .then((result) => {
+            measuredRunRef = result?.runRef ?? null
+          })
+          .catch((error) => {
+            measurementError = errorMessage(error)
+            manifest.error = measurementError
+          })
+        await withoutProcessExitCode(() =>
+          commandExpLog({
+            positional: ["exp", "log"],
+            options: {
+              ...args.options,
+              cwd: worktree,
+              campaign: campaign.name,
+              base: measurementBaseCommitSha,
+              hypothesis: hypothesis.id,
+              session: sessionId,
+              worker: workerId,
+              ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
+              ...(measurementError
+                ? { status: "failed", "allow-unmeasured": "true" }
+                : {}),
+              name: `${hypothesis.name}-final-${commit.commitSha.slice(0, 7)}`,
+              description: workerFailed
+                ? `Best-effort salvage from ${hypothesis.name} after worker process failure.`
+                : `Final ${hypothesis.name} worker result.`,
+              "agent-notes": JSON.stringify({
+                finalizedBy: "onyx worker harness",
+                workerFailed,
+                measurementError,
+                hypothesis: hypothesis.name,
+                measurementBaseCommitSha,
+                unloggedCommitCount: analysis.unloggedCommits.length,
+              }),
+            },
+          })
+        )
+          .then(async (record) => {
+            manifest.finalizationStatus = "measured_and_logged"
+            if (record && activityManifest) {
+              await appendWorkerActivityEvent(activityManifest, {
+                type: "metrics",
+                phase: "measured",
+                summary: `${record.primaryMetricName}=${record.primaryMetricValue ?? "null"}`,
+                metadata: {
+                  runRef: record.runRef,
+                  status: record.status,
+                  primaryMetricName: record.primaryMetricName,
+                  primaryMetricValue: record.primaryMetricValue,
+                  metrics: record.metrics,
+                  resultCommitSha: record.resultCommitSha,
+                  resultRef: record.resultRef,
+                },
+              })
+            }
+          })
+          .catch((error) => {
+            manifest.finalizationStatus = "failed"
+            manifest.error = [
+              manifest.error,
+              `experiment log failed: ${errorMessage(error)}`,
+            ]
+              .filter(Boolean)
+              .join("; ")
+          })
+      }
     }
 
     const workerBranchPush = await pushWorkerBranch({
@@ -2188,7 +2425,10 @@ export async function collectResearchStopReasons({
   const workerResearchDeadline = process.env.ONYX_RESEARCH_DEADLINE_AT
     ? Date.parse(process.env.ONYX_RESEARCH_DEADLINE_AT)
     : Number.NaN
-  if (Number.isFinite(workerResearchDeadline) && nowMs >= workerResearchDeadline) {
+  if (
+    Number.isFinite(workerResearchDeadline) &&
+    nowMs >= workerResearchDeadline
+  ) {
     addStopReason("deadline_reached", "worker shutdown cushion reached")
   }
   if (localSession?.endTimeMs && nowMs >= localSession.endTimeMs) {
@@ -2393,7 +2633,7 @@ function finalizationLoggedExperiment(status: WorkerFinalizationStatus) {
   return status === "measured_and_logged"
 }
 
-function finalizationStatusLabel(status: WorkerFinalizationStatus) {
+export function finalizationStatusLabel(status: WorkerFinalizationStatus) {
   switch (status) {
     case "none":
       return "no result changes"
@@ -2403,6 +2643,8 @@ function finalizationStatusLabel(status: WorkerFinalizationStatus) {
       return "measured and logged"
     case "salvaged_unmeasured":
       return "salvaged without measurement"
+    case "salvaged_unmeasured_budget_exhausted":
+      return "salvaged without measurement after budget exhaustion"
     case "failed":
       return "failed"
   }
@@ -3510,6 +3752,9 @@ export async function commandResearchStatus(args: Args) {
       : false)
   const pendingSync = await pendingResearchSyncCount(root).catch(() => 0)
   const conflicts = await researchSyncConflictCount(root).catch(() => 0)
+  const live = activeSessionId
+    ? await getResearchSessionLive(activeSessionId, args).catch(() => null)
+    : null
   const bestExperiment =
     localSessionState?.bestExperiment ??
     ("bestExperiment" in campaignInfo.overview
@@ -3518,8 +3763,31 @@ export async function commandResearchStatus(args: Args) {
   const sessionRuntimeState = activeSessionId
     ? state.sessions?.[activeSessionId]
     : undefined
+  const supervisorTelemetry = freshSupervisorTelemetry(
+    sessionRuntimeState?.supervisor
+  )
   const ignoredPresence = sessionRuntimeState?.ignoredPresence ?? null
-  const providerBackoff = sessionRuntimeState?.providerBackoff ?? null
+  const providerBackoff =
+    supervisorTelemetry?.providerBackoff ??
+    sessionRuntimeState?.providerBackoff ??
+    null
+  const sessionMetadata = sessionState?.session.metadata ?? {}
+  const launchRate = supervisorTelemetry?.launchRate ?? {
+    batchSize:
+      typeof sessionMetadata.launchBatchSize === "number"
+        ? sessionMetadata.launchBatchSize
+        : null,
+    intervalSeconds:
+      typeof sessionMetadata.launchIntervalSeconds === "number"
+        ? sessionMetadata.launchIntervalSeconds
+        : null,
+  }
+  const activeProcessCount =
+    supervisorTelemetry?.activeProcessCount ?? activeWorkers
+  const recentFailedLaunches =
+    supervisorTelemetry?.recentFailedLaunches ??
+    providerBackoff?.recentFailures ??
+    []
   const failureSummary = workers
     .filter((worker) => worker.status === "failed")
     .slice(0, 10)
@@ -3557,6 +3825,16 @@ export async function commandResearchStatus(args: Args) {
                 terminalWorkers,
                 openSlots,
                 stopping,
+                launchRate,
+                activeProcessCount,
+                supervisor: supervisorTelemetry
+                  ? {
+                      pid: supervisorTelemetry.pid ?? null,
+                      logPath: supervisorTelemetry.logPath ?? null,
+                      updatedAt: supervisorTelemetry.updatedAt ?? null,
+                    }
+                  : null,
+                budget: live?.budget ?? null,
               }
             : null,
           hypotheses,
@@ -3567,11 +3845,17 @@ export async function commandResearchStatus(args: Args) {
           pendingSync,
           bestExperiment,
           providerBackoff,
+          recentFailedLaunches,
           failures: failureSummary,
           sync: {
             pendingSync,
             conflicts,
+            oldestPendingAgeMs: live?.sync?.oldestPendingAgeMs ?? null,
+            lastDurationMs: live?.sync?.lastDurationMs ?? null,
+            lastError: live?.sync?.lastError ?? null,
+            sites: live?.sites ?? [],
           },
+          finalization: live?.finalization ?? null,
           launchSuggestions,
         },
         null,
@@ -3591,6 +3875,20 @@ export async function commandResearchStatus(args: Args) {
       conflicts ? `, ${conflicts} conflict(s)` : ""
     }`
   )
+  if (live?.sync) {
+    console.log(
+      `sync telemetry: oldestPending=${live.sync.oldestPendingAgeMs ?? "-"}ms lastDuration=${live.sync.lastDurationMs ?? "-"}ms lastError=${live.sync.lastError ?? "-"}`
+    )
+  }
+  if (providerBackoff) {
+    console.log(`provider backoff: ${JSON.stringify(providerBackoff)}`)
+  }
+  if (recentFailedLaunches.length > 0) {
+    const latestFailure = recentFailedLaunches[recentFailedLaunches.length - 1]
+    console.log(
+      `recent launch failures: ${recentFailedLaunches.length} latest=${latestFailure?.reason ?? "unknown"}`
+    )
+  }
   if (ignoredPresence && ignoredPresence.total > 0) {
     console.log(
       `presence ignored: ${ignoredPresence.total} (${formatPresenceReasonCounts(
@@ -3999,6 +4297,9 @@ export async function commandResearchFinish(args: Args) {
         pending,
         conflicts,
         offline: false,
+        batches: 0,
+        lastDurationMs: null,
+        lastError: null,
         firstFailed:
           conflictEvents[0] ??
           pendingEvents.find((event) => event.lastError) ??
@@ -4033,11 +4334,38 @@ export async function commandResearchFinish(args: Args) {
     )
     branches.push(`${bestBranch} -> ${overview.campaign.bestCommitSha}`)
   }
+  const finishLive = sessionId
+    ? await getResearchSessionLive(sessionId, args).catch(() => null)
+    : null
+  const finishLocal = sessionId
+    ? await getLocalSessionState(root, sessionId).catch(() => null)
+    : null
+  const finishManifests = sessionId
+    ? await readWorkerLaunchManifests(root, sessionId).catch(() => [])
+    : []
+  const finishUnmeasuredSalvage =
+    finishLive?.finalization?.unmeasuredSalvageCount ??
+    finishManifests.filter(
+      (manifest) =>
+        manifest.finalization?.salvaged &&
+        manifest.finalization.finalizationStatus.startsWith(
+          "salvaged_unmeasured"
+        )
+    ).length
+  const finishReservedAttempts =
+    finishLive?.session.reservedExperimentCount ??
+    finishLocal?.session.reservedExperimentCount ??
+    0
+  const finishTerminalMeasured =
+    finishLive?.session.terminalExperimentCount ??
+    finishLocal?.session.terminalExperimentCount ??
+    0
 
   const body = [
     `Finalized campaign ${campaign.name}.`,
     `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
     `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
+    `Budget counts: reservedAttempts=${finishReservedAttempts} terminalMeasuredAttempts=${finishTerminalMeasured} verifiedSyncedExperiments=${finishLive?.budget.terminalCount ?? finishTerminalMeasured} unmeasuredSalvage=${finishUnmeasuredSalvage}`,
     "Hypothesis refs are not promoted from mutable hypothesis heads; use verified experiment best projections for curated outputs.",
     "",
     "Local branches:",
@@ -4320,7 +4648,8 @@ function unresolvedReservationCount(reservations: Iterable<LaunchReservation>) {
 }
 
 function defaultPresenceIntervalSeconds(workerTarget: number) {
-  if (workerTarget > 50) return 10
+  if (workerTarget >= 100) return 15
+  if (workerTarget >= 50) return 10
   return 5
 }
 
@@ -4344,10 +4673,18 @@ export function providerBackoffReasonForResult(
   ) {
     return "auth_error"
   }
-  if (/rate limit|too many requests|429|quota|throttl|retry[- ]?after/i.test(message)) {
+  if (
+    /rate limit|too many requests|429|quota|throttl|retry[- ]?after/i.test(
+      message
+    )
+  ) {
     return "rate_limit"
   }
-  if (/overloaded|capacity|temporarily unavailable|503|529|server busy/i.test(message)) {
+  if (
+    /overloaded|capacity|temporarily unavailable|503|529|server busy/i.test(
+      message
+    )
+  ) {
     return "overloaded"
   }
   if (
@@ -4385,6 +4722,204 @@ function sessionStopRequested({
 }) {
   const session = state.sessions?.[sessionId]
   return Boolean(session?.stopRequested || session?.status === "stop_requested")
+}
+
+function freshSupervisorTelemetry(
+  supervisor: SupervisorRuntimeTelemetry | undefined
+) {
+  if (!supervisor || supervisor.status !== "running") return null
+  const updatedAt = supervisor.updatedAt ? Date.parse(supervisor.updatedAt) : NaN
+  if (!Number.isFinite(updatedAt)) return null
+  if (Date.now() - updatedAt > SUPERVISOR_TELEMETRY_STALE_MS) return null
+  return supervisor
+}
+
+async function persistSupervisorTelemetry({
+  root,
+  sessionId,
+  campaignName,
+  campaignId,
+  telemetry,
+}: {
+  root: string
+  sessionId: string
+  campaignName: string
+  campaignId: string
+  telemetry: Omit<SupervisorRuntimeTelemetry, "updatedAt">
+}) {
+  const updatedAt = new Date().toISOString()
+  await updateState(root, (state) => {
+    state.sessions = state.sessions ?? {}
+    const current = state.sessions[sessionId] ?? {}
+    const supervisor = {
+      ...(current.supervisor ?? {}),
+      ...telemetry,
+      updatedAt,
+    }
+    state.sessions[sessionId] = {
+      ...current,
+      campaignName,
+      campaignId,
+      providerBackoff: telemetry.providerBackoff ?? null,
+      supervisor,
+    }
+  }).catch(() => {})
+}
+
+function supervisorCliCommand() {
+  const execPath = process.execPath
+  const argv1 = process.argv[1]
+  if (execPath && /(?:^|\/)onyx(?:\.exe)?$/.test(execPath)) {
+    return { command: execPath, args: [] }
+  }
+  if (argv1 && /(?:^|\/)onyx\.js$/.test(argv1)) {
+    return { command: execPath, args: [argv1] }
+  }
+  return {
+    command: execPath,
+    args: [fileURLToPath(new URL("../../bin/onyx.js", import.meta.url))],
+  }
+}
+
+function researchRunChildArgv({
+  args,
+  root,
+  sessionId,
+  logPath,
+}: {
+  args: Args
+  root: string
+  sessionId: string
+  logPath: string
+}) {
+  const options: Record<string, string | undefined> = {
+    ...args.options,
+    session: sessionId,
+    cwd: root,
+    foreground: "true",
+    "supervisor-log-path": logPath,
+  }
+  delete options.json
+  delete options.hypotheses
+
+  const argv = [...args.positional]
+  for (const [key, value] of Object.entries(options)) {
+    if (value === undefined) continue
+    argv.push(`--${key}`)
+    if (value !== "true") argv.push(value)
+  }
+  return argv
+}
+
+async function supervisorLogPath(root: string, sessionId: string) {
+  const dir = join(await onyxStateDir(root), SUPERVISOR_LOG_DIR)
+  await mkdir(dir, { recursive: true })
+  return join(dir, `${sessionId}-${Date.now()}.log`)
+}
+
+function statusCommand(campaignName: string) {
+  return `onyx research status --campaign ${campaignName} --json`
+}
+
+function listenCommand() {
+  return "onyx listen"
+}
+
+async function launchDetachedResearchSupervisor({
+  root,
+  args,
+  sessionId,
+  campaign,
+  launchRate,
+}: {
+  root: string
+  args: Args
+  sessionId: string
+  campaign: ApiCampaign
+  launchRate: { batchSize: number | null; intervalSeconds: number | null }
+}) {
+  const latest = await readState(root).catch(() => null)
+  const existing = freshSupervisorTelemetry(
+    latest?.sessions?.[sessionId]?.supervisor
+  )
+  if (existing?.pid) {
+    const payload = {
+      sessionId,
+      pid: existing.pid,
+      logPath: existing.logPath ?? null,
+      statusCommand: statusCommand(campaign.name),
+      listenCommand: listenCommand(),
+      alreadyRunning: true,
+    }
+    if (args.options.json === "true") {
+      console.log(JSON.stringify(payload, null, 2))
+    } else {
+      console.log(`Research supervisor already running: ${sessionId}`)
+      console.log(`PID: ${existing.pid}`)
+      if (existing.logPath) console.log(`Log: ${existing.logPath}`)
+      console.log(`Status: ${payload.statusCommand}`)
+      console.log(`Listen: ${payload.listenCommand}`)
+    }
+    return payload
+  }
+
+  const logPath = await supervisorLogPath(root, sessionId)
+  await appendFile(
+    logPath,
+    `[${new Date().toISOString()}] starting Onyx research supervisor ${sessionId}\n`,
+    "utf8"
+  )
+  const command = supervisorCliCommand()
+  const childArgv = researchRunChildArgv({ args, root, sessionId, logPath })
+  const outputFd = openSync(logPath, "a")
+  let pid: number | null = null
+  try {
+    const child = spawn(command.command, [...command.args, ...childArgv], {
+      cwd: root,
+      detached: true,
+      stdio: ["ignore", outputFd, outputFd],
+      env: { ...process.env, ONYX_LAUNCHER_BYPASS: "1" },
+    })
+    pid = child.pid ?? null
+    child.unref()
+  } finally {
+    closeSync(outputFd)
+  }
+
+  await persistSupervisorTelemetry({
+    root,
+    sessionId,
+    campaignName: campaign.name,
+    campaignId: campaign.id,
+    telemetry: {
+      pid,
+      logPath,
+      activeProcessCount: 0,
+      launchRate,
+      providerBackoff: null,
+      recentFailedLaunches: [],
+      status: "running",
+    },
+  })
+
+  const payload = {
+    sessionId,
+    pid,
+    logPath,
+    statusCommand: statusCommand(campaign.name),
+    listenCommand: listenCommand(),
+    alreadyRunning: false,
+  }
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(payload, null, 2))
+  } else {
+    console.log(`Research supervisor started: ${sessionId}`)
+    if (pid) console.log(`PID: ${pid}`)
+    console.log(`Log: ${logPath}`)
+    console.log(`Status: ${payload.statusCommand}`)
+    console.log(`Listen: ${payload.listenCommand}`)
+  }
+  return payload
 }
 
 export async function commandResearchRun(args: Args) {
@@ -4498,14 +5033,19 @@ export async function commandResearchRun(args: Args) {
     ) * 1000
   const launchBatchSize = Math.min(
     maxConcurrency,
+    25,
     positiveIntegerOption(
       args,
       "launch-batch-size",
-      Math.min(10, maxConcurrency)
+      workerTarget >= 100 ? 10 : Math.min(10, maxConcurrency)
     )
   )
   const launchIntervalMs =
     positiveNumberOption(args, "launch-interval-seconds", 5) * 1000
+  const launchRate = {
+    batchSize: launchBatchSize,
+    intervalSeconds: launchIntervalMs / 1000,
+  }
   const providerBackoffMs =
     positiveNumberOption(args, "provider-backoff-seconds", 30) * 1000
   const finalSyncTimeoutMs =
@@ -4568,6 +5108,17 @@ export async function commandResearchRun(args: Args) {
     message: `supervisor target ${workerTarget}, concurrency ${maxConcurrency}`,
   })
 
+  if (args.options.foreground !== "true") {
+    await launchDetachedResearchSupervisor({
+      root,
+      args,
+      sessionId,
+      campaign,
+      launchRate,
+    })
+    return
+  }
+
   const syncSupervisor = createSyncSupervisor({
     root,
     args,
@@ -4579,6 +5130,7 @@ export async function commandResearchRun(args: Args) {
     sessionId,
     intervalMs: presenceIntervalMs,
     syncQueueDepth: syncSupervisor.depth,
+    syncTelemetry: syncSupervisor.telemetry,
   })
   syncSupervisor.request({ reason: "startup" })
   presenceSupervisor.request()
@@ -4595,31 +5147,63 @@ export async function commandResearchRun(args: Args) {
   let providerBackoffReason: string | null = null
   let providerBackoffAttempt = 0
   let providerBackoffLogged = false
+  let recentProviderFailures: ProviderLaunchFailure[] = []
+  const supervisorPid = process.pid
+  const supervisorLogPath = args.options["supervisor-log-path"] ?? null
+  let lastTelemetryAt = 0
   let stopLogged = false
   const sessionStopChecker = createResearchSessionStopChecker({
     root,
     sessionId,
     args,
   })
-  const persistProviderBackoff = async (
-    providerBackoff: {
+  const currentProviderBackoff = () => {
+    if (!providerBackoffReason || Date.now() >= providerBackoffUntil) {
+      return null
+    }
+    return {
+      reason: providerBackoffReason,
+      until: new Date(providerBackoffUntil).toISOString(),
+      attempt: providerBackoffAttempt,
+      recentFailures: recentProviderFailures,
+    }
+  }
+  const persistRuntimeTelemetry = async (options: {
+    force?: boolean
+    status?: string
+    activeProcessCount?: number
+    providerBackoff?: {
       reason: string
       until: string
       attempt?: number
       delayMs?: number
+      recentFailures?: ProviderLaunchFailure[]
     } | null
-  ) => {
-    const state = await readState(root).catch(() => null)
-    if (!state) return
-    state.sessions = state.sessions ?? {}
-    state.sessions[sessionId] = {
-      ...(state.sessions[sessionId] ?? {}),
+  } = {}) => {
+    const now = Date.now()
+    if (!options.force && now - lastTelemetryAt < 2_000) return
+    lastTelemetryAt = now
+    await persistSupervisorTelemetry({
+      root,
+      sessionId,
       campaignName: campaign.name,
       campaignId: campaign.id,
-      providerBackoff,
-    }
-    await writeState(root, state).catch(() => {})
+      telemetry: {
+        pid: supervisorPid,
+        logPath: supervisorLogPath,
+        activeProcessCount: options.activeProcessCount ?? activeRuns.size,
+        launchRate,
+        providerBackoff:
+          options.providerBackoff === undefined
+            ? currentProviderBackoff()
+            : options.providerBackoff,
+        recentFailedLaunches: recentProviderFailures,
+        status: options.status ?? "running",
+      },
+    })
   }
+
+  await persistRuntimeTelemetry({ force: true, activeProcessCount: 0 })
 
   console.log(`Research supervisor: ${sessionId}`)
   console.log(`Campaign: ${campaign.name}`)
@@ -4639,6 +5223,7 @@ export async function commandResearchRun(args: Args) {
   try {
     while (Date.now() < hardEndTimeMs) {
       const loopNow = Date.now()
+      await persistRuntimeTelemetry({ activeProcessCount: activeRuns.size })
       let stopCheck: ResearchStopCheck = {
         shouldStop: false,
         sessionId,
@@ -4808,12 +5393,26 @@ export async function commandResearchRun(args: Args) {
                 providerBackoffUntil = 0
                 providerBackoffReason = null
                 providerBackoffLogged = false
-                await persistProviderBackoff(null)
+                await persistRuntimeTelemetry({
+                  force: true,
+                  providerBackoff: null,
+                  activeProcessCount: activeRuns.size,
+                })
               }
             } else if (result.status === "stopped") stopped += 1
             else failed += 1
             const backoffReason = providerBackoffReasonForResult(result)
             if (backoffReason) {
+              recentProviderFailures = [
+                ...recentProviderFailures,
+                {
+                  at: new Date().toISOString(),
+                  reason: backoffReason,
+                  workerId: result.workerId ?? null,
+                  hypothesisId: result.hypothesis.id,
+                  error: result.error ?? null,
+                },
+              ].slice(-20)
               providerBackoffAttempt += 1
               const delayMs = providerBackoffDelayMs({
                 baseMs: providerBackoffMs,
@@ -4845,11 +5444,16 @@ export async function commandResearchRun(args: Args) {
                   })
                 }
               }
-              await persistProviderBackoff({
-                reason: backoffReason,
-                until,
-                attempt: providerBackoffAttempt,
-                delayMs,
+              await persistRuntimeTelemetry({
+                force: true,
+                activeProcessCount: activeRuns.size,
+                providerBackoff: {
+                  reason: backoffReason,
+                  until,
+                  attempt: providerBackoffAttempt,
+                  delayMs,
+                  recentFailures: recentProviderFailures,
+                },
               })
             }
             return result
@@ -4869,10 +5473,18 @@ export async function commandResearchRun(args: Args) {
           .finally(() => {
             activeRuns.delete(runKey)
             launchReservations.delete(runKey)
+            void persistRuntimeTelemetry({
+              force: true,
+              activeProcessCount: activeRuns.size,
+            })
             syncSupervisor.request({ reason: "worker-finished" })
             presenceSupervisor.request()
           })
         activeRuns.set(runKey, run)
+        await persistRuntimeTelemetry({
+          force: true,
+          activeProcessCount: activeRuns.size,
+        })
         presenceSupervisor.request()
       }
       if (launchedThisTick > 0) lastLaunchBatchAt = Date.now()
@@ -5003,11 +5615,49 @@ export async function commandResearchRun(args: Args) {
           : "final session sync remains pending",
     }).catch(() => {})
   }
+  const completionLive = await getResearchSessionLive(sessionId, args).catch(
+    () => null
+  )
+  const completionLocal = await getLocalSessionState(root, sessionId).catch(
+    () => null
+  )
+  const completionManifests = await readWorkerLaunchManifests(
+    root,
+    sessionId
+  ).catch(() => [])
+  const unmeasuredSalvageCount =
+    completionLive?.finalization?.unmeasuredSalvageCount ??
+    completionManifests.filter(
+      (manifest) =>
+        manifest.finalization?.salvaged &&
+        manifest.finalization.finalizationStatus.startsWith(
+          "salvaged_unmeasured"
+        )
+    ).length
+  const reservedAttempts =
+    completionLive?.session.reservedExperimentCount ??
+    completionLocal?.session.reservedExperimentCount ??
+    0
+  const terminalMeasuredAttempts =
+    completionLive?.session.terminalExperimentCount ??
+    completionLocal?.session.terminalExperimentCount ??
+    0
+  const verifiedSyncedExperiments =
+    completionLive?.budget.terminalCount ?? terminalMeasuredAttempts
+  await persistRuntimeTelemetry({
+    force: true,
+    status: finalStatus,
+    providerBackoff: null,
+    activeProcessCount: 0,
+  })
 
   console.log(
     `Research run ${finalStatus}: launched=${launched}${
       maxLaunches ? `/${maxLaunches}` : ""
-    } completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}; ${finalSync.pending} sync record(s) pending.`
+    } completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
+  )
+  console.log(
+    `Budget counts: reservedAttempts=${reservedAttempts} terminalMeasuredAttempts=${terminalMeasuredAttempts} verifiedSyncedExperiments=${verifiedSyncedExperiments} unmeasuredSalvage=${unmeasuredSalvageCount} pendingSync=${finalSync.pending}.`
   )
 }
 

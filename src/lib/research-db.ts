@@ -146,11 +146,7 @@ type LocalTombstoneInput = {
 
 const dbCache = new Map<string, Database>()
 const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 4
-const TERMINAL_WORKER_STATUSES = new Set([
-  "completed",
-  "failed",
-  "stopped",
-])
+const TERMINAL_WORKER_STATUSES = new Set(["completed", "failed", "stopped"])
 
 function nowIso() {
   return new Date().toISOString()
@@ -751,7 +747,9 @@ function applyMigrations(db: Db) {
         }
       }
       db.run("UPDATE workers SET status = 'registered' WHERE status = 'idle'")
-      db.run("UPDATE workers SET status = 'running' WHERE status IN ('stale', 'lost')")
+      db.run(
+        "UPDATE workers SET status = 'running' WHERE status IN ('stale', 'lost')"
+      )
       db.query(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
       ).run(4, nowIso())
@@ -935,7 +933,9 @@ function workerFromRow(row: Row): ApiWorker {
     agentKind: row.agent_kind as string,
     runtime: row.runtime as ApiWorker["runtime"],
     status:
-      row.status === "idle" ? "registered" : (row.status as ApiWorker["status"]),
+      row.status === "idle"
+        ? "registered"
+        : (row.status as ApiWorker["status"]),
     liveness: ["completed", "failed", "stopped"].includes(String(row.status))
       ? "terminal"
       : "unknown",
@@ -3714,6 +3714,18 @@ export async function pendingResearchSyncCount(root: string) {
     .query("SELECT COUNT(*) AS count FROM sync_events WHERE status = 'pending'")
     .get() as { count: number }
   return Number(row.count ?? 0)
+}
+
+export async function oldestPendingResearchSyncAgeMs(root: string) {
+  const row = (await openDb(root))
+    .query(
+      "SELECT MIN(created_at) AS created_at FROM sync_events WHERE status = 'pending'"
+    )
+    .get() as { created_at?: string | null }
+  if (!row?.created_at) return null
+  const createdAt = Date.parse(row.created_at)
+  if (!Number.isFinite(createdAt)) return null
+  return Math.max(0, Date.now() - createdAt)
 }
 
 export async function researchSyncConflictCount(root: string) {
