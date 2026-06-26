@@ -12,13 +12,12 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { onyxStateDir } from "./outbox"
-import { readConfig } from "./config"
+import { readConfig, type BuiltInWorkerAgent } from "./config"
 import { gitCommonDir, gitDir } from "./git"
 import { pathExists, runProcess } from "./process"
 
 const ONYX_LAUNCHER_BYPASS = "ONYX_LAUNCHER_BYPASS"
 
-export type BuiltInWorkerAgent = "codex" | "claude"
 export type WorkerAgentKind = BuiltInWorkerAgent | "custom"
 
 export type WorkerInvocation = {
@@ -29,6 +28,7 @@ export type WorkerInvocation = {
   stdin?: string
   preflightArgs?: string[]
   addedWritableRoots: string[]
+  workerModel?: string | null
 }
 
 export type WorkerPreflightCheck = {
@@ -74,6 +74,7 @@ export type WorkerFinalizationManifest = {
 export type WorkerLaunchManifest = {
   schemaVersion: 1
   agentKind: WorkerAgentKind
+  workerModel: string | null
   command: string
   args: string[]
   onyxShimPath: string | null
@@ -127,6 +128,40 @@ function compactPreflightOutput(value: string, limit = 2048) {
   return compacted.length > limit
     ? `${compacted.slice(0, Math.max(0, limit - 3))}...`
     : compacted
+}
+
+function opencodeModelIds(output: string) {
+  return [
+    ...new Set(
+      output
+        .match(/\b[A-Za-z0-9_.-]+\/[A-Za-z0-9_.:/@+-]+\b/g)
+        ?.filter((value) => !value.startsWith("http")) ?? []
+    ),
+  ].sort()
+}
+
+function modelSimilarity(left: string, right: string) {
+  const leftParts = new Set(left.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))
+  const rightParts = new Set(
+    right.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+  )
+  let overlap = 0
+  for (const part of leftParts) {
+    if (rightParts.has(part)) overlap += 1
+  }
+  return overlap
+}
+
+function closestModelIds(requested: string, candidates: string[]) {
+  return candidates
+    .map((candidate) => ({
+      candidate,
+      score: modelSimilarity(requested, candidate),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 5)
+    .map((item) => item.candidate)
 }
 
 async function sourceCheckoutOnyxBin() {
@@ -224,12 +259,16 @@ export function buildWorkerInvocation({
   worktree,
   prompt,
   addedWritableRoots = [],
+  workerModel = null,
+  workerTitle,
 }: {
   agentKind: string
   workerCommand?: string
   worktree: string
   prompt: string
   addedWritableRoots?: string[]
+  workerModel?: string | null
+  workerTitle?: string
 }): WorkerInvocation {
   if (workerCommand) {
     return {
@@ -238,10 +277,12 @@ export function buildWorkerInvocation({
       args: ["-lc", workerCommand],
       redactedArgs: ["-lc", "<worker-command>"],
       addedWritableRoots: [],
+      workerModel: null,
     }
   }
 
   if (agentKind === "codex") {
+    const modelArgs = workerModel ? ["--model", workerModel] : []
     const writableArgs = addedWritableRoots.flatMap((root) => [
       "--add-dir",
       root,
@@ -252,6 +293,7 @@ export function buildWorkerInvocation({
       "workspace-write",
       "--ask-for-approval",
       "never",
+      ...modelArgs,
       "exec",
       "--cd",
       worktree,
@@ -270,16 +312,19 @@ export function buildWorkerInvocation({
       preflightArgs: args.slice(0, -1).concat("--help"),
       stdin: prompt,
       addedWritableRoots,
+      workerModel,
     }
   }
 
   if (agentKind === "claude") {
+    const modelArgs = workerModel ? ["--model", workerModel] : []
     const writableArgs = unique([worktree, ...addedWritableRoots]).flatMap(
       (root) => ["--add-dir", root]
     )
     const args = [
       "--verbose",
       "--print",
+      ...modelArgs,
       "--input-format",
       "text",
       "--output-format",
@@ -298,11 +343,37 @@ export function buildWorkerInvocation({
       preflightArgs: args.concat("--help"),
       stdin: prompt,
       addedWritableRoots,
+      workerModel,
+    }
+  }
+
+  if (agentKind === "opencode") {
+    const modelArgs = workerModel ? ["--model", workerModel] : []
+    const args = [
+      "run",
+      "--dir",
+      worktree,
+      "--format",
+      "json",
+      "--title",
+      workerTitle ?? "onyx-worker",
+      ...modelArgs,
+      "--dangerously-skip-permissions",
+    ]
+    return {
+      agentKind,
+      command: "opencode",
+      args,
+      redactedArgs: args,
+      preflightArgs: ["run", "--help"],
+      stdin: prompt,
+      addedWritableRoots: [],
+      workerModel,
     }
   }
 
   throw new Error(
-    `Unknown --agent ${agentKind}. Use codex, claude, or pass --worker-command.`
+    `Unknown --agent ${agentKind}. Use codex, claude, opencode, or pass --worker-command.`
   )
 }
 
@@ -344,12 +415,49 @@ export async function preflightWorkerInvocation(
     const install =
       invocation.agentKind === "codex"
         ? "Install or authenticate the Codex CLI before using `--agent codex`."
-        : "Install or authenticate Claude Code before using `--agent claude`."
+        : invocation.agentKind === "claude"
+          ? "Install or authenticate Claude Code before using `--agent claude`."
+          : "Install or authenticate OpenCode before using `--agent opencode`."
     throw new Error(
       `${invocation.command} preflight failed. ${install} ${
         error instanceof Error ? error.message : String(error)
       }`
     )
+  }
+
+  const checks: WorkerPreflightCheck[] = []
+
+  if (invocation.agentKind === "opencode" && invocation.workerModel) {
+    const modelsResult = await runProcess(invocation.command, ["models"], {
+      cwd: options.cwd,
+      env: options.env,
+      timeoutMs: options.timeoutMs ?? 10_000,
+    })
+    const output = [modelsResult.stdout.trim(), modelsResult.stderr.trim()]
+      .filter(Boolean)
+      .join("\n")
+    const unavailable =
+      modelsResult.timedOut ||
+      modelsResult.code !== 0 ||
+      /Unknown command|not found/i.test(output)
+    if (!unavailable) {
+      const models = opencodeModelIds(output)
+      if (models.length > 0 && !models.includes(invocation.workerModel)) {
+        const suggestions = closestModelIds(invocation.workerModel, models)
+        const suggestionText =
+          suggestions.length > 0
+            ? ` Nearby model id(s): ${suggestions.join(", ")}.`
+            : ""
+        throw new Error(
+          `OpenCode model "${invocation.workerModel}" was not found in \`opencode models\`.${suggestionText} Run \`opencode models\` to choose an exact provider/model id.`
+        )
+      }
+      checks.push({
+        name: "opencode model",
+        status: "passed",
+        output: null,
+      })
+    }
   }
 
   if (invocation.preflightArgs) {
@@ -373,7 +481,6 @@ export async function preflightWorkerInvocation(
     }
   }
 
-  const checks: WorkerPreflightCheck[] = []
   let onyxVersion: string | null = null
   const runCheck = async (
     name: string,

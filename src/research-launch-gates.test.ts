@@ -15,6 +15,7 @@ describe("research supervisor launch gates", () => {
     const shutdownCushionMs = 60_000
 
     expect(minimumUsefulLaunchMs("codex")).toBe(5 * 60_000)
+    expect(minimumUsefulLaunchMs("opencode")).toBe(5 * 60_000)
     expect(
       canLaunchWorkerBeforeDeadline({
         now,
@@ -28,7 +29,7 @@ describe("research supervisor launch gates", () => {
         now,
         endTimeMs: now + shutdownCushionMs + 5 * 60_000 - 1,
         shutdownCushionMs,
-        agentKind: "claude",
+        agentKind: "opencode",
       })
     ).toBe(false)
   })

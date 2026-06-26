@@ -50,6 +50,9 @@ Usage:
   onyx profile use <name>
   onyx profile delete <name>
   onyx profile set-api-key-env <name> <ENV_VAR>
+  onyx profile worker get [profile]
+  onyx profile worker set [profile] --agent codex|claude|opencode [--model <model>]
+  onyx profile worker clear [profile] (--all | --agent | --model codex|claude|opencode)
   onyx campaign setup --name <name> [--description <text>] [--project-path <path>] [--offline] [--require-online]
       (creates a campaign and draft setup; each measured experiment is pushed
       as an immutable refs/onyx/experiments/* ref; setup comes from onyx/setup.json)
@@ -60,13 +63,13 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude] [--hypotheses <json-array>] [--max-experiments <n>] [--max-worker-iterations <cap>] [--max-minutes <n>]
+  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude|opencode] [--model <model>] [--hypotheses <json-array>] [--max-experiments <n>] [--max-worker-iterations <cap>] [--max-minutes <n>]
       (creates an async research session and prints low-level worker launch commands)
-  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--max-launches <n>] [--launch-batch-size <n>] [--launch-interval-seconds <n>] [--provider-backoff-seconds <n>] [--heartbeat-sample-interval <seconds>] [--agent codex|claude] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-experiments <n>] [--max-worker-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--sync-batch-size <1..100>] [--sync-drain-batches <n>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>] [--foreground] [--json]
+  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--max-launches <n>] [--launch-batch-size <n>] [--launch-interval-seconds <n>] [--provider-backoff-seconds <n>] [--heartbeat-sample-interval <seconds>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--max-experiments <n>] [--max-worker-iterations <cap>] [--max-minutes <n>] [--sync-interval <seconds>] [--sync-batch-size <1..100>] [--sync-drain-batches <n>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>] [--foreground] [--json]
       (starts the local supervisor detached by default; use --foreground to attach)
   onyx research hypotheses --example
-  onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude]
-  onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude] [--worker-command "<cmd>"] [--max-worker-iterations <cap>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>] [--quiet]
+  onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude|opencode]
+  onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-worker-iterations <cap>] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>] [--quiet]
   onyx research should-stop [--session <id>] [--iteration <n>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>] [--final-sync-timeout <seconds>] [--require-online]

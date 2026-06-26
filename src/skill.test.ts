@@ -50,7 +50,7 @@ describe("managed skill installs", () => {
     expect(ONYX_SKILL_MARKDOWN).toBe(await readFile(source, "utf8"))
   })
 
-  test("agent install-skill writes Claude and Codex managed targets", async () => {
+  test("agent install-skill writes Claude, Codex, and OpenCode managed targets", async () => {
     await withManagedSkillHome(async () => {
       await commandAgent({
         positional: ["agent", "install-skill"],
@@ -62,6 +62,7 @@ describe("managed skill installs", () => {
         "claude",
         "codex",
         "codex-home",
+        "opencode",
       ])
       for (const target of targets) {
         expect(await readFile(target.target, "utf8")).toContain("name: onyx")
@@ -69,7 +70,7 @@ describe("managed skill installs", () => {
     })
   })
 
-  test("developer skill install symlinks Claude and Codex managed targets", async () => {
+  test("developer skill install symlinks Claude, Codex, and OpenCode managed targets", async () => {
     await withManagedSkillHome(async (root) => {
       const source = join(root, "checkout", "skills", "onyx", "SKILL.md")
       await mkdir(join(root, "checkout", "skills", "onyx"), {

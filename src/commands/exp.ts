@@ -9,6 +9,7 @@ import type {
 
 import {
   listProjectCampaigns,
+  releaseResearchExperimentReservations,
   reserveResearchExperiment,
   resolveProject,
 } from "../lib/api"
@@ -34,6 +35,8 @@ import {
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import {
   cacheLocalCampaign,
+  clearLocalAttempt,
+  abandonBlockedWorkflowRunsForSession,
   listWorkflowSteps,
   listLocalAttempts,
   listLocalExperimentHistory,
@@ -636,6 +639,23 @@ async function createWorkflowRun({
     campaign.hypothesisId
   const baseCommitSha =
     args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+  if (sessionId && (workerId || hypothesisId)) {
+    const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
+      root,
+      sessionId,
+      workerId,
+      hypothesisId,
+      reason:
+        "A new workflow run superseded this blocked workflow reservation.",
+    }).catch(() => [])
+    await releaseUnloggedReservationsForRunRefs({
+      root,
+      args,
+      sessionId,
+      runRefs: abandonedRunRefs,
+      reason: "superseded blocked workflow",
+    })
+  }
   await reserveExperimentSlotForSession({
     root,
     args,
@@ -737,6 +757,37 @@ async function reserveExperimentSlotForSession({
       `Unable to reserve experiment slot for session ${sessionId}: ${message}`
     )
   }
+}
+
+async function releaseUnloggedReservationsForRunRefs({
+  root,
+  args,
+  sessionId,
+  runRefs,
+  reason,
+}: {
+  root: string
+  args: Args
+  sessionId?: string
+  runRefs: string[]
+  reason: string
+}) {
+  if (!sessionId || args.options.offline === "true" || runRefs.length === 0) {
+    return
+  }
+  const logged = await listLocalExperimentHistory(root).catch(() => [])
+  const loggedRunRefs = new Set(logged.map((record) => record.runRef))
+  const releasable = [...new Set(runRefs)].filter(
+    (runRef) => !loggedRunRefs.has(runRef)
+  )
+  if (releasable.length === 0) return
+  await releaseResearchExperimentReservations(
+    sessionId,
+    { runRefs: releasable, reason },
+    args
+  ).catch((error) => {
+    if (args.options["require-online"] === "true") throw error
+  })
 }
 
 async function executeWorkflow({
@@ -1237,6 +1288,9 @@ export async function commandExpLog(args: Args) {
         record.campaignName === campaignName
     )
     if (logged) {
+      await clearLocalAttempt(root, {
+        runRef: args.options["run-ref"],
+      }).catch(() => {})
       console.log(
         `Experiment ${args.options["run-ref"]} is already recorded for campaign ${campaignName}`
       )
@@ -1368,7 +1422,11 @@ export async function commandExpLog(args: Args) {
     hypothesisId,
   }
   await logLocalExperiment({ root, record })
-  if (args.options.offline !== "true") {
+  await clearLocalAttempt(root, { runRef }).catch(() => {})
+  const deferSync =
+    args.options["defer-sync"] === "true" ||
+    process.env.ONYX_DEFER_EXP_LOG_SYNC === "1"
+  if (args.options.offline !== "true" && !deferSync) {
     await flushOutbox(root, args, { quiet: true }).catch((error) => {
       if (args.options["require-online"] === "true") throw error
     })
@@ -1393,9 +1451,17 @@ export async function commandExpList(args: Args) {
   const sqliteRows = await listLocalExperimentHistory(root).catch(() => [])
   const rows: LocalResearchHistoryRecord[] = [...sqliteRows]
   const seenRunRefs = new Set(rows.map((row) => row.runRef))
+  const loggedCommitKeys = new Set(
+    rows.map((row) => `${row.campaignName}\0${row.resultCommitSha}`)
+  )
   const lastRuns = await listLocalAttempts(root)
   for (const lastRun of lastRuns) {
     if (seenRunRefs.has(lastRun.runRef)) continue
+    if (
+      loggedCommitKeys.has(`${lastRun.campaignName}\0${lastRun.resultCommitSha}`)
+    ) {
+      continue
+    }
     rows.push({
       schemaVersion: 1,
       source: "local",

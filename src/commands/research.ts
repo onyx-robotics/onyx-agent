@@ -17,6 +17,7 @@ import {
   getResearchSessionLive,
   getResearchSessionState,
   listProjectCampaigns,
+  releaseResearchExperimentReservations,
   reconcileCampaign,
   stopCampaignSession,
   syncResearchPresence,
@@ -38,6 +39,13 @@ import {
   validationPath,
   type ResearchSetupFile,
 } from "../lib/contract"
+import {
+  normalizeWorkerModel,
+  profileNameFromArgs,
+  readConfig,
+  validateBuiltInWorkerAgent,
+  type BuiltInWorkerAgent,
+} from "../lib/config"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import {
@@ -105,6 +113,7 @@ import {
   type WorkerFinalizationStatus,
   type WorkerInvocation,
   type WorkerLaunchManifest,
+  type WorkerAgentKind,
   type WorkerOnyxShim,
 } from "../lib/worker-launcher"
 import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
@@ -447,7 +456,7 @@ function workerHardStopGraceMs(shutdownCushionMs: number) {
 }
 
 export function minimumUsefulLaunchMs(
-  agentKind: "codex" | "claude" | "custom"
+  agentKind: WorkerAgentKind
 ) {
   return agentKind === "custom"
     ? CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS
@@ -463,7 +472,7 @@ export function canLaunchWorkerBeforeDeadline({
   now: number
   endTimeMs: number
   shutdownCushionMs: number
-  agentKind: "codex" | "claude" | "custom"
+  agentKind: WorkerAgentKind
 }) {
   const usefulMs = endTimeMs - shutdownCushionMs - now
   return usefulMs >= minimumUsefulLaunchMs(agentKind)
@@ -619,12 +628,92 @@ function workerBudgetOptions({
   return ` --max-worker-iterations ${maxWorkerIterations} --max-minutes ${maxMinutes}`
 }
 
-function workerAgentOption(args: Args) {
-  const agentKind = args.options.agent ?? "codex"
-  if (agentKind !== "codex" && agentKind !== "claude") {
-    throw new Error("--agent must be codex or claude")
+function metadataString(
+  metadata: Record<string, unknown>,
+  key: string
+) {
+  const value = metadata[key]
+  return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
+function validateWorkerModel(agentKind: BuiltInWorkerAgent, model: string | null) {
+  if (!model) return null
+  if (agentKind === "opencode") {
+    const slash = model.indexOf("/")
+    if (slash <= 0 || slash === model.length - 1) {
+      throw new Error("--model for --agent opencode must use provider/model")
+    }
   }
-  return agentKind
+  return model
+}
+
+type WorkerSettings = {
+  agentKind: BuiltInWorkerAgent
+  workerModel: string | null
+}
+
+async function resolveWorkerSettings({
+  args,
+  sessionMetadata,
+}: {
+  args: Args
+  sessionMetadata?: Record<string, unknown> | null
+}): Promise<WorkerSettings> {
+  const existingAgent = sessionMetadata
+    ? metadataString(sessionMetadata, "agentKind")
+    : null
+  const existingModel = sessionMetadata
+    ? metadataString(sessionMetadata, "workerModel")
+    : null
+  if (existingAgent) {
+    const agentKind = validateBuiltInWorkerAgent(existingAgent)
+    if (args.options.agent !== undefined && args.options.agent !== agentKind) {
+      throw new Error(
+        `Research session already uses --agent ${agentKind}; create a new session to use ${args.options.agent}.`
+      )
+    }
+    const requestedModel = normalizeWorkerModel(args.options.model)
+    if (args.options.model !== undefined && requestedModel !== existingModel) {
+      throw new Error(
+        existingModel
+          ? `Research session already uses --model ${existingModel}; create a new session to use ${requestedModel ?? "(default)"}.`
+          : `Research session has no worker model; create a new session to use ${requestedModel ?? "(default)"}.`
+      )
+    }
+    return {
+      agentKind,
+      workerModel: validateWorkerModel(agentKind, existingModel),
+    }
+  }
+
+  const config = await readConfig()
+  const profileName = profileNameFromArgs(args, config)
+  const profile = profileName ? config.profiles[profileName] : undefined
+  const agentKind = validateBuiltInWorkerAgent(
+    args.options.agent ??
+      process.env.ONYX_WORKER_AGENT ??
+      profile?.worker?.agent ??
+      "codex"
+  )
+  const workerModel = validateWorkerModel(
+    agentKind,
+    normalizeWorkerModel(args.options.model) ??
+      normalizeWorkerModel(process.env.ONYX_WORKER_MODEL) ??
+      normalizeWorkerModel(profile?.worker?.models?.[agentKind]) ??
+      null
+  )
+  return { agentKind, workerModel }
+}
+
+function workerOptions({
+  agentKind,
+  workerModel,
+}: WorkerSettings) {
+  return ` --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}`
+}
+
+function workerModelMetadata(workerModel: string | null) {
+  return workerModel ? { workerModel } : {}
 }
 
 async function createWorkerTempDir({
@@ -969,6 +1058,7 @@ function createSyncSupervisor({
   let lastSyncDurationMs: number | null = null
   let lastSyncError: string | null = null
   let lastSyncOffline = false
+  let flushActive = false
 
   const depth = () => queue.length + active
   const syncTelemetry = () => ({
@@ -1008,6 +1098,7 @@ function createSyncSupervisor({
     timedOut: false,
   })
   const runFlushJob = async (job: SyncQueueFlushJob) => {
+    flushActive = true
     await flushOutbox(root, args, {
       quiet: true,
       maxBatches: maxBatchesPerFlush,
@@ -1039,11 +1130,19 @@ function createSyncSupervisor({
         })
       })
       .catch((error) => {
-        lastSyncError = error instanceof Error ? error.message : String(error)
+        const message = error instanceof Error ? error.message : String(error)
+        const lockContention = /Timed out waiting for local Onyx research-sync lock/i.test(
+          message
+        )
+        if (!lockContention) lastSyncError = message
         void emitJobEvent(job, "sync_result", "SQLite sync failed", {
-          error: lastSyncError,
+          error: message,
+          lockContention,
         })
-        console.warn(`Background sync skipped: ${lastSyncError}`)
+        if (!lockContention) console.warn(`Background sync skipped: ${message}`)
+      })
+      .finally(() => {
+        flushActive = false
       })
   }
   const runPushRefJob = async (job: SyncQueuePushRefJob) => {
@@ -1075,6 +1174,12 @@ function createSyncSupervisor({
   }
   const enqueue = (job: SyncQueueJob, options: { force?: boolean } = {}) => {
     if (stopped && !options.force) return null
+    if (
+      job.kind === "flush" &&
+      (flushActive || queue.some((item) => item.kind === "flush"))
+    ) {
+      return depth()
+    }
     if (depth() >= MAX_SYNC_QUEUE_DEPTH) return null
     queue.push(job)
     pump()
@@ -1516,6 +1621,39 @@ async function drainFinalSync({
     lastDurationMs,
     lastError,
     firstFailed: firstConflict ?? firstPendingError ?? null,
+  }
+}
+
+async function releaseUnloggedExperimentReservations({
+  root,
+  args,
+  sessionId,
+  runRefs,
+  reason,
+}: {
+  root: string
+  args: Args
+  sessionId: string
+  runRefs: string[]
+  reason: string
+}) {
+  const uniqueRunRefs = [...new Set(runRefs.filter(Boolean))]
+  if (uniqueRunRefs.length === 0 || args.options.offline === "true") return
+  const logged = await listLocalExperimentHistory(root).catch(() => [])
+  const loggedRunRefs = new Set(logged.map((record) => record.runRef))
+  const releasable = uniqueRunRefs.filter((runRef) => !loggedRunRefs.has(runRef))
+  if (releasable.length === 0) return
+  try {
+    await releaseResearchExperimentReservations(
+      sessionId,
+      { runRefs: releasable, reason },
+      args
+    )
+  } catch (error) {
+    if (args.options["require-online"] === "true") throw error
+    console.warn(
+      `Reservation release skipped: ${error instanceof Error ? error.message : String(error)}`
+    )
   }
 }
 
@@ -2254,6 +2392,7 @@ export async function finalizeHypothesisAttempt({
               hypothesis: hypothesis.id,
               session: sessionId,
               worker: workerId,
+              "defer-sync": "true",
               ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
               ...(measurementError
                 ? { status: "failed", "allow-unmeasured": "true" }
@@ -2302,6 +2441,23 @@ export async function finalizeHypothesisAttempt({
               .join("; ")
           })
       }
+    }
+
+    if (manifest.finalizationStatus.startsWith("salvaged_unmeasured")) {
+      const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
+        root,
+        sessionId,
+        workerId,
+        hypothesisId: hypothesis.id,
+        reason: `Worker finalization ${manifest.finalizationStatus}; reservation no longer represents a loggable attempt.`,
+      }).catch(() => [])
+      await releaseUnloggedExperimentReservations({
+        root,
+        args,
+        sessionId,
+        runRefs: abandonedRunRefs,
+        reason: `worker finalization ${manifest.finalizationStatus}`,
+      })
     }
 
     const workerBranchPush = await pushWorkerBranch({
@@ -2493,6 +2649,8 @@ export type ResearchStopCheck = {
   sessionId: string
   reasonCodes: ResearchStopReasonCode[]
   reasons: string[]
+  budgetSaturated: boolean
+  budgetExhausted: boolean
 }
 
 type ResearchStopControlStateCache = {
@@ -2575,6 +2733,8 @@ export async function collectResearchStopReasons({
 }): Promise<ResearchStopCheck> {
   const reasons: string[] = []
   const reasonCodes = new Set<ResearchStopReasonCode>()
+  let budgetSaturated = false
+  let budgetExhausted = false
   const addStopReason = (code: ResearchStopReasonCode, reason: string) =>
     addResearchStopReason(reasonCodes, reasons, code, reason)
 
@@ -2622,10 +2782,13 @@ export async function collectResearchStopReasons({
       controlStateCache,
       controlStateTtlMs,
     })
-    if (
-      remote.budget.remainingCount !== null &&
-      remote.budget.remainingCount <= 0
-    ) {
+    budgetSaturated = Boolean(remote.budget.budgetSaturated)
+    budgetExhausted =
+      remote.budget.budgetExhausted ??
+      (remote.budget.remainingCount !== null &&
+        remote.budget.remainingCount <= 0 &&
+        remote.budget.reservedCount === 0)
+    if (budgetExhausted) {
       addStopReason("budget_exhausted", "experiment budget exhausted")
     }
     if (remote.budget.expiredReservationCount > 0) {
@@ -2651,6 +2814,8 @@ export async function collectResearchStopReasons({
     sessionId,
     reasonCodes: [...reasonCodes],
     reasons,
+    budgetSaturated,
+    budgetExhausted,
   }
 }
 
@@ -2847,6 +3012,7 @@ function workerMetadata({
 }) {
   return {
     launcher: invocation.agentKind,
+    ...workerModelMetadata(invocation.workerModel ?? null),
     workerLogPath: manifest.logPath,
     workerActivityLogPath: manifest.activityLogPath,
     workerActivityJsonlPath: manifest.activityJsonlPath,
@@ -2897,6 +3063,7 @@ async function persistWorkerLaunchState({
         onyxShimPath: manifest.onyxShimPath,
         latestStatePath: manifest.latestStatePath,
         addedWritableRoots: manifest.addedWritableRoots,
+        ...workerModelMetadata(manifest.workerModel ?? null),
       },
       startedAt: manifest.startedAt,
       completedAt: manifest.completedAt,
@@ -2922,6 +3089,7 @@ async function runHypothesisOnce({
   hypothesis,
   workerCommand,
   agentKind,
+  workerModel,
   maxIterations,
   endTimeMs,
   hardEndTimeMs,
@@ -2941,6 +3109,7 @@ async function runHypothesisOnce({
   hypothesis: ApiHypothesis
   workerCommand?: string
   agentKind: string
+  workerModel: string | null
   maxIterations: number
   endTimeMs: number
   hardEndTimeMs: number
@@ -2985,6 +3154,7 @@ async function runHypothesisOnce({
       workerName: `${hypothesis.name}-${effectiveAgentKind}`,
       agentKind: effectiveAgentKind,
       runtime: "local",
+      metadata: workerModelMetadata(workerModel),
     })
     workerId = worker.id
     onRegistered?.({ workerId: worker.id, hypothesisId: hypothesis.id })
@@ -2997,6 +3167,7 @@ async function runHypothesisOnce({
       phase: "starting",
       event: "hypothesis_started",
       progressMessage: `Preparing ${hypothesis.name} worker preflight`,
+      metadata: workerModelMetadata(workerModel),
     })
 
     const worktreeInfo = await ensureWorktree({
@@ -3049,6 +3220,7 @@ async function runHypothesisOnce({
       ONYX_HYPOTHESIS_NAME: hypothesis.name,
       ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
+      ONYX_DEFER_EXP_LOG_SYNC: "1",
       ONYX_RESEARCH_DB: await researchDbPath(root),
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
@@ -3068,6 +3240,9 @@ async function runHypothesisOnce({
       ONYX_SHUTDOWN_CUSHION_SECONDS: String(
         Math.ceil(prompt.shutdownCushionMs / 1000)
       ),
+      ...(effectiveAgentKind === "opencode"
+        ? { OPENCODE_DISABLE_PROJECT_CONFIG: "1" }
+        : {}),
     }
     const addedWritableRoots = workerCommand
       ? []
@@ -3078,6 +3253,8 @@ async function runHypothesisOnce({
       worktree,
       prompt: prompt.markdown,
       addedWritableRoots,
+      workerModel,
+      workerTitle: worker.id,
     })
     await recordLocalWorkerHeartbeat({
       root,
@@ -3088,6 +3265,7 @@ async function runHypothesisOnce({
       phase: "orienting",
       event: "context_ready",
       progressMessage: `Worker context files are ready for ${hypothesis.name}`,
+      metadata: workerModelMetadata(workerModel),
     })
     const preflight = await preflightWorkerInvocation(invocation, {
       cwd: worktree,
@@ -3105,6 +3283,7 @@ async function runHypothesisOnce({
     launchManifest = {
       schemaVersion: 1,
       agentKind: invocation.agentKind,
+      workerModel: invocation.workerModel ?? null,
       command: invocation.command,
       args: invocation.redactedArgs,
       onyxShimPath: workerShim.onyxPath,
@@ -3150,6 +3329,7 @@ async function runHypothesisOnce({
         command: invocation.command,
         args: invocation.redactedArgs,
         workerBranch,
+        ...workerModelMetadata(workerModel),
       },
     })
     await appendWorkerActivityEvent(launchManifest, {
@@ -3575,14 +3755,7 @@ export async function commandResearchStart(args: Args) {
     workerTargetOption === undefined && hypotheses
       ? hypotheses.length
       : positiveIntegerOption(args, "workers", Number(workerTargetOption ?? 1))
-  const launchAgent = args.options.agent
-  if (
-    launchAgent !== undefined &&
-    launchAgent !== "codex" &&
-    launchAgent !== "claude"
-  ) {
-    throw new Error("--agent must be codex or claude")
-  }
+  const workerSettings = await resolveWorkerSettings({ args })
   const endTimeMs = Date.now() + maxMinutes * 60_000
   const result = await createLocalSession({
     root,
@@ -3598,7 +3771,8 @@ export async function commandResearchStart(args: Args) {
       maxWorkerIterations,
       maxExperiments,
       maxMinutes,
-      agentKind: launchAgent ?? "codex",
+      agentKind: workerSettings.agentKind,
+      ...workerModelMetadata(workerSettings.workerModel),
     },
   })
   const state = await readState(root)
@@ -3638,7 +3812,7 @@ export async function commandResearchStart(args: Args) {
   console.log(`Workers: 0/${workerTarget}`)
   console.log(`Hypotheses: ${result.hypotheses.length}`)
   console.log(`Max experiments: ${maxExperiments ?? "unbounded"}`)
-  const agentOption = launchAgent ? ` --agent ${launchAgent}` : ""
+  const agentOption = workerOptions(workerSettings)
   const budgetOptions = workerBudgetOptions({
     maxWorkerIterations,
     maxMinutes,
@@ -3701,14 +3875,20 @@ export async function commandResearchHypothesisAdd(args: Args) {
   }
   await assertLocalSetupReady(root, projectPath)
   const sessionMetadata = before?.session.metadata ?? {}
-  const agentKind =
+  const rawAgentKind =
     args.options.agent ??
     (typeof sessionMetadata.agentKind === "string"
       ? sessionMetadata.agentKind
       : "codex")
-  if (agentKind !== "codex" && agentKind !== "claude") {
-    throw new Error("--agent must be codex or claude")
-  }
+  const agentKind =
+    rawAgentKind === "custom" ? "custom" : validateBuiltInWorkerAgent(rawAgentKind)
+  const workerModel =
+    agentKind === "custom"
+      ? null
+      : validateWorkerModel(
+          agentKind,
+          metadataString(sessionMetadata, "workerModel")
+        )
   const createdHypothesis = await createLocalHypothesis({
     root,
     campaignId: campaign.id,
@@ -3779,7 +3959,7 @@ export async function commandResearchHypothesisAdd(args: Args) {
       maxMinutes,
     })
     console.log(
-      `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}${budgetOptions}`
+      `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}${budgetOptions}`
     )
   } else {
     console.log("Start or choose a research session before launching a worker.")
@@ -4353,6 +4533,8 @@ export async function commandResearchShouldStop(args: Args) {
           sessionId,
           reasonCodes: result.reasonCodes,
           reasons: result.reasons,
+          budgetSaturated: result.budgetSaturated,
+          budgetExhausted: result.budgetExhausted,
         },
         null,
         2
@@ -4470,12 +4652,19 @@ export async function commandResearchFinish(args: Args) {
       providerBackoff: null,
     }
     await writeState(root, state)
-    await abandonBlockedWorkflowRunsForSession({
+    const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
       root,
       sessionId,
       reason:
         "Campaign finalized; blocked worker workflow is no longer active.",
-    }).catch(() => {})
+    }).catch(() => [])
+    await releaseUnloggedExperimentReservations({
+      root,
+      args,
+      sessionId,
+      runRefs: abandonedRunRefs,
+      reason: "blocked workflows abandoned during campaign finish",
+    })
     await stopLocalSession({
       root,
       sessionId,
@@ -5214,9 +5403,27 @@ export async function commandResearchRun(args: Args) {
   })
   await assertMainWorktreeClean(root, "before running research")
 
-  const agentKind = workerAgentOption(args)
-  const sessionAgentKind = args.options["worker-command"] ? "custom" : agentKind
+  if (args.options["worker-command"] && args.options.model !== undefined) {
+    throw new Error("Pass either --worker-command or --model, not both.")
+  }
   const sessionMetadata = sessionState?.session.metadata ?? {}
+  const workerSettings = args.options["worker-command"]
+    ? ({ agentKind: "codex", workerModel: null } satisfies WorkerSettings)
+    : await resolveWorkerSettings({
+        args,
+        sessionMetadata: sessionState ? sessionMetadata : null,
+      })
+  const agentKind = workerSettings.agentKind
+  const workerModel = workerSettings.workerModel
+  const resolvedWorkerArgs: Args = {
+    ...args,
+    options: {
+      ...args.options,
+      agent: agentKind,
+      ...(workerModel ? { model: workerModel } : {}),
+    },
+  }
+  const sessionAgentKind = args.options["worker-command"] ? "custom" : agentKind
   const maxWorkerIterations = maxWorkerIterationsOption(
     args,
     typeof sessionMetadata.maxWorkerIterations === "number"
@@ -5327,6 +5534,7 @@ export async function commandResearchRun(args: Args) {
         maxExperiments,
         maxMinutes,
         agentKind: sessionAgentKind,
+        ...workerModelMetadata(workerModel),
         maxConcurrency,
         ...(maxLaunches ? { maxLaunches } : {}),
         launchBatchSize,
@@ -5370,7 +5578,7 @@ export async function commandResearchRun(args: Args) {
   if (args.options.foreground !== "true") {
     await launchDetachedResearchSupervisor({
       root,
-      args,
+      args: resolvedWorkerArgs,
       sessionId,
       campaign,
       launchRate,
@@ -5504,7 +5712,11 @@ export async function commandResearchRun(args: Args) {
   console.log(
     `Launch ramp: batch=${launchBatchSize} interval=${launchIntervalMs / 1000}s`
   )
-  console.log(`Agent: ${args.options["worker-command"] ? "custom" : agentKind}`)
+  console.log(
+    `Agent: ${args.options["worker-command"] ? "custom" : agentKind}${
+      workerModel ? ` (${workerModel})` : ""
+    }`
+  )
   console.log(`Presence: every ${presenceIntervalMs / 1000}s`)
   console.log(`Sync: every ${syncIntervalMs / 1000}s`)
 
@@ -5526,6 +5738,8 @@ export async function commandResearchRun(args: Args) {
         sessionId,
         reasonCodes: [],
         reasons: [],
+        budgetSaturated: false,
+        budgetExhausted: false,
       }
       try {
         stopCheck = await sessionStopChecker.check({ nowMs: loopNow })
@@ -5579,6 +5793,8 @@ export async function commandResearchRun(args: Args) {
       const launchCapSlots =
         maxLaunches === null ? Number.POSITIVE_INFINITY : maxLaunches - launched
       const providerBackoffActive = Date.now() < providerBackoffUntil
+      const budgetSaturated =
+        stopCheck.budgetSaturated && !stopCheck.budgetExhausted
       if (
         providerBackoffActive &&
         activeRuns.size === 0 &&
@@ -5597,7 +5813,7 @@ export async function commandResearchRun(args: Args) {
         lastLaunchBatchAt > 0 &&
         Date.now() - lastLaunchBatchAt < launchIntervalMs
       const launchSlots =
-        providerBackoffActive || rampWaiting
+        providerBackoffActive || rampWaiting || budgetSaturated
           ? 0
           : Math.min(
               openSlots,
@@ -5613,6 +5829,12 @@ export async function commandResearchRun(args: Args) {
           `Provider backoff active (${providerBackoffReason ?? "startup failure"}); pausing launches for ${Math.ceil(
             (providerBackoffUntil - Date.now()) / 1000
           )}s.`
+        )
+      }
+      if (budgetSaturated && activeRuns.size === 0 && !waitingLogged) {
+        waitingLogged = true
+        console.log(
+          "Supervisor waiting for experiment reservations to resolve before launching more workers."
         )
       }
 
@@ -5675,6 +5897,7 @@ export async function commandResearchRun(args: Args) {
           hypothesis,
           workerCommand: args.options["worker-command"],
           agentKind,
+          workerModel,
           maxIterations: maxWorkerIterations,
           endTimeMs,
           hardEndTimeMs,
@@ -6075,6 +6298,9 @@ export async function commandWorkerRun(args: Args) {
       "Use --hypothesis <id>; lanes have been replaced by hypotheses."
     )
   }
+  if (args.options["worker-command"] && args.options.model !== undefined) {
+    throw new Error("Pass either --worker-command or --model, not both.")
+  }
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
@@ -6125,6 +6351,12 @@ export async function commandWorkerRun(args: Args) {
   }
 
   const sessionMetadata = sessionState.session.metadata
+  const workerSettings = args.options["worker-command"]
+    ? ({ agentKind: "codex", workerModel: null } satisfies WorkerSettings)
+    : await resolveWorkerSettings({
+        args,
+        sessionMetadata,
+      })
   const maxWorkerIterations = maxWorkerIterationsOption(
     args,
     typeof sessionMetadata.maxWorkerIterations === "number"
@@ -6170,7 +6402,8 @@ export async function commandWorkerRun(args: Args) {
     sessionId,
     hypothesis,
     workerCommand: args.options["worker-command"],
-    agentKind: args.options.agent ?? "codex",
+    agentKind: workerSettings.agentKind,
+    workerModel: workerSettings.workerModel,
     maxIterations: maxWorkerIterations,
     endTimeMs: Date.now() + sessionBudgetMs,
     hardEndTimeMs: Date.now() + sessionBudgetMs + hardStopGraceMs,

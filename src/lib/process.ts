@@ -49,6 +49,32 @@ function textFromClaudeMessage(record: Record<string, unknown>) {
   return lines
 }
 
+function activityLinesFromOpenCodeEvent(record: Record<string, unknown>) {
+  const type = record.type
+  if (type === "text" && typeof record.text === "string") {
+    return [compact(record.text)]
+  }
+  if (type === "tool_use") {
+    const name =
+      typeof record.name === "string"
+        ? record.name
+        : typeof record.tool === "string"
+          ? record.tool
+          : "tool"
+    return [`tool: ${name}`]
+  }
+  if (type === "step_start") return ["step: start"]
+  if (type === "step_finish") return ["step: finish"]
+  if (type === "error") {
+    return [
+      `error: ${
+        typeof record.message === "string" ? compact(record.message) : "opencode"
+      }`,
+    ]
+  }
+  return []
+}
+
 function activityLinesForOutput(
   stream: "stdout" | "stderr",
   text: string
@@ -73,6 +99,11 @@ function activityLinesForOutput(
       }
       if (parsed.type === "assistant") {
         lines.push(...textFromClaudeMessage(parsed))
+        continue
+      }
+      const openCodeLines = activityLinesFromOpenCodeEvent(parsed)
+      if (openCodeLines.length > 0) {
+        lines.push(...openCodeLines)
         continue
       }
       if (parsed.type === "result" && typeof parsed.subtype === "string") {
@@ -367,7 +398,7 @@ export async function runStreamingProcess(
       )
       reject(error)
     })
-    child.on("close", (code, signal) => {
+    child.on("close", async (code, signal) => {
       if (closed) return
       closed = true
       if (timeout) clearTimeout(timeout)
@@ -375,27 +406,37 @@ export async function runStreamingProcess(
       if (forceKill) clearTimeout(forceKill)
       if (cancelPoll) clearInterval(cancelPoll)
       removeSignalHandlers()
-      log.end(
-        [
-          "",
-          `# onyx worker process exited ${new Date().toISOString()}`,
-          `# code: ${code ?? "null"}`,
-          `# signal: ${signal ?? "null"}`,
-          `# timedOut: ${timedOut}`,
-          `# startupTimedOut: ${startupTimedOut}`,
-          `# cancelled: ${cancelled}`,
-          "",
-        ].join("\n")
-      )
-      activityLog?.end(
-        [
-          `# onyx worker activity exited ${new Date().toISOString()}`,
-          `# code: ${code ?? "null"}`,
-          `# signal: ${signal ?? "null"}`,
-          `# cancelled: ${cancelled}`,
-          "",
-        ].join("\n")
-      )
+      await Promise.all([
+        new Promise<void>((resolve) => {
+          log.end(
+            [
+              "",
+              `# onyx worker process exited ${new Date().toISOString()}`,
+              `# code: ${code ?? "null"}`,
+              `# signal: ${signal ?? "null"}`,
+              `# timedOut: ${timedOut}`,
+              `# startupTimedOut: ${startupTimedOut}`,
+              `# cancelled: ${cancelled}`,
+              "",
+            ].join("\n"),
+            resolve
+          )
+        }),
+        activityLog
+          ? new Promise<void>((resolve) => {
+              activityLog.end(
+                [
+                  `# onyx worker activity exited ${new Date().toISOString()}`,
+                  `# code: ${code ?? "null"}`,
+                  `# signal: ${signal ?? "null"}`,
+                  `# cancelled: ${cancelled}`,
+                  "",
+                ].join("\n"),
+                resolve
+              )
+            })
+          : Promise.resolve(),
+      ])
       resolveProcess({
         code,
         signal,

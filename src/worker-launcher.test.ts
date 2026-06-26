@@ -93,7 +93,7 @@ async function writeFakeOnyx(path: string) {
 }
 
 describe("worker launchers", () => {
-  test("builds direct Codex and Claude invocations with git writable roots", () => {
+  test("builds direct Codex, Claude, and OpenCode invocations", () => {
     const prompt = "SECRET_PROMPT"
     const addedWritableRoots = ["/tmp/worktree/.git", "/tmp/repo/.git"]
     const codex = buildWorkerInvocation({
@@ -101,12 +101,21 @@ describe("worker launchers", () => {
       worktree: "/tmp/worktree",
       prompt,
       addedWritableRoots,
+      workerModel: "gpt-5-codex",
     })
     const claude = buildWorkerInvocation({
       agentKind: "claude",
       worktree: "/tmp/worktree",
       prompt,
       addedWritableRoots,
+      workerModel: "sonnet",
+    })
+    const opencode = buildWorkerInvocation({
+      agentKind: "opencode",
+      worktree: "/tmp/worktree",
+      prompt,
+      workerModel: "openrouter/qwen/qwen3-coder",
+      workerTitle: "worker_123",
     })
 
     expect(codex.command).toBe("codex")
@@ -116,6 +125,8 @@ describe("worker launchers", () => {
       "workspace-write",
       "--ask-for-approval",
       "never",
+      "--model",
+      "gpt-5-codex",
       "exec",
       "--cd",
       "/tmp/worktree",
@@ -136,6 +147,8 @@ describe("worker launchers", () => {
     expect(claude.args).toEqual([
       "--verbose",
       "--print",
+      "--model",
+      "sonnet",
       "--input-format",
       "text",
       "--output-format",
@@ -153,6 +166,23 @@ describe("worker launchers", () => {
     ])
     expect(claude.stdin).toBe(prompt)
     expect(JSON.stringify(claude.args)).not.toContain(prompt)
+
+    expect(opencode.command).toBe("opencode")
+    expect(opencode.args).toEqual([
+      "run",
+      "--dir",
+      "/tmp/worktree",
+      "--format",
+      "json",
+      "--title",
+      "worker_123",
+      "--model",
+      "openrouter/qwen/qwen3-coder",
+      "--dangerously-skip-permissions",
+    ])
+    expect(opencode.preflightArgs).toEqual(["run", "--help"])
+    expect(opencode.stdin).toBe(prompt)
+    expect(JSON.stringify(opencode.args)).not.toContain(prompt)
   })
 
   test("preflights and streams built-in worker stdin to logs", async () => {
@@ -216,6 +246,40 @@ describe("worker launchers", () => {
     expect(result.activityLogPath).toBe(activityLogPath)
   })
 
+  test("streams common OpenCode JSON events to activity logs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-opencode-activity-"))
+    const logPath = join(root, "worker.log")
+    const activityLogPath = join(root, "worker.activity.log")
+    const result = await runStreamingProcess(
+      "sh",
+      [
+        "-c",
+        [
+          `printf '%s\\n' '{"type":"step_start"}'`,
+          `printf '%s\\n' '{"type":"text","text":"hello from opencode"}'`,
+          `printf '%s\\n' '{"type":"tool_use","name":"bash"}'`,
+          `printf '%s\\n' '{"type":"step_finish"}'`,
+          `printf '%s\\n' '{"type":"error","message":"provider failed"}'`,
+        ].join("; "),
+      ],
+      {
+        logPath,
+        activityLogPath,
+        timeoutMs: 5000,
+        startupTimeoutMs: 1000,
+        killGraceMs: 100,
+      }
+    )
+
+    expect(result.code).toBe(0)
+    const activity = await readFile(activityLogPath, "utf8")
+    expect(activity).toContain("[stdout] step: start")
+    expect(activity).toContain("[stdout] hello from opencode")
+    expect(activity).toContain("[stdout] tool: bash")
+    expect(activity).toContain("[stdout] step: finish")
+    expect(activity).toContain("[stdout] error: provider failed")
+  })
+
   test("streams full output to logs while retaining only bounded tails", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-tail-"))
     const logPath = join(root, "worker.log")
@@ -276,6 +340,44 @@ describe("worker launchers", () => {
     expect(preflight.version).toContain("claude fake 2.0")
   })
 
+  test("OpenCode preflight failures include install guidance", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-opencode-preflight-"))
+    const bin = join(root, "bin")
+    const worktree = join(root, "worktree")
+    await mkdir(bin)
+    await mkdir(worktree)
+    await writeFile(
+      join(bin, "opencode"),
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'echo "opencode auth missing" >&2',
+        "exit 7",
+        "",
+      ].join("\n"),
+      "utf8"
+    )
+    await chmod(join(bin, "opencode"), 0o755)
+
+    const invocation = buildWorkerInvocation({
+      agentKind: "opencode",
+      worktree,
+      prompt: "do useful work",
+      workerModel: "openrouter/qwen/qwen3-coder",
+    })
+    await expect(
+      preflightWorkerInvocation(invocation, {
+        cwd: worktree,
+        env: {
+          ...process.env,
+          PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+        },
+      })
+    ).rejects.toThrow(
+      "Install or authenticate OpenCode before using `--agent opencode`."
+    )
+  })
+
   test("preflight does not run the evaluation tool before worker launch", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-no-eval-"))
     const bin = join(root, "bin")
@@ -312,6 +414,7 @@ describe("worker launchers", () => {
     await writeWorkerLaunchManifest({
       schemaVersion: 1,
       agentKind: "codex",
+      workerModel: null,
       command: "codex",
       args: ["exec"],
       onyxShimPath: null,

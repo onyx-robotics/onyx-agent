@@ -83,6 +83,7 @@ import {
   upsertWorkflowRun,
   writeLocalAttempt,
 } from "./lib/research-db"
+import { writeConfig } from "./lib/config"
 import { runProcess } from "./lib/process"
 import { writeWorkerLaunchManifest } from "./lib/worker-launcher"
 
@@ -945,6 +946,7 @@ describe("worker finalization", () => {
     const manifest: WorkerLaunchManifest = {
       schemaVersion: 1,
       agentKind: "codex",
+      workerModel: null,
       command: "codex",
       args: [],
       onyxShimPath: null,
@@ -1228,10 +1230,13 @@ describe("worker finalization", () => {
                   finalizationStatus: "running",
                   budget: {
                     maxExperiments: 1,
-                    reservedCount: 1,
-                    terminalCount: 0,
+                    reservedCount: 0,
+                    terminalCount: 1,
                     remainingCount: 0,
-                    openReservationCount: 1,
+                    terminalRemainingCount: 0,
+                    budgetSaturated: true,
+                    budgetExhausted: true,
+                    openReservationCount: 0,
                     expiredReservationCount: 0,
                   },
                   finalization: {
@@ -1284,7 +1289,7 @@ describe("worker finalization", () => {
 })
 
 describe("exp log", () => {
-  test("preserves explicit scoped run attempts and logs each run ref once", async () => {
+  test("logs explicit scoped run attempts once and clears local duplicates", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
       await writeResearchSmokeRepo()
     const sessionId = "22222222-2222-4222-8222-222222222222"
@@ -1386,7 +1391,7 @@ describe("exp log", () => {
     ).toHaveLength(1)
     const remainingRuns = await listLocalAttempts(root)
     expect(new Set(remainingRuns.map((run) => run.runRef))).toEqual(
-      new Set([workerOne.runRef, workerTwo.runRef])
+      new Set([workerOne.runRef])
     )
 
     const listLogs: string[] = []
@@ -1732,6 +1737,156 @@ describe("automated research smoke", () => {
       "printf 'fast worker done\\n'",
     ].join(" && ")
   }
+
+  test("research start resolves profile worker defaults and CLI model overrides", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "profile-worker-defaults"
+    await createSupervisorRunCampaign({ root, baseCommitSha, campaignName })
+    const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-profile-"))
+    const previousConfigHome = process.env.XDG_CONFIG_HOME
+    const previousWorkerAgent = process.env.ONYX_WORKER_AGENT
+    const previousWorkerModel = process.env.ONYX_WORKER_MODEL
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...items: unknown[]) => {
+      logs.push(items.join(" "))
+    }
+
+    try {
+      process.env.XDG_CONFIG_HOME = configHome
+      delete process.env.ONYX_WORKER_AGENT
+      delete process.env.ONYX_WORKER_MODEL
+      await writeConfig({
+        currentProfile: "alpha",
+        profiles: {
+          alpha: {
+            apiUrl: "https://app.onyx.test",
+            apiKey: "onyx_key",
+            teamId: "22222222-2222-4222-8222-222222222222",
+            teamName: "Alpha Team",
+            updatedAt: "2026-06-20T00:00:00.000Z",
+            worker: {
+              agent: "opencode",
+              models: { opencode: "openrouter/qwen/qwen3-coder" },
+            },
+          },
+        },
+      })
+
+      process.chdir(root)
+      await commandResearchStart({
+        positional: ["research", "start"],
+        options: {
+          campaign: campaignName,
+          workers: "1",
+          hypotheses: JSON.stringify(supervisorPlans(1)),
+          model: "openrouter/deepseek/deepseek-v3",
+          "max-worker-iterations": "2",
+          "max-minutes": "5",
+        },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+      if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = previousConfigHome
+      if (previousWorkerAgent === undefined) delete process.env.ONYX_WORKER_AGENT
+      else process.env.ONYX_WORKER_AGENT = previousWorkerAgent
+      if (previousWorkerModel === undefined) delete process.env.ONYX_WORKER_MODEL
+      else process.env.ONYX_WORKER_MODEL = previousWorkerModel
+    }
+
+    const sessionLine = logs.find((line) =>
+      line.startsWith("Research session: ")
+    )
+    expect(sessionLine).toBeDefined()
+    const sessionId = sessionLine!.replace("Research session: ", "")
+    const state = await getLocalSessionState(root, sessionId)
+    expect(state.session.metadata).toMatchObject({
+      agentKind: "opencode",
+      workerModel: "openrouter/deepseek/deepseek-v3",
+    })
+    const workerLine = logs.find((line) => line.includes("onyx worker run"))
+    expect(workerLine).toContain(
+      "--agent opencode --model openrouter/deepseek/deepseek-v3"
+    )
+  })
+
+  test("research run rejects conflicting worker settings for existing sessions", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "existing-worker-settings"
+    const campaign = await createSupervisorRunCampaign({
+      root,
+      baseCommitSha,
+      campaignName,
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      hypotheses: supervisorPlans(1),
+      metadata: {
+        agentKind: "opencode",
+        workerModel: "openrouter/qwen/qwen3-coder",
+      },
+    })
+    await updateState(root, (state) => {
+      const key = campaignStateKey("", campaignName)
+      state.campaigns = state.campaigns ?? {}
+      state.campaigns[key] = {
+        ...(state.campaigns[key] ?? {}),
+        campaignId: campaign.id,
+        projectPath: "",
+        baseCommitSha,
+        metricName: "score",
+        metricDirection: "maximize",
+        sessionId: session.session.id,
+      }
+      state.sessions = state.sessions ?? {}
+      state.sessions[session.session.id] = {
+        campaignName,
+        campaignId: campaign.id,
+        endTimeMs: Date.now() + 60_000,
+        status: "running",
+      }
+    })
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            session: session.session.id,
+            workers: "1",
+            agent: "codex",
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow("Research session already uses --agent opencode")
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            session: session.session.id,
+            workers: "1",
+            agent: "opencode",
+            model: "openrouter/deepseek/deepseek-v3",
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow(
+        "Research session already uses --model openrouter/qwen/qwen3-coder"
+      )
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
 
   test("research run starts a detached supervisor by default", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
@@ -2241,7 +2396,6 @@ describe("automated research smoke", () => {
         "metrics",
         "push_result",
         "finalization_result",
-        "sync_result",
       ])
     )
 
@@ -3388,6 +3542,7 @@ describe("research status", () => {
     await writeWorkerLaunchManifest({
       schemaVersion: 1,
       agentKind: "codex",
+      workerModel: null,
       command: "codex",
       args: [],
       onyxShimPath: null,

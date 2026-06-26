@@ -70,6 +70,12 @@ function remoteControlState(overrides: Record<string, unknown> = {}) {
     typeof overrides.expiredReservationCount === "number"
       ? overrides.expiredReservationCount
       : 0
+  const remainingCount =
+    maxExperiments === null
+      ? null
+      : Math.max(0, maxExperiments - reservedCount - terminalCount)
+  const terminalRemainingCount =
+    maxExperiments === null ? null : Math.max(0, maxExperiments - terminalCount)
   return {
     sessionId: session.id,
     status: session.status,
@@ -78,10 +84,11 @@ function remoteControlState(overrides: Record<string, unknown> = {}) {
       maxExperiments,
       reservedCount,
       terminalCount,
-      remainingCount:
-        maxExperiments === null
-          ? null
-          : Math.max(0, maxExperiments - reservedCount - terminalCount),
+      remainingCount,
+      terminalRemainingCount,
+      budgetSaturated: remainingCount !== null && remainingCount <= 0,
+      budgetExhausted:
+        terminalRemainingCount !== null && terminalRemainingCount <= 0,
       openReservationCount: reservedCount,
       expiredReservationCount,
     },
@@ -229,6 +236,8 @@ describe("research should-stop", () => {
       await withMockApi(
         () =>
           remoteControlState({
+            reservedExperimentCount: 0,
+            terminalExperimentCount: 2,
             status: "completed",
             expiredReservationCount: 1,
           }),
@@ -271,7 +280,12 @@ describe("research should-stop", () => {
     })
 
     await withMockApi(
-      () => remoteControlState({ expiredReservationCount: 0 }),
+      () =>
+        remoteControlState({
+          reservedExperimentCount: 0,
+          terminalExperimentCount: 2,
+          expiredReservationCount: 0,
+        }),
       async () => {
         const checker = createResearchSessionStopChecker({
           root,

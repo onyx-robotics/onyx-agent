@@ -1541,6 +1541,11 @@ export const reserveResearchExperimentRequestSchema = z.object({
   ttlSeconds: z.number().int().positive().max(7200).optional(),
 })
 
+export const releaseResearchExperimentReservationsRequestSchema = z.object({
+  runRefs: z.array(z.string().trim().min(1).max(500)).min(1).max(500),
+  reason: z.string().trim().min(1).max(500).optional(),
+})
+
 export const researchExperimentReservationSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
@@ -1557,6 +1562,16 @@ export const researchExperimentReservationSchema = z.object({
   updatedAt: z.iso.datetime(),
 })
 
+export const researchSessionBudgetSchema = z.object({
+  maxExperiments: z.number().int().positive().nullable(),
+  reservedCount: z.number().int().nonnegative(),
+  terminalCount: z.number().int().nonnegative(),
+  remainingCount: z.number().int().nonnegative().nullable(),
+  terminalRemainingCount: z.number().int().nonnegative().nullable(),
+  budgetSaturated: z.boolean(),
+  budgetExhausted: z.boolean(),
+})
+
 export const reserveResearchExperimentResponseSchema = z.object({
   data: z.object({
     reservationStatus: z.enum([
@@ -1567,12 +1582,27 @@ export const reserveResearchExperimentResponseSchema = z.object({
       "session_terminal",
     ]),
     reservation: researchExperimentReservationSchema.nullable(),
-    budget: z.object({
-      maxExperiments: z.number().int().positive().nullable(),
-      reservedCount: z.number().int().nonnegative(),
-      terminalCount: z.number().int().nonnegative(),
-      remainingCount: z.number().int().nonnegative().nullable(),
-    }),
+    budget: researchSessionBudgetSchema,
+  }),
+})
+
+export const releaseResearchExperimentReservationsResponseSchema = z.object({
+  data: z.object({
+    releasedCount: z.number().int().nonnegative(),
+    reservations: z.array(
+      z.object({
+        runRef: z.string().min(1),
+        releaseStatus: z.enum([
+          "released",
+          "already_released",
+          "consumed",
+          "expired",
+          "missing",
+        ]),
+        reservation: researchExperimentReservationSchema.nullable(),
+      })
+    ),
+    budget: researchSessionBudgetSchema,
   }),
 })
 
@@ -1590,10 +1620,7 @@ export const researchSessionLiveResponseSchema = z.object({
     session: researchSessionSchema,
     campaign: researchCampaignSchema,
     budget: z.object({
-      maxExperiments: z.number().int().positive().nullable(),
-      reservedCount: z.number().int().nonnegative(),
-      terminalCount: z.number().int().nonnegative(),
-      remainingCount: z.number().int().nonnegative().nullable(),
+      ...researchSessionBudgetSchema.shape,
       openReservationCount: z.number().int().nonnegative(),
       expiredReservationCount: z.number().int().nonnegative(),
       warning: z.string().nullable().optional(),
@@ -1627,10 +1654,7 @@ export const researchSessionControlStateResponseSchema = z.object({
     status: researchSessionStatusSchema,
     finalizationStatus: researchFinalizationStatusSchema,
     budget: z.object({
-      maxExperiments: z.number().int().positive().nullable(),
-      reservedCount: z.number().int().nonnegative(),
-      terminalCount: z.number().int().nonnegative(),
-      remainingCount: z.number().int().nonnegative().nullable(),
+      ...researchSessionBudgetSchema.shape,
       openReservationCount: z.number().int().nonnegative(),
       expiredReservationCount: z.number().int().nonnegative(),
     }),
@@ -2079,6 +2103,12 @@ export type ResearchExperimentReservation = z.infer<
 >
 export type ReserveResearchExperimentResponse = z.infer<
   typeof reserveResearchExperimentResponseSchema
+>
+export type ReleaseResearchExperimentReservationsRequest = z.infer<
+  typeof releaseResearchExperimentReservationsRequestSchema
+>
+export type ReleaseResearchExperimentReservationsResponse = z.infer<
+  typeof releaseResearchExperimentReservationsResponseSchema
 >
 export type ResearchSessionLiveResponse = z.infer<
   typeof researchSessionLiveResponseSchema
