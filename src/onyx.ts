@@ -149,6 +149,7 @@ export {
   commandKnowledgeList,
   commandSummaryList,
   commandSummaryUpsert,
+  finalizationStatusLabel,
   finalizeHypothesisAttempt,
   summarizeWorkerOutput,
   commandWorkerRun,

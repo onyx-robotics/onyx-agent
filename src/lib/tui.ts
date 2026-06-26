@@ -268,6 +268,8 @@ export function spinnerChar(nowMs: number) {
 export type ListenModel = {
   projectName: string | null
   campaignName: string | null
+  sessionId?: string | null
+  sessionStatus?: string | null
   metricName: string | null
   metricUnit: string | null
   metricDirection: "maximize" | "minimize" | null
@@ -280,6 +282,96 @@ export type ListenModel = {
   pendingOutbox: number
   conflictOutbox: number
   syncedCount: number
+  providerBackoff?: {
+    reason: string
+    until: string
+    attempt?: number
+    delayMs?: number
+  } | null
+  workers?: ListenWorkerRow[]
+}
+
+export type ListenWorkerRow = {
+  workerId: string
+  workerName: string | null
+  hypothesisName: string | null
+  status: string
+  phase: string | null
+  progressMessage: string | null
+  latestAt: string | null
+  lastSeenAt: string | null
+  lastOutputAt: string | null
+  startedAt: string | null
+  completedAt: string | null
+  finalizationStatus: string | null
+  activityLogPath: string | null
+  logPath: string | null
+}
+
+function workerIsTerminal(status: string) {
+  return status === "completed" || status === "failed" || status === "stopped"
+}
+
+function renderWorkerPanel(
+  model: ListenModel,
+  options: { columns: number; color: boolean; nowMs: number }
+) {
+  const workers = model.workers ?? []
+  if (!model.sessionId && workers.length === 0 && !model.providerBackoff) {
+    return []
+  }
+
+  const active = workers.filter((worker) => !workerIsTerminal(worker.status))
+  const terminal = workers.length - active.length
+  const backoff = model.providerBackoff
+    ? ` · backoff ${model.providerBackoff.reason} ${formatAge(
+        model.providerBackoff.until,
+        options.nowMs
+      )}`
+    : ""
+  const summary = truncate(
+    [
+      `session ${model.sessionStatus ?? model.sessionId ?? "local"}`,
+      `workers ${active.length}/${workers.length}`,
+      terminal ? `terminal ${terminal}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") + backoff,
+    options.columns
+  )
+  const lines = [bold(summary, options.color)]
+
+  for (const worker of workers.slice(0, 8)) {
+    const activityAt =
+      worker.latestAt ??
+      worker.lastOutputAt ??
+      worker.lastSeenAt ??
+      worker.completedAt ??
+      worker.startedAt
+    const name = worker.workerName ?? worker.workerId.slice(0, 8)
+    const phase = worker.phase ? ` phase=${worker.phase}` : ""
+    const finalization = worker.finalizationStatus
+      ? ` final=${worker.finalizationStatus}`
+      : ""
+    const age = formatAge(activityAt, options.nowMs)
+    const logPath = worker.activityLogPath ?? worker.logPath
+    const detail = [
+      worker.progressMessage ?? worker.hypothesisName,
+      logPath ? `activity=${logPath}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ")
+    lines.push(
+      truncate(
+        `  ${name}: ${worker.status}${phase}${finalization} seen=${age}${
+          detail ? ` · ${detail}` : ""
+        }`,
+        options.columns
+      )
+    )
+  }
+
+  return lines
 }
 
 /**
@@ -322,17 +414,26 @@ export function renderFrame(
     return `${dim("│ ", color)}${line}${padding}${dim(" │", color)}`
   }
 
+  const workerLines = renderWorkerPanel(model, {
+    columns: inner,
+    color,
+    nowMs: size.nowMs,
+  })
   // Newest at the bottom: keep the tail when the table outgrows the screen.
-  const tableRows = Math.max(1, size.rows - 8)
+  const tableRows = Math.max(1, size.rows - 8 - workerLines.length)
   const table = renderExperimentTable(model.rows.slice(-tableRows), {
     columns: inner,
     color,
     nowMs: size.nowMs,
   })
-  const body =
+  const tableBody =
     model.rows.length === 0
       ? [table[0]!, dim("no experiments yet", color)]
       : table
+  const body =
+    workerLines.length > 0
+      ? [...workerLines, dim("─".repeat(Math.min(inner, 24)), color), ...tableBody]
+      : tableBody
 
   const bottom = dim(`╰${"─".repeat(columns - 2)}╯`, color)
 

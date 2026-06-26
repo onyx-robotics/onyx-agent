@@ -7,7 +7,11 @@ import type {
   LocalResearchHistoryRecord,
 } from "../protocol"
 
-import { listProjectCampaigns, resolveProject } from "../lib/api"
+import {
+  listProjectCampaigns,
+  reserveResearchExperiment,
+  resolveProject,
+} from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
 import {
   normalizeSetupFile,
@@ -34,6 +38,7 @@ import {
   listLocalAttempts,
   listLocalExperimentHistory,
   localCampaignByName,
+  getLocalSessionState,
   logLocalExperiment,
   readLocalAttempt,
   readWorkflowRun,
@@ -370,7 +375,10 @@ async function commitCountBetween({
   headCommitSha: string
 }) {
   return Number(
-    await git(["rev-list", "--count", `${baseCommitSha}..${headCommitSha}`], root)
+    await git(
+      ["rev-list", "--count", `${baseCommitSha}..${headCommitSha}`],
+      root
+    )
   )
 }
 
@@ -528,7 +536,9 @@ async function writeTerminalAttempt({
 }) {
   const resultCommitSha = run.resultCommitSha
   if (!resultCommitSha) {
-    throw new Error("Workflow cannot finish before a result commit is selected.")
+    throw new Error(
+      "Workflow cannot finish before a result commit is selected."
+    )
   }
   const completed = new Date()
   const compliance = setupCompliance({
@@ -626,6 +636,14 @@ async function createWorkflowRun({
     campaign.hypothesisId
   const baseCommitSha =
     args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+  await reserveExperimentSlotForSession({
+    root,
+    args,
+    sessionId,
+    runRef,
+    workerId,
+    hypothesisId,
+  })
   const run: LocalWorkflowRun = {
     id: randomUUID(),
     campaignId: campaign.campaignId,
@@ -666,6 +684,61 @@ async function createWorkflowRun({
   return run
 }
 
+async function reserveExperimentSlotForSession({
+  root,
+  args,
+  sessionId,
+  runRef,
+  workerId,
+  hypothesisId,
+}: {
+  root: string
+  args: Args
+  sessionId?: string
+  runRef: string
+  workerId?: string
+  hypothesisId?: string | null
+}) {
+  if (!sessionId || args.options.offline === "true") return
+  const localSession = await getLocalSessionState(root, sessionId).catch(
+    () => null
+  )
+  if (!localSession || localSession.session.maxExperiments === null) return
+  try {
+    const response = await reserveResearchExperiment(
+      sessionId,
+      {
+        runRef,
+        workerId,
+        hypothesisId: hypothesisId ?? undefined,
+      },
+      args
+    )
+    if (
+      response.reservationStatus === "budget_exhausted" ||
+      response.reservationStatus === "session_terminal"
+    ) {
+      throw new Error(response.reservationStatus)
+    }
+    return response
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message === "budget_exhausted") {
+      throw new Error(
+        `Experiment budget exhausted for session ${sessionId}; the experiment was not reserved.`
+      )
+    }
+    if (message === "session_terminal") {
+      throw new Error(
+        `Research session ${sessionId} is terminal; the experiment was not reserved.`
+      )
+    }
+    throw new Error(
+      `Unable to reserve experiment slot for session ${sessionId}: ${message}`
+    )
+  }
+}
+
 async function executeWorkflow({
   root,
   projectPath,
@@ -683,7 +756,9 @@ async function executeWorkflow({
 }) {
   let currentRun = run
   let advanced = false
-  const firstCommandStepIndex = setup.workflow.findIndex((step) => Boolean(step.run))
+  const firstCommandStepIndex = setup.workflow.findIndex((step) =>
+    Boolean(step.run)
+  )
 
   while (currentRun.currentStepIndex < setup.workflow.length) {
     const index = currentRun.currentStepIndex
@@ -709,14 +784,17 @@ async function executeWorkflow({
         const paused = {
           ...currentRun,
           status: "paused" as const,
-          blockReason: "Paused at agent step. Make exactly one commit, then resume.",
+          blockReason:
+            "Paused at agent step. Make exactly one commit, then resume.",
         }
         await upsertWorkflowRun({ root, run: paused })
         await upsertWorkflowStep({
           root,
           step: stepRecord({ run: paused, step, index, status: "paused" }),
         })
-        console.log("Paused at agent step. Make exactly one commit, then resume.")
+        console.log(
+          "Paused at agent step. Make exactly one commit, then resume."
+        )
         return paused
       }
       if (commitCount !== 1) {
@@ -835,7 +913,12 @@ async function executeWorkflow({
       name: step.run!,
       timeoutSeconds,
     })
-    const logPath = await writeWorkflowStepLog({ root, run: currentRun, step, result })
+    const logPath = await writeWorkflowStepLog({
+      root,
+      run: currentRun,
+      step,
+      result,
+    })
     const failed = result.timedOut || result.code !== 0
     let stepMetrics: Record<string, number> = {}
     let metricError: string | null = null
@@ -878,9 +961,8 @@ async function executeWorkflow({
         if (mode === "next") return currentRun
         continue
       }
-      const terminalStatus: ExperimentStatus = step.guardrail && !step.metric
-        ? "checks_failed"
-        : "failed"
+      const terminalStatus: ExperimentStatus =
+        step.guardrail && !step.metric ? "checks_failed" : "failed"
       const failedRun = {
         ...currentRun,
         status: terminalStatus,
@@ -979,7 +1061,9 @@ async function executeWorkflow({
     }
     if (currentRun.resultCommitSha && currentRun.resultCommitSha !== head) {
       const rerunFrom =
-        firstCommandStepIndex >= 0 ? firstCommandStepIndex : setup.workflow.length
+        firstCommandStepIndex >= 0
+          ? firstCommandStepIndex
+          : setup.workflow.length
       currentRun = {
         ...currentRun,
         status: "running",
@@ -1003,7 +1087,14 @@ async function executeWorkflow({
         }
       }
       if (mode === "next") return currentRun
-      return executeWorkflow({ root, projectPath, setup, run: currentRun, args, mode })
+      return executeWorkflow({
+        root,
+        projectPath,
+        setup,
+        run: currentRun,
+        args,
+        mode,
+      })
     }
   }
 
@@ -1062,7 +1153,9 @@ export async function commandExpRun(args: Args) {
       campaignName,
     })
     const baseCommitSha =
-      args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+      args.options.base ??
+      process.env.ONYX_BASE_COMMIT ??
+      campaign.baseCommitSha
     try {
       setup = await readSetupFileFromCommit({
         root,
@@ -1147,7 +1240,7 @@ export async function commandExpLog(args: Args) {
       console.log(
         `Experiment ${args.options["run-ref"]} is already recorded for campaign ${campaignName}`
       )
-      return
+      return logged
     }
   }
   if (args.options["run-ref"] && !usableLastRun) {
@@ -1225,6 +1318,14 @@ export async function commandExpLog(args: Args) {
     process.env.ONYX_SESSION_ID
   const workerId =
     args.options.worker ?? usableLastRun?.workerId ?? process.env.ONYX_WORKER_ID
+  await reserveExperimentSlotForSession({
+    root,
+    args,
+    sessionId,
+    runRef,
+    workerId,
+    hypothesisId,
+  })
   const loggedCompliance =
     usableLastRun?.setupCompliance ??
     setupCompliance({
@@ -1284,6 +1385,7 @@ export async function commandExpLog(args: Args) {
   console.log(
     `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}`
   )
+  return record
 }
 
 export async function commandExpList(args: Args) {

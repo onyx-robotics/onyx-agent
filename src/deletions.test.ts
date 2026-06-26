@@ -11,7 +11,7 @@ const CAMPAIGN_DELETED_AT = "2026-06-10T12:00:00.000Z"
 const BEFORE_DELETE = "2026-06-09T00:00:00.000Z"
 const AFTER_DELETE = "2026-06-11T00:00:00.000Z"
 const setup = {
-  schemaVersion: 1 as const,
+  schemaVersion: 2 as const,
   goal: "Improve score",
   projectPath: "",
   scope: {
@@ -22,6 +22,10 @@ const setup = {
     name: "score",
     unit: null,
     direction: "maximize" as const,
+  },
+  experimentPolicy: {
+    mode: "single_candidate" as const,
+    maxDiagnosticSeconds: 30,
   },
   resources: {},
   tools: {

@@ -55,6 +55,7 @@ export type WorkerFinalizationStatus =
   | "already_logged"
   | "measured_and_logged"
   | "salvaged_unmeasured"
+  | "salvaged_unmeasured_budget_exhausted"
   | "failed"
 
 export type WorkerFinalizationManifest = {
@@ -67,6 +68,7 @@ export type WorkerFinalizationManifest = {
   workerBranchPushStatus: "not_attempted" | "pushed" | "failed"
   rootDriftStatus: "not_checked" | "clean" | "dirty"
   error: string | null
+  warnings?: string[]
 }
 
 export type WorkerLaunchManifest = {
@@ -80,6 +82,8 @@ export type WorkerLaunchManifest = {
   promptPath: string
   logPath: string
   activityLogPath: string
+  activityJsonlPath: string
+  latestStatePath: string
   manifestPath: string
   sessionId: string
   hypothesisId: string
@@ -96,6 +100,7 @@ export type WorkerLaunchManifest = {
   timedOut: boolean
   startupTimedOut: boolean
   error: string | null
+  warnings?: string[]
   preflight: WorkerPreflightResult | null
   finalization: WorkerFinalizationManifest | null
 }
@@ -115,6 +120,13 @@ function shellQuote(value: string) {
 
 function unique(values: string[]) {
   return [...new Set(values.filter(Boolean))]
+}
+
+function compactPreflightOutput(value: string, limit = 2048) {
+  const compacted = value.replace(/\s+/g, " ").trim()
+  return compacted.length > limit
+    ? `${compacted.slice(0, Math.max(0, limit - 3))}...`
+    : compacted
 }
 
 async function sourceCheckoutOnyxBin() {
@@ -386,7 +398,7 @@ export async function preflightWorkerInvocation(
     checks.push({
       name,
       status: passed ? "passed" : "failed",
-      output: output || null,
+      output: passed ? null : output ? compactPreflightOutput(output) : null,
     })
     if (!passed) {
       throw new Error(
@@ -495,6 +507,8 @@ export async function workerLaunchPaths({
     dir,
     logPath: join(dir, `${base}.log`),
     activityLogPath: join(dir, `${base}.activity.log`),
+    activityJsonlPath: join(dir, `${base}.activity.jsonl`),
+    latestStatePath: join(dir, `${base}.latest.json`),
     manifestPath: join(dir, `${base}.manifest.json`),
   }
 }

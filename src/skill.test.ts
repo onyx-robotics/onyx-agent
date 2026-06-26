@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { describe, expect, test } from "bun:test"
 
@@ -18,6 +19,7 @@ import {
   installDeveloperSkill,
   skillInstallTarget,
 } from "./onyx"
+import { ONYX_SKILL_MARKDOWN } from "./lib/skill-content"
 
 async function withManagedSkillHome<T>(fn: (root: string) => Promise<T>) {
   const previousHome = process.env.HOME
@@ -43,6 +45,11 @@ async function withManagedSkillHome<T>(fn: (root: string) => Promise<T>) {
 }
 
 describe("managed skill installs", () => {
+  test("embedded release skill matches canonical skill markdown", async () => {
+    const source = fileURLToPath(new URL("../skills/onyx/SKILL.md", import.meta.url))
+    expect(ONYX_SKILL_MARKDOWN).toBe(await readFile(source, "utf8"))
+  })
+
   test("agent install-skill writes Claude and Codex managed targets", async () => {
     await withManagedSkillHome(async () => {
       await commandAgent({

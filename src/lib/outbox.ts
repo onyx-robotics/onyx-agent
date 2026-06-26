@@ -67,8 +67,17 @@ export type CliState = {
       campaignId?: string
       endTimeMs?: number
       maxIterations?: number
+      maxWorkerIterations?: number
+      maxExperiments?: number | null
       stopRequested?: boolean
       status?: string
+      terminalReason?: string | null
+      finalizationStatus?:
+        | "not_started"
+        | "running"
+        | "complete"
+        | "incomplete"
+        | "failed"
       ignoredPresence?: {
         total: number
         byReason: Record<string, number>
@@ -83,7 +92,50 @@ export type CliState = {
       providerBackoff?: {
         reason: string
         until: string
+        attempt?: number
+        delayMs?: number
+        recentFailures?: Array<{
+          at: string
+          reason: string
+          workerId: string | null
+          hypothesisId: string
+          error?: string | null
+          errorSummary?: string | null
+        }>
       } | null
+      supervisor?: {
+        pid?: number | null
+        logPath?: string | null
+        activeProcessCount?: number
+        launchRate?: {
+          batchSize: number | null
+          intervalSeconds: number | null
+        } | null
+        providerBackoff?: {
+          reason: string
+          until: string
+          attempt?: number
+          delayMs?: number
+          recentFailures?: Array<{
+            at: string
+            reason: string
+            workerId: string | null
+            hypothesisId: string
+            error?: string | null
+            errorSummary?: string | null
+          }>
+        } | null
+        recentFailedLaunches?: Array<{
+          at: string
+          reason: string
+          workerId: string | null
+          hypothesisId: string
+          error?: string | null
+          errorSummary?: string | null
+        }>
+        status?: string
+        updatedAt?: string
+      }
     }
   >
 }

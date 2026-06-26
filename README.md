@@ -55,7 +55,9 @@ Codex. It writes Claude's personal skill file at
 `~/.claude/skills/onyx/SKILL.md`, Codex's user skill file at
 `~/.agents/skills/onyx/SKILL.md`, and the Codex home skill file at
 `${CODEX_HOME:-~/.codex}/skills/onyx/SKILL.md` for Codex builds that discover
-skills from `CODEX_HOME`. To install it manually:
+skills from `CODEX_HOME`. The canonical source is `skills/onyx/SKILL.md`;
+after editing it, run `bun run generate:skill-content` so the embedded release
+fallback stays in sync. To install it manually:
 
 ```bash
 onyx agent install-skill
@@ -78,7 +80,7 @@ git commit -m "Add Onyx setup"
 git push origin HEAD
 onyx campaign setup --name fast-eval --description "Improve score"
 onyx research run --campaign fast-eval --workers 4
-onyx push
+onyx listen
 ```
 
 The CLI stores local research state and retry events in `.git/onyx/research.db`
@@ -133,9 +135,15 @@ repo-level supervisor with a built-in agent launcher:
 
 ```bash
 plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
-onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --max-iterations 5
+onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --max-experiments 20 --max-worker-iterations 5
 onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
+
+`onyx research run` validates the campaign and starts a detached supervisor by
+default, then prints the session id, supervisor PID, log path, and monitoring
+commands before returning. Use `--json` for parseable startup output in
+orchestrator agents, and `--foreground` only when you intentionally want an
+attached debugging or smoke-test shell.
 
 `--workers` is the active slot target: when a short worker exits, the
 supervisor backfills that slot. For a bounded fake-worker smoke test, cap
@@ -147,22 +155,39 @@ onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --max-lau
 
 For large local runs, the supervisor ramps launches in batches
 (`--launch-batch-size`, default up to 10) separated by
-`--launch-interval-seconds` (default 5), backs off briefly when provider
-startup or rate-limit failures happen, and stops launching new workers once the
-shutdown cushion begins.
+`--launch-interval-seconds` (default 5), backs off with capped exponential
+jitter when provider startup, rate-limit, overload, auth, or degraded-service
+failures happen, and stops launching new workers once the shutdown cushion
+begins or the shared session stop reasons say the experiment budget is
+exhausted, reservations expired, a stop was requested, or the session became
+terminal.
+
+Sync and presence are bounded for large sessions: `onyx sync` defaults to 50
+events per request (`--sync-batch-size`, max 100), the supervisor drains at
+most 4 sync batches per interval by default (`--sync-drain-batches`), and
+presence sends site telemetry every interval while uploading changed worker
+snapshots by default, a full worker snapshot every 60 seconds or final upload,
+and at most 250 worker snapshots per request.
 
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
 receive the worker prompt over stdin, and write raw stdout/stderr logs,
-readable `.activity.log` files, and launch manifests under
+readable `.activity.log` files, structured `.activity.jsonl` files,
+per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-shared sync, adaptive coalesced presence updates, sampled durable heartbeats,
-stop handling, and final sync for the session. `onyx worker run --session <id> --hypothesis <id>` remains available
+the supervisor-owned push/sync queue with default concurrency 4, adaptive
+coalesced presence updates, sampled durable heartbeats, stop handling, and
+final sync for the session. `onyx research status --json` reports fresh
+supervisor telemetry when available, including active process count, launch
+rate, provider backoff, recent launch failures, PID, and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
 as a low-level debugging and recovery primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
-errors when local manifests are available. `--max-iterations` is a cap, not a
-target count. `--max-launches` caps only new workers launched by the current
+errors when local manifests are available. `--max-experiments` is the global
+attempt budget and `--max-worker-iterations` is a per-worker safety cap.
+`onyx listen` shows the same local worker latest-state/manifests and active
+provider backoff metadata alongside the experiment/outbox view.
+`--max-launches` caps only new workers launched by the current
 supervisor invocation and does not change the session's active slot target.
 `onyx workflow status --active` shows only actionable running or paused
 workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked
@@ -188,7 +213,8 @@ the workflow base, and pushes the worker branch so useful offline work is not
 lost. Multi-commit, restore-forward, or dirty salvage preserves the branch
 without producing a measured experiment or blocked workflow run. Worker
 manifests report `finalizationStatus` as `none`, `already_logged`,
-`measured_and_logged`, `salvaged_unmeasured`, or `failed`. If
+`measured_and_logged`, `salvaged_unmeasured`,
+`salvaged_unmeasured_budget_exhausted`, or `failed`. If
 `onyx research stop` is requested while a provider process is still running,
 the harness gives it the configured stop grace (30 seconds by default),
 terminates it if needed, then runs the same finalization path. Use

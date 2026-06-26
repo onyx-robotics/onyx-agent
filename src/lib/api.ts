@@ -82,6 +82,15 @@ export type ApiSession = {
   name: string
   status: "running" | "stop_requested" | "completed" | "failed" | "stopped"
   workerTarget: number | null
+  maxExperiments: number | null
+  reservedExperimentCount: number
+  terminalExperimentCount: number
+  finalizationStatus:
+    | "not_started"
+    | "running"
+    | "complete"
+    | "incomplete"
+    | "failed"
   metadata: Record<string, unknown>
   startedAt?: string
   completedAt?: string | null
@@ -97,14 +106,8 @@ export type ApiWorker = {
   workerName: string
   agentKind: string
   runtime: "local" | "hosted"
-  status:
-    | "idle"
-    | "running"
-    | "stale"
-    | "lost"
-    | "completed"
-    | "failed"
-    | "stopped"
+  status: "registered" | "running" | "completed" | "failed" | "stopped"
+  liveness?: "active" | "stale" | "lost" | "unknown" | "terminal"
   currentExperimentId: string | null
   phase: string | null
   progressMessage: string | null
@@ -185,6 +188,7 @@ export type ApiCampaignTimeline = {
 export type ApiCampaignOverview = ApiCampaignTimeline & {
   bestExperiment: ApiCampaignExperiment | null
   latestExperiments: ApiCampaignExperiment[]
+  sessions: ApiSession[]
   counts: {
     experiments: number
     hypothesisCount: number
@@ -201,6 +205,137 @@ export type ApiSessionState = {
   workers: ApiWorker[]
   summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
+  updatedAt: string
+}
+
+export type ApiSessionLive = {
+  session: ApiSession
+  campaign: ApiCampaign
+  budget: {
+    maxExperiments: number | null
+    reservedCount: number
+    terminalCount: number
+    remainingCount: number | null
+    openReservationCount: number
+    expiredReservationCount: number
+    warning?: string | null
+  }
+  sync?: {
+    oldestPendingAgeMs: number | null
+    lastDurationMs: number | null
+    lastError: string | null
+  }
+  finalization?: {
+    status: ApiSession["finalizationStatus"]
+    reasons: string[]
+    terminalReason:
+      | "max_experiments"
+      | "time_budget_reached"
+      | "stop_requested"
+      | "provider_capacity_exhausted"
+      | "no_active_hypotheses"
+      | "finalization_debt"
+      | null
+    releasedReservationCount: number
+    expiredReservationCount: number
+    unmeasuredSalvageCount: number
+  }
+  livenessCounts: Record<string, number>
+  phaseCounts: Record<string, number>
+  workers: Array<{
+    id: string
+    campaignId?: string
+    sessionId?: string | null
+    hypothesisId?: string | null
+    workerName?: string | null
+    agentKind?: string | null
+    runtime?: ApiWorker["runtime"] | null
+    status: ApiWorker["status"]
+    liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
+    phase: string | null
+    progressMessage: string | null
+    gitLabel: string | null
+    currentExperimentId: string | null
+    lastOutputAt: string | null
+    activitySummary: Record<string, unknown>
+    observedAt?: string | null
+    receivedAt: string
+    matched: boolean
+  }>
+  sites: Array<{
+    siteId: string
+    supervisorRunId: string | null
+    liveness?: "active" | "stale" | "lost"
+    status?: "active" | "stale" | "inactive"
+    lastSequence: number
+    pendingSyncCount: number
+    pushQueueDepth: number
+    activeWorkerCount: number
+    uploadedWorkerCount?: number
+    unchangedWorkerCount?: number
+    droppedOrDeferredWorkerCount?: number
+    syncLagMs: number | null
+    providerBackoff: Record<string, unknown> | null
+    ignoredPresence: Record<string, unknown>
+    lastUploadAt: string | null
+    receivedAt: string
+  }>
+  unmatchedPresenceCount: number
+  ignoredPresence: Record<string, unknown>
+  syncLagMs: number | null
+  providerBackoff: Record<string, unknown> | null
+  recentExperiments: ApiCampaignExperiment[]
+  recentTerminalWorkers: Array<{
+    id: string
+    campaignId?: string
+    sessionId?: string | null
+    hypothesisId?: string | null
+    workerName?: string | null
+    agentKind?: string | null
+    runtime?: ApiWorker["runtime"] | null
+    status: ApiWorker["status"]
+    liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
+    phase: string | null
+    progressMessage: string | null
+    gitLabel: string | null
+    currentExperimentId: string | null
+    lastOutputAt: string | null
+    activitySummary: Record<string, unknown>
+    observedAt?: string | null
+    receivedAt: string
+    matched: boolean
+  }>
+  liveWatermark: string
+  updatedAt: string
+}
+
+export type ApiSessionControlState = {
+  sessionId: string
+  status: ApiSession["status"]
+  finalizationStatus: ApiSession["finalizationStatus"]
+  budget: {
+    maxExperiments: number | null
+    reservedCount: number
+    terminalCount: number
+    remainingCount: number | null
+    openReservationCount: number
+    expiredReservationCount: number
+  }
+  finalization: {
+    status: ApiSession["finalizationStatus"]
+    reasons: string[]
+    terminalReason:
+      | "max_experiments"
+      | "time_budget_reached"
+      | "stop_requested"
+      | "provider_capacity_exhausted"
+      | "no_active_hypotheses"
+      | "finalization_debt"
+      | null
+    releasedReservationCount: number
+    expiredReservationCount: number
+    unmeasuredSalvageCount: number
+  }
   updatedAt: string
 }
 
@@ -270,24 +405,34 @@ export type ApiResearchSyncResponse = {
 }
 
 export type ApiResearchPresenceResponse = {
-  workers: ApiWorker[]
   ignoredWorkers: Array<{
     id: string
     reason:
       | "not_found"
-      | "project_mismatch"
       | "session_mismatch"
+      | "stale_sequence"
+      | "unmatched_cap"
       | "update_failed"
+      | "session_not_found"
     message: string
   }>
   ignoredByReason: {
     notFound: number
-    projectMismatch: number
     sessionMismatch: number
+    staleSequence: number
+    unmatchedCap: number
     updateFailed: number
+    sessionNotFound: number
   }
-  updatedCount: number
+  acceptedCount: number
   ignoredCount: number
+  unmatchedCount: number
+  uploadedWorkerCount: number
+  unchangedWorkerCount: number
+  droppedOrDeferredWorkerCount: number
+  deferredStartupTelemetryCount: number
+  splitCount: number
+  siteAccepted: boolean
 }
 
 export type ApiReconcileCampaignResponse = {
@@ -310,7 +455,7 @@ export async function callApi(
   body?: unknown,
   args?: Args
 ) {
-  const timeoutMs = Number(args?.options["api-timeout"] ?? 30_000)
+  const timeoutMs = Number(args?.options["api-timeout"] ?? 120_000)
   const signal =
     Number.isFinite(timeoutMs) && timeoutMs > 0
       ? AbortSignal.timeout(timeoutMs)
@@ -556,6 +701,7 @@ export async function createCampaignSession(
     workerTarget?: number
     hypotheses?: ResearchHypothesisPlan[]
     metadata?: Record<string, unknown>
+    maxExperiments?: number
   },
   args?: Args
 ): Promise<{ session: ApiSession; hypotheses: ApiHypothesis[] }> {
@@ -629,6 +775,7 @@ export async function stopCampaignSession(
   body: {
     campaignId: string
     status?: "stop_requested" | "completed" | "failed" | "stopped"
+    finalizationStatus?: ApiSession["finalizationStatus"]
     reason?: string
     metadata?: Record<string, unknown>
   },
@@ -652,6 +799,34 @@ export async function getResearchSessionState(
     await callApi(
       "GET",
       `/api/v1/research/sessions/${sessionId}/state`,
+      undefined,
+      args
+    )
+  )
+}
+
+export async function getResearchSessionLive(
+  sessionId: string,
+  args?: Args
+): Promise<ApiSessionLive> {
+  return apiData<ApiSessionLive>(
+    await callApi(
+      "GET",
+      `/api/v1/research/sessions/${sessionId}/live`,
+      undefined,
+      args
+    )
+  )
+}
+
+export async function getResearchSessionControlState(
+  sessionId: string,
+  args?: Args
+): Promise<ApiSessionControlState> {
+  return apiData<ApiSessionControlState>(
+    await callApi(
+      "GET",
+      `/api/v1/research/sessions/${sessionId}/control-state`,
       undefined,
       args
     )
@@ -697,14 +872,7 @@ export async function registerCampaignWorker(
 export async function heartbeatWorker(
   workerId: string,
   body: {
-    status?:
-      | "idle"
-      | "running"
-      | "stale"
-      | "lost"
-      | "completed"
-      | "failed"
-      | "stopped"
+    status?: "registered" | "running" | "completed" | "failed" | "stopped"
     sessionId?: string
     hypothesisId?: string
     experimentId?: string | null
@@ -841,16 +1009,35 @@ export async function syncResearchEvents(
 export async function syncResearchPresence(
   body: {
     siteId: string
-    repositoryUrl: string
-    projectPath: string
+    supervisorRunId: string
+    sequence: number
     sessionId: string
+    site?: {
+      providerBackoff?: Record<string, unknown> | null
+      syncLagMs?: number | null
+      oldestPendingAgeMs?: number | null
+      lastSyncDurationMs?: number | null
+      lastSyncError?: string | null
+      pendingSyncCount?: number
+      pushQueueDepth?: number
+      ignoredPresence?: Record<string, unknown>
+      activeWorkerCount?: number
+      uploadedWorkerCount?: number
+      unchangedWorkerCount?: number
+      droppedOrDeferredWorkerCount?: number
+      unmeasuredSalvageCount?: number
+      lastUploadAt?: string | null
+      metadata?: Record<string, unknown>
+    }
     workers: Array<{
       id: string
       status: ApiWorker["status"]
       phase?: string | null
       progressMessage?: string | null
       gitLabel?: string | null
+      currentExperimentId?: string | null
       lastOutputAt?: string | null
+      activitySummary?: Record<string, unknown>
       metadata?: Record<string, unknown>
       observedAt: string
     }>
@@ -859,6 +1046,45 @@ export async function syncResearchPresence(
 ): Promise<ApiResearchPresenceResponse> {
   return apiData<ApiResearchPresenceResponse>(
     await callApi("POST", "/api/v1/research/presence", body, args)
+  )
+}
+
+export async function reserveResearchExperiment(
+  sessionId: string,
+  body: {
+    runRef: string
+    workerId?: string
+    hypothesisId?: string
+    ttlSeconds?: number
+  },
+  args?: Args
+): Promise<{
+  reservationStatus:
+    | "reserved"
+    | "duplicate"
+    | "renewed"
+    | "budget_exhausted"
+    | "session_terminal"
+  reservation: {
+    id: string
+    runRef: string
+    status: "reserved" | "consumed" | "released" | "expired"
+    expiresAt: string
+  } | null
+  budget: {
+    maxExperiments: number | null
+    reservedCount: number
+    terminalCount: number
+    remainingCount: number | null
+  }
+}> {
+  return apiData(
+    await callApi(
+      "POST",
+      `/api/v1/research/sessions/${sessionId}/experiment-reservations`,
+      body,
+      args
+    )
   )
 }
 

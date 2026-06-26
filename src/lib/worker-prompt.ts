@@ -49,7 +49,7 @@ You are an autonomous Onyx research hypothesis worker. Do not ask the user quest
 - Worker branch: ${input.workerBranch}
 - Worktree root: ${input.worktreeRoot}
 - Project root: ${input.projectRoot}
-- Iteration cap: ${input.maxIterations} maximum; stop earlier when the hypothesis is exhausted or a strong result is logged.
+- Per-worker iteration cap: ${input.maxIterations} maximum; stop earlier when the global experiment budget is exhausted, the hypothesis is exhausted, or a strong result is logged.
 - Time budget remaining at launch: ${input.minutesRemaining} minute(s)
 - Stop starting new research by: ${input.researchDeadlineIso}
 - Final shutdown deadline: ${input.shutdownDeadlineIso}
@@ -58,7 +58,7 @@ You are an autonomous Onyx research hypothesis worker. Do not ask the user quest
 
 - Campaign brief command: \`onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"\`
 - Research spec: ${input.researchSpecPath}
-- Setup file: ${input.setupFilePath}
+- Setup file: ${input.setupFilePath} (schema v2, including experimentPolicy)
 - Validation report (diagnostics only): ${input.validationFilePath}
 
 ## Hypothesis Plan
@@ -84,10 +84,10 @@ If you need scratch scripts or generated probes, create them inside this worktre
 
 ## Loop
 
-1. Run \`onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"\` first for current campaign memory, then read the research spec for project-specific constraints. Inspect the setup file for exact metric, editable scope, protected paths, workflow, and tool policy. Query detailed live state with \`onyx research status --json\`, \`onyx exp list --json\`, \`onyx knowledge list --json\`, and \`onyx summary list --json\` as needed before editing.
+1. Run \`onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"\` first for current campaign memory, then read the research spec for project-specific constraints. Inspect the setup file for exact metric, editable scope, protected paths, workflow, tools, and experimentPolicy. Query detailed live state with \`onyx research status --json\`, \`onyx exp list --json\`, \`onyx knowledge list --json\`, and \`onyx summary list --json\` as needed before editing.
 2. Identify the current best experiment with \`onyx exp list\`. If HEAD is a regression, plan the restore as a normal measured workflow attempt; do not create an unmeasured restore-forward commit outside \`onyx exp run\`.
 3. Pick a concrete research idea for this hypothesis. Use peer progress as inspiration, but do not duplicate an already-failed idea.
-4. Before each iteration and before any sweep that might take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json\`. Treat the configured iteration value as a maximum cap, not a target count. Stop cleanly when the JSON output contains \`"shouldStop": true\`; a nonzero exit means the stop check itself failed.
+4. Before each iteration and before any command that might become a sweep or take more than a few seconds, run \`onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json\`. Treat the configured iteration value as a maximum cap, not a target count. Stop cleanly when the JSON output contains \`"shouldStop": true\`; budget exhaustion is a stop condition, and a nonzero exit means the stop check itself failed.
 5. Start the first measured workflow early, before any broad sweep or multi-minute search. Use \`onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --base <pre-edit-sha> --auto\`; copy the printed workflow run id and runRef. The CLI should pause at the agent step.
 6. Edit only in-scope project files, make exactly one clean commit, then resume with \`onyx exp run --resume <workflowRunId> --auto\`. If blocked, inspect \`onyx workflow status --run <workflowRunId>\`; use \`onyx tools run <tool-id>\` only for diagnostics.
 7. Inspect the output, metric, and checks result. Record every terminal attempt with \`onyx exp log --run-ref <runRef> --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\`.
@@ -99,7 +99,8 @@ If you need scratch scripts or generated probes, create them inside this worktre
 
 - Primary metric is king: improved results are candidates to build from; worse or equal results should send you back to the current best before trying the next idea.
 - Make one small, measured, logged attempt early. Do not spend more than a quick orientation pass before the first \`onyx exp run\`.
-- Keep local sweeps bounded to seconds, not minutes. Before the first workflow, use at most one tiny sanity check; then start a workflow, commit one promising candidate, measure it through Onyx, and refine in a new workflow.
+- In \`single_candidate\` mode, make exactly one measured candidate per workflow. Before the first workflow only, you may run at most one tiny pre-workflow sanity check comparing the baseline against one candidate. After the first workflow starts, every new candidate must be measured through a fresh Onyx workflow. Do not write grid, sweep, probe, broad tuning, candidate-loop, or scratch-search scripts unless setup policy explicitly permits them.
+- Keep local diagnostics bounded to seconds, not minutes. Do not evaluate arrays/lists of candidates outside \`onyx exp run\`. Start a workflow, commit one promising candidate, measure it through Onyx, and refine in a new workflow.
 - Secondary metrics inform tradeoffs, but hard guardrails belong in declared guardrail steps so a primary win that violates constraints becomes \`checks_failed\`.
 - Confirm surprising wins on noisy metrics before building on them. A single lucky trial can mislead the campaign.
 - Use loop statuses from \`onyx exp run\`: \`succeeded\`, \`failed\`, \`checks_failed\`, and \`setup_violation\`. Do not mark autonomous attempts \`accepted\` or \`rejected\`; those are for human curation.
