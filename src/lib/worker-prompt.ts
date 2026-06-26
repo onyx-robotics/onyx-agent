@@ -99,8 +99,8 @@ If you need scratch scripts or generated probes, create them inside this worktre
 
 - Primary metric is king: improved results are candidates to build from; worse or equal results should send you back to the current best before trying the next idea.
 - Make one small, measured, logged attempt early. Do not spend more than a quick orientation pass before the first \`onyx exp run\`.
-- In \`single_candidate\` mode, make exactly one measured candidate per workflow. Brief diagnostics are allowed before the first attempt, but do not write grid, sweep, probe, broad tuning, or scratch-search scripts unless setup policy explicitly permits them.
-- Keep local diagnostics bounded to seconds, not minutes. Before the first workflow, use at most one tiny sanity check; then start a workflow, commit one promising candidate, measure it through Onyx, and refine in a new workflow.
+- In \`single_candidate\` mode, make exactly one measured candidate per workflow. Before the first workflow only, you may run at most one tiny pre-workflow sanity check comparing the baseline against one candidate. After the first workflow starts, every new candidate must be measured through a fresh Onyx workflow. Do not write grid, sweep, probe, broad tuning, candidate-loop, or scratch-search scripts unless setup policy explicitly permits them.
+- Keep local diagnostics bounded to seconds, not minutes. Do not evaluate arrays/lists of candidates outside \`onyx exp run\`. Start a workflow, commit one promising candidate, measure it through Onyx, and refine in a new workflow.
 - Secondary metrics inform tradeoffs, but hard guardrails belong in declared guardrail steps so a primary win that violates constraints becomes \`checks_failed\`.
 - Confirm surprising wins on noisy metrics before building on them. A single lucky trial can mislead the campaign.
 - Use loop statuses from \`onyx exp run\`: \`succeeded\`, \`failed\`, \`checks_failed\`, and \`setup_violation\`. Do not mark autonomous attempts \`accepted\` or \`rejected\`; those are for human curation.

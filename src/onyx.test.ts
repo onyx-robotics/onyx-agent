@@ -981,6 +981,11 @@ describe("worker finalization", () => {
         "onyx exp log --campaign smoke | tail -n 1",
         "onyx sync | cat",
         "onyx push | cat",
+        "candidates = [1, 2]",
+        "for candidate in candidates; do echo $candidate; done",
+        "onyx/tools/evaluation/run.sh",
+        "onyx/tools/evaluation/run.sh",
+        "onyx/tools/evaluation/run.sh",
       ].join("\n"),
       "utf8"
     )
@@ -1003,18 +1008,20 @@ describe("worker finalization", () => {
       })
 
       expect(finalization.finalizationStatus).toBe("none")
-      expect(manifest.warnings).toHaveLength(4)
-      expect(manifest.warnings?.join("\n")).toContain("onyx exp run")
-      expect(manifest.warnings?.join("\n")).toContain("onyx push")
+      expect(manifest.warnings?.length).toBeGreaterThanOrEqual(7)
+      const warnings = manifest.warnings?.join("\n") ?? ""
+      expect(warnings).toContain("onyx exp run")
+      expect(warnings).toContain("onyx push")
+      expect(warnings).toContain("candidate array")
+      expect(warnings).toContain("multi-candidate loop")
+      expect(warnings).toContain("evaluator/simulator invocations")
       expect(await readFile(manifest.activityLogPath, "utf8")).toContain(
         "[warning] piped Onyx mutation command detected"
       )
-      const activityEvents = await readFile(
-        manifest.activityJsonlPath,
-        "utf8"
-      )
+      const activityEvents = await readFile(manifest.activityJsonlPath, "utf8")
       expect(activityEvents).toContain('"type":"warning"')
       expect(activityEvents).toContain("piped_onyx_mutation_command")
+      expect(activityEvents).toContain("worker_harness_policy_warning")
     } finally {
       process.chdir(previousCwd)
     }
@@ -1211,38 +1218,30 @@ describe("worker finalization", () => {
           if (
             request.method === "GET" &&
             request.path ===
-              `/api/v1/research/sessions/${hypothesis.createdBySessionId}/state`
+              `/api/v1/research/sessions/${hypothesis.createdBySessionId}/control-state`
           ) {
             return {
               body: {
                 data: {
-                  session: {
-                    id: hypothesis.createdBySessionId,
-                    campaignId,
-                    name: "session",
-                    status: "running",
-                    workerTarget: 1,
+                  sessionId: hypothesis.createdBySessionId,
+                  status: "running",
+                  finalizationStatus: "running",
+                  budget: {
                     maxExperiments: 1,
-                    reservedExperimentCount: 1,
-                    terminalExperimentCount: 0,
-                    finalizationStatus: "running",
-                    metadata: {},
-                    startedAt: "2026-06-20T00:00:00.000Z",
-                    completedAt: null,
-                    createdAt: "2026-06-20T00:00:00.000Z",
-                    updatedAt: "2026-06-20T00:00:00.000Z",
+                    reservedCount: 1,
+                    terminalCount: 0,
+                    remainingCount: 0,
+                    openReservationCount: 1,
+                    expiredReservationCount: 0,
                   },
-                  campaign: testCampaign({
-                    campaignId,
-                    campaignName,
-                    baseCommitSha,
-                  }),
-                  latestExperiments: [],
-                  bestExperiment: null,
-                  hypotheses: [hypothesis],
-                  workers: [],
-                  summaries: [],
-                  knowledge: [],
+                  finalization: {
+                    status: "running",
+                    reasons: [],
+                    terminalReason: null,
+                    releasedReservationCount: 0,
+                    expiredReservationCount: 0,
+                    unmeasuredSalvageCount: 0,
+                  },
                   updatedAt: "2026-06-20T00:00:00.000Z",
                 },
               },
@@ -2313,6 +2312,61 @@ describe("automated research smoke", () => {
       db.close()
     }
   }, 30_000)
+
+  test("research run marks provider quota exhaustion as a failed session", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "quota-smoke"
+    await createSupervisorRunCampaign({ root, baseCommitSha, campaignName })
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    const originalWarn = console.warn
+    console.log = () => {}
+    console.warn = () => {}
+
+    try {
+      process.chdir(root)
+      await commandResearchRun({
+        positional: ["research", "run"],
+        options: {
+          campaign: campaignName,
+          workers: "2",
+          "max-concurrency": "1",
+          hypotheses: JSON.stringify(supervisorPlans(2)),
+          "worker-command":
+            "printf 'Claude session limit reached: out_of_credits billing overage rejected\\n' >&2; exit 1",
+          "max-minutes": "1",
+          "worker-timeout": "5",
+          "startup-timeout": "0",
+          "sync-interval": "60",
+          "presence-interval": "60",
+          "final-sync-timeout": "1",
+          "stop-grace-seconds": "1",
+          offline: "true",
+          quiet: "true",
+          foreground: "true",
+        },
+      })
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+      console.warn = originalWarn
+    }
+
+    const state = await readState(root)
+    const sessionId =
+      state.campaigns?.[campaignStateKey("", campaignName)]?.sessionId
+    if (!sessionId) throw new Error("expected session id")
+    const sessionState = await getLocalSessionState(root, sessionId)
+    expect(sessionState.session.status).toBe("failed")
+    expect(sessionState.session.metadata).toMatchObject({
+      terminalReason: "provider_capacity_exhausted",
+      providerFailure: {
+        reason: "quota_exhausted",
+      },
+    })
+    expect(sessionState.workers).toHaveLength(1)
+    expect(sessionState.workers[0]?.status).toBe("failed")
+  })
 
   test("max-launches one stops a two-slot supervisor after one worker", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()

@@ -81,6 +81,15 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("onyx summary list --json")
     expect(prompt).toContain("In `single_candidate` mode")
     expect(prompt).toContain(
+      "Before the first workflow only, you may run at most one tiny pre-workflow sanity check comparing the baseline against one candidate"
+    )
+    expect(prompt).toContain(
+      "After the first workflow starts, every new candidate must be measured through a fresh Onyx workflow"
+    )
+    expect(prompt).toContain(
+      "Do not evaluate arrays/lists of candidates outside `onyx exp run`"
+    )
+    expect(prompt).toContain(
       'onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
     )
     expect(prompt).toContain("onyx knowledge add")
@@ -103,9 +112,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "run `onyx push` only when network access is clearly available"
     )
-    expect(prompt).not.toContain(
-      "Run `onyx sync` or `onyx push` periodically"
-    )
+    expect(prompt).not.toContain("Run `onyx sync` or `onyx push` periodically")
     expect(prompt).toContain("Primary metric is king")
     expect(prompt).toContain("Do not ask whether to continue")
     expect(prompt).not.toContain("Peer hypothesis state")

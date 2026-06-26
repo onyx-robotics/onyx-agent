@@ -71,6 +71,7 @@ export type CliState = {
       maxExperiments?: number | null
       stopRequested?: boolean
       status?: string
+      terminalReason?: string | null
       finalizationStatus?:
         | "not_started"
         | "running"
@@ -98,7 +99,8 @@ export type CliState = {
           reason: string
           workerId: string | null
           hypothesisId: string
-          error: string | null
+          error?: string | null
+          errorSummary?: string | null
         }>
       } | null
       supervisor?: {
@@ -119,7 +121,8 @@ export type CliState = {
             reason: string
             workerId: string | null
             hypothesisId: string
-            error: string | null
+            error?: string | null
+            errorSummary?: string | null
           }>
         } | null
         recentFailedLaunches?: Array<{
@@ -127,7 +130,8 @@ export type CliState = {
           reason: string
           workerId: string | null
           hypothesisId: string
-          error: string | null
+          error?: string | null
+          errorSummary?: string | null
         }>
         status?: string
         updatedAt?: string

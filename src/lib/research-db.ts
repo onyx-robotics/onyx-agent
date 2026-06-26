@@ -1823,21 +1823,31 @@ export async function stopLocalSession({
   status,
   finalizationStatus,
   reason,
+  metadata,
 }: {
   root: string
   sessionId: string
   status: ApiSession["status"]
   finalizationStatus?: ApiSession["finalizationStatus"] | null
   reason?: string | null
+  metadata?: Record<string, unknown>
 }) {
   const at = nowIso()
   return withResearchDbWrite(root, (db) => {
     const tx = db.transaction(() => {
+      const existing = db
+        .query("SELECT metadata_json FROM sessions WHERE id = ?")
+        .get(sessionId) as Row | null
+      const mergedMetadata = {
+        ...parseJson(existing?.metadata_json, {}),
+        ...(metadata ?? {}),
+      }
       db.query(
-        "UPDATE sessions SET status = ?, finalization_status = COALESCE(?, finalization_status), completed_at = ?, updated_at = ? WHERE id = ?"
+        "UPDATE sessions SET status = ?, finalization_status = COALESCE(?, finalization_status), metadata_json = ?, completed_at = ?, updated_at = ? WHERE id = ?"
       ).run(
         status,
         finalizationStatus ?? null,
+        json(mergedMetadata),
         status === "stop_requested" || status === "running" ? null : at,
         at,
         sessionId

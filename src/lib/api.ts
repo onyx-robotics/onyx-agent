@@ -226,31 +226,53 @@ export type ApiSessionLive = {
     lastError: string | null
   }
   finalization?: {
+    status: ApiSession["finalizationStatus"]
+    reasons: string[]
+    terminalReason:
+      | "max_experiments"
+      | "time_budget_reached"
+      | "stop_requested"
+      | "provider_capacity_exhausted"
+      | "no_active_hypotheses"
+      | "finalization_debt"
+      | null
+    releasedReservationCount: number
+    expiredReservationCount: number
     unmeasuredSalvageCount: number
   }
   livenessCounts: Record<string, number>
   phaseCounts: Record<string, number>
   workers: Array<{
     id: string
+    campaignId?: string
+    sessionId?: string | null
+    hypothesisId?: string | null
+    workerName?: string | null
+    agentKind?: string | null
+    runtime?: ApiWorker["runtime"] | null
     status: ApiWorker["status"]
     liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
     phase: string | null
     progressMessage: string | null
     gitLabel: string | null
+    currentExperimentId: string | null
     lastOutputAt: string | null
     activitySummary: Record<string, unknown>
+    observedAt?: string | null
     receivedAt: string
     matched: boolean
   }>
   sites: Array<{
     siteId: string
     supervisorRunId: string | null
-    liveness: "active" | "stale" | "lost"
+    liveness?: "active" | "stale" | "lost"
+    status?: "active" | "stale" | "inactive"
     lastSequence: number
     pendingSyncCount: number
     pushQueueDepth: number
     activeWorkerCount: number
     uploadedWorkerCount?: number
+    unchangedWorkerCount?: number
     droppedOrDeferredWorkerCount?: number
     syncLagMs: number | null
     providerBackoff: Record<string, unknown> | null
@@ -265,17 +287,55 @@ export type ApiSessionLive = {
   recentExperiments: ApiCampaignExperiment[]
   recentTerminalWorkers: Array<{
     id: string
+    campaignId?: string
+    sessionId?: string | null
+    hypothesisId?: string | null
+    workerName?: string | null
+    agentKind?: string | null
+    runtime?: ApiWorker["runtime"] | null
     status: ApiWorker["status"]
     liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
     phase: string | null
     progressMessage: string | null
     gitLabel: string | null
+    currentExperimentId: string | null
     lastOutputAt: string | null
     activitySummary: Record<string, unknown>
+    observedAt?: string | null
     receivedAt: string
     matched: boolean
   }>
   liveWatermark: string
+  updatedAt: string
+}
+
+export type ApiSessionControlState = {
+  sessionId: string
+  status: ApiSession["status"]
+  finalizationStatus: ApiSession["finalizationStatus"]
+  budget: {
+    maxExperiments: number | null
+    reservedCount: number
+    terminalCount: number
+    remainingCount: number | null
+    openReservationCount: number
+    expiredReservationCount: number
+  }
+  finalization: {
+    status: ApiSession["finalizationStatus"]
+    reasons: string[]
+    terminalReason:
+      | "max_experiments"
+      | "time_budget_reached"
+      | "stop_requested"
+      | "provider_capacity_exhausted"
+      | "no_active_hypotheses"
+      | "finalization_debt"
+      | null
+    releasedReservationCount: number
+    expiredReservationCount: number
+    unmeasuredSalvageCount: number
+  }
   updatedAt: string
 }
 
@@ -368,7 +428,9 @@ export type ApiResearchPresenceResponse = {
   ignoredCount: number
   unmatchedCount: number
   uploadedWorkerCount: number
+  unchangedWorkerCount: number
   droppedOrDeferredWorkerCount: number
+  deferredStartupTelemetryCount: number
   splitCount: number
   siteAccepted: boolean
 }
@@ -757,6 +819,20 @@ export async function getResearchSessionLive(
   )
 }
 
+export async function getResearchSessionControlState(
+  sessionId: string,
+  args?: Args
+): Promise<ApiSessionControlState> {
+  return apiData<ApiSessionControlState>(
+    await callApi(
+      "GET",
+      `/api/v1/research/sessions/${sessionId}/control-state`,
+      undefined,
+      args
+    )
+  )
+}
+
 export async function reconcileCampaign(
   campaignId: string,
   args?: Args
@@ -947,6 +1023,7 @@ export async function syncResearchPresence(
       ignoredPresence?: Record<string, unknown>
       activeWorkerCount?: number
       uploadedWorkerCount?: number
+      unchangedWorkerCount?: number
       droppedOrDeferredWorkerCount?: number
       unmeasuredSalvageCount?: number
       lastUploadAt?: string | null

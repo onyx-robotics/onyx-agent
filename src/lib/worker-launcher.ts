@@ -122,6 +122,13 @@ function unique(values: string[]) {
   return [...new Set(values.filter(Boolean))]
 }
 
+function compactPreflightOutput(value: string, limit = 2048) {
+  const compacted = value.replace(/\s+/g, " ").trim()
+  return compacted.length > limit
+    ? `${compacted.slice(0, Math.max(0, limit - 3))}...`
+    : compacted
+}
+
 async function sourceCheckoutOnyxBin() {
   const binPath = fileURLToPath(new URL("../../bin/onyx.js", import.meta.url))
   return (await pathExists(binPath)) ? binPath : null
@@ -391,7 +398,7 @@ export async function preflightWorkerInvocation(
     checks.push({
       name,
       status: passed ? "passed" : "failed",
-      output: output || null,
+      output: passed ? null : output ? compactPreflightOutput(output) : null,
     })
     if (!passed) {
       throw new Error(

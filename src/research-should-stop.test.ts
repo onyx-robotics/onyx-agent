@@ -54,43 +54,45 @@ function remoteSession(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function remoteState(overrides: Record<string, unknown> = {}) {
+function remoteControlState(overrides: Record<string, unknown> = {}) {
+  const session = remoteSession(overrides)
+  const maxExperiments =
+    typeof session.maxExperiments === "number" ? session.maxExperiments : null
+  const reservedCount =
+    typeof session.reservedExperimentCount === "number"
+      ? session.reservedExperimentCount
+      : 0
+  const terminalCount =
+    typeof session.terminalExperimentCount === "number"
+      ? session.terminalExperimentCount
+      : 0
+  const expiredReservationCount =
+    typeof overrides.expiredReservationCount === "number"
+      ? overrides.expiredReservationCount
+      : 0
   return {
-    session: remoteSession(overrides),
-    campaign: { id: "campaign_123", name: "smoke" },
-    latestExperiments: [],
-    bestExperiment: null,
-    hypotheses: [],
-    workers: [],
-    summaries: [],
-    knowledge: [],
-    updatedAt: new Date().toISOString(),
-  }
-}
-
-function remoteLive(overrides: Record<string, unknown> = {}) {
-  return {
-    session: remoteSession(),
-    campaign: { id: "campaign_123", name: "smoke" },
+    sessionId: session.id,
+    status: session.status,
+    finalizationStatus: session.finalizationStatus,
     budget: {
-      maxExperiments: 2,
-      reservedCount: 1,
-      terminalCount: 1,
-      remainingCount: 0,
-      openReservationCount: 0,
-      expiredReservationCount: 1,
-      ...overrides,
+      maxExperiments,
+      reservedCount,
+      terminalCount,
+      remainingCount:
+        maxExperiments === null
+          ? null
+          : Math.max(0, maxExperiments - reservedCount - terminalCount),
+      openReservationCount: reservedCount,
+      expiredReservationCount,
     },
-    livenessCounts: {},
-    phaseCounts: {},
-    workers: [],
-    sites: [],
-    unmatchedPresenceCount: 0,
-    ignoredPresence: {},
-    syncLagMs: null,
-    providerBackoff: null,
-    recentExperiments: [],
-    recentTerminalWorkers: [],
+    finalization: {
+      status: session.finalizationStatus,
+      reasons: [],
+      terminalReason: null,
+      releasedReservationCount: 0,
+      expiredReservationCount: 0,
+      unmeasuredSalvageCount: 0,
+    },
     updatedAt: new Date().toISOString(),
   }
 }
@@ -225,10 +227,11 @@ describe("research should-stop", () => {
     try {
       process.chdir(root)
       await withMockApi(
-        (path) =>
-          path.endsWith("/live")
-            ? remoteLive()
-            : remoteState({ status: "completed" }),
+        () =>
+          remoteControlState({
+            status: "completed",
+            expiredReservationCount: 1,
+          }),
         () =>
           commandResearchShouldStop({
             positional: ["research", "should-stop"],
@@ -268,10 +271,7 @@ describe("research should-stop", () => {
     })
 
     await withMockApi(
-      (path) =>
-        path.endsWith("/live")
-          ? remoteLive({ expiredReservationCount: 0 })
-          : remoteState(),
+      () => remoteControlState({ expiredReservationCount: 0 }),
       async () => {
         const checker = createResearchSessionStopChecker({
           root,
@@ -301,30 +301,31 @@ describe("research should-stop", () => {
         },
       },
     })
-    let liveCalls = 0
+    let controlStateCalls = 0
 
     await withMockApi(
       (path) => {
-        if (path.endsWith("/live")) {
-          liveCalls += 1
-          return remoteLive({ expiredReservationCount: 0 })
+        if (path.endsWith("/control-state")) {
+          controlStateCalls += 1
+          return remoteControlState({
+            maxExperiments: 3,
+            reservedExperimentCount: 0,
+            terminalExperimentCount: 0,
+            expiredReservationCount: 0,
+          })
         }
-        return remoteState({
-          maxExperiments: 3,
-          reservedExperimentCount: 0,
-          terminalExperimentCount: 0,
-        })
+        throw new Error(`unexpected path ${path}`)
       },
       async () => {
         const checker = createResearchSessionStopChecker({
           root,
           sessionId: "session_123",
           args: { positional: [], options: {} },
-          liveTtlMs: 5000,
+          controlStateTtlMs: 5000,
         })
         await checker.check({ nowMs: 10_000 })
         await checker.check({ nowMs: 11_000 })
-        expect(liveCalls).toBe(1)
+        expect(controlStateCalls).toBe(1)
       }
     )
   })

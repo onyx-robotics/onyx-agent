@@ -99,6 +99,15 @@ export const researchFinalizationStatusSchema = z.enum([
   "incomplete",
   "failed",
 ])
+
+export const researchSessionTerminalReasonSchema = z.enum([
+  "max_experiments",
+  "time_budget_reached",
+  "stop_requested",
+  "provider_capacity_exhausted",
+  "no_active_hypotheses",
+  "finalization_debt",
+])
 export const researchExperimentReservationStatusSchema = z.enum([
   "reserved",
   "consumed",
@@ -750,6 +759,7 @@ export const researchPresenceSiteSnapshotSchema = z.object({
   ignoredPresence: metadataSchema.default({}),
   activeWorkerCount: z.number().int().nonnegative().default(0),
   uploadedWorkerCount: z.number().int().nonnegative().default(0),
+  unchangedWorkerCount: z.number().int().nonnegative().default(0),
   droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
   unmeasuredSalvageCount: z.number().int().nonnegative().default(0),
   lastUploadAt: z.iso.datetime().nullable().optional(),
@@ -767,6 +777,7 @@ export const syncResearchPresenceRequestSchema = z.object({
     ignoredPresence: {},
     activeWorkerCount: 0,
     uploadedWorkerCount: 0,
+    unchangedWorkerCount: 0,
     droppedOrDeferredWorkerCount: 0,
     unmeasuredSalvageCount: 0,
     metadata: {},
@@ -802,7 +813,9 @@ export const syncResearchPresenceResponseSchema = z.object({
     ignoredCount: z.number().int().nonnegative(),
     unmatchedCount: z.number().int().nonnegative(),
     uploadedWorkerCount: z.number().int().nonnegative().default(0),
+    unchangedWorkerCount: z.number().int().nonnegative().default(0),
     droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
+    deferredStartupTelemetryCount: z.number().int().nonnegative().default(0),
     splitCount: z.number().int().nonnegative().default(1),
     siteAccepted: z.boolean(),
   }),
@@ -1483,7 +1496,7 @@ export const researchSessionSiteSchema = z.object({
   sessionId: z.uuid(),
   siteId: z.uuid(),
   supervisorRunId: z.string().min(1),
-  status: z.enum(["active", "stale"]),
+  status: z.enum(["active", "stale", "inactive"]),
   providerBackoff: metadataSchema.nullable(),
   syncLagMs: z.number().int().nonnegative().nullable(),
   pendingSyncCount: z.number().int().nonnegative(),
@@ -1491,6 +1504,7 @@ export const researchSessionSiteSchema = z.object({
   ignoredPresence: metadataSchema,
   activeWorkerCount: z.number().int().nonnegative(),
   uploadedWorkerCount: z.number().int().nonnegative().default(0),
+  unchangedWorkerCount: z.number().int().nonnegative().default(0),
   droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
   lastUploadAt: z.iso.datetime().nullable(),
   lastSequence: z.number().int().nonnegative(),
@@ -1562,6 +1576,15 @@ export const reserveResearchExperimentResponseSchema = z.object({
   }),
 })
 
+export const researchSessionFinalizationSummarySchema = z.object({
+  status: researchFinalizationStatusSchema,
+  reasons: z.array(z.string().min(1)).default([]),
+  terminalReason: researchSessionTerminalReasonSchema.nullable(),
+  releasedReservationCount: z.number().int().nonnegative().default(0),
+  expiredReservationCount: z.number().int().nonnegative().default(0),
+  unmeasuredSalvageCount: z.number().int().nonnegative().default(0),
+})
+
 export const researchSessionLiveResponseSchema = z.object({
   data: z.object({
     session: researchSessionSchema,
@@ -1582,11 +1605,7 @@ export const researchSessionLiveResponseSchema = z.object({
         lastError: z.string().nullable(),
       })
       .optional(),
-    finalization: z
-      .object({
-        unmeasuredSalvageCount: z.number().int().nonnegative(),
-      })
-      .optional(),
+    finalization: researchSessionFinalizationSummarySchema.optional(),
     livenessCounts: z.record(researchWorkerLivenessSchema, z.number().int()),
     phaseCounts: z.record(z.string(), z.number().int().nonnegative()),
     workers: z.array(researchLiveWorkerSummarySchema),
@@ -1598,6 +1617,24 @@ export const researchSessionLiveResponseSchema = z.object({
     recentExperiments: z.array(researchCampaignExperimentSummarySchema),
     recentTerminalWorkers: z.array(researchLiveWorkerSummarySchema),
     liveWatermark: z.string().min(1),
+    updatedAt: z.iso.datetime(),
+  }),
+})
+
+export const researchSessionControlStateResponseSchema = z.object({
+  data: z.object({
+    sessionId: z.uuid(),
+    status: researchSessionStatusSchema,
+    finalizationStatus: researchFinalizationStatusSchema,
+    budget: z.object({
+      maxExperiments: z.number().int().positive().nullable(),
+      reservedCount: z.number().int().nonnegative(),
+      terminalCount: z.number().int().nonnegative(),
+      remainingCount: z.number().int().nonnegative().nullable(),
+      openReservationCount: z.number().int().nonnegative(),
+      expiredReservationCount: z.number().int().nonnegative(),
+    }),
+    finalization: researchSessionFinalizationSummarySchema,
     updatedAt: z.iso.datetime(),
   }),
 })
@@ -1948,6 +1985,9 @@ export type ResearchProjectGraphResponse = z.infer<
 >
 export type ResearchSession = z.infer<typeof researchSessionSchema>
 export type ResearchSessionStatus = z.infer<typeof researchSessionStatusSchema>
+export type ResearchSessionTerminalReason = z.infer<
+  typeof researchSessionTerminalReasonSchema
+>
 export type CreateResearchSessionRequest = z.infer<
   typeof createResearchSessionRequestSchema
 >
@@ -2042,6 +2082,12 @@ export type ReserveResearchExperimentResponse = z.infer<
 >
 export type ResearchSessionLiveResponse = z.infer<
   typeof researchSessionLiveResponseSchema
+>
+export type ResearchSessionFinalizationSummary = z.infer<
+  typeof researchSessionFinalizationSummarySchema
+>
+export type ResearchSessionControlStateResponse = z.infer<
+  typeof researchSessionControlStateResponseSchema
 >
 export type ResearchSyncEventType = z.infer<typeof researchSyncEventTypeSchema>
 export type ResearchSyncEvent = z.infer<typeof researchSyncEventSchema>
