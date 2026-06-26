@@ -24,6 +24,7 @@ import {
   saveLoginProfile,
 } from "./commands/login"
 import {
+  commandProfile,
   commandProfileList,
   commandProfileDelete,
   commandProfileSetApiKeyEnv,
@@ -170,6 +171,10 @@ describe("CLI profiles", () => {
         custom: profile({
           apiKey: "old-key",
           teamName: "Original Team",
+          worker: {
+            agent: "opencode",
+            models: { opencode: "openrouter/qwen/qwen3-coder" },
+          },
         }),
       },
     })
@@ -189,6 +194,10 @@ describe("CLI profiles", () => {
     const config = await readConfig()
     expect(config.profiles.custom?.apiKey).toBe("new-key")
     expect(config.profiles.custom?.teamName).toBe("Renamed Team")
+    expect(config.profiles.custom?.worker).toEqual({
+      agent: "opencode",
+      models: { opencode: "openrouter/qwen/qwen3-coder" },
+    })
   })
 
   test("suffixes generated profile names when another team owns the name", async () => {
@@ -258,6 +267,10 @@ describe("CLI profiles", () => {
         alpha: profile({
           apiKey: undefined,
           apiKeyEnv: ALPHA_API_KEY_ENV,
+          worker: {
+            agent: "claude",
+            models: { claude: "sonnet" },
+          },
         }),
       },
     })
@@ -278,6 +291,10 @@ describe("CLI profiles", () => {
     expect(alpha?.apiKey).toBe("new-stored-key")
     expect(alpha?.apiKeyId).toBe("44444444-4444-4444-8444-444444444444")
     expect(alpha?.apiKeyEnv).toBeUndefined()
+    expect(alpha?.worker).toEqual({
+      agent: "claude",
+      models: { claude: "sonnet" },
+    })
   })
 
   test("resolves current and overridden profiles for API calls", async () => {
@@ -483,6 +500,10 @@ describe("CLI profiles", () => {
           apiKey: "beta-key",
           teamId: "33333333-3333-4333-8333-333333333333",
           teamName: "Beta Team",
+          worker: {
+            agent: "opencode",
+            models: { opencode: "openrouter/qwen/qwen3-coder" },
+          },
         }),
       },
     })
@@ -490,7 +511,11 @@ describe("CLI profiles", () => {
     const output = await captureLogs(commandProfileList)
     expect(output).toContain("* alpha")
     expect(output).toContain("stored key")
+    expect(output).toContain("worker:codex (default)")
     expect(output).toContain("  beta")
+    expect(output).toContain(
+      "worker:opencode model=openrouter/qwen/qwen3-coder"
+    )
 
     await captureLogs(() =>
       commandProfileUse({
@@ -499,6 +524,78 @@ describe("CLI profiles", () => {
       })
     )
     expect((await readConfig()).currentProfile).toBe("beta")
+  })
+
+  test("gets, sets, and clears profile worker defaults", async () => {
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: {
+        alpha: profile({ apiKey: "alpha-key" }),
+      },
+    })
+
+    await captureLogs(() =>
+      commandProfile({
+        positional: ["profile", "worker", "set"],
+        options: {
+          agent: "opencode",
+          model: "openrouter/qwen/qwen3-coder",
+        },
+      })
+    )
+
+    let alpha = (await readConfig()).profiles.alpha
+    expect(alpha?.worker).toEqual({
+      agent: "opencode",
+      models: { opencode: "openrouter/qwen/qwen3-coder" },
+    })
+
+    const output = await captureLogs(() =>
+      commandProfile({
+        positional: ["profile", "worker", "get"],
+        options: {},
+      })
+    )
+    expect(output).toContain("Worker agent: opencode")
+    expect(output).toContain("Model opencode: openrouter/qwen/qwen3-coder")
+    expect(output).toContain("Model codex: (default)")
+
+    await captureLogs(() =>
+      commandProfile({
+        positional: ["profile", "worker", "clear"],
+        options: { model: "opencode" },
+      })
+    )
+    alpha = (await readConfig()).profiles.alpha
+    expect(alpha?.worker).toEqual({ agent: "opencode" })
+
+    await captureLogs(() =>
+      commandProfile({
+        positional: ["profile", "worker", "clear"],
+        options: { agent: "true" },
+      })
+    )
+    alpha = (await readConfig()).profiles.alpha
+    expect(alpha?.worker).toBeUndefined()
+  })
+
+  test("rejects invalid OpenCode profile model identifiers", async () => {
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: {
+        alpha: profile({ apiKey: "alpha-key" }),
+      },
+    })
+
+    await expect(
+      commandProfile({
+        positional: ["profile", "worker", "set"],
+        options: {
+          agent: "opencode",
+          model: "qwen3-coder",
+        },
+      })
+    ).rejects.toThrow("--model for --agent opencode must use provider/model")
   })
 
   test("deletes profiles without switching teams implicitly", async () => {

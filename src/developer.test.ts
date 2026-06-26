@@ -225,7 +225,7 @@ describe("developer mode", () => {
     }
   })
 
-  test("use dev syncs managed Claude and Codex skill targets by default", async () => {
+  test("use dev syncs managed Claude, Codex, and OpenCode skill targets by default", async () => {
     const previousHome = process.env.HOME
     const previousCodexHome = process.env.CODEX_HOME
     const root = await mkdtemp(join(tmpdir(), "onyx-agent-managed-skill-"))

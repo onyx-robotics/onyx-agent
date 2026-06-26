@@ -33,6 +33,7 @@ describe("onyx listen", () => {
     await writeWorkerLaunchManifest({
       schemaVersion: 1,
       agentKind: "codex",
+      workerModel: null,
       command: "codex",
       args: [],
       onyxShimPath: null,

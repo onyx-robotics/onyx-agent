@@ -34,7 +34,10 @@ If you cancel authentication during install, run `onyx login` later.
 
 Profiles are team-scoped. Use `onyx profile list`, `onyx profile use <name>`,
 and `onyx profile delete <name>` to inspect, switch, or remove local profile
-entries.
+entries; profile listing includes each profile's worker defaults. Use
+`onyx profile worker set --agent codex|claude|opencode [--model <model>]` to
+store default worker settings for new research sessions; `--agent` and `--model`
+flags on `onyx research run` override those defaults.
 
 Only for local app development, point the agent at a non-production API.
 `--local` is shorthand for `--api-url http://localhost:3000`:
@@ -50,14 +53,15 @@ CLI targets.
 
 ## Agent Skill
 
-The installer installs the bundled skill automatically for Claude Code and
-Codex. It writes Claude's personal skill file at
+The installer installs the bundled skill automatically for Claude Code, Codex,
+and OpenCode. It writes Claude's personal skill file at
 `~/.claude/skills/onyx/SKILL.md`, Codex's user skill file at
-`~/.agents/skills/onyx/SKILL.md`, and the Codex home skill file at
+`~/.agents/skills/onyx/SKILL.md`, the Codex home skill file at
 `${CODEX_HOME:-~/.codex}/skills/onyx/SKILL.md` for Codex builds that discover
-skills from `CODEX_HOME`. The canonical source is `skills/onyx/SKILL.md`;
-after editing it, run `bun run generate:skill-content` so the embedded release
-fallback stays in sync. To install it manually:
+skills from `CODEX_HOME`, and OpenCode's global skill file at
+`~/.config/opencode/skills/onyx/SKILL.md`. The canonical source is
+`skills/onyx/SKILL.md`; after editing it, run `bun run generate:skill-content`
+so the embedded release fallback stays in sync. To install it manually:
 
 ```bash
 onyx agent install-skill
@@ -169,9 +173,9 @@ presence sends site telemetry every interval while uploading changed worker
 snapshots by default, a full worker snapshot every 60 seconds or final upload,
 and at most 250 worker snapshots per request.
 
-Codex and Claude are first-class built-in launchers. Both are spawned directly
-in non-interactive mode with the same Onyx CLI surface as the orchestrator,
-receive the worker prompt over stdin, and write raw stdout/stderr logs,
+Codex, Claude, and OpenCode are first-class built-in launchers. All are spawned
+directly in non-interactive mode with the same Onyx CLI surface as the
+orchestrator, receive the worker prompt over stdin, and write raw stdout/stderr logs,
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
@@ -257,9 +261,9 @@ onyx developer link .
 onyx developer use dev
 ```
 
-Developer mode runs source through Bun and replaces
-the managed Claude and Codex skill files with symlinks to this checkout's
-`skills/onyx/SKILL.md`, so active agents see skill edits from local source.
+Developer mode runs source through Bun and replaces the managed Claude, Codex,
+and OpenCode skill files with symlinks to this checkout's `skills/onyx/SKILL.md`,
+so active agents see skill edits from local source.
 Return to the installed release with:
 
 ```bash

@@ -12,13 +12,12 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { onyxStateDir } from "./outbox"
-import { readConfig } from "./config"
+import { readConfig, type BuiltInWorkerAgent } from "./config"
 import { gitCommonDir, gitDir } from "./git"
 import { pathExists, runProcess } from "./process"
 
 const ONYX_LAUNCHER_BYPASS = "ONYX_LAUNCHER_BYPASS"
 
-export type BuiltInWorkerAgent = "codex" | "claude"
 export type WorkerAgentKind = BuiltInWorkerAgent | "custom"
 
 export type WorkerInvocation = {
@@ -29,6 +28,7 @@ export type WorkerInvocation = {
   stdin?: string
   preflightArgs?: string[]
   addedWritableRoots: string[]
+  workerModel?: string | null
 }
 
 export type WorkerPreflightCheck = {
@@ -74,6 +74,7 @@ export type WorkerFinalizationManifest = {
 export type WorkerLaunchManifest = {
   schemaVersion: 1
   agentKind: WorkerAgentKind
+  workerModel: string | null
   command: string
   args: string[]
   onyxShimPath: string | null
@@ -224,12 +225,16 @@ export function buildWorkerInvocation({
   worktree,
   prompt,
   addedWritableRoots = [],
+  workerModel = null,
+  workerTitle,
 }: {
   agentKind: string
   workerCommand?: string
   worktree: string
   prompt: string
   addedWritableRoots?: string[]
+  workerModel?: string | null
+  workerTitle?: string
 }): WorkerInvocation {
   if (workerCommand) {
     return {
@@ -238,10 +243,12 @@ export function buildWorkerInvocation({
       args: ["-lc", workerCommand],
       redactedArgs: ["-lc", "<worker-command>"],
       addedWritableRoots: [],
+      workerModel: null,
     }
   }
 
   if (agentKind === "codex") {
+    const modelArgs = workerModel ? ["--model", workerModel] : []
     const writableArgs = addedWritableRoots.flatMap((root) => [
       "--add-dir",
       root,
@@ -252,6 +259,7 @@ export function buildWorkerInvocation({
       "workspace-write",
       "--ask-for-approval",
       "never",
+      ...modelArgs,
       "exec",
       "--cd",
       worktree,
@@ -270,16 +278,19 @@ export function buildWorkerInvocation({
       preflightArgs: args.slice(0, -1).concat("--help"),
       stdin: prompt,
       addedWritableRoots,
+      workerModel,
     }
   }
 
   if (agentKind === "claude") {
+    const modelArgs = workerModel ? ["--model", workerModel] : []
     const writableArgs = unique([worktree, ...addedWritableRoots]).flatMap(
       (root) => ["--add-dir", root]
     )
     const args = [
       "--verbose",
       "--print",
+      ...modelArgs,
       "--input-format",
       "text",
       "--output-format",
@@ -298,11 +309,37 @@ export function buildWorkerInvocation({
       preflightArgs: args.concat("--help"),
       stdin: prompt,
       addedWritableRoots,
+      workerModel,
+    }
+  }
+
+  if (agentKind === "opencode") {
+    const modelArgs = workerModel ? ["--model", workerModel] : []
+    const args = [
+      "run",
+      "--dir",
+      worktree,
+      "--format",
+      "json",
+      "--title",
+      workerTitle ?? "onyx-worker",
+      ...modelArgs,
+      "--dangerously-skip-permissions",
+    ]
+    return {
+      agentKind,
+      command: "opencode",
+      args,
+      redactedArgs: args,
+      preflightArgs: ["run", "--help"],
+      stdin: prompt,
+      addedWritableRoots: [],
+      workerModel,
     }
   }
 
   throw new Error(
-    `Unknown --agent ${agentKind}. Use codex, claude, or pass --worker-command.`
+    `Unknown --agent ${agentKind}. Use codex, claude, opencode, or pass --worker-command.`
   )
 }
 
@@ -344,7 +381,9 @@ export async function preflightWorkerInvocation(
     const install =
       invocation.agentKind === "codex"
         ? "Install or authenticate the Codex CLI before using `--agent codex`."
-        : "Install or authenticate Claude Code before using `--agent claude`."
+        : invocation.agentKind === "claude"
+          ? "Install or authenticate Claude Code before using `--agent claude`."
+          : "Install or authenticate OpenCode before using `--agent opencode`."
     throw new Error(
       `${invocation.command} preflight failed. ${install} ${
         error instanceof Error ? error.message : String(error)

@@ -7,6 +7,14 @@ import type { Args } from "./args"
 const CONFIG_FILE = "config.json"
 export const DEFAULT_API_URL = "https://app.onyxresearch.ai"
 
+export const BUILT_IN_WORKER_AGENTS = ["codex", "claude", "opencode"] as const
+export type BuiltInWorkerAgent = (typeof BUILT_IN_WORKER_AGENTS)[number]
+
+export type WorkerProfileConfig = {
+  agent?: BuiltInWorkerAgent
+  models?: Partial<Record<BuiltInWorkerAgent, string>>
+}
+
 export type CliProfile = {
   apiUrl: string
   apiKey?: string
@@ -15,6 +23,7 @@ export type CliProfile = {
   teamId: string
   teamName: string
   updatedAt: string
+  worker?: WorkerProfileConfig
 }
 
 export type DeveloperMode = "release" | "dev"
@@ -74,6 +83,82 @@ function normalizeDeveloperConfig(value: unknown): DeveloperConfig {
   return { mode }
 }
 
+export function isBuiltInWorkerAgent(value: unknown): value is BuiltInWorkerAgent {
+  return (
+    typeof value === "string" &&
+    (BUILT_IN_WORKER_AGENTS as readonly string[]).includes(value)
+  )
+}
+
+export function validateBuiltInWorkerAgent(value: string): BuiltInWorkerAgent {
+  if (isBuiltInWorkerAgent(value)) return value
+  throw new Error("--agent must be codex, claude, or opencode")
+}
+
+export function normalizeWorkerModel(value: unknown) {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed || undefined
+}
+
+export function normalizeWorkerProfileConfig(
+  value: unknown
+): WorkerProfileConfig | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const candidate = value as Partial<WorkerProfileConfig>
+  const worker: WorkerProfileConfig = {}
+  if (isBuiltInWorkerAgent(candidate.agent)) worker.agent = candidate.agent
+  if (candidate.models && typeof candidate.models === "object") {
+    const models: Partial<Record<BuiltInWorkerAgent, string>> = {}
+    for (const agent of BUILT_IN_WORKER_AGENTS) {
+      const model = normalizeWorkerModel(
+        (candidate.models as Record<string, unknown>)[agent]
+      )
+      if (model) models[agent] = model
+    }
+    if (Object.keys(models).length > 0) worker.models = models
+  }
+  return worker.agent || worker.models ? worker : undefined
+}
+
+function normalizeCliProfile(value: unknown): CliProfile | null {
+  if (!value || typeof value !== "object") return null
+  const candidate = value as Partial<CliProfile>
+  if (
+    typeof candidate.apiUrl !== "string" ||
+    typeof candidate.teamId !== "string" ||
+    typeof candidate.teamName !== "string" ||
+    typeof candidate.updatedAt !== "string"
+  ) {
+    return null
+  }
+  const worker = normalizeWorkerProfileConfig(candidate.worker)
+  return {
+    apiUrl: candidate.apiUrl,
+    ...(typeof candidate.apiKey === "string" ? { apiKey: candidate.apiKey } : {}),
+    ...(typeof candidate.apiKeyId === "string"
+      ? { apiKeyId: candidate.apiKeyId }
+      : {}),
+    ...(typeof candidate.apiKeyEnv === "string"
+      ? { apiKeyEnv: candidate.apiKeyEnv }
+      : {}),
+    teamId: candidate.teamId,
+    teamName: candidate.teamName,
+    updatedAt: candidate.updatedAt,
+    ...(worker ? { worker } : {}),
+  }
+}
+
+function normalizeProfiles(value: unknown): Record<string, CliProfile> {
+  if (!value || typeof value !== "object") return {}
+  const profiles: Record<string, CliProfile> = {}
+  for (const [name, profile] of Object.entries(value)) {
+    const normalized = normalizeCliProfile(profile)
+    if (normalized) profiles[name] = normalized
+  }
+  return profiles
+}
+
 async function readExistingDeveloperConfig() {
   try {
     const parsed = JSON.parse(
@@ -92,7 +177,7 @@ export async function readConfig(): Promise<Config> {
     ) as Partial<Config>
 
     return {
-      profiles: parsed.profiles ?? {},
+      profiles: normalizeProfiles(parsed.profiles),
       currentProfile: parsed.currentProfile ?? "",
       developer: normalizeDeveloperConfig(parsed.developer),
     }

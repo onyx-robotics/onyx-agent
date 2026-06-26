@@ -100,9 +100,11 @@ export function buildCliLoginUrl({
 function storedProfileFromLoginResult({
   apiUrl,
   result,
+  existing,
 }: {
   apiUrl: string
   result: CliLoginResult
+  existing?: CliProfile
 }): CliProfile {
   if (!result.apiKey) {
     throw new Error("Login callback did not include an API key.")
@@ -114,6 +116,7 @@ function storedProfileFromLoginResult({
     ...(result.apiKeyId ? { apiKeyId: result.apiKeyId } : {}),
     teamId: result.teamId,
     teamName: result.teamName,
+    ...(existing?.worker ? { worker: existing.worker } : {}),
     updatedAt: new Date().toISOString(),
   }
 }
@@ -151,7 +154,11 @@ export async function saveLoginProfile({
   await writeConfig({
     profiles: {
       ...config.profiles,
-      [profileName]: storedProfileFromLoginResult({ apiUrl, result }),
+      [profileName]: storedProfileFromLoginResult({
+        apiUrl,
+        result,
+        existing: config.profiles[profileName],
+      }),
     },
     currentProfile: profileName,
   })

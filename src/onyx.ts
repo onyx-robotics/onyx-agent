@@ -101,6 +101,7 @@ export {
   installDeveloperSkill,
   installOnyxSkill,
   installReleaseSkill,
+  opencodeSkillInstallRoot,
   packagedSkillPath,
   readPackagedSkill,
   skillInstallTarget,

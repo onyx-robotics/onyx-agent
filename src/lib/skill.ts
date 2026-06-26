@@ -15,7 +15,7 @@ import { ONYX_SKILL_MARKDOWN } from "./skill-content"
 export const ONYX_SKILL_NAME = "onyx"
 
 export type ManagedSkillInstallTarget = {
-  agent: "claude" | "codex" | "codex-home" | "custom"
+  agent: "claude" | "codex" | "codex-home" | "opencode" | "custom"
   label: string
   root: string
   target: string
@@ -42,6 +42,10 @@ export function codexHomeSkillInstallRoot() {
     process.env.CODEX_HOME?.trim() || join(userHomeDir(), ".codex"),
     "skills"
   )
+}
+
+export function opencodeSkillInstallRoot() {
+  return join(userHomeDir(), ".config", "opencode", "skills")
 }
 
 export function skillInstallTarget(root = defaultSkillInstallRoot()) {
@@ -82,6 +86,12 @@ export function defaultSkillInstallTargets(): ManagedSkillInstallTarget[] {
       label: "Codex (CODEX_HOME)",
       root: codexHomeSkillInstallRoot(),
       target: skillInstallTarget(codexHomeSkillInstallRoot()),
+    },
+    {
+      agent: "opencode",
+      label: "OpenCode",
+      root: opencodeSkillInstallRoot(),
+      target: skillInstallTarget(opencodeSkillInstallRoot()),
     },
   ])
 }
