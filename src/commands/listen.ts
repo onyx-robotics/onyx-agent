@@ -6,12 +6,20 @@ import { onyxStateDir, readState } from "../lib/outbox"
 import { campaignStateKey } from "../lib/project"
 import {
   getActiveLocalCampaignName,
+  getLocalSessionState,
   listLocalAttempts,
   listLocalExperimentHistory,
   pendingResearchSyncCount,
   researchSyncConflictCount,
 } from "../lib/research-db"
-import { formatAge, renderFrame, type ListenModel } from "../lib/tui"
+import {
+  formatAge,
+  renderFrame,
+  type ListenModel,
+  type ListenWorkerRow,
+} from "../lib/tui"
+import { readWorkerLatestState } from "../lib/worker-activity"
+import { readWorkerLaunchManifests } from "../lib/worker-launcher"
 
 const CSI = "\x1b["
 const RENDER_INTERVAL_MS = 500
@@ -40,6 +48,24 @@ async function buildModel(root: string): Promise<ListenModel> {
   const state = await readState(root)
   const campaignName =
     state.activeCampaign ?? (await getActiveLocalCampaignName(root)) ?? null
+  const meta = campaignName
+    ? state.campaigns?.[campaignStateKey(state.projectPath ?? "", campaignName)]
+    : undefined
+  const activeSessionId = meta?.sessionId ?? null
+  const localSession = activeSessionId
+    ? await getLocalSessionState(root, activeSessionId).catch(() => null)
+    : null
+  const manifests = activeSessionId
+    ? await readWorkerLaunchManifests(root, activeSessionId).catch(() => [])
+    : []
+  const latestByWorker = new Map(
+    await Promise.all(
+      manifests.map(
+        async (manifest) =>
+          [manifest.workerId, await readWorkerLatestState(manifest)] as const
+      )
+    )
+  )
 
   const records = await listLocalExperimentHistory(root)
   // Ascending — the most recent experiment renders at the bottom of the
@@ -96,9 +122,6 @@ async function buildModel(root: string): Promise<ListenModel> {
     })
   }
 
-  const meta = campaignName
-    ? state.campaigns?.[campaignStateKey(state.projectPath ?? "", campaignName)]
-    : undefined
   const metricName = meta?.metricName ?? rows[0]?.primaryMetricName ?? null
   const metricDirection = meta?.metricDirection ?? "maximize"
   const measured = rows.filter(
@@ -132,20 +155,103 @@ async function buildModel(root: string): Promise<ListenModel> {
     pendingResearchSyncCount(root),
     researchSyncConflictCount(root),
   ])
+  const manifestByWorker = new Map(
+    manifests.map((manifest) => [manifest.workerId, manifest])
+  )
+  const workersById = new Map(
+    (localSession?.workers ?? [])
+      .filter((worker) => worker.sessionId === activeSessionId)
+      .map((worker) => [worker.id, worker])
+  )
+  const hypothesesById = new Map(
+    (localSession?.hypotheses ?? []).map((hypothesis) => [
+      hypothesis.id,
+      hypothesis,
+    ])
+  )
+  const workerIds = new Set([
+    ...workersById.keys(),
+    ...manifestByWorker.keys(),
+  ])
+  const workers: ListenWorkerRow[] = [...workerIds]
+    .map((workerId) => {
+      const worker = workersById.get(workerId)
+      const manifest = manifestByWorker.get(workerId)
+      const latest = manifest ? latestByWorker.get(workerId) : null
+      const hypothesisName =
+        manifest?.hypothesisName ??
+        (worker?.hypothesisId
+          ? hypothesesById.get(worker.hypothesisId)?.name
+          : null) ??
+        null
+      return {
+        workerId,
+        workerName: worker?.workerName ?? manifest?.workerName ?? null,
+        hypothesisName,
+        status: latest?.status ?? worker?.status ?? manifest?.status ?? "running",
+        phase: latest?.phase ?? worker?.phase ?? null,
+        progressMessage:
+          latest?.progressMessage ?? worker?.progressMessage ?? null,
+        latestAt: latest?.at ?? null,
+        lastSeenAt: worker?.lastSeenAt ?? null,
+        lastOutputAt: manifest?.lastOutputAt ?? null,
+        startedAt: manifest?.startedAt ?? null,
+        completedAt: manifest?.completedAt ?? null,
+        finalizationStatus:
+          manifest?.finalization?.finalizationStatus ?? null,
+        activityLogPath: manifest?.activityLogPath ?? null,
+        logPath: manifest?.logPath ?? null,
+      }
+    })
+    .sort((a, b) => {
+      const activeA = ["registered", "running", "starting"].includes(a.status)
+      const activeB = ["registered", "running", "starting"].includes(b.status)
+      if (activeA !== activeB) return activeA ? -1 : 1
+      const aAt = Date.parse(
+        a.latestAt ??
+          a.lastOutputAt ??
+          a.lastSeenAt ??
+          a.completedAt ??
+          a.startedAt ??
+          ""
+      )
+      const bAt = Date.parse(
+        b.latestAt ??
+          b.lastOutputAt ??
+          b.lastSeenAt ??
+          b.completedAt ??
+          b.startedAt ??
+          ""
+      )
+      return (Number.isFinite(bAt) ? bAt : 0) - (Number.isFinite(aAt) ? aAt : 0)
+    })
 
   return {
     projectName: basename(root),
     campaignName,
+    sessionId: activeSessionId,
+    sessionStatus:
+      localSession?.session.status ??
+      (activeSessionId ? state.sessions?.[activeSessionId]?.status : null) ??
+      null,
     metricName,
     metricUnit: meta?.metricUnit ?? null,
     metricDirection,
     bestValue,
     activity,
-    active,
+    active:
+      active ||
+      workers.some((worker) =>
+        ["registered", "running", "starting"].includes(worker.status)
+      ),
     rows,
     pendingOutbox,
     conflictOutbox: conflictCount,
     syncedCount: 0,
+    providerBackoff: activeSessionId
+      ? (state.sessions?.[activeSessionId]?.providerBackoff ?? null)
+      : null,
+    workers,
   }
 }
 

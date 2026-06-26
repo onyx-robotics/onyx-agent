@@ -91,6 +91,8 @@ export type CliState = {
       providerBackoff?: {
         reason: string
         until: string
+        attempt?: number
+        delayMs?: number
       } | null
     }
   >

@@ -4,7 +4,10 @@ import { join } from "node:path"
 
 import { afterEach, describe, expect, test } from "bun:test"
 
-import { commandResearchShouldStop } from "./commands/research"
+import {
+  commandResearchShouldStop,
+  createResearchSessionStopChecker,
+} from "./commands/research"
 import { writeState } from "./lib/outbox"
 import { runProcess } from "./lib/process"
 
@@ -245,5 +248,84 @@ describe("research should-stop", () => {
     expect(payload.reasonCodes).toContain("budget_exhausted")
     expect(payload.reasonCodes).toContain("reservation_expired")
     expect(payload.reasonCodes).toContain("session_terminal")
+  })
+
+  test("shared session stop checker stops supervisor launches on budget exhaustion", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: "smoke",
+      sessions: {
+        session_123: {
+          campaignName: "smoke",
+          campaignId: "campaign_123",
+          endTimeMs: Date.now() + 60_000,
+          maxExperiments: 2,
+          status: "running",
+        },
+      },
+    })
+
+    await withMockApi(
+      (path) =>
+        path.endsWith("/live")
+          ? remoteLive({ expiredReservationCount: 0 })
+          : remoteState(),
+      async () => {
+        const checker = createResearchSessionStopChecker({
+          root,
+          sessionId: "session_123",
+          args: { positional: [], options: {} },
+        })
+        const result = await checker.check()
+        expect(result.shouldStop).toBe(true)
+        expect(result.reasonCodes).toContain("budget_exhausted")
+      }
+    )
+  })
+
+  test("shared session stop checker caches live budget reads", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: "smoke",
+      sessions: {
+        session_123: {
+          campaignName: "smoke",
+          campaignId: "campaign_123",
+          endTimeMs: Date.now() + 60_000,
+          maxExperiments: 3,
+          status: "running",
+        },
+      },
+    })
+    let liveCalls = 0
+
+    await withMockApi(
+      (path) => {
+        if (path.endsWith("/live")) {
+          liveCalls += 1
+          return remoteLive({ expiredReservationCount: 0 })
+        }
+        return remoteState({
+          maxExperiments: 3,
+          reservedExperimentCount: 0,
+          terminalExperimentCount: 0,
+        })
+      },
+      async () => {
+        const checker = createResearchSessionStopChecker({
+          root,
+          sessionId: "session_123",
+          args: { positional: [], options: {} },
+          liveTtlMs: 5000,
+        })
+        await checker.check({ nowMs: 10_000 })
+        await checker.check({ nowMs: 11_000 })
+        expect(liveCalls).toBe(1)
+      }
+    )
   })
 })

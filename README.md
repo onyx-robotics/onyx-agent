@@ -55,7 +55,9 @@ Codex. It writes Claude's personal skill file at
 `~/.claude/skills/onyx/SKILL.md`, Codex's user skill file at
 `~/.agents/skills/onyx/SKILL.md`, and the Codex home skill file at
 `${CODEX_HOME:-~/.codex}/skills/onyx/SKILL.md` for Codex builds that discover
-skills from `CODEX_HOME`. To install it manually:
+skills from `CODEX_HOME`. The canonical source is `skills/onyx/SKILL.md`;
+after editing it, run `bun run generate:skill-content` so the embedded release
+fallback stays in sync. To install it manually:
 
 ```bash
 onyx agent install-skill
@@ -147,9 +149,12 @@ onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --max-lau
 
 For large local runs, the supervisor ramps launches in batches
 (`--launch-batch-size`, default up to 10) separated by
-`--launch-interval-seconds` (default 5), backs off briefly when provider
-startup or rate-limit failures happen, and stops launching new workers once the
-shutdown cushion begins.
+`--launch-interval-seconds` (default 5), backs off with capped exponential
+jitter when provider startup, rate-limit, overload, auth, or degraded-service
+failures happen, and stops launching new workers once the shutdown cushion
+begins or the shared session stop reasons say the experiment budget is
+exhausted, reservations expired, a stop was requested, or the session became
+terminal.
 
 Codex and Claude are first-class built-in launchers. Both are spawned directly
 in non-interactive mode with the same Onyx CLI surface as the orchestrator,
@@ -165,6 +170,8 @@ as a low-level debugging and recovery primitive.
 including activity/raw log paths, last-output age, timeout state, and manifest
 errors when local manifests are available. `--max-experiments` is the global
 attempt budget and `--max-worker-iterations` is a per-worker safety cap.
+`onyx listen` shows the same local worker latest-state/manifests and active
+provider backoff metadata alongside the experiment/outbox view.
 `--max-launches` caps only new workers launched by the current
 supervisor invocation and does not change the session's active slot target.
 `onyx workflow status --active` shows only actionable running or paused
