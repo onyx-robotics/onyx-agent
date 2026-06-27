@@ -10,6 +10,7 @@ import { runProcess } from "./lib/process"
 import {
   acquireLocalResourceLease,
   applyProjectDeletions,
+  acceptOrDiscardLocalExperiment,
   cacheLocalCampaign,
   createLocalCampaign,
   createLocalSession,
@@ -247,6 +248,71 @@ describe("SQLite research ledger", () => {
 
     const state = await getLocalSessionState(root, session.session.id)
     expect(state.workers[0]?.status).toBe("completed")
+  })
+
+  test("rejects scheduling and experiment logs for sessions owned by another site", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "site-owned",
+      description: "offline campaign",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "owned-elsewhere",
+      workerTarget: 1,
+      schedulerSiteId: "other-site",
+      hypotheses: [
+        {
+          focus: "try one thing",
+          statement: "A focused local change can improve score.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+      metadata: { agentKind: "codex" },
+    })
+    const hypothesis = session.hypotheses[0]!
+
+    await expect(
+      registerLocalWorker({
+        root,
+        campaignId: campaign.id,
+        sessionId: session.session.id,
+        hypothesisId: hypothesis.id,
+        workerName: "worker-1",
+        agentKind: "codex",
+      })
+    ).rejects.toThrow("single-machine scheduling")
+
+    await expect(
+      acceptOrDiscardLocalExperiment({
+        root,
+        record: experimentRecord({
+          campaignName: campaign.name,
+          campaignId: campaign.id,
+          runRef: "local/site-owned/1",
+          name: "site-owned-run",
+          value: 1,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          sessionId: session.session.id,
+          hypothesisId: hypothesis.id,
+        }),
+      })
+    ).rejects.toThrow("single-machine scheduling")
+
+    const state = await getLocalSessionState(root, session.session.id)
+    expect(state.workers).toHaveLength(0)
+    expect(state.session.acceptedExperimentCount).toBe(0)
   })
 
   test("serializes concurrent worker registration without SQLite lock errors", async () => {
@@ -509,6 +575,105 @@ describe("SQLite research ledger", () => {
     expect(history).toHaveLength(1)
     expect(history[0]?.runRef).toBe("local/experiments/1")
     expect(history[0]?.primaryMetricValue).toBe(2)
+  })
+
+  test("accepts exactly the session experiment target under concurrent logs", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "exact-budget",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "target-50",
+      workerTarget: 100,
+      hypotheses: [
+        {
+          focus: "controller",
+          statement: "Try many scoped controller changes.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+      experimentTarget: 50,
+    })
+    const hypothesis = session.hypotheses[0]!
+    const records = Array.from({ length: 100 }, (_, index) =>
+      experimentRecord({
+        campaignName: campaign.name,
+        campaignId: campaign.id,
+        runRef: `local/exact-budget/${index + 1}`,
+        name: `attempt-${index + 1}`,
+        value: index + 1,
+        createdAt: `2026-01-01T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
+        sessionId: session.session.id,
+        hypothesisId: hypothesis.id,
+      })
+    )
+
+    const outcomes = await Promise.all(
+      records.map(async (record) => ({
+        record,
+        result: await acceptOrDiscardLocalExperiment({ root, record }),
+      }))
+    )
+    const accepted = outcomes.filter(
+      (outcome) => outcome.result.outcome === "accepted"
+    )
+    const discarded = outcomes.filter(
+      (outcome) => outcome.result.outcome === "discarded"
+    )
+    const acceptedIndexes = accepted
+      .map((outcome) =>
+        outcome.result.outcome === "accepted"
+          ? outcome.result.experiment.acceptedIndex
+          : null
+      )
+      .filter((index): index is number => index !== null)
+      .sort((a, b) => a - b)
+
+    expect(accepted).toHaveLength(50)
+    expect(discarded).toHaveLength(50)
+    expect(acceptedIndexes).toEqual(
+      Array.from({ length: 50 }, (_, index) => index + 1)
+    )
+    expect(await listLocalExperimentHistory(root)).toHaveLength(50)
+
+    const acceptedRetry = await acceptOrDiscardLocalExperiment({
+      root,
+      record: accepted[0]!.record,
+    })
+    const firstAcceptedIndex =
+      accepted[0]!.result.outcome === "accepted"
+        ? accepted[0]!.result.experiment.acceptedIndex
+        : null
+    expect(acceptedRetry.outcome).toBe("accepted")
+    expect(acceptedRetry.idempotent).toBe(true)
+    if (acceptedRetry.outcome === "accepted") {
+      expect(acceptedRetry.experiment.acceptedIndex).toBe(firstAcceptedIndex)
+    }
+
+    const discardedRetry = await acceptOrDiscardLocalExperiment({
+      root,
+      record: discarded[0]!.record,
+    })
+    expect(discardedRetry.outcome).toBe("discarded")
+    expect(discardedRetry.idempotent).toBe(true)
+
+    const state = await getLocalSessionState(root, session.session.id)
+    expect(state.session.status).toBe("completed")
+    expect(state.session.terminalReason).toBe("experiment_target_reached")
+    expect(state.session.acceptedExperimentCount).toBe(50)
+    expect(state.session.remainingExperimentCount).toBe(0)
   })
 
   test("keeps the earliest maximizing experiment when best metrics tie", async () => {

@@ -17,7 +17,6 @@ import {
   getResearchSessionLive,
   getResearchSessionState,
   listProjectCampaigns,
-  releaseResearchExperimentReservations,
   reconcileCampaign,
   stopCampaignSession,
   syncResearchPresence,
@@ -26,7 +25,6 @@ import {
   type ApiHypothesis,
   type ApiResearchPresenceResponse,
   type ApiSession,
-  type ApiSessionControlState,
   type ApiSessionLive,
   type ApiSummary,
   type ApiWorker,
@@ -67,6 +65,7 @@ import {
 } from "../lib/process"
 import {
   abandonBlockedWorkflowRunsForSession,
+  assertLocalSessionSchedulerSite,
   cacheLocalCampaign,
   applyRemoteProjectionDeltas,
   completeLocalCampaign,
@@ -169,12 +168,12 @@ async function frozenWorkerApiEnv(args: Args) {
 
 type SessionFinalizationStatus = ApiSession["finalizationStatus"]
 type SessionTerminalReason =
-  | "max_experiments"
-  | "time_budget_reached"
+  | "experiment_target_reached"
+  | "deadline_reached"
   | "stop_requested"
   | "provider_capacity_exhausted"
   | "no_active_hypotheses"
-  | "finalization_debt"
+  | "failed"
 type ProviderLaunchFailure = {
   at: string
   reason: string
@@ -377,15 +376,6 @@ function optionalPositiveIntegerOption(args: Args, name: string) {
   return value
 }
 
-function maxWorkerIterationsOption(args: Args, fallback = 10): number {
-  if (args.options["max-iterations"] !== undefined) {
-    throw new Error(
-      "--max-iterations was removed. Use --max-worker-iterations for the per-worker safety cap, and --max-experiments for the global session budget."
-    )
-  }
-  return positiveIntegerOption(args, "max-worker-iterations", fallback)
-}
-
 function positiveNumberOption(args: Args, name: string, fallback: number) {
   const raw = args.options[name]
   if (raw === undefined) return fallback
@@ -584,14 +574,8 @@ function safeFileSegment(value: string) {
   )
 }
 
-function workerBudgetOptions({
-  maxWorkerIterations,
-  maxMinutes,
-}: {
-  maxWorkerIterations: number
-  maxMinutes: number
-}) {
-  return ` --max-worker-iterations ${maxWorkerIterations} --max-minutes ${maxMinutes}`
+function workerBudgetOptions({ maxMinutes }: { maxMinutes: number }) {
+  return ` --max-minutes ${maxMinutes}`
 }
 
 function metadataString(metadata: Record<string, unknown>, key: string) {
@@ -913,11 +897,9 @@ function launchSuggestionsForSession({
 function chooseSupervisorHypothesis({
   hypotheses,
   workers,
-  reservations = [],
 }: {
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
-  reservations?: LaunchReservation[]
 }) {
   const activeHypotheses = hypotheses.filter(
     (hypothesis) => hypothesis.status === "active"
@@ -926,13 +908,9 @@ function chooseSupervisorHypothesis({
 
   const activeWorkers = workers.filter(workerIsActive)
   const completedWorkers = workers.filter(workerIsCompleted)
-  const reservedCountFor = (hypothesisId: string) =>
-    reservations.filter(
-      (reservation) => reservation.hypothesisId === hypothesisId
-    ).length
   const activeCountFor = (hypothesisId: string) =>
     activeWorkers.filter((worker) => worker.hypothesisId === hypothesisId)
-      .length + reservedCountFor(hypothesisId)
+      .length
   const neverWorked = activeHypotheses.find((hypothesis) => {
     const relatedActive = activeWorkers.some(
       (worker) => worker.hypothesisId === hypothesis.id
@@ -940,15 +918,7 @@ function chooseSupervisorHypothesis({
     const relatedCompleted = completedWorkers.some(
       (worker) => worker.hypothesisId === hypothesis.id
     )
-    const relatedReserved = reservations.some(
-      (reservation) => reservation.hypothesisId === hypothesis.id
-    )
-    return (
-      !hypothesis.lastWorkedAt &&
-      !relatedActive &&
-      !relatedCompleted &&
-      !relatedReserved
-    )
+    return !hypothesis.lastWorkedAt && !relatedActive && !relatedCompleted
   })
   if (neverWorked) return neverWorked
 
@@ -1590,41 +1560,6 @@ async function drainFinalSync({
   }
 }
 
-async function releaseUnloggedExperimentReservations({
-  root,
-  args,
-  sessionId,
-  runRefs,
-  reason,
-}: {
-  root: string
-  args: Args
-  sessionId: string
-  runRefs: string[]
-  reason: string
-}) {
-  const uniqueRunRefs = [...new Set(runRefs.filter(Boolean))]
-  if (uniqueRunRefs.length === 0 || args.options.offline === "true") return
-  const logged = await listLocalExperimentHistory(root).catch(() => [])
-  const loggedRunRefs = new Set(logged.map((record) => record.runRef))
-  const releasable = uniqueRunRefs.filter(
-    (runRef) => !loggedRunRefs.has(runRef)
-  )
-  if (releasable.length === 0) return
-  try {
-    await releaseResearchExperimentReservations(
-      sessionId,
-      { runRefs: releasable, reason },
-      args
-    )
-  } catch (error) {
-    if (args.options["require-online"] === "true") throw error
-    console.warn(
-      `Reservation release skipped: ${error instanceof Error ? error.message : String(error)}`
-    )
-  }
-}
-
 function printFinalSyncReport(
   report: Awaited<ReturnType<typeof drainFinalSync>>
 ) {
@@ -1650,53 +1585,32 @@ type SessionFinalizationComputation = {
   conflictCount: number
 }
 
-function finalizationIsBudgetedSession(
-  local: Awaited<ReturnType<typeof getLocalSessionState>> | null,
-  cliState: CliState,
-  sessionId: string
-) {
-  const localMax = local?.session.maxExperiments
-  if (localMax !== undefined) return localMax !== null
-  const cachedMax = cliState.sessions?.[sessionId]?.maxExperiments
-  return cachedMax !== undefined && cachedMax !== null
-}
-
 async function computeSessionFinalizationStatus({
   root,
-  args,
   sessionId,
   pendingSyncCount,
-  launchReservationDebt,
+  requireOnline,
 }: {
   root: string
-  args: Args
   sessionId: string
   pendingSyncCount: number
-  launchReservationDebt: number
+  requireOnline: boolean
 }): Promise<SessionFinalizationComputation> {
   const failedReasons: string[] = []
   const incompleteReasons: string[] = []
-  const [conflictCount, manifests, cliState, localState] = await Promise.all([
+  const [conflictCount, manifests] = await Promise.all([
     researchSyncConflictCount(root).catch(() => 0),
     readWorkerLaunchManifests(root, sessionId).catch(() => []),
-    readState(root).catch(() => ({}) as CliState),
-    getLocalSessionState(root, sessionId).catch(() => null),
   ])
 
   if (pendingSyncCount > 0) {
     const message = `${pendingSyncCount} pending sync event(s)`
-    if (args.options["require-online"] === "true") failedReasons.push(message)
+    if (requireOnline) failedReasons.push(message)
     else incompleteReasons.push(message)
   }
   if (conflictCount > 0) {
     incompleteReasons.push(`${conflictCount} sync conflict(s)`)
   }
-  if (launchReservationDebt > 0) {
-    incompleteReasons.push(
-      `${launchReservationDebt} unresolved launch reservation(s)`
-    )
-  }
-
   for (let index = 0; index < manifests.length; index += 25) {
     const batch = manifests.slice(index, index + 25)
     if (manifests.length > 25) {
@@ -1754,36 +1668,7 @@ async function computeSessionFinalizationStatus({
     }
   }
 
-  let live: ApiSessionLive | null = null
-  const budgetedSession = finalizationIsBudgetedSession(
-    localState,
-    cliState,
-    sessionId
-  )
-  if (budgetedSession) {
-    if (args.options.offline === "true") {
-      incompleteReasons.push("remote reservation debt was not verified offline")
-    } else {
-      try {
-        live = await getResearchSessionLive(sessionId, args)
-        if (live.budget.openReservationCount > 0) {
-          incompleteReasons.push(
-            `${live.budget.openReservationCount} open reservation(s)`
-          )
-        }
-        if (live.budget.expiredReservationCount > 0) {
-          incompleteReasons.push(
-            `${live.budget.expiredReservationCount} expired reservation(s)`
-          )
-        }
-      } catch (error) {
-        const message = `remote reservation debt check failed: ${errorMessage(error)}`
-        if (args.options["require-online"] === "true")
-          failedReasons.push(message)
-        else incompleteReasons.push(message)
-      }
-    }
-  }
+  const live: ApiSessionLive | null = null
 
   const reasons = failedReasons.length > 0 ? failedReasons : incompleteReasons
   return {
@@ -2306,21 +2191,17 @@ export async function finalizeHypothesisAttempt({
       const stopCheck = await collectResearchStopReasons({
         root,
         sessionId,
-        args,
       }).catch(() => null)
-      if (
-        stopCheck?.reasonCodes.includes("budget_exhausted") ||
-        stopCheck?.reasonCodes.includes("budget_saturated")
-      ) {
-        manifest.finalizationStatus = "salvaged_unmeasured_budget_exhausted"
-        manifest.salvaged = true
+      if (stopCheck?.shouldStop) {
+        manifest.finalizationStatus = "discarded_after_completion"
+        manifest.salvaged = false
         manifest.error =
-          "Experiment budget saturated before worker harness finalization; pushed salvage branch without logging a measured attempt."
+          "Session stop condition reached before final measurement; discarded unlogged work without creating an experiment."
         if (activityManifest) {
           await appendWorkerActivityEvent(activityManifest, {
             type: "finalization",
-            phase: "salvaged",
-            summary: "Budget saturated before final measurement",
+            phase: "discarded",
+            summary: "Session completed before final measurement",
             metadata: {
               finalizationStatus: manifest.finalizationStatus,
               measurementBaseCommitSha,
@@ -2387,6 +2268,23 @@ export async function finalizeHypothesisAttempt({
           })
         )
           .then(async (record) => {
+            if (record && "discarded" in record && record.discarded) {
+              manifest.finalizationStatus = "discarded_after_completion"
+              manifest.salvaged = false
+              manifest.error = `experiment log discarded: ${record.discardReason}`
+              if (activityManifest) {
+                await appendWorkerActivityEvent(activityManifest, {
+                  type: "finalization",
+                  phase: "discarded",
+                  summary: "Experiment log discarded",
+                  metadata: {
+                    runRef: record.runRef,
+                    discardReason: record.discardReason,
+                  },
+                })
+              }
+              return
+            }
             manifest.finalizationStatus = "measured_and_logged"
             if (record && activityManifest) {
               await appendWorkerActivityEvent(activityManifest, {
@@ -2398,7 +2296,10 @@ export async function finalizeHypothesisAttempt({
                   status: record.status,
                   primaryMetricName: record.primaryMetricName,
                   primaryMetricValue: record.primaryMetricValue,
-                  metrics: record.metrics,
+                  metrics:
+                    "metrics" in record
+                      ? record.metrics
+                      : record.secondaryMetrics,
                   resultCommitSha: record.resultCommitSha,
                   resultRef: record.resultRef,
                 },
@@ -2417,21 +2318,21 @@ export async function finalizeHypothesisAttempt({
       }
     }
 
-    if (manifest.finalizationStatus.startsWith("salvaged_unmeasured")) {
-      const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
+    if (
+      manifest.finalizationStatus.startsWith("salvaged_unmeasured") ||
+      manifest.finalizationStatus === "discarded_after_completion"
+    ) {
+      await abandonBlockedWorkflowRunsForSession({
         root,
         sessionId,
         workerId,
         hypothesisId: hypothesis.id,
-        reason: `Worker finalization ${manifest.finalizationStatus}; reservation no longer represents a loggable attempt.`,
+        reason: `Worker finalization ${manifest.finalizationStatus}; workflow no longer represents a loggable attempt.`,
       }).catch(() => [])
-      await releaseUnloggedExperimentReservations({
-        root,
-        args,
-        sessionId,
-        runRefs: abandonedRunRefs,
-        reason: `worker finalization ${manifest.finalizationStatus}`,
-      })
+    }
+
+    if (manifest.finalizationStatus === "discarded_after_completion") {
+      return manifest
     }
 
     const workerBranchPush = await pushWorkerBranch({
@@ -2503,7 +2404,6 @@ async function writeWorkerPrompt({
   hypothesis,
   workerId,
   workerBranch,
-  maxIterations,
   endTimeMs,
 }: {
   root: string
@@ -2515,7 +2415,6 @@ async function writeWorkerPrompt({
   hypothesis: ApiHypothesis
   workerId: string
   workerBranch: string
-  maxIterations: number
   endTimeMs: number
 }) {
   const dir = join(await onyxStateDir(root), "worker-prompts", sessionId)
@@ -2537,7 +2436,6 @@ async function writeWorkerPrompt({
     hypothesisId: hypothesis.id,
     hypothesisName: hypothesis.name,
     hypothesisPlan: hypothesis.plan,
-    maxIterations,
     metricLabel: `${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
     minutesRemaining,
     protectedPaths,
@@ -2613,24 +2511,13 @@ export type ResearchStopReasonCode =
   | "stop_requested"
   | "session_terminal"
   | "deadline_reached"
-  | "time_budget_reached"
-  | "iteration_budget_reached"
-  | "budget_saturated"
-  | "budget_exhausted"
-  | "reservation_expired"
+  | "experiment_target_reached"
 
 export type ResearchStopCheck = {
   shouldStop: boolean
   sessionId: string
   reasonCodes: ResearchStopReasonCode[]
   reasons: string[]
-  budgetSaturated: boolean
-  budgetExhausted: boolean
-}
-
-type ResearchStopControlStateCache = {
-  fetchedAtMs: number
-  controlState: ApiSessionControlState | null
 }
 
 function addResearchStopReason(
@@ -2649,70 +2536,26 @@ function terminalReasonForStopCheck(
   if (stopCheck.reasonCodes.includes("stop_requested")) {
     return "stop_requested"
   }
-  if (stopCheck.reasonCodes.includes("budget_exhausted")) {
-    return "max_experiments"
+  if (stopCheck.reasonCodes.includes("experiment_target_reached")) {
+    return "experiment_target_reached"
   }
-  if (stopCheck.reasonCodes.includes("budget_saturated")) {
-    return "max_experiments"
-  }
-  if (
-    stopCheck.reasonCodes.includes("time_budget_reached") ||
-    stopCheck.reasonCodes.includes("deadline_reached")
-  ) {
-    return "time_budget_reached"
+  if (stopCheck.reasonCodes.includes("deadline_reached")) {
+    return "deadline_reached"
   }
   return null
-}
-
-async function cachedResearchSessionControlState({
-  sessionId,
-  args,
-  nowMs,
-  controlStateCache,
-  controlStateTtlMs,
-}: {
-  sessionId: string
-  args: Args
-  nowMs: number
-  controlStateCache?: ResearchStopControlStateCache
-  controlStateTtlMs: number
-}) {
-  if (
-    controlStateCache &&
-    controlStateCache.controlState &&
-    nowMs - controlStateCache.fetchedAtMs < controlStateTtlMs
-  ) {
-    return controlStateCache.controlState
-  }
-  const controlState = await getResearchSessionControlState(sessionId, args)
-  if (controlStateCache) {
-    controlStateCache.fetchedAtMs = nowMs
-    controlStateCache.controlState = controlState
-  }
-  return controlState
 }
 
 export async function collectResearchStopReasons({
   root,
   sessionId,
-  args,
-  iteration = null,
   nowMs = Date.now(),
-  controlStateCache,
-  controlStateTtlMs = 0,
 }: {
   root: string
   sessionId: string
-  args: Args
-  iteration?: number | null
   nowMs?: number
-  controlStateCache?: ResearchStopControlStateCache
-  controlStateTtlMs?: number
 }): Promise<ResearchStopCheck> {
   const reasons: string[] = []
   const reasonCodes = new Set<ResearchStopReasonCode>()
-  let budgetSaturated = false
-  let budgetExhausted = false
   const addStopReason = (code: ResearchStopReasonCode, reason: string) =>
     addResearchStopReason(reasonCodes, reasons, code, reason)
 
@@ -2725,10 +2568,23 @@ export async function collectResearchStopReasons({
     () => null
   )
   if (localSessionState && localSessionState.session.status !== "running") {
+    if (
+      localSessionState.session.terminalReason === "experiment_target_reached"
+    ) {
+      addStopReason("experiment_target_reached", "experiment target reached")
+    } else if (localSessionState.session.terminalReason === "deadline_reached") {
+      addStopReason("deadline_reached", "deadline reached")
+    }
     addStopReason(
       "session_terminal",
       `local session ${localSessionState.session.status}`
     )
+  }
+  const localDeadline = localSessionState?.session.deadlineAt
+    ? Date.parse(localSessionState.session.deadlineAt)
+    : Number.NaN
+  if (Number.isFinite(localDeadline) && nowMs >= localDeadline) {
+    addStopReason("deadline_reached", "deadline reached")
   }
   const workerResearchDeadline = process.env.ONYX_RESEARCH_DEADLINE_AT
     ? Date.parse(process.env.ONYX_RESEARCH_DEADLINE_AT)
@@ -2739,69 +2595,12 @@ export async function collectResearchStopReasons({
   ) {
     addStopReason("deadline_reached", "worker shutdown cushion reached")
   }
-  if (localSession?.endTimeMs && nowMs >= localSession.endTimeMs) {
-    addStopReason("time_budget_reached", "time budget reached")
-  }
-  if (
-    iteration !== null &&
-    Number.isFinite(iteration) &&
-    (localSession?.maxWorkerIterations ?? localSession?.maxIterations) &&
-    iteration >
-      (localSession.maxWorkerIterations ?? localSession.maxIterations ?? 0)
-  ) {
-    addStopReason("iteration_budget_reached", "iteration budget reached")
-  }
-
-  try {
-    const remote = await cachedResearchSessionControlState({
-      sessionId,
-      args,
-      nowMs,
-      controlStateCache,
-      controlStateTtlMs,
-    })
-    budgetSaturated = Boolean(remote.budget.budgetSaturated)
-    budgetExhausted =
-      remote.budget.budgetExhausted ??
-      (remote.budget.remainingCount !== null &&
-        remote.budget.remainingCount <= 0 &&
-        remote.budget.reservedCount === 0)
-    if (budgetSaturated) {
-      addStopReason(
-        "budget_saturated",
-        budgetExhausted
-          ? "experiment budget saturated"
-          : "experiment budget saturated by open reservations"
-      )
-    }
-    if (budgetExhausted) {
-      addStopReason("budget_exhausted", "experiment budget exhausted")
-    }
-    if (remote.budget.expiredReservationCount > 0) {
-      addStopReason(
-        "reservation_expired",
-        `${remote.budget.expiredReservationCount} experiment reservation(s) expired`
-      )
-    }
-    if (
-      remote.status === "stop_requested" ||
-      remote.status === "stopped" ||
-      remote.status === "completed" ||
-      remote.status === "failed"
-    ) {
-      addStopReason("session_terminal", `remote session ${remote.status}`)
-    }
-  } catch {
-    // Local state is enough for offline stop checks.
-  }
 
   return {
     shouldStop: reasons.length > 0,
     sessionId,
     reasonCodes: [...reasonCodes],
     reasons,
-    budgetSaturated,
-    budgetExhausted,
   }
 }
 
@@ -2809,42 +2608,21 @@ export function createResearchSessionStopChecker({
   root,
   sessionId,
   args,
-  controlStateTtlMs = 5000,
 }: {
   root: string
   sessionId: string
   args: Args
-  controlStateTtlMs?: number
 }) {
-  const controlStateCache: ResearchStopControlStateCache = {
-    fetchedAtMs: 0,
-    controlState: null,
-  }
+  void args
   return {
-    check({
-      iteration = null,
-      nowMs = Date.now(),
-    }: { iteration?: number | null; nowMs?: number } = {}) {
+    check({ nowMs = Date.now() }: { nowMs?: number } = {}) {
       return collectResearchStopReasons({
         root,
         sessionId,
-        args,
-        iteration,
         nowMs,
-        controlStateCache,
-        controlStateTtlMs,
       })
     },
   }
-}
-
-function isPureBudgetSaturation(stopCheck: ResearchStopCheck) {
-  return (
-    stopCheck.budgetSaturated &&
-    !stopCheck.budgetExhausted &&
-    stopCheck.reasonCodes.length > 0 &&
-    stopCheck.reasonCodes.every((code) => code === "budget_saturated")
-  )
 }
 
 async function harnessShouldStopSession({
@@ -2964,8 +2742,8 @@ export function finalizationStatusLabel(status: WorkerFinalizationStatus) {
       return "measured and logged"
     case "salvaged_unmeasured":
       return "salvaged without measurement"
-    case "salvaged_unmeasured_budget_exhausted":
-      return "salvaged without measurement after budget exhaustion"
+    case "discarded_after_completion":
+      return "discarded after session completion"
     case "failed":
       return "failed"
   }
@@ -3087,7 +2865,6 @@ async function runHypothesisOnce({
   workerCommand,
   agentKind,
   workerModel,
-  maxIterations,
   endTimeMs,
   hardEndTimeMs,
   workerTimeoutMs,
@@ -3107,7 +2884,6 @@ async function runHypothesisOnce({
   workerCommand?: string
   agentKind: string
   workerModel: string | null
-  maxIterations: number
   endTimeMs: number
   hardEndTimeMs: number
   workerTimeoutMs: number
@@ -3196,7 +2972,6 @@ async function runHypothesisOnce({
       hypothesis,
       workerId: worker.id,
       workerBranch,
-      maxIterations,
       endTimeMs,
     })
     runtimePaths = await workerRuntimePaths({
@@ -3766,29 +3541,45 @@ export async function commandResearchStart(args: Args) {
   })
 
   const workerTargetOption = args.options.workers ?? args.options.agents
-  const maxWorkerIterations = maxWorkerIterationsOption(args, 10)
-  const maxExperiments = optionalPositiveIntegerOption(args, "max-experiments")
-  const maxMinutes = positiveNumberOption(args, "max-minutes", 120)
+  if (args.options["max-experiments"] !== undefined) {
+    throw new Error("--max-experiments was removed. Use --experiments.")
+  }
+  if (args.options["max-worker-iterations"] !== undefined) {
+    throw new Error(
+      "--max-worker-iterations is no longer a research session option."
+    )
+  }
+  const experimentTarget = optionalPositiveIntegerOption(args, "experiments")
+  const maxMinutes =
+    args.options["max-minutes"] === undefined
+      ? null
+      : positiveNumberOption(args, "max-minutes", 120)
+  if (experimentTarget === null && maxMinutes === null) {
+    throw new Error("Pass --experiments <n> or --max-minutes <n>.")
+  }
   const hypotheses = await hypothesisPlansOption(args)
   const workerTarget =
     workerTargetOption === undefined && hypotheses
       ? hypotheses.length
       : positiveIntegerOption(args, "workers", Number(workerTargetOption ?? 1))
   const workerSettings = await resolveWorkerSettings({ args })
-  const endTimeMs = Date.now() + maxMinutes * 60_000
+  const deadlineAt =
+    maxMinutes === null
+      ? null
+      : new Date(Date.now() + maxMinutes * 60_000).toISOString()
+  const schedulerSiteId = await getResearchSiteId(root)
   const result = await createLocalSession({
     root,
     campaignId: campaign.id,
     name: args.options.name ?? `research-${new Date().toISOString()}`,
     workerTarget,
     hypotheses,
-    maxIterations: maxWorkerIterations,
-    maxExperiments,
-    endTimeMs,
+    experimentTarget,
+    deadlineAt,
+    schedulerSiteId,
     metadata: {
       startedBy: "onyx-research",
-      maxWorkerIterations,
-      maxExperiments,
+      experimentTarget,
       maxMinutes,
       agentKind: workerSettings.agentKind,
       ...workerModelMetadata(workerSettings.workerModel),
@@ -3806,10 +3597,11 @@ export async function commandResearchStart(args: Args) {
   state.sessions[result.session.id] = {
     campaignName: campaign.name,
     campaignId: campaign.id,
-    endTimeMs,
-    maxIterations: maxWorkerIterations,
-    maxWorkerIterations,
-    maxExperiments,
+    deadlineAt,
+    experimentTarget,
+    acceptedExperimentCount: 0,
+    remainingExperimentCount: experimentTarget,
+    schedulerSiteId,
     status: "running",
   }
   await writeState(root, state)
@@ -3830,12 +3622,11 @@ export async function commandResearchStart(args: Args) {
   console.log(`Campaign: ${campaign.name}`)
   console.log(`Workers: 0/${workerTarget}`)
   console.log(`Hypotheses: ${result.hypotheses.length}`)
-  console.log(`Max experiments: ${maxExperiments ?? "unbounded"}`)
+  console.log(`Experiment target: ${experimentTarget ?? "deadline only"}`)
+  console.log(`Deadline: ${deadlineAt ?? "none"}`)
   const agentOption = workerOptions(workerSettings)
-  const budgetOptions = workerBudgetOptions({
-    maxWorkerIterations,
-    maxMinutes,
-  })
+  const budgetOptions =
+    maxMinutes === null ? "" : workerBudgetOptions({ maxMinutes })
   if (result.hypotheses.length === 0) {
     console.log(
       "No hypotheses were created. Add one with `onyx research hypothesis add --session " +
@@ -3924,34 +3715,37 @@ export async function commandResearchHypothesisAdd(args: Args) {
     },
   })
 
-  const maxWorkerIterations =
-    typeof sessionMetadata.maxWorkerIterations === "number"
-      ? sessionMetadata.maxWorkerIterations
-      : typeof sessionMetadata.maxIterations === "number"
-        ? sessionMetadata.maxIterations
-        : 10
-  const maxExperiments =
-    typeof sessionMetadata.maxExperiments === "number"
-      ? sessionMetadata.maxExperiments
-      : state.sessions?.[sessionId ?? ""]?.maxExperiments
   const maxMinutes =
     typeof sessionMetadata.maxMinutes === "number"
       ? sessionMetadata.maxMinutes
-      : 120
-  const endTimeMs =
-    sessionId && state.sessions?.[sessionId]?.endTimeMs
-      ? state.sessions[sessionId].endTimeMs
-      : Date.now() + maxMinutes * 60_000
+      : null
+  const deadlineAt =
+    before?.session.deadlineAt ??
+    (sessionId ? state.sessions?.[sessionId]?.deadlineAt : null) ??
+    null
   if (sessionId) {
     state.sessions = state.sessions ?? {}
     state.sessions[sessionId] = {
       ...(state.sessions[sessionId] ?? {}),
       campaignName: campaign.name,
       campaignId: campaign.id,
-      endTimeMs,
-      maxIterations: maxWorkerIterations,
-      maxWorkerIterations,
-      maxExperiments,
+      deadlineAt,
+      experimentTarget:
+        before?.session.experimentTarget ??
+        state.sessions[sessionId]?.experimentTarget ??
+        null,
+      acceptedExperimentCount:
+        before?.session.acceptedExperimentCount ??
+        state.sessions[sessionId]?.acceptedExperimentCount ??
+        0,
+      remainingExperimentCount:
+        before?.session.remainingExperimentCount ??
+        state.sessions[sessionId]?.remainingExperimentCount ??
+        null,
+      schedulerSiteId:
+        before?.session.schedulerSiteId ??
+        state.sessions[sessionId]?.schedulerSiteId ??
+        null,
       status: "running",
     }
   }
@@ -3975,10 +3769,8 @@ export async function commandResearchHypothesisAdd(args: Args) {
   if (sessionId) console.log(`Session: ${sessionId}`)
   console.log(`Hypothesis: ${hypothesis.name}: ${hypothesis.plan.focus}`)
   if (sessionId) {
-    const budgetOptions = workerBudgetOptions({
-      maxWorkerIterations,
-      maxMinutes,
-    })
+    const budgetOptions =
+      maxMinutes === null ? "" : workerBudgetOptions({ maxMinutes })
     console.log(
       `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}${budgetOptions}`
     )
@@ -4255,7 +4047,7 @@ export async function commandResearchStatus(args: Args) {
                       updatedAt: supervisorTelemetry.updatedAt ?? null,
                     }
                   : null,
-                budget: live?.budget ?? null,
+                progress: live?.progress ?? null,
               }
             : null,
           hypotheses,
@@ -4311,7 +4103,7 @@ export async function commandResearchStatus(args: Args) {
   }
   if (live?.finalization) {
     console.log(
-      `finalization: ${live.finalization.status} terminalReason=${live.finalization.terminalReason ?? "-"} releasedReservations=${live.finalization.releasedReservationCount} expiredReservations=${live.finalization.expiredReservationCount}`
+      `finalization: ${live.finalization.status} terminalReason=${live.finalization.terminalReason ?? "-"}`
     )
   }
   if (localUnloggedAttempts.length > 0) {
@@ -4340,6 +4132,16 @@ export async function commandResearchStatus(args: Args) {
   }
 
   if (activeSessionId) {
+    const progress = live?.progress ?? (sessionState?.session ?? null)
+    if (progress) {
+      console.log(
+        `experiments: accepted=${progress.acceptedExperimentCount}${
+          progress.experimentTarget === null
+            ? ""
+            : `/${progress.experimentTarget}`
+        } remaining=${progress.remainingExperimentCount ?? "-"} deadline=${progress.deadlineAt ?? "-"}`
+      )
+    }
     console.log(
       `worker slots: ${activeWorkers}/${target ?? "?"}${
         stopping ? " (stop requested; open slots are intentionally idle)" : ""
@@ -4538,13 +4340,9 @@ export async function commandResearchShouldStop(args: Args) {
     return
   }
 
-  const iteration =
-    args.options.iteration === undefined ? null : Number(args.options.iteration)
   const result = await collectResearchStopReasons({
     root,
     sessionId,
-    args,
-    iteration,
   })
   if (args.options.json === "true") {
     console.log(
@@ -4554,8 +4352,6 @@ export async function commandResearchShouldStop(args: Args) {
           sessionId,
           reasonCodes: result.reasonCodes,
           reasons: result.reasons,
-          budgetSaturated: result.budgetSaturated,
-          budgetExhausted: result.budgetExhausted,
         },
         null,
         2
@@ -4604,6 +4400,7 @@ export async function commandResearchStop(args: Args) {
       root,
       sessionId,
       status: "stop_requested",
+      terminalReason: "stop_requested",
       reason: args.options.reason ?? "stop requested",
     }).catch(() => {})
     if (args.options.offline !== "true") {
@@ -4673,19 +4470,12 @@ export async function commandResearchFinish(args: Args) {
       providerBackoff: null,
     }
     await writeState(root, state)
-    const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
+    await abandonBlockedWorkflowRunsForSession({
       root,
       sessionId,
       reason:
         "Campaign finalized; blocked worker workflow is no longer active.",
     }).catch(() => [])
-    await releaseUnloggedExperimentReservations({
-      root,
-      args,
-      sessionId,
-      runRefs: abandonedRunRefs,
-      reason: "blocked workflows abandoned during campaign finish",
-    })
     await stopLocalSession({
       root,
       sessionId,
@@ -4809,20 +4599,21 @@ export async function commandResearchFinish(args: Args) {
           "salvaged_unmeasured"
         )
     ).length
-  const finishReservedAttempts =
-    finishLive?.session.reservedExperimentCount ??
-    finishLocal?.session.reservedExperimentCount ??
+  const finishAccepted =
+    finishLive?.session.acceptedExperimentCount ??
+    finishLocal?.session.acceptedExperimentCount ??
+    overview.campaign.experimentCount ??
     0
-  const finishTerminalMeasured =
-    finishLive?.session.terminalExperimentCount ??
-    finishLocal?.session.terminalExperimentCount ??
-    0
+  const finishTarget =
+    finishLive?.session.experimentTarget ??
+    finishLocal?.session.experimentTarget ??
+    null
 
   const body = [
     `Finalized campaign ${campaign.name}.`,
     `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
     `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
-    `Budget counts: reservedAttempts=${finishReservedAttempts} terminalMeasuredAttempts=${finishTerminalMeasured} verifiedSyncedExperiments=${finishLive?.budget.terminalCount ?? finishTerminalMeasured} unmeasuredSalvage=${finishUnmeasuredSalvage}`,
+    `Experiment counts: accepted=${finishAccepted}${finishTarget === null ? "" : `/${finishTarget}`} unmeasuredSalvage=${finishUnmeasuredSalvage}`,
     "Hypothesis refs are not promoted from mutable hypothesis heads; use verified experiment best projections for curated outputs.",
     "",
     "Local branches:",
@@ -5072,6 +4863,11 @@ async function existingRunSession({
       `Session ${sessionId} belongs to ${sessionState.campaign.name}, not ${args.options.campaign}.`
     )
   }
+  await assertLocalSessionSchedulerSite({
+    root,
+    sessionId,
+    schedulerSiteId: sessionState.session.schedulerSiteId,
+  })
   return sessionState
 }
 
@@ -5095,19 +4891,6 @@ function activeSessionWorkers({
   return workers.filter(
     (worker) => worker.sessionId === sessionId && workerIsActive(worker)
   )
-}
-
-type LaunchReservation = {
-  hypothesisId: string
-  workerId: string | null
-}
-
-function unresolvedReservationCount(reservations: Iterable<LaunchReservation>) {
-  let count = 0
-  for (const reservation of reservations) {
-    if (!reservation.workerId) count += 1
-  }
-  return count
 }
 
 function defaultPresenceIntervalSeconds(workerTarget: number) {
@@ -5433,6 +5216,9 @@ export async function commandResearchRun(args: Args) {
   if (args.options["worker-command"] && args.options.model !== undefined) {
     throw new Error("Pass either --worker-command or --model, not both.")
   }
+  if (args.options["max-worker-iterations"] !== undefined) {
+    throw new Error("--max-worker-iterations is no longer a worker option.")
+  }
   const sessionMetadata = sessionState?.session.metadata ?? {}
   const workerSettings = args.options["worker-command"]
     ? ({ agentKind: "codex", workerModel: null } satisfies WorkerSettings)
@@ -5451,27 +5237,27 @@ export async function commandResearchRun(args: Args) {
     },
   }
   const sessionAgentKind = args.options["worker-command"] ? "custom" : agentKind
-  const maxWorkerIterations = maxWorkerIterationsOption(
-    args,
-    typeof sessionMetadata.maxWorkerIterations === "number"
-      ? sessionMetadata.maxWorkerIterations
-      : typeof sessionMetadata.maxIterations === "number"
-        ? sessionMetadata.maxIterations
-        : 10
-  )
-  const maxExperiments =
-    optionalPositiveIntegerOption(args, "max-experiments") ??
-    sessionState?.session.maxExperiments ??
-    (typeof sessionMetadata.maxExperiments === "number"
-      ? sessionMetadata.maxExperiments
+  if (args.options["max-experiments"] !== undefined) {
+    throw new Error("--max-experiments was removed. Use --experiments.")
+  }
+  if (args.options["max-worker-iterations"] !== undefined) {
+    throw new Error(
+      "--max-worker-iterations is no longer a research session option."
+    )
+  }
+  if (args.options["max-launches"] !== undefined) {
+    throw new Error("--max-launches was removed.")
+  }
+  const experimentTarget =
+    optionalPositiveIntegerOption(args, "experiments") ??
+    sessionState?.session.experimentTarget ??
+    (typeof sessionMetadata.experimentTarget === "number"
+      ? sessionMetadata.experimentTarget
       : null)
-  const maxMinutes = positiveNumberOption(
-    args,
-    "max-minutes",
-    typeof sessionMetadata.maxMinutes === "number"
-      ? sessionMetadata.maxMinutes
-      : 120
-  )
+  const maxMinutes =
+    args.options["max-minutes"] === undefined
+      ? null
+      : positiveNumberOption(args, "max-minutes", 120)
   const workerFallback = sessionState
     ? (sessionState.session.workerTarget ?? 1)
     : (hypotheses?.length ?? 1)
@@ -5492,21 +5278,30 @@ export async function commandResearchRun(args: Args) {
       `--max-concurrency is capped at ${MAX_LOCAL_SUPERVISOR_WORKERS}`
     )
   }
-  const maxLaunches = optionalPositiveIntegerOption(args, "max-launches")
-
   const now = Date.now()
-  const existingEndTime =
-    requestedSessionId && state.sessions?.[requestedSessionId]?.endTimeMs
-  const endTimeMs =
-    args.options["max-minutes"] === undefined &&
-    typeof existingEndTime === "number" &&
-    existingEndTime > now
-      ? existingEndTime
-      : now + maxMinutes * 60_000
-  const sessionBudgetMs = Math.max(1, endTimeMs - now)
+  const existingDeadlineAt =
+    sessionState?.session.deadlineAt ??
+    (requestedSessionId
+      ? state.sessions?.[requestedSessionId]?.deadlineAt
+      : null) ??
+    null
+  const deadlineAt =
+    maxMinutes === null
+      ? existingDeadlineAt
+      : new Date(now + maxMinutes * 60_000).toISOString()
+  if (!requestedSessionId && experimentTarget === null && deadlineAt === null) {
+    throw new Error("Pass --experiments <n> or --max-minutes <n>.")
+  }
+  const endTimeMs = deadlineAt ? Date.parse(deadlineAt) : Number.POSITIVE_INFINITY
+  const defaultWorkerBudgetMs = 120 * 60_000
+  const sessionBudgetMs = Number.isFinite(endTimeMs)
+    ? Math.max(1, endTimeMs - now)
+    : defaultWorkerBudgetMs
   const shutdownCushionMs = workerShutdownCushionMs(sessionBudgetMs)
   const hardStopGraceMs = workerHardStopGraceMs(shutdownCushionMs)
-  const hardEndTimeMs = endTimeMs + hardStopGraceMs
+  const hardEndTimeMs = Number.isFinite(endTimeMs)
+    ? endTimeMs + hardStopGraceMs
+    : Number.POSITIVE_INFINITY
   const workerTimeoutMs =
     positiveNumberOption(
       args,
@@ -5545,25 +5340,25 @@ export async function commandResearchRun(args: Args) {
     positiveNumberOption(args, "final-sync-timeout", 120) * 1000
 
   let sessionId = requestedSessionId
+  let schedulerSiteId = sessionState?.session.schedulerSiteId ?? null
   if (!sessionId) {
+    schedulerSiteId = await getResearchSiteId(root)
     const result = await createLocalSession({
       root,
       campaignId: campaign.id,
       name: args.options.name ?? `research-${new Date().toISOString()}`,
       workerTarget,
       hypotheses,
-      maxIterations: maxWorkerIterations,
-      maxExperiments,
-      endTimeMs,
+      experimentTarget,
+      deadlineAt,
+      schedulerSiteId,
       metadata: {
         startedBy: "onyx-research-supervisor",
-        maxWorkerIterations,
-        maxExperiments,
+        experimentTarget,
         maxMinutes,
         agentKind: sessionAgentKind,
         ...workerModelMetadata(workerModel),
         maxConcurrency,
-        ...(maxLaunches ? { maxLaunches } : {}),
         launchBatchSize,
         launchIntervalSeconds: launchIntervalMs / 1000,
         presenceIntervalSeconds: presenceIntervalMs / 1000,
@@ -5586,10 +5381,19 @@ export async function commandResearchRun(args: Args) {
     ...(nextState.sessions[sessionId] ?? {}),
     campaignName: campaign.name,
     campaignId: campaign.id,
-    endTimeMs,
-    maxIterations: maxWorkerIterations,
-    maxWorkerIterations,
-    maxExperiments,
+    deadlineAt,
+    experimentTarget,
+    acceptedExperimentCount:
+      sessionState?.session.acceptedExperimentCount ?? 0,
+    remainingExperimentCount:
+      experimentTarget === null
+        ? null
+        : Math.max(
+            0,
+            experimentTarget -
+              (sessionState?.session.acceptedExperimentCount ?? 0)
+          ),
+    schedulerSiteId,
     status: "running",
   }
   await writeState(root, nextState)
@@ -5631,9 +5435,10 @@ export async function commandResearchRun(args: Args) {
       sessionId,
       status: "failed",
       finalizationStatus: "failed",
+      terminalReason: "failed",
       reason,
       metadata: {
-        terminalReason: "finalization_debt",
+        terminalReason: "failed",
         finalizationReasons: [reason],
       },
     }).catch(() => {})
@@ -5655,7 +5460,6 @@ export async function commandResearchRun(args: Args) {
   presenceSupervisor.request()
 
   const activeRuns = new Map<string, Promise<HypothesisRunResult>>()
-  const launchReservations = new Map<string, LaunchReservation>()
   let launched = 0
   let completed = 0
   let failed = 0
@@ -5731,11 +5535,9 @@ export async function commandResearchRun(args: Args) {
 
   console.log(`Research supervisor: ${sessionId}`)
   console.log(`Campaign: ${campaign.name}`)
-  console.log(
-    `Workers: target=${workerTarget} concurrency=${maxConcurrency}${
-      maxLaunches ? ` maxLaunches=${maxLaunches}` : ""
-    }`
-  )
+  console.log(`Workers: target=${workerTarget} concurrency=${maxConcurrency}`)
+  console.log(`Experiment target: ${experimentTarget ?? "deadline only"}`)
+  console.log(`Deadline: ${deadlineAt ?? "none"}`)
   console.log(
     `Launch ramp: batch=${launchBatchSize} interval=${launchIntervalMs / 1000}s`
   )
@@ -5765,24 +5567,14 @@ export async function commandResearchRun(args: Args) {
         sessionId,
         reasonCodes: [],
         reasons: [],
-        budgetSaturated: false,
-        budgetExhausted: false,
       }
       try {
         stopCheck = await sessionStopChecker.check({ nowMs: loopNow })
         lastStopCheck = stopCheck
       } catch {
-        // Network stop checks are best-effort; local state is checked again by workers.
+        // Local state is checked again by workers.
       }
-      const launchCutoffReached = !canLaunchWorkerBeforeDeadline({
-        now: loopNow,
-        endTimeMs,
-        shutdownCushionMs,
-        agentKind: sessionAgentKind,
-      })
-      const launchLimitReached = maxLaunches !== null && launched >= maxLaunches
-      const stopShouldEndSupervisor =
-        stopCheck.shouldStop && !isPureBudgetSaturation(stopCheck)
+      const stopShouldEndSupervisor = stopCheck.shouldStop
       if (stopShouldEndSupervisor && !stopLogged) {
         stopLogged = true
         terminalReason = terminalReasonForStopCheck(stopCheck)
@@ -5790,15 +5582,9 @@ export async function commandResearchRun(args: Args) {
           `Stop requested for session ${sessionId}: ${stopCheck.reasons.join(", ")}`
         )
       }
-      if (
-        stopShouldEndSupervisor ||
-        launchCutoffReached ||
-        launchLimitReached
-      ) {
+      if (stopShouldEndSupervisor) {
         if (!terminalReason) {
-          terminalReason = stopShouldEndSupervisor
-            ? terminalReasonForStopCheck(stopCheck)
-            : "time_budget_reached"
+          terminalReason = terminalReasonForStopCheck(stopCheck)
         }
         if (activeRuns.size === 0) break
         await Promise.race([
@@ -5816,44 +5602,20 @@ export async function commandResearchRun(args: Args) {
         workers: latest.workers,
         sessionId,
       }).length
+      const occupiedWorkerSlots = Math.max(activeWorkers, activeRuns.size)
       const openSlots = Math.max(
         0,
-        workerTarget -
-          activeWorkers -
-          unresolvedReservationCount(launchReservations.values())
+        workerTarget - occupiedWorkerSlots
       )
       const concurrencySlots = Math.max(0, maxConcurrency - activeRuns.size)
-      const launchCapSlots =
-        maxLaunches === null ? Number.POSITIVE_INFINITY : maxLaunches - launched
       const providerBackoffActive = Date.now() < providerBackoffUntil
-      const budgetSaturated =
-        stopCheck.budgetSaturated && !stopCheck.budgetExhausted
-      if (
-        providerBackoffActive &&
-        activeRuns.size === 0 &&
-        !canLaunchWorkerBeforeDeadline({
-          now: providerBackoffUntil,
-          endTimeMs,
-          shutdownCushionMs,
-          agentKind: sessionAgentKind,
-        })
-      ) {
-        terminalReason = "provider_capacity_exhausted"
-        providerTerminalFailure = recentProviderFailures.at(-1) ?? null
-        break
-      }
       const rampWaiting =
         lastLaunchBatchAt > 0 &&
         Date.now() - lastLaunchBatchAt < launchIntervalMs
       const launchSlots =
-        providerBackoffActive || rampWaiting || budgetSaturated
+        providerBackoffActive || rampWaiting
           ? 0
-          : Math.min(
-              openSlots,
-              concurrencySlots,
-              launchCapSlots,
-              launchBatchSize
-            )
+          : Math.min(openSlots, concurrencySlots, launchBatchSize)
       let launchedThisTick = 0
 
       if (providerBackoffActive && !providerBackoffLogged) {
@@ -5864,39 +5626,24 @@ export async function commandResearchRun(args: Args) {
           )}s.`
         )
       }
-      if (budgetSaturated && activeRuns.size === 0 && !waitingLogged) {
-        waitingLogged = true
-        console.log(
-          "Supervisor waiting for experiment reservations to resolve before launching more workers."
-        )
-      }
-
       for (let index = 0; index < launchSlots; index += 1) {
         const launchStopCheck = await sessionStopChecker
           .check()
           .catch(() => null)
         if (launchStopCheck?.shouldStop) break
-        if (
-          !canLaunchWorkerBeforeDeadline({
-            now: Date.now(),
-            endTimeMs,
-            shutdownCushionMs,
-            agentKind: sessionAgentKind,
-          })
-        )
-          break
         const refreshed = await getLocalSessionState(root, sessionId).catch(
           () => getResearchSessionState(sessionId, args)
         )
-        const activeCount =
+        const activeCount = Math.max(
           activeSessionWorkers({
             workers: refreshed.workers,
             sessionId,
-          }).length + unresolvedReservationCount(launchReservations.values())
+          }).length,
+          activeRuns.size
+        )
         if (
           activeCount >= workerTarget ||
           activeRuns.size >= maxConcurrency ||
-          (maxLaunches !== null && launched >= maxLaunches) ||
           refreshed.session.status !== "running"
         ) {
           break
@@ -5906,7 +5653,6 @@ export async function commandResearchRun(args: Args) {
           workers: refreshed.workers.filter(
             (worker) => worker.sessionId === sessionId
           ),
-          reservations: [...launchReservations.values()],
         })
         if (!hypothesis) {
           if (activeRuns.size === 0) terminalReason = "no_active_hypotheses"
@@ -5917,10 +5663,6 @@ export async function commandResearchRun(args: Args) {
         launched += 1
         launchedThisTick += 1
         const runKey = `${Date.now()}:${launched}:${hypothesis.id}`
-        launchReservations.set(runKey, {
-          hypothesisId: hypothesis.id,
-          workerId: null,
-        })
         const run = runHypothesisOnce({
           root,
           projectPath: effectiveProjectPath,
@@ -5931,22 +5673,15 @@ export async function commandResearchRun(args: Args) {
           workerCommand: args.options["worker-command"],
           agentKind,
           workerModel,
-          maxIterations: maxWorkerIterations,
-          endTimeMs,
+          endTimeMs: Number.isFinite(endTimeMs)
+            ? endTimeMs
+            : Date.now() + workerTimeoutMs,
           hardEndTimeMs,
           workerTimeoutMs,
           startupTimeoutMs,
           stopGraceMs,
           quiet: args.options.quiet === "true",
           syncSupervisor,
-          onRegistered: ({ workerId }) => {
-            const reservation = launchReservations.get(runKey)
-            if (!reservation) return
-            launchReservations.set(runKey, {
-              ...reservation,
-              workerId,
-            })
-          },
           args,
         })
           .then(async (result) => {
@@ -6002,15 +5737,7 @@ export async function commandResearchRun(args: Args) {
                     baseMs: providerBackoffMs,
                     attempt: providerBackoffAttempt,
                   })
-              if (
-                terminalProviderFailure ||
-                !canLaunchWorkerBeforeDeadline({
-                  now: Date.now() + delayMs,
-                  endTimeMs,
-                  shutdownCushionMs,
-                  agentKind: sessionAgentKind,
-                })
-              ) {
+              if (terminalProviderFailure) {
                 terminalReason = "provider_capacity_exhausted"
                 providerTerminalFailure = failure
                 providerBackoffReason = backoffReason
@@ -6083,7 +5810,6 @@ export async function commandResearchRun(args: Args) {
           })
           .finally(() => {
             activeRuns.delete(runKey)
-            launchReservations.delete(runKey)
             void persistRuntimeTelemetry({
               force: true,
               activeProcessCount: activeRuns.size,
@@ -6135,10 +5861,16 @@ export async function commandResearchRun(args: Args) {
 
   const finalState = await readState(root)
   const explicitStop = sessionStopRequested({ state: finalState, sessionId })
+  const postLoopLocal = await getLocalSessionState(root, sessionId).catch(
+    () => null
+  )
   terminalReason =
     (explicitStop ? "stop_requested" : terminalReason) ??
     (lastStopCheck ? terminalReasonForStopCheck(lastStopCheck) : null) ??
-    (Date.now() >= endTimeMs ? "time_budget_reached" : null) ??
+    postLoopLocal?.session.terminalReason ??
+    (Number.isFinite(endTimeMs) && Date.now() >= endTimeMs
+      ? "deadline_reached"
+      : null) ??
     "no_active_hypotheses"
   let finalStatus: ApiSession["status"] = providerTerminalFailure
     ? "failed"
@@ -6167,6 +5899,7 @@ export async function commandResearchRun(args: Args) {
     sessionId,
     status: finalStatus,
     finalizationStatus: "running",
+    terminalReason,
     reason: explicitStop
       ? "stop requested"
       : providerTerminalFailure
@@ -6183,10 +5916,9 @@ export async function commandResearchRun(args: Args) {
   printFinalSyncReport(preFinalizationSync)
   const finalization = await computeSessionFinalizationStatus({
     root,
-    args,
     sessionId,
     pendingSyncCount: preFinalizationSync.pending,
-    launchReservationDebt: launchReservations.size,
+    requireOnline: args.options["require-online"] === "true",
   })
   if (finalization.reasons.length > 0) {
     console.warn(
@@ -6197,9 +5929,7 @@ export async function commandResearchRun(args: Args) {
   }
   if (finalization.status === "failed") {
     finalStatus = "failed"
-    terminalReason = "finalization_debt"
-  } else if (finalization.status === "incomplete" && !providerTerminalFailure) {
-    terminalReason = "finalization_debt"
+    terminalReason = "failed"
   }
   const finalSessionState = await readState(root)
   finalSessionState.sessions = finalSessionState.sessions ?? {}
@@ -6219,6 +5949,7 @@ export async function commandResearchRun(args: Args) {
     sessionId,
     status: finalStatus,
     finalizationStatus: finalization.status,
+    terminalReason,
     reason:
       finalization.reasons.length > 0
         ? finalization.reasons.slice(0, 5).join("; ")
@@ -6256,13 +5987,16 @@ export async function commandResearchRun(args: Args) {
       finalizationStatus: reportedFinalizationStatus,
     }
     await writeState(root, adjustedState)
-    terminalReason = "finalization_debt"
-    if (reportedFinalizationStatus === "failed") finalStatus = "failed"
+    if (reportedFinalizationStatus === "failed") {
+      finalStatus = "failed"
+      terminalReason = "failed"
+    }
     await stopLocalSession({
       root,
       sessionId,
       status: finalStatus,
       finalizationStatus: reportedFinalizationStatus,
+      terminalReason,
       reason:
         args.options["require-online"] === "true"
           ? "final session sync failed with --require-online"
@@ -6298,16 +6032,14 @@ export async function commandResearchRun(args: Args) {
           "salvaged_unmeasured"
         )
     ).length
-  const reservedAttempts =
-    completionLive?.session.reservedExperimentCount ??
-    completionLocal?.session.reservedExperimentCount ??
+  const acceptedExperiments =
+    completionLive?.session.acceptedExperimentCount ??
+    completionLocal?.session.acceptedExperimentCount ??
     0
-  const terminalMeasuredAttempts =
-    completionLive?.session.terminalExperimentCount ??
-    completionLocal?.session.terminalExperimentCount ??
-    0
-  const verifiedSyncedExperiments =
-    completionLive?.budget.terminalCount ?? terminalMeasuredAttempts
+  const completedExperimentTarget =
+    completionLive?.session.experimentTarget ??
+    completionLocal?.session.experimentTarget ??
+    null
   await persistRuntimeTelemetry({
     force: true,
     status: finalStatus,
@@ -6317,12 +6049,10 @@ export async function commandResearchRun(args: Args) {
   await presenceSupervisor.flush()
 
   console.log(
-    `Research run ${finalStatus}: launched=${launched}${
-      maxLaunches ? `/${maxLaunches}` : ""
-    } completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
+    `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
   )
   console.log(
-    `Budget counts: reservedAttempts=${reservedAttempts} terminalMeasuredAttempts=${terminalMeasuredAttempts} verifiedSyncedExperiments=${verifiedSyncedExperiments} unmeasuredSalvage=${unmeasuredSalvageCount} releasedReservations=${completionLive?.finalization?.releasedReservationCount ?? "-"} expiredReservations=${completionLive?.finalization?.expiredReservationCount ?? "-"} pendingSync=${finalSync.pending}.`
+    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount} pendingSync=${finalSync.pending}.`
   )
 }
 
@@ -6391,22 +6121,19 @@ export async function commandWorkerRun(args: Args) {
         args,
         sessionMetadata,
       })
-  const maxWorkerIterations = maxWorkerIterationsOption(
-    args,
-    typeof sessionMetadata.maxWorkerIterations === "number"
-      ? sessionMetadata.maxWorkerIterations
-      : typeof sessionMetadata.maxIterations === "number"
-        ? sessionMetadata.maxIterations
-        : 10
-  )
-  const maxMinutes = positiveNumberOption(
-    args,
-    "max-minutes",
-    typeof sessionMetadata.maxMinutes === "number"
-      ? sessionMetadata.maxMinutes
-      : 120
-  )
-  const sessionBudgetMs = maxMinutes * 60_000
+  const deadlineMs = sessionState.session.deadlineAt
+    ? Date.parse(sessionState.session.deadlineAt)
+    : Number.NaN
+  const maxMinutes =
+    args.options["max-minutes"] === undefined
+      ? null
+      : positiveNumberOption(args, "max-minutes", 120)
+  const sessionBudgetMs =
+    maxMinutes !== null
+      ? maxMinutes * 60_000
+      : Number.isFinite(deadlineMs)
+        ? Math.max(1, deadlineMs - Date.now())
+        : 120 * 60_000
   const shutdownCushionMs = workerShutdownCushionMs(sessionBudgetMs)
   const hardStopGraceMs = workerHardStopGraceMs(shutdownCushionMs)
   const workerTimeoutMs =
@@ -6438,9 +6165,14 @@ export async function commandWorkerRun(args: Args) {
     workerCommand: args.options["worker-command"],
     agentKind: workerSettings.agentKind,
     workerModel: workerSettings.workerModel,
-    maxIterations: maxWorkerIterations,
-    endTimeMs: Date.now() + sessionBudgetMs,
-    hardEndTimeMs: Date.now() + sessionBudgetMs + hardStopGraceMs,
+    endTimeMs:
+      maxMinutes !== null || Number.isFinite(deadlineMs)
+        ? Date.now() + sessionBudgetMs
+        : Date.now() + workerTimeoutMs,
+    hardEndTimeMs:
+      maxMinutes !== null || Number.isFinite(deadlineMs)
+        ? Date.now() + sessionBudgetMs + hardStopGraceMs
+        : Number.POSITIVE_INFINITY,
     workerTimeoutMs,
     startupTimeoutMs,
     stopGraceMs,

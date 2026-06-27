@@ -64,7 +64,7 @@ export type WorkerFinalizationStatus =
   | "already_logged"
   | "measured_and_logged"
   | "salvaged_unmeasured"
-  | "salvaged_unmeasured_budget_exhausted"
+  | "discarded_after_completion"
   | "failed"
 
 export type WorkerFinalizationManifest = {
@@ -636,8 +636,6 @@ export async function preflightWorkerInvocation(
         "should-stop",
         "--session",
         options.sessionId,
-        "--iteration",
-        "0",
         "--json",
       ],
       { allowExitCodes: [0] }

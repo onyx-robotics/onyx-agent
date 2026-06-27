@@ -16,7 +16,6 @@ const baseInput = {
     successSignals: ["tracking_error decreases"],
     giveUpSignals: ["three attempts regress"],
   },
-  maxIterations: 8,
   metricLabel: "tracking_error (m), minimize",
   minutesRemaining: 10,
   protectedPaths: ["onyx/onyx.md", "onyx/setup.json"],
@@ -45,7 +44,9 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "- Final shutdown deadline: 2026-06-20T14:10:00.000Z"
     )
-    expect(prompt).toContain("- Per-worker iteration cap: 8 maximum")
+    expect(prompt).toContain(
+      "- Session target: keep producing measured attempts until local stop checks ask you to stop"
+    )
     expect(prompt).toContain(
       "- Worktree root: /repo/.git/onyx/worktrees/session-hypothesis"
     )
@@ -90,11 +91,11 @@ describe("hypothesis worker prompt", () => {
     )
     expect(prompt).toContain("onyx-worker knowledge add")
     expect(prompt).toContain(
-      'onyx-worker research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json'
+      'onyx-worker research should-stop --session "$ONYX_SESSION_ID" --json'
     )
     expect(prompt).toContain('"shouldStop": true')
     expect(prompt).toContain(
-      "stop earlier when the global experiment budget is exhausted"
+      "If `onyx-worker exp log` says the attempt was discarded, treat the session as complete"
     )
     expect(prompt).toContain("Make one small, measured, logged attempt early")
     expect(prompt).toContain(
@@ -134,7 +135,7 @@ describe("hypothesis worker prompt", () => {
     )
     expect(prompt).not.toContain("Run `onyx sync` or `onyx push` periodically")
     expect(prompt).toContain("Primary metric is king")
-    expect(prompt).toContain("Do not ask whether to continue")
+    expect(prompt).toContain("Do not ask the user questions")
     expect(prompt).not.toContain("Peer hypothesis state")
     expect(prompt).not.toContain("ONYX_BRIEF_FILE")
     expect(prompt).not.toContain(".git/onyx/briefs")

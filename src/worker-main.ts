@@ -18,7 +18,7 @@ export const WORKER_USAGE = `onyx-worker - worker-safe Onyx research CLI
 Usage:
   onyx-worker --version
   onyx-worker research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
-  onyx-worker research should-stop [--session <id>] [--iteration <n>] [--json]
+  onyx-worker research should-stop [--session <id>] [--json]
   onyx-worker tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
   onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx-worker workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]

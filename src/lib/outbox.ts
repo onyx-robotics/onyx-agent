@@ -65,10 +65,11 @@ export type CliState = {
     {
       campaignName?: string
       campaignId?: string
-      endTimeMs?: number
-      maxIterations?: number
-      maxWorkerIterations?: number
-      maxExperiments?: number | null
+      deadlineAt?: string | null
+      experimentTarget?: number | null
+      acceptedExperimentCount?: number
+      remainingExperimentCount?: number | null
+      schedulerSiteId?: string | null
       stopRequested?: boolean
       status?: string
       terminalReason?: string | null

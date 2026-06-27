@@ -8,99 +8,77 @@ import {
   commandResearchShouldStop,
   createResearchSessionStopChecker,
 } from "./commands/research"
+import {
+  createLocalCampaign,
+  createLocalSession,
+  stopLocalSession,
+} from "./lib/research-db"
 import { writeState } from "./lib/outbox"
 import { runProcess } from "./lib/process"
 
-async function withMockApi(
-  handler: (path: string) => unknown,
-  run: () => Promise<void>
+const setup = {
+  schemaVersion: 2 as const,
+  goal: "Improve score",
+  projectPath: "",
+  scope: {
+    editable: ["src"],
+    protected: ["onyx/setup.json", "onyx/validation.json", "onyx/onyx.md"],
+  },
+  metric: {
+    name: "score",
+    unit: null,
+    direction: "maximize" as const,
+  },
+  resources: {},
+  tools: {
+    "evaluation.run": {
+      command: "bash",
+      args: ["onyx/tools/evaluation/run.sh"],
+      shell: false,
+      cwd: "project" as const,
+      env: {},
+      resources: [],
+      timeoutSeconds: 600,
+      leaseTimeoutSeconds: 120,
+      outputLimitBytes: 4000,
+    },
+  },
+  workflow: [
+    { id: "edit", agent: "Make one scoped code change.", optional: false },
+    { id: "evaluate", run: "evaluation.run", metric: true as const, optional: false },
+  ],
+}
+
+async function createRepo() {
+  const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
+  await runProcess("git", ["init"], { cwd: root })
+  return root
+}
+
+async function captureShouldStop(
+  root: string,
+  options: Record<string, string>
 ) {
-  const originalFetch = globalThis.fetch
-  const previousApiUrl = process.env.ONYX_API_URL
-  const previousApiKey = process.env.ONYX_API_KEY
-  process.env.ONYX_API_URL = "https://api.onyx.test"
-  process.env.ONYX_API_KEY = "test-key"
-  globalThis.fetch = (async (input) => {
-    const url = new URL(String(input))
-    return new Response(JSON.stringify({ data: handler(url.pathname) }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    })
-  }) as typeof fetch
+  const previousCwd = process.cwd()
+  const lines: string[] = []
+  const originalLog = console.log
+  console.log = (...items: unknown[]) => {
+    lines.push(items.join(" "))
+  }
   try {
-    await run()
+    process.chdir(root)
+    await commandResearchShouldStop({
+      positional: ["research", "should-stop"],
+      options,
+    })
   } finally {
-    globalThis.fetch = originalFetch
-    if (previousApiUrl === undefined) delete process.env.ONYX_API_URL
-    else process.env.ONYX_API_URL = previousApiUrl
-    if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
-    else process.env.ONYX_API_KEY = previousApiKey
+    process.chdir(previousCwd)
+    console.log = originalLog
   }
-}
-
-function remoteSession(overrides: Record<string, unknown> = {}) {
-  return {
-    id: "session_123",
-    campaignId: "campaign_123",
-    name: "session",
-    status: "running",
-    workerTarget: 1,
-    maxExperiments: 2,
-    reservedExperimentCount: 1,
-    terminalExperimentCount: 1,
-    finalizationStatus: "running",
-    metadata: {},
-    ...overrides,
-  }
-}
-
-function remoteControlState(overrides: Record<string, unknown> = {}) {
-  const session = remoteSession(overrides)
-  const maxExperiments =
-    typeof session.maxExperiments === "number" ? session.maxExperiments : null
-  const reservedCount =
-    typeof session.reservedExperimentCount === "number"
-      ? session.reservedExperimentCount
-      : 0
-  const terminalCount =
-    typeof session.terminalExperimentCount === "number"
-      ? session.terminalExperimentCount
-      : 0
-  const expiredReservationCount =
-    typeof overrides.expiredReservationCount === "number"
-      ? overrides.expiredReservationCount
-      : 0
-  const remainingCount =
-    maxExperiments === null
-      ? null
-      : Math.max(0, maxExperiments - reservedCount - terminalCount)
-  const terminalRemainingCount =
-    maxExperiments === null ? null : Math.max(0, maxExperiments - terminalCount)
-  return {
-    sessionId: session.id,
-    status: session.status,
-    finalizationStatus: session.finalizationStatus,
-    budget: {
-      maxExperiments,
-      reservedCount,
-      terminalCount,
-      remainingCount,
-      terminalRemainingCount,
-      budgetSaturated: remainingCount !== null && remainingCount <= 0,
-      budgetExhausted:
-        terminalRemainingCount !== null && terminalRemainingCount <= 0,
-      openReservationCount: reservedCount,
-      expiredReservationCount,
-    },
-    finalization: {
-      status: session.finalizationStatus,
-      reasons: [],
-      terminalReason: null,
-      releasedReservationCount: 0,
-      expiredReservationCount: 0,
-      unmeasuredSalvageCount: 0,
-    },
-    updatedAt: new Date().toISOString(),
+  return JSON.parse(lines.join("\n")) as {
+    shouldStop: boolean
+    reasonCodes: string[]
+    reasons: string[]
   }
 }
 
@@ -110,8 +88,7 @@ afterEach(() => {
 
 describe("research should-stop", () => {
   test("continues with a successful JSON response when no stop reason exists", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
-    await runProcess("git", ["init"], { cwd: root })
+    const root = await createRepo()
     await writeState(root, {
       projectPath: "",
       activeCampaign: "smoke",
@@ -119,35 +96,20 @@ describe("research should-stop", () => {
         session_123: {
           campaignName: "smoke",
           campaignId: "campaign_123",
-          endTimeMs: Date.now() + 60_000,
-          maxIterations: 10,
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          experimentTarget: 10,
+          acceptedExperimentCount: 0,
+          remainingExperimentCount: 10,
           status: "running",
         },
       },
     })
 
-    const previousCwd = process.cwd()
-    const lines: string[] = []
-    const originalLog = console.log
-    console.log = (...items: unknown[]) => {
-      lines.push(items.join(" "))
-    }
-    try {
-      process.chdir(root)
-      await commandResearchShouldStop({
-        positional: ["research", "should-stop"],
-        options: { session: "session_123", iteration: "1", json: "true" },
-      })
-    } finally {
-      process.chdir(previousCwd)
-      console.log = originalLog
-    }
+    const payload = await captureShouldStop(root, {
+      session: "session_123",
+      json: "true",
+    })
 
-    const payload = JSON.parse(lines.join("\n")) as {
-      shouldStop: boolean
-      reasonCodes: string[]
-      reasons: string[]
-    }
     expect(process.exitCode).toBeUndefined()
     expect(payload.shouldStop).toBe(false)
     expect(payload.reasonCodes).toEqual([])
@@ -155,8 +117,7 @@ describe("research should-stop", () => {
   })
 
   test("stops when worker shutdown cushion deadline is reached", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
-    await runProcess("git", ["init"], { cwd: root })
+    const root = await createRepo()
     await writeState(root, {
       projectPath: "",
       activeCampaign: "smoke",
@@ -164,53 +125,40 @@ describe("research should-stop", () => {
         session_123: {
           campaignName: "smoke",
           campaignId: "campaign_123",
-          endTimeMs: Date.now() + 60_000,
-          maxIterations: 10,
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          experimentTarget: 10,
+          acceptedExperimentCount: 0,
+          remainingExperimentCount: 10,
           status: "running",
         },
       },
     })
 
-    const previousCwd = process.cwd()
     const previousDeadline = process.env.ONYX_RESEARCH_DEADLINE_AT
-    const lines: string[] = []
-    const originalLog = console.log
-    console.log = (...items: unknown[]) => {
-      lines.push(items.join(" "))
-    }
     try {
-      process.chdir(root)
       process.env.ONYX_RESEARCH_DEADLINE_AT = new Date(
         Date.now() - 1000
       ).toISOString()
-      await commandResearchShouldStop({
-        positional: ["research", "should-stop"],
-        options: { session: "session_123", json: "true" },
+      const payload = await captureShouldStop(root, {
+        session: "session_123",
+        json: "true",
       })
+
+      expect(process.exitCode).toBeUndefined()
+      expect(payload.shouldStop).toBe(true)
+      expect(payload.reasonCodes).toContain("deadline_reached")
+      expect(payload.reasons).toContain("worker shutdown cushion reached")
     } finally {
-      process.chdir(previousCwd)
-      console.log = originalLog
       if (previousDeadline === undefined) {
         delete process.env.ONYX_RESEARCH_DEADLINE_AT
       } else {
         process.env.ONYX_RESEARCH_DEADLINE_AT = previousDeadline
       }
     }
-
-    const payload = JSON.parse(lines.join("\n")) as {
-      shouldStop: boolean
-      reasonCodes: string[]
-      reasons: string[]
-    }
-    expect(process.exitCode).toBeUndefined()
-    expect(payload.shouldStop).toBe(true)
-    expect(payload.reasonCodes).toContain("deadline_reached")
-    expect(payload.reasons).toContain("worker shutdown cushion reached")
   })
 
-  test("returns stable remote budget, reservation, and terminal reason codes", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
-    await runProcess("git", ["init"], { cwd: root })
+  test("stops when local state has an explicit stop request", async () => {
+    const root = await createRepo()
     await writeState(root, {
       projectPath: "",
       activeCampaign: "smoke",
@@ -218,185 +166,78 @@ describe("research should-stop", () => {
         session_123: {
           campaignName: "smoke",
           campaignId: "campaign_123",
-          endTimeMs: Date.now() + 60_000,
-          maxIterations: 10,
+          experimentTarget: 10,
+          acceptedExperimentCount: 0,
+          remainingExperimentCount: 10,
           status: "running",
+          stopRequested: true,
         },
       },
     })
 
-    const previousCwd = process.cwd()
-    const lines: string[] = []
-    const originalLog = console.log
-    console.log = (...items: unknown[]) => {
-      lines.push(items.join(" "))
-    }
-    try {
-      process.chdir(root)
-      await withMockApi(
-        () =>
-          remoteControlState({
-            reservedExperimentCount: 0,
-            terminalExperimentCount: 2,
-            status: "completed",
-            expiredReservationCount: 1,
-          }),
-        () =>
-          commandResearchShouldStop({
-            positional: ["research", "should-stop"],
-            options: { session: "session_123", json: "true" },
-          })
-      )
-    } finally {
-      process.chdir(previousCwd)
-      console.log = originalLog
-    }
+    const checker = createResearchSessionStopChecker({
+      root,
+      sessionId: "session_123",
+      args: { positional: [], options: {} },
+    })
+    const result = await checker.check()
 
-    const payload = JSON.parse(lines.join("\n")) as {
-      shouldStop: boolean
-      reasonCodes: string[]
-    }
+    expect(result.shouldStop).toBe(true)
+    expect(result.reasonCodes).toContain("stop_requested")
+  })
+
+  test("stops when the local ledger marks the experiment target reached", async () => {
+    const root = await createRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "smoke",
+      description: null,
+      projectPath: "",
+      baseCommitSha: "base",
+      setup,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const { session } = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 10,
+      experimentTarget: 2,
+      deadlineAt: null,
+      schedulerSiteId: "site-1",
+    })
+    await stopLocalSession({
+      root,
+      sessionId: session.id,
+      status: "completed",
+      finalizationStatus: "complete",
+      terminalReason: "experiment_target_reached",
+    })
+
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: "smoke",
+      sessions: {
+        [session.id]: {
+          campaignName: "smoke",
+          campaignId: campaign.id,
+          experimentTarget: 2,
+          acceptedExperimentCount: 2,
+          remainingExperimentCount: 0,
+          status: "completed",
+        },
+      },
+    })
+
+    const payload = await captureShouldStop(root, {
+      session: session.id,
+      json: "true",
+    })
+
     expect(payload.shouldStop).toBe(true)
-    expect(payload.reasonCodes).toContain("budget_exhausted")
-    expect(payload.reasonCodes).toContain("reservation_expired")
+    expect(payload.reasonCodes).toContain("experiment_target_reached")
     expect(payload.reasonCodes).toContain("session_terminal")
-  })
-
-  test("shared session stop checker stops supervisor launches on budget exhaustion", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
-    await runProcess("git", ["init"], { cwd: root })
-    await writeState(root, {
-      projectPath: "",
-      activeCampaign: "smoke",
-      sessions: {
-        session_123: {
-          campaignName: "smoke",
-          campaignId: "campaign_123",
-          endTimeMs: Date.now() + 60_000,
-          maxExperiments: 2,
-          status: "running",
-        },
-      },
-    })
-
-    await withMockApi(
-      () =>
-        remoteControlState({
-          reservedExperimentCount: 0,
-          terminalExperimentCount: 2,
-          expiredReservationCount: 0,
-        }),
-      async () => {
-        const checker = createResearchSessionStopChecker({
-          root,
-          sessionId: "session_123",
-          args: { positional: [], options: {} },
-        })
-        const result = await checker.check()
-        expect(result.shouldStop).toBe(true)
-        expect(result.reasonCodes).toContain("budget_exhausted")
-      }
-    )
-  })
-
-  test("stops workers when budget is saturated by open reservations", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
-    await runProcess("git", ["init"], { cwd: root })
-    await writeState(root, {
-      projectPath: "",
-      activeCampaign: "smoke",
-      sessions: {
-        session_123: {
-          campaignName: "smoke",
-          campaignId: "campaign_123",
-          endTimeMs: Date.now() + 60_000,
-          maxExperiments: 2,
-          status: "running",
-        },
-      },
-    })
-
-    const previousCwd = process.cwd()
-    const lines: string[] = []
-    const originalLog = console.log
-    console.log = (...items: unknown[]) => {
-      lines.push(items.join(" "))
-    }
-    try {
-      process.chdir(root)
-      await withMockApi(
-        () =>
-          remoteControlState({
-            reservedExperimentCount: 1,
-            terminalExperimentCount: 1,
-            expiredReservationCount: 0,
-          }),
-        () =>
-          commandResearchShouldStop({
-            positional: ["research", "should-stop"],
-            options: { session: "session_123", json: "true" },
-          })
-      )
-    } finally {
-      process.chdir(previousCwd)
-      console.log = originalLog
-    }
-
-    const payload = JSON.parse(lines.join("\n")) as {
-      shouldStop: boolean
-      reasonCodes: string[]
-      budgetSaturated: boolean
-      budgetExhausted: boolean
-    }
-    expect(payload.shouldStop).toBe(true)
-    expect(payload.budgetSaturated).toBe(true)
-    expect(payload.budgetExhausted).toBe(false)
-    expect(payload.reasonCodes).toContain("budget_saturated")
-    expect(payload.reasonCodes).not.toContain("budget_exhausted")
-  })
-
-  test("shared session stop checker caches live budget reads", async () => {
-    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
-    await runProcess("git", ["init"], { cwd: root })
-    await writeState(root, {
-      projectPath: "",
-      activeCampaign: "smoke",
-      sessions: {
-        session_123: {
-          campaignName: "smoke",
-          campaignId: "campaign_123",
-          endTimeMs: Date.now() + 60_000,
-          maxExperiments: 3,
-          status: "running",
-        },
-      },
-    })
-    let controlStateCalls = 0
-
-    await withMockApi(
-      (path) => {
-        if (path.endsWith("/control-state")) {
-          controlStateCalls += 1
-          return remoteControlState({
-            maxExperiments: 3,
-            reservedExperimentCount: 0,
-            terminalExperimentCount: 0,
-            expiredReservationCount: 0,
-          })
-        }
-        throw new Error(`unexpected path ${path}`)
-      },
-      async () => {
-        const checker = createResearchSessionStopChecker({
-          root,
-          sessionId: "session_123",
-          args: { positional: [], options: {} },
-          controlStateTtlMs: 5000,
-        })
-        await checker.check({ nowMs: 10_000 })
-        await checker.check({ nowMs: 11_000 })
-        expect(controlStateCalls).toBe(1)
-      }
-    )
   })
 })

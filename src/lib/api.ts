@@ -47,6 +47,7 @@ export type ApiCampaignExperiment = {
   sessionId: string | null
   hypothesisId: string | null
   workerId: string | null
+  acceptedIndex: number | null
   runRef: string
   name: string
   description: string | null
@@ -82,9 +83,19 @@ export type ApiSession = {
   name: string
   status: "running" | "stop_requested" | "completed" | "failed" | "stopped"
   workerTarget: number | null
-  maxExperiments: number | null
-  reservedExperimentCount: number
-  terminalExperimentCount: number
+  experimentTarget: number | null
+  acceptedExperimentCount: number
+  remainingExperimentCount: number | null
+  deadlineAt: string | null
+  terminalReason:
+    | "experiment_target_reached"
+    | "deadline_reached"
+    | "stop_requested"
+    | "provider_capacity_exhausted"
+    | "no_active_hypotheses"
+    | "failed"
+    | null
+  schedulerSiteId: string | null
   finalizationStatus:
     | "not_started"
     | "running"
@@ -211,16 +222,12 @@ export type ApiSessionState = {
 export type ApiSessionLive = {
   session: ApiSession
   campaign: ApiCampaign
-  budget: {
-    maxExperiments: number | null
-    reservedCount: number
-    terminalCount: number
-    remainingCount: number | null
-    terminalRemainingCount: number | null
-    budgetSaturated: boolean
-    budgetExhausted: boolean
-    openReservationCount: number
-    expiredReservationCount: number
+  progress: {
+    experimentTarget: number | null
+    acceptedExperimentCount: number
+    remainingExperimentCount: number | null
+    deadlineAt: string | null
+    terminalReason: ApiSession["terminalReason"]
     warning?: string | null
   }
   sync?: {
@@ -231,16 +238,7 @@ export type ApiSessionLive = {
   finalization?: {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
-    terminalReason:
-      | "max_experiments"
-      | "time_budget_reached"
-      | "stop_requested"
-      | "provider_capacity_exhausted"
-      | "no_active_hypotheses"
-      | "finalization_debt"
-      | null
-    releasedReservationCount: number
-    expiredReservationCount: number
+    terminalReason: ApiSession["terminalReason"]
     unmeasuredSalvageCount: number
   }
   livenessCounts: Record<string, number>
@@ -316,30 +314,17 @@ export type ApiSessionControlState = {
   sessionId: string
   status: ApiSession["status"]
   finalizationStatus: ApiSession["finalizationStatus"]
-  budget: {
-    maxExperiments: number | null
-    reservedCount: number
-    terminalCount: number
-    remainingCount: number | null
-    terminalRemainingCount: number | null
-    budgetSaturated: boolean
-    budgetExhausted: boolean
-    openReservationCount: number
-    expiredReservationCount: number
+  progress: {
+    experimentTarget: number | null
+    acceptedExperimentCount: number
+    remainingExperimentCount: number | null
+    deadlineAt: string | null
+    terminalReason: ApiSession["terminalReason"]
   }
   finalization: {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
-    terminalReason:
-      | "max_experiments"
-      | "time_budget_reached"
-      | "stop_requested"
-      | "provider_capacity_exhausted"
-      | "no_active_hypotheses"
-      | "finalization_debt"
-      | null
-    releasedReservationCount: number
-    expiredReservationCount: number
+    terminalReason: ApiSession["terminalReason"]
     unmeasuredSalvageCount: number
   }
   updatedAt: string
@@ -707,7 +692,9 @@ export async function createCampaignSession(
     workerTarget?: number
     hypotheses?: ResearchHypothesisPlan[]
     metadata?: Record<string, unknown>
-    maxExperiments?: number
+    experimentTarget?: number
+    deadlineAt?: string
+    schedulerSiteId?: string
   },
   args?: Args
 ): Promise<{ session: ApiSession; hypotheses: ApiHypothesis[] }> {
@@ -1052,92 +1039,6 @@ export async function syncResearchPresence(
 ): Promise<ApiResearchPresenceResponse> {
   return apiData<ApiResearchPresenceResponse>(
     await callApi("POST", "/api/v1/research/presence", body, args)
-  )
-}
-
-export async function reserveResearchExperiment(
-  sessionId: string,
-  body: {
-    runRef: string
-    workerId?: string
-    hypothesisId?: string
-    ttlSeconds?: number
-  },
-  args?: Args
-): Promise<{
-  reservationStatus:
-    | "reserved"
-    | "duplicate"
-    | "renewed"
-    | "budget_exhausted"
-    | "session_terminal"
-  reservation: {
-    id: string
-    runRef: string
-    status: "reserved" | "consumed" | "released" | "expired"
-    expiresAt: string
-  } | null
-  budget: {
-    maxExperiments: number | null
-    reservedCount: number
-    terminalCount: number
-    remainingCount: number | null
-    terminalRemainingCount: number | null
-    budgetSaturated: boolean
-    budgetExhausted: boolean
-  }
-}> {
-  return apiData(
-    await callApi(
-      "POST",
-      `/api/v1/research/sessions/${sessionId}/experiment-reservations`,
-      body,
-      args
-    )
-  )
-}
-
-export async function releaseResearchExperimentReservations(
-  sessionId: string,
-  body: {
-    runRefs: string[]
-    reason?: string
-  },
-  args?: Args
-): Promise<{
-  releasedCount: number
-  reservations: Array<{
-    runRef: string
-    releaseStatus:
-      | "released"
-      | "already_released"
-      | "consumed"
-      | "expired"
-      | "missing"
-    reservation: {
-      id: string
-      runRef: string
-      status: "reserved" | "consumed" | "released" | "expired"
-      expiresAt: string
-    } | null
-  }>
-  budget: {
-    maxExperiments: number | null
-    reservedCount: number
-    terminalCount: number
-    remainingCount: number | null
-    terminalRemainingCount: number | null
-    budgetSaturated: boolean
-    budgetExhausted: boolean
-  }
-}> {
-  return apiData(
-    await callApi(
-      "POST",
-      `/api/v1/research/sessions/${sessionId}/experiment-reservations/release`,
-      body,
-      args
-    )
   )
 }
 

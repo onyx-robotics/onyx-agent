@@ -139,7 +139,7 @@ repo-level supervisor with a built-in agent launcher:
 
 ```bash
 plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
-onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --max-experiments 20 --max-worker-iterations 5
+onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --experiments 20
 onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 
@@ -150,21 +150,21 @@ orchestrator agents, and `--foreground` only when you intentionally want an
 attached debugging or smoke-test shell.
 
 `--workers` is the active slot target: when a short worker exits, the
-supervisor backfills that slot. For a bounded fake-worker smoke test, cap
-launches explicitly:
+supervisor backfills that slot while the session is running. Bound sessions with
+`--experiments <n>` for an exact accepted experiment target, `--max-minutes <n>`
+for a deadline, or both:
 
 ```bash
-onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --max-launches 2 --worker-command "<cmd>"
+onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --experiments 2 --worker-command "<cmd>"
 ```
 
 For large local runs, the supervisor ramps launches in batches
 (`--launch-batch-size`, default up to 10) separated by
 `--launch-interval-seconds` (default 5), backs off with capped exponential
 jitter when provider startup, rate-limit, overload, auth, or degraded-service
-failures happen, and stops launching new workers once the shutdown cushion
-begins or the shared session stop reasons say the experiment budget is
-exhausted, reservations expired, a stop was requested, or the session became
-terminal.
+failures happen, and keeps launching up to the worker target until the local
+SQLite session becomes terminal. `onyx exp log` accepts the first N terminal
+attempts and discards late attempts idempotently after completion.
 
 Sync and presence are bounded for large sessions: `onyx sync` defaults to 50
 events per request (`--sync-batch-size`, max 100), the supervisor drains at
@@ -190,12 +190,10 @@ rate, provider backoff, recent launch failures, PID, and log path. `onyx worker 
 as a low-level debugging and recovery primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
-errors when local manifests are available. `--max-experiments` is the global
-attempt budget and `--max-worker-iterations` is a per-worker safety cap.
+errors when local manifests are available. `--experiments` is the exact accepted
+experiment target and `--max-minutes` is the optional deadline.
 `onyx listen` shows the same local worker latest-state/manifests and active
 provider backoff metadata alongside the experiment/outbox view.
-`--max-launches` caps only new workers launched by the current
-supervisor invocation and does not change the session's active slot target.
 `onyx workflow status --active` shows only actionable running or paused
 workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked
 diagnostics.
@@ -216,12 +214,15 @@ orchestrator/human decision.
 After the agent exits, the worker harness performs one final best-effort
 commit, checks whether HEAD is already represented by a local experiment,
 measures/logs exactly one unlogged HEAD commit using that commit's parent as
-the workflow base, and pushes the worker branch so useful offline work is not
-lost. Multi-commit, restore-forward, or dirty salvage preserves the branch
+the workflow base when the session is still accepting experiments, and pushes
+the worker branch so useful offline work is not lost. If the session is already
+terminal, finalization records `discarded_after_completion` locally and does not
+create an experiment, ranking input, sync event, result ref, or recovery
+artifact. Multi-commit, restore-forward, or dirty salvage preserves the branch
 without producing a measured experiment or blocked workflow run. Worker
 manifests report `finalizationStatus` as `none`, `already_logged`,
 `measured_and_logged`, `salvaged_unmeasured`,
-`salvaged_unmeasured_budget_exhausted`, or `failed`. If
+`discarded_after_completion`, or `failed`. If
 `onyx research stop` is requested while a provider process is still running,
 the harness gives it the configured stop grace (30 seconds by default),
 terminates it if needed, then runs the same finalization path. Use

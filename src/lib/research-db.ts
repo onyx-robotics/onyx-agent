@@ -153,6 +153,36 @@ type LocalTombstoneInput = {
   deletedAt: string
 }
 
+export type LocalDiscardedAttempt = {
+  runRef: string
+  campaignId: string | null
+  campaignName: string
+  projectPath: string
+  sessionId: string | null
+  workerId: string | null
+  hypothesisId: string | null
+  resultCommitSha: string | null
+  resultRef: string | null
+  reason: string
+  manifestPath: string | null
+  logPath: string | null
+  metadata: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
+}
+
+export type AcceptOrDiscardExperimentResult =
+  | {
+      outcome: "accepted"
+      experiment: ApiCampaignExperiment
+      idempotent: boolean
+    }
+  | {
+      outcome: "discarded"
+      discarded: LocalDiscardedAttempt
+      idempotent: boolean
+    }
+
 const dbCache = new Map<string, Database>()
 const CURRENT_RESEARCH_DB_SCHEMA_VERSION = 4
 const TERMINAL_WORKER_STATUSES = new Set(["completed", "failed", "stopped"])
@@ -388,11 +418,11 @@ function applyMigrations(db: Db) {
       status TEXT NOT NULL DEFAULT 'running',
       worker_target INTEGER,
       metadata_json TEXT NOT NULL DEFAULT '{}',
-      end_time_ms INTEGER,
-      max_iterations INTEGER,
-      max_experiments INTEGER,
-      reserved_experiment_count INTEGER NOT NULL DEFAULT 0,
-      terminal_experiment_count INTEGER NOT NULL DEFAULT 0,
+      experiment_target INTEGER,
+      accepted_experiment_count INTEGER NOT NULL DEFAULT 0,
+      deadline_at TEXT,
+      terminal_reason TEXT,
+      scheduler_site_id TEXT,
       finalization_status TEXT NOT NULL DEFAULT 'not_started',
       started_at TEXT NOT NULL,
       completed_at TEXT,
@@ -469,6 +499,7 @@ function applyMigrations(db: Db) {
       session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
       hypothesis_id TEXT REFERENCES hypotheses(id) ON DELETE SET NULL,
       worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
+      accepted_index INTEGER,
       name TEXT NOT NULL,
       description TEXT,
       run_ref TEXT NOT NULL,
@@ -493,7 +524,8 @@ function applyMigrations(db: Db) {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(campaign_id, run_ref),
-      UNIQUE(campaign_id, result_ref)
+      UNIQUE(campaign_id, result_ref),
+      UNIQUE(session_id, accepted_index)
     )
   `)
 
@@ -613,6 +645,26 @@ function applyMigrations(db: Db) {
     )
   `)
 
+      db.run(`
+    CREATE TABLE IF NOT EXISTS discarded_attempts (
+      run_ref TEXT PRIMARY KEY,
+      campaign_id TEXT,
+      campaign_name TEXT NOT NULL,
+      project_path TEXT NOT NULL DEFAULT '',
+      session_id TEXT,
+      worker_id TEXT,
+      hypothesis_id TEXT,
+      result_commit_sha TEXT,
+      result_ref TEXT,
+      reason TEXT NOT NULL,
+      manifest_path TEXT,
+      log_path TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `)
+
       db.run(
         "CREATE INDEX IF NOT EXISTS sync_events_pending_idx ON sync_events(status, sequence)"
       )
@@ -633,6 +685,12 @@ function applyMigrations(db: Db) {
       )
       db.run(
         "CREATE INDEX IF NOT EXISTS local_attempts_context_idx ON local_attempts(campaign_name, project_path, session_id, worker_id, hypothesis_id, updated_at DESC)"
+      )
+      db.run(
+        "CREATE INDEX IF NOT EXISTS discarded_attempts_context_idx ON discarded_attempts(campaign_name, project_path, session_id, worker_id, hypothesis_id, updated_at DESC)"
+      )
+      db.run(
+        "CREATE UNIQUE INDEX IF NOT EXISTS experiments_session_accepted_idx ON experiments(session_id, accepted_index) WHERE session_id IS NOT NULL AND accepted_index IS NOT NULL"
       )
       db.query(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
@@ -744,9 +802,12 @@ function applyMigrations(db: Db) {
   if (currentVersion < 4) {
     db.transaction(() => {
       for (const statement of [
-        "ALTER TABLE sessions ADD COLUMN max_experiments INTEGER",
-        "ALTER TABLE sessions ADD COLUMN reserved_experiment_count INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE sessions ADD COLUMN terminal_experiment_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN experiment_target INTEGER",
+        "ALTER TABLE sessions ADD COLUMN accepted_experiment_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN deadline_at TEXT",
+        "ALTER TABLE sessions ADD COLUMN terminal_reason TEXT",
+        "ALTER TABLE sessions ADD COLUMN scheduler_site_id TEXT",
+        "ALTER TABLE experiments ADD COLUMN accepted_index INTEGER",
         "ALTER TABLE sessions ADD COLUMN finalization_status TEXT NOT NULL DEFAULT 'not_started'",
       ]) {
         try {
@@ -758,6 +819,70 @@ function applyMigrations(db: Db) {
       db.run("UPDATE workers SET status = 'registered' WHERE status = 'idle'")
       db.run(
         "UPDATE workers SET status = 'running' WHERE status IN ('stale', 'lost')"
+      )
+      for (const statement of [
+        "UPDATE sessions SET experiment_target = max_experiments WHERE experiment_target IS NULL AND max_experiments IS NOT NULL",
+        "UPDATE sessions SET deadline_at = strftime('%Y-%m-%dT%H:%M:%fZ', end_time_ms / 1000.0, 'unixepoch') WHERE deadline_at IS NULL AND end_time_ms IS NOT NULL",
+      ]) {
+        try {
+          db.run(statement)
+        } catch (error) {
+          if (!/no such column/i.test(String(error))) throw error
+        }
+      }
+      db.run(`
+        WITH numbered AS (
+          SELECT
+            id,
+            row_number() OVER (
+              PARTITION BY session_id
+              ORDER BY COALESCE(completed_at, created_at), created_at, id
+            ) AS accepted_index
+          FROM experiments
+          WHERE session_id IS NOT NULL
+        )
+        UPDATE experiments
+        SET accepted_index = (
+          SELECT numbered.accepted_index
+          FROM numbered
+          WHERE numbered.id = experiments.id
+        )
+        WHERE accepted_index IS NULL
+          AND session_id IS NOT NULL
+      `)
+      db.run(`
+        UPDATE sessions
+        SET accepted_experiment_count = (
+          SELECT COUNT(*)
+          FROM experiments
+          WHERE experiments.session_id = sessions.id
+        )
+        WHERE accepted_experiment_count = 0
+      `)
+      db.run(`
+      CREATE TABLE IF NOT EXISTS discarded_attempts (
+        run_ref TEXT PRIMARY KEY,
+        campaign_id TEXT,
+        campaign_name TEXT NOT NULL,
+        project_path TEXT NOT NULL DEFAULT '',
+        session_id TEXT,
+        worker_id TEXT,
+        hypothesis_id TEXT,
+        result_commit_sha TEXT,
+        result_ref TEXT,
+        reason TEXT NOT NULL,
+        manifest_path TEXT,
+        log_path TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `)
+      db.run(
+        "CREATE INDEX IF NOT EXISTS discarded_attempts_context_idx ON discarded_attempts(campaign_name, project_path, session_id, worker_id, hypothesis_id, updated_at DESC)"
+      )
+      db.run(
+        "CREATE UNIQUE INDEX IF NOT EXISTS experiments_session_accepted_idx ON experiments(session_id, accepted_index) WHERE session_id IS NOT NULL AND accepted_index IS NOT NULL"
       )
       db.query(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
@@ -794,6 +919,33 @@ function ensureSiteId(db: Db) {
   return siteId
 }
 
+function assertSessionSchedulerSite({
+  sessionId,
+  schedulerSiteId,
+  localSiteId,
+}: {
+  sessionId: string
+  schedulerSiteId?: string | null
+  localSiteId: string
+}) {
+  if (!schedulerSiteId || schedulerSiteId === localSiteId) return
+  throw new Error(
+    `Research session ${sessionId} is owned by scheduler site ${schedulerSiteId}, but this checkout is scheduler site ${localSiteId}. Exact experiment budgeting uses single-machine scheduling; run this session from its original checkout or start a new session.`
+  )
+}
+
+function assertSessionOwnedByThisSite(
+  db: Db,
+  sessionId: string,
+  schedulerSiteId?: string | null
+) {
+  assertSessionSchedulerSite({
+    sessionId,
+    schedulerSiteId,
+    localSiteId: ensureSiteId(db),
+  })
+}
+
 function nextSequence(db: Db) {
   const current = Number(setting(db, "sync_sequence") ?? "0")
   const next = current + 1
@@ -825,6 +977,22 @@ async function openDb(root: string) {
 
 export async function getResearchSiteId(root: string) {
   return ensureSiteId(await openDb(root))
+}
+
+export async function assertLocalSessionSchedulerSite({
+  root,
+  sessionId,
+  schedulerSiteId,
+}: {
+  root: string
+  sessionId: string
+  schedulerSiteId?: string | null
+}) {
+  assertSessionSchedulerSite({
+    sessionId,
+    schedulerSiteId,
+    localSiteId: await getResearchSiteId(root),
+  })
 }
 
 function enqueueSyncEvent({
@@ -890,15 +1058,25 @@ function campaignFromRow(row: Row): LocalCampaign {
 }
 
 function sessionFromRow(row: Row): ApiSession {
+  const experimentTarget = numberOrNull(row.experiment_target)
+  const acceptedExperimentCount = Number(row.accepted_experiment_count ?? 0)
   return {
     id: row.id as string,
     campaignId: row.campaign_id as string,
     name: row.name as string,
     status: row.status as ApiSession["status"],
     workerTarget: numberOrNull(row.worker_target),
-    maxExperiments: numberOrNull(row.max_experiments),
-    reservedExperimentCount: Number(row.reserved_experiment_count ?? 0),
-    terminalExperimentCount: Number(row.terminal_experiment_count ?? 0),
+    experimentTarget,
+    acceptedExperimentCount,
+    remainingExperimentCount:
+      experimentTarget === null
+        ? null
+        : Math.max(0, experimentTarget - acceptedExperimentCount),
+    deadlineAt: nullableString(row.deadline_at),
+    terminalReason: nullableString(
+      row.terminal_reason
+    ) as ApiSession["terminalReason"],
+    schedulerSiteId: nullableString(row.scheduler_site_id),
     finalizationStatus:
       (row.finalization_status as ApiSession["finalizationStatus"]) ??
       "not_started",
@@ -967,6 +1145,10 @@ function experimentFromRow(row: Row): ApiCampaignExperiment {
     sessionId: nullableString(row.session_id),
     hypothesisId: nullableString(row.hypothesis_id),
     workerId: nullableString(row.worker_id),
+    acceptedIndex:
+      typeof row.accepted_index === "number"
+        ? Number(row.accepted_index)
+        : null,
     runRef: row.run_ref as string,
     name: row.name as string,
     description: nullableString(row.description),
@@ -989,6 +1171,26 @@ function experimentFromRow(row: Row): ApiCampaignExperiment {
     outputSummary: nullableString(row.output_summary),
     startedAt: nullableString(row.started_at),
     completedAt: nullableString(row.completed_at),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  }
+}
+
+function discardedAttemptFromRow(row: Row): LocalDiscardedAttempt {
+  return {
+    runRef: row.run_ref as string,
+    campaignId: nullableString(row.campaign_id),
+    campaignName: row.campaign_name as string,
+    projectPath: (row.project_path as string) ?? "",
+    sessionId: nullableString(row.session_id),
+    workerId: nullableString(row.worker_id),
+    hypothesisId: nullableString(row.hypothesis_id),
+    resultCommitSha: nullableString(row.result_commit_sha),
+    resultRef: nullableString(row.result_ref),
+    reason: row.reason as string,
+    manifestPath: nullableString(row.manifest_path),
+    logPath: nullableString(row.log_path),
+    metadata: parseJson(row.metadata_json, {}),
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
   }
@@ -1354,9 +1556,9 @@ export async function createLocalSession({
   workerTarget,
   hypotheses,
   metadata = {},
-  maxIterations,
-  maxExperiments,
-  endTimeMs,
+  experimentTarget,
+  deadlineAt,
+  schedulerSiteId,
 }: {
   root: string
   campaignId: string
@@ -1364,9 +1566,9 @@ export async function createLocalSession({
   workerTarget: number
   hypotheses?: ResearchHypothesisPlan[]
   metadata?: Record<string, unknown>
-  maxIterations?: number
-  maxExperiments?: number | null
-  endTimeMs?: number
+  experimentTarget?: number | null
+  deadlineAt?: string | null
+  schedulerSiteId?: string | null
 }) {
   const sessionId = randomUUID()
   const at = nowIso()
@@ -1376,10 +1578,11 @@ export async function createLocalSession({
         `
         INSERT INTO sessions (
           id, campaign_id, name, status, worker_target, metadata_json,
-          end_time_ms, max_iterations, max_experiments, finalization_status,
+          experiment_target, accepted_experiment_count, deadline_at,
+          terminal_reason, scheduler_site_id, finalization_status,
           started_at, created_at, updated_at
         )
-        VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+        VALUES (?, ?, ?, 'running', ?, ?, ?, 0, ?, NULL, ?, 'running', ?, ?, ?)
       `
       ).run(
         sessionId,
@@ -1387,9 +1590,9 @@ export async function createLocalSession({
         name,
         workerTarget,
         json(metadata),
-        endTimeMs ?? null,
-        maxIterations ?? null,
-        maxExperiments ?? null,
+        experimentTarget ?? null,
+        deadlineAt ?? null,
+        schedulerSiteId ?? null,
         at,
         at,
         at
@@ -1631,6 +1834,11 @@ export async function registerLocalWorker({
           .query("SELECT * FROM sessions WHERE id = ? AND campaign_id = ?")
           .get(sessionId, campaignId) as Row | null
         if (!session) throw new Error("Local research session not found")
+        assertSessionOwnedByThisSite(
+          db,
+          sessionId,
+          nullableString(session.scheduler_site_id)
+        )
         if (session.status !== "running") {
           throw new Error(`Research session ${sessionId} is ${session.status}`)
         }
@@ -1831,6 +2039,7 @@ export async function stopLocalSession({
   sessionId,
   status,
   finalizationStatus,
+  terminalReason,
   reason,
   metadata,
 }: {
@@ -1838,6 +2047,7 @@ export async function stopLocalSession({
   sessionId: string
   status: ApiSession["status"]
   finalizationStatus?: ApiSession["finalizationStatus"] | null
+  terminalReason?: ApiSession["terminalReason"] | null
   reason?: string | null
   metadata?: Record<string, unknown>
 }) {
@@ -1852,10 +2062,11 @@ export async function stopLocalSession({
         ...(metadata ?? {}),
       }
       db.query(
-        "UPDATE sessions SET status = ?, finalization_status = COALESCE(?, finalization_status), metadata_json = ?, completed_at = ?, updated_at = ? WHERE id = ?"
+        "UPDATE sessions SET status = ?, finalization_status = COALESCE(?, finalization_status), terminal_reason = COALESCE(?, terminal_reason), metadata_json = ?, completed_at = ?, updated_at = ? WHERE id = ?"
       ).run(
         status,
         finalizationStatus ?? null,
+        terminalReason ?? null,
         json(mergedMetadata),
         status === "stop_requested" || status === "running" ? null : at,
         at,
@@ -2109,13 +2320,90 @@ function recomputeLocalHypothesisProjectionForDb({
   )
 }
 
-export async function logLocalExperiment({
+function discardReasonForSession(row: Row) {
+  const terminalReason = nullableString(row.terminal_reason)
+  if (terminalReason) return terminalReason
+  const status = String(row.status)
+  if (status === "stop_requested" || status === "stopped") {
+    return "stop_requested"
+  }
+  if (status === "failed") return "failed"
+  if (status === "completed") return "experiment_target_reached"
+  return "session_terminal"
+}
+
+function insertDiscardedAttemptForDb({
+  db,
+  record,
+  campaignId,
+  sessionId,
+  hypothesisId,
+  workerId,
+  reason,
+  manifestPath = null,
+  logPath = null,
+  metadata = {},
+  at,
+}: {
+  db: Db
+  record: LocalResearchCampaignExperimentLoggedRecord
+  campaignId: string | null
+  sessionId: string | null
+  hypothesisId: string | null
+  workerId: string | null
+  reason: string
+  manifestPath?: string | null
+  logPath?: string | null
+  metadata?: Record<string, unknown>
+  at: string
+}) {
+  db.query(
+    `
+      INSERT INTO discarded_attempts (
+        run_ref, campaign_id, campaign_name, project_path, session_id,
+        worker_id, hypothesis_id, result_commit_sha, result_ref, reason,
+        manifest_path, log_path, metadata_json, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_ref) DO NOTHING
+    `
+  ).run(
+    record.runRef,
+    campaignId,
+    record.campaignName,
+    record.projectPath ?? "",
+    sessionId,
+    workerId,
+    hypothesisId,
+    record.resultCommitSha ?? null,
+    record.resultRef ?? null,
+    reason,
+    manifestPath,
+    logPath,
+    json(metadata),
+    at,
+    at
+  )
+  const row = db
+    .query("SELECT * FROM discarded_attempts WHERE run_ref = ?")
+    .get(record.runRef) as Row | null
+  if (!row) throw new Error("Failed to record discarded experiment attempt")
+  return discardedAttemptFromRow(row)
+}
+
+export async function acceptOrDiscardLocalExperiment({
   root,
   record,
+  manifestPath,
+  logPath,
+  metadata = {},
 }: {
   root: string
   record: LocalResearchCampaignExperimentLoggedRecord
-}) {
+  manifestPath?: string | null
+  logPath?: string | null
+  metadata?: Record<string, unknown>
+}): Promise<AcceptOrDiscardExperimentResult> {
   const id = randomUUID()
   const at = record.createdAt || nowIso()
   return withResearchDbWrite(root, (db) => {
@@ -2128,30 +2416,170 @@ export async function logLocalExperiment({
       if (!campaign)
         throw new Error(`Local campaign ${record.campaignName} not found`)
       const campaignId = campaign.id as string
-      let sessionId = record.sessionId ?? null
+      const sessionId = record.sessionId ?? null
       let hypothesisId = record.hypothesisId ?? null
       let workerId = record.workerId ?? null
+      const existingDiscard = db
+        .query("SELECT * FROM discarded_attempts WHERE run_ref = ?")
+        .get(record.runRef) as Row | null
+      if (existingDiscard) {
+        return {
+          outcome: "discarded" as const,
+          discarded: discardedAttemptFromRow(existingDiscard),
+          idempotent: true,
+        }
+      }
 
-      if (
-        sessionId &&
-        !db.query("SELECT id FROM sessions WHERE id = ?").get(sessionId)
-      ) {
-        db.query(
-          `
-          INSERT INTO sessions (
-            id, campaign_id, name, status, worker_target, metadata_json,
-            started_at, created_at, updated_at
-          )
-          VALUES (?, ?, ?, 'running', 0, '{}', ?, ?, ?)
-        `
-        ).run(
-          sessionId,
-          campaignId,
-          `session-${sessionId.slice(0, 8)}`,
-          at,
-          at,
-          at
+      const existing = db
+        .query(
+          "SELECT * FROM experiments WHERE campaign_id = ? AND run_ref = ?"
         )
+        .get(campaignId, record.runRef) as Row | null
+      if (existing) {
+        const experiment = experimentFromRow(existing)
+        recomputeLocalCampaignProjectionForDb({ db, campaignId, at })
+        recomputeLocalHypothesisProjectionForDb({
+          db,
+          campaignId,
+          hypothesisId: experiment.hypothesisId,
+          at,
+        })
+        return {
+          outcome: "accepted" as const,
+          experiment,
+          idempotent: true,
+        }
+      }
+
+      let acceptedIndex: number | null = null
+      if (sessionId) {
+        const session = db
+          .query("SELECT * FROM sessions WHERE id = ? AND campaign_id = ?")
+          .get(sessionId, campaignId) as Row | null
+        if (!session) {
+          const discarded = insertDiscardedAttemptForDb({
+            db,
+            record,
+            campaignId,
+            sessionId,
+            workerId,
+            hypothesisId,
+            reason: "session_not_found",
+            manifestPath,
+            logPath,
+            metadata,
+            at,
+          })
+          return {
+            outcome: "discarded" as const,
+            discarded,
+            idempotent: false,
+          }
+        }
+        assertSessionOwnedByThisSite(
+          db,
+          sessionId,
+          nullableString(session.scheduler_site_id)
+        )
+
+        const deadlineAt = nullableString(session.deadline_at)
+        const deadlineMs = deadlineAt ? Date.parse(deadlineAt) : NaN
+        if (Number.isFinite(deadlineMs) && Date.parse(at) >= deadlineMs) {
+          db.query(
+            `
+              UPDATE sessions
+              SET status = 'completed',
+                terminal_reason = 'deadline_reached',
+                completed_at = COALESCE(completed_at, ?),
+                updated_at = ?
+              WHERE id = ?
+            `
+          ).run(at, at, sessionId)
+          const discarded = insertDiscardedAttemptForDb({
+            db,
+            record,
+            campaignId,
+            sessionId,
+            workerId,
+            hypothesisId,
+            reason: "deadline_reached",
+            manifestPath,
+            logPath,
+            metadata,
+            at,
+          })
+          return {
+            outcome: "discarded" as const,
+            discarded,
+            idempotent: false,
+          }
+        }
+
+        if (session.status !== "running") {
+          const discarded = insertDiscardedAttemptForDb({
+            db,
+            record,
+            campaignId,
+            sessionId,
+            workerId,
+            hypothesisId,
+            reason: discardReasonForSession(session),
+            manifestPath,
+            logPath,
+            metadata,
+            at,
+          })
+          return {
+            outcome: "discarded" as const,
+            discarded,
+            idempotent: false,
+          }
+        }
+
+        const counted = db
+          .query("SELECT COUNT(*) AS value FROM experiments WHERE session_id = ?")
+          .get(sessionId) as Row | null
+        const acceptedCount = Math.max(
+          Number(session.accepted_experiment_count ?? 0),
+          Number(counted?.value ?? 0)
+        )
+        if (acceptedCount !== Number(session.accepted_experiment_count ?? 0)) {
+          db.query(
+            "UPDATE sessions SET accepted_experiment_count = ?, updated_at = ? WHERE id = ?"
+          ).run(acceptedCount, at, sessionId)
+        }
+        const experimentTarget = numberOrNull(session.experiment_target)
+        if (experimentTarget !== null && acceptedCount >= experimentTarget) {
+          db.query(
+            `
+              UPDATE sessions
+              SET status = 'completed',
+                terminal_reason = 'experiment_target_reached',
+                completed_at = COALESCE(completed_at, ?),
+                updated_at = ?
+              WHERE id = ?
+            `
+          ).run(at, at, sessionId)
+          const discarded = insertDiscardedAttemptForDb({
+            db,
+            record,
+            campaignId,
+            sessionId,
+            workerId,
+            hypothesisId,
+            reason: "experiment_target_reached",
+            manifestPath,
+            logPath,
+            metadata,
+            at,
+          })
+          return {
+            outcome: "discarded" as const,
+            discarded,
+            idempotent: false,
+          }
+        }
+        acceptedIndex = acceptedCount + 1
       }
 
       if (
@@ -2205,12 +2633,6 @@ export async function logLocalExperiment({
       }
 
       if (
-        sessionId &&
-        !db.query("SELECT id FROM sessions WHERE id = ?").get(sessionId)
-      ) {
-        sessionId = null
-      }
-      if (
         hypothesisId &&
         !db.query("SELECT id FROM hypotheses WHERE id = ?").get(hypothesisId)
       ) {
@@ -2222,36 +2644,20 @@ export async function logLocalExperiment({
       ) {
         workerId = null
       }
-      const existing = db
-        .query(
-          "SELECT * FROM experiments WHERE campaign_id = ? AND run_ref = ?"
-        )
-        .get(campaignId, record.runRef) as Row | null
-      if (existing) {
-        const experiment = experimentFromRow(existing)
-        recomputeLocalCampaignProjectionForDb({ db, campaignId, at })
-        recomputeLocalHypothesisProjectionForDb({
-          db,
-          campaignId,
-          hypothesisId: experiment.hypothesisId,
-          at,
-        })
-        return experiment
-      }
 
       const secondaryMetrics: Record<string, unknown> = { ...record.metrics }
       delete secondaryMetrics[record.primaryMetricName]
       db.query(
         `
         INSERT INTO experiments (
-          id, campaign_id, session_id, hypothesis_id, worker_id, name,
-          description, run_ref, base_commit_sha, result_commit_sha, result_ref,
-          git_status, status, setup_compliance_json, primary_metric_name,
+          id, campaign_id, session_id, hypothesis_id, worker_id,
+          accepted_index, name, description, run_ref, base_commit_sha,
+          result_commit_sha, result_ref, git_status, status, setup_compliance_json, primary_metric_name,
           primary_metric_value, secondary_metrics_json, artifact_refs_json,
           agent_notes_json, checks_json, duration_ms, output_summary,
           started_at, completed_at, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?)
       `
       ).run(
         id,
@@ -2259,6 +2665,7 @@ export async function logLocalExperiment({
         sessionId,
         hypothesisId,
         workerId,
+        acceptedIndex,
         record.name,
         record.description ?? null,
         record.runRef,
@@ -2289,6 +2696,33 @@ export async function logLocalExperiment({
         hypothesisId,
         at,
       })
+      if (sessionId && acceptedIndex !== null) {
+        const session = db
+          .query("SELECT experiment_target FROM sessions WHERE id = ?")
+          .get(sessionId) as Row | null
+        const experimentTarget = numberOrNull(session?.experiment_target)
+        const reachedTarget =
+          experimentTarget !== null && acceptedIndex >= experimentTarget
+        db.query(
+          `
+            UPDATE sessions
+            SET accepted_experiment_count = ?,
+              status = CASE WHEN ? THEN 'completed' ELSE status END,
+              terminal_reason = CASE WHEN ? THEN 'experiment_target_reached' ELSE terminal_reason END,
+              completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE completed_at END,
+              updated_at = ?
+            WHERE id = ?
+          `
+        ).run(
+          acceptedIndex,
+          reachedTarget ? 1 : 0,
+          reachedTarget ? 1 : 0,
+          reachedTarget ? 1 : 0,
+          at,
+          at,
+          sessionId
+        )
+      }
       enqueueSyncEvent({
         db,
         type: "experiment.logged",
@@ -2301,10 +2735,30 @@ export async function logLocalExperiment({
           fingerprint: experimentFingerprint(experiment),
         },
       })
-      return experiment
+      return {
+        outcome: "accepted" as const,
+        experiment,
+        idempotent: false,
+      }
     })
     return tx()
   })
+}
+
+export async function logLocalExperiment({
+  root,
+  record,
+}: {
+  root: string
+  record: LocalResearchCampaignExperimentLoggedRecord
+}) {
+  const result = await acceptOrDiscardLocalExperiment({ root, record })
+  if (result.outcome === "discarded") {
+    throw new Error(
+      `Experiment ${record.runRef} was discarded: ${result.discarded.reason}`
+    )
+  }
+  return result.experiment
 }
 
 function listLocalExperimentsForDb(db: Db, campaignId: string, limit?: number) {
@@ -2544,19 +2998,22 @@ function upsertRemoteSessionForDb(
     `
       INSERT INTO sessions (
         id, campaign_id, name, status, worker_target, metadata_json,
-        max_experiments, reserved_experiment_count, terminal_experiment_count,
-        finalization_status, started_at, completed_at, created_at, updated_at
+        experiment_target, accepted_experiment_count, deadline_at,
+        terminal_reason, scheduler_site_id, finalization_status, started_at,
+        completed_at, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         campaign_id = excluded.campaign_id,
         name = excluded.name,
         status = excluded.status,
         worker_target = excluded.worker_target,
         metadata_json = excluded.metadata_json,
-        max_experiments = excluded.max_experiments,
-        reserved_experiment_count = excluded.reserved_experiment_count,
-        terminal_experiment_count = excluded.terminal_experiment_count,
+        experiment_target = excluded.experiment_target,
+        accepted_experiment_count = excluded.accepted_experiment_count,
+        deadline_at = excluded.deadline_at,
+        terminal_reason = excluded.terminal_reason,
+        scheduler_site_id = excluded.scheduler_site_id,
         finalization_status = excluded.finalization_status,
         completed_at = excluded.completed_at,
         updated_at = excluded.updated_at
@@ -2568,9 +3025,11 @@ function upsertRemoteSessionForDb(
     session.status,
     session.workerTarget,
     json(session.metadata),
-    session.maxExperiments ?? null,
-    session.reservedExperimentCount ?? 0,
-    session.terminalExperimentCount ?? 0,
+    session.experimentTarget ?? null,
+    session.acceptedExperimentCount ?? 0,
+    session.deadlineAt ?? null,
+    session.terminalReason ?? null,
+    session.schedulerSiteId ?? null,
     session.finalizationStatus ?? "not_started",
     session.startedAt ?? at,
     session.completedAt ?? null,
@@ -2719,6 +3178,7 @@ function upsertRemoteExperimentForDb(
     optionalExistingId(db, "sessions", experiment.sessionId),
     optionalExistingId(db, "hypotheses", experiment.hypothesisId),
     optionalExistingId(db, "workers", experiment.workerId),
+    experiment.acceptedIndex,
     experiment.name,
     experiment.description,
     experiment.runRef,
@@ -2748,14 +3208,14 @@ function upsertRemoteExperimentForDb(
       `
         UPDATE experiments
         SET campaign_id = ?, session_id = ?, hypothesis_id = ?, worker_id = ?,
-          name = ?, description = ?, run_ref = ?, base_commit_sha = ?,
-          result_commit_sha = ?, result_ref = ?, git_status = ?,
-          git_verified_at = ?, git_status_reason = ?, status = ?,
-          setup_compliance_json = ?, primary_metric_name = ?,
+          accepted_index = ?, name = ?, description = ?, run_ref = ?,
+          base_commit_sha = ?, result_commit_sha = ?, result_ref = ?,
+          git_status = ?, git_verified_at = ?, git_status_reason = ?,
+          status = ?, setup_compliance_json = ?, primary_metric_name = ?,
           primary_metric_value = ?, secondary_metrics_json = ?,
           artifact_refs_json = ?, agent_notes_json = ?, checks_json = ?,
-          duration_ms = ?, output_summary = ?, started_at = ?,
-          completed_at = ?, created_at = ?, updated_at = ?
+          duration_ms = ?, output_summary = ?, started_at = ?, completed_at = ?,
+          created_at = ?, updated_at = ?
         WHERE id = ?
       `
     ).run(...values.slice(1), targetId)
@@ -2764,15 +3224,15 @@ function upsertRemoteExperimentForDb(
   db.query(
     `
       INSERT INTO experiments (
-        id, campaign_id, session_id, hypothesis_id, worker_id, name,
-        description, run_ref, base_commit_sha, result_commit_sha, result_ref,
-        git_status, git_verified_at, git_status_reason, status,
+        id, campaign_id, session_id, hypothesis_id, worker_id, accepted_index,
+        name, description, run_ref, base_commit_sha, result_commit_sha,
+        result_ref, git_status, git_verified_at, git_status_reason, status,
         setup_compliance_json, primary_metric_name, primary_metric_value,
         secondary_metrics_json, artifact_refs_json, agent_notes_json,
         checks_json, duration_ms, output_summary, started_at, completed_at,
         created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
   ).run(...values)
 }

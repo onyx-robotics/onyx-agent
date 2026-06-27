@@ -9,8 +9,6 @@ import type {
 
 import {
   listProjectCampaigns,
-  releaseResearchExperimentReservations,
-  reserveResearchExperiment,
   resolveProject,
 } from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
@@ -42,8 +40,7 @@ import {
   listLocalExperimentHistory,
   listWorkflowRuns,
   localCampaignByName,
-  getLocalSessionState,
-  logLocalExperiment,
+  acceptOrDiscardLocalExperiment,
   readWorkflowRun,
   upsertWorkflowRun,
   upsertWorkflowStep,
@@ -853,30 +850,15 @@ async function createWorkflowRun({
   })
   if (sessionId && (workerId || hypothesisId)) {
     const blockedWorkflowHypothesisId = workerId ? null : hypothesisId
-    const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
+    await abandonBlockedWorkflowRunsForSession({
       root,
       sessionId,
       workerId,
       hypothesisId: blockedWorkflowHypothesisId,
       reason:
-        "A new workflow run superseded this blocked workflow reservation.",
+        "A new workflow run superseded this blocked workflow attempt.",
     }).catch(() => [])
-    await releaseUnloggedReservationsForRunRefs({
-      root,
-      args,
-      sessionId,
-      runRefs: abandonedRunRefs,
-      reason: "superseded blocked workflow",
-    })
   }
-  await reserveExperimentSlotForSession({
-    root,
-    args,
-    sessionId,
-    runRef,
-    workerId,
-    hypothesisId,
-  })
   const run: LocalWorkflowRun = {
     id: randomUUID(),
     campaignId: campaign.campaignId,
@@ -915,104 +897,6 @@ async function createWorkflowRun({
     resultRef: run.resultRef,
   })
   return run
-}
-
-async function reserveExperimentSlotForSession({
-  root,
-  args,
-  sessionId,
-  runRef,
-  workerId,
-  hypothesisId,
-}: {
-  root: string
-  args: Args
-  sessionId?: string
-  runRef: string
-  workerId?: string
-  hypothesisId?: string | null
-}) {
-  if (!sessionId || args.options.offline === "true") return
-  const localSession = await getLocalSessionState(root, sessionId).catch(
-    () => null
-  )
-  if (!localSession || localSession.session.maxExperiments === null) return
-  try {
-    const response = await reserveResearchExperiment(
-      sessionId,
-      {
-        runRef,
-        workerId,
-        hypothesisId: hypothesisId ?? undefined,
-      },
-      args
-    )
-    if (
-      response.reservationStatus === "budget_exhausted" ||
-      response.reservationStatus === "session_terminal"
-    ) {
-      if (
-        response.reservationStatus === "budget_exhausted" &&
-        response.budget.budgetSaturated &&
-        !response.budget.budgetExhausted
-      ) {
-        throw new Error("budget_saturated")
-      }
-      throw new Error(response.reservationStatus)
-    }
-    return response
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (message === "budget_saturated") {
-      throw new Error(
-        `Experiment budget saturated for session ${sessionId}; open reservations or terminal attempts have consumed all slots, so the experiment was not reserved.`
-      )
-    }
-    if (message === "budget_exhausted") {
-      throw new Error(
-        `Experiment budget exhausted for session ${sessionId}; the experiment was not reserved.`
-      )
-    }
-    if (message === "session_terminal") {
-      throw new Error(
-        `Research session ${sessionId} is terminal; the experiment was not reserved.`
-      )
-    }
-    throw new Error(
-      `Unable to reserve experiment slot for session ${sessionId}: ${message}`
-    )
-  }
-}
-
-async function releaseUnloggedReservationsForRunRefs({
-  root,
-  args,
-  sessionId,
-  runRefs,
-  reason,
-}: {
-  root: string
-  args: Args
-  sessionId?: string
-  runRefs: string[]
-  reason: string
-}) {
-  if (!sessionId || args.options.offline === "true" || runRefs.length === 0) {
-    return
-  }
-  const logged = await listLocalExperimentHistory(root).catch(() => [])
-  const loggedRunRefs = new Set(logged.map((record) => record.runRef))
-  const releasable = [...new Set(runRefs)].filter(
-    (runRef) => !loggedRunRefs.has(runRef)
-  )
-  if (releasable.length === 0) return
-  await releaseResearchExperimentReservations(
-    sessionId,
-    { runRefs: releasable, reason },
-    args
-  ).catch((error) => {
-    if (args.options["require-online"] === "true") throw error
-  })
 }
 
 async function executeWorkflow({
@@ -1603,14 +1487,6 @@ export async function commandExpLog(args: Args) {
     process.env.ONYX_SESSION_ID
   const workerId =
     args.options.worker ?? usableLastRun?.workerId ?? process.env.ONYX_WORKER_ID
-  await reserveExperimentSlotForSession({
-    root,
-    args,
-    sessionId,
-    runRef,
-    workerId,
-    hypothesisId,
-  })
   const loggedCompliance =
     usableLastRun?.setupCompliance ??
     setupCompliance({
@@ -1652,8 +1528,18 @@ export async function commandExpLog(args: Args) {
     workerId,
     hypothesisId,
   }
-  await logLocalExperiment({ root, record })
+  const result = await acceptOrDiscardLocalExperiment({ root, record })
   await clearLocalAttempt(root, { runRef }).catch(() => {})
+  if (result.outcome === "discarded") {
+    console.log(
+      `Discarded ${record.name} for campaign ${campaignName}: ${result.discarded.reason}`
+    )
+    return {
+      ...record,
+      discarded: true,
+      discardReason: result.discarded.reason,
+    }
+  }
   const deferSync =
     args.options["defer-sync"] === "true" ||
     process.env.ONYX_DEFER_EXP_LOG_SYNC === "1"
@@ -1672,9 +1558,13 @@ export async function commandExpLog(args: Args) {
     message: `${record.name} (${loggedStatus})`,
   })
   console.log(
-    `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}`
+    `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}${
+      result.experiment.acceptedIndex
+        ? ` as #${result.experiment.acceptedIndex}`
+        : ""
+    }`
   )
-  return record
+  return result.experiment
 }
 
 export async function commandExpList(args: Args) {

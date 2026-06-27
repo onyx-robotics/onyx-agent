@@ -246,8 +246,10 @@ async function writeResearchSmokeRepo() {
       "22222222-2222-4222-8222-222222222222": {
         campaignName,
         campaignId,
-        maxIterations: 10,
-        endTimeMs: Date.now() + 60_000,
+        deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+        experimentTarget: 10,
+        acceptedExperimentCount: 0,
+        remainingExperimentCount: 10,
         status: "running",
       },
     },
@@ -332,6 +334,88 @@ function testHypothesis({
     createdAt: "2026-06-20T00:00:00.000Z",
     updatedAt: "2026-06-20T00:00:00.000Z",
   }
+}
+
+async function createLocalBudgetSessionFixture({
+  root,
+  campaignName,
+  baseCommitSha,
+  experimentTarget = 10,
+  workerCount = 1,
+}: {
+  root: string
+  campaignName: string
+  baseCommitSha: string
+  experimentTarget?: number
+  workerCount?: number
+}) {
+  const setup = await readSetupFile(root, "")
+  const campaign = await createLocalCampaign({
+    root,
+    name: campaignName,
+    description: "Improve score.",
+    projectPath: "",
+    baseCommitSha,
+    setup,
+    metricName: "score",
+    metricUnit: null,
+    metricDirection: "maximize",
+  })
+  const plans = Array.from({ length: Math.max(1, workerCount) }, (_, index) => ({
+    focus: `Scoped text tuning ${index + 1}`,
+    statement: `A small scoped change ${index + 1} can improve the score.`,
+    startingPoints: ["src/controller.txt"],
+    avoidList: ["onyx/"],
+    successSignals: ["METRIC score improves"],
+    giveUpSignals: ["No clean scoped change"],
+  }))
+  const session = await createLocalSession({
+    root,
+    campaignId: campaign.id,
+    name: "test-session",
+    workerTarget: Math.max(1, workerCount),
+    hypotheses: plans,
+    experimentTarget,
+  })
+  const workers = []
+  for (const [index, hypothesis] of session.hypotheses.entries()) {
+    workers.push(
+      await registerLocalWorker({
+        root,
+        campaignId: campaign.id,
+        sessionId: session.session.id,
+        hypothesisId: hypothesis.id,
+        workerName: `test-worker-${index + 1}`,
+        agentKind: "custom",
+      })
+    )
+  }
+  await updateState(root, (state) => {
+    const key = campaignStateKey("", campaignName)
+    state.projectPath = ""
+    state.activeCampaign = campaignName
+    state.campaigns = state.campaigns ?? {}
+    state.campaigns[key] = {
+      ...(state.campaigns[key] ?? {}),
+      campaignId: campaign.id,
+      projectPath: "",
+      baseCommitSha,
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+      sessionId: session.session.id,
+    }
+    state.sessions = state.sessions ?? {}
+    state.sessions[session.session.id] = {
+      campaignName,
+      campaignId: campaign.id,
+      experimentTarget,
+      acceptedExperimentCount: 0,
+      remainingExperimentCount: experimentTarget,
+      status: "running",
+    }
+  })
+  return { campaign, session: session.session, hypotheses: session.hypotheses, workers }
 }
 
 async function withMockResearchApi(
@@ -1469,8 +1553,8 @@ describe("worker finalization", () => {
       "salvaged without measurement"
     )
     expect(
-      finalizationStatusLabel("salvaged_unmeasured_budget_exhausted")
-    ).toBe("salvaged without measurement after budget exhaustion")
+      finalizationStatusLabel("discarded_after_completion")
+    ).toBe("discarded after session completion")
     expect(finalizationStatusLabel("failed")).toBe("failed")
   })
 
@@ -1572,9 +1656,17 @@ describe("worker finalization", () => {
   })
 
   test("measures and logs exactly one unlogged worker commit", async () => {
-    const { root, baseCommitSha, campaignId, campaignName } =
+    const { root, baseCommitSha, campaignName } =
       await writeResearchSmokeRepo()
     await addBareOrigin(root)
+    const local = await createLocalBudgetSessionFixture({
+      root,
+      campaignName,
+      baseCommitSha,
+      experimentTarget: 2,
+    })
+    const hypothesis = local.hypotheses[0]!
+    const worker = local.workers[0]!
     const previousCwd = process.cwd()
     const originalLog = console.log
     console.log = () => {}
@@ -1591,10 +1683,14 @@ describe("worker finalization", () => {
       const manifest = await finalizeHypothesisAttempt({
         root,
         worktree: root,
-        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
-        hypothesis: testHypothesis({ campaignId, baseCommitSha }),
-        sessionId: "22222222-2222-4222-8222-222222222222",
-        workerId: "77777777-7777-4777-8777-777777777777",
+        campaign: testCampaign({
+          campaignId: local.campaign.id,
+          campaignName,
+          baseCommitSha,
+        }),
+        hypothesis,
+        sessionId: local.session.id,
+        workerId: worker.id,
         workerBranch: "onyx/test/finalization",
         args: { positional: ["worker", "run"], options: { offline: "true" } },
         workerFailed: false,
@@ -1741,7 +1837,7 @@ describe("worker finalization", () => {
     }
   })
 
-  test("salvages a single unlogged commit without measuring after budget exhaustion", async () => {
+  test("discards a single unlogged commit without measuring after session completion", async () => {
     const { root, baseCommitSha, campaignId, campaignName } =
       await writeResearchSmokeRepo()
     await addBareOrigin(root)
@@ -1757,71 +1853,51 @@ describe("worker finalization", () => {
         await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
       ).stdout.trim()
       const hypothesis = testHypothesis({ campaignId, baseCommitSha })
-
-      await withMockResearchApi(
-        (request) => {
-          if (
-            request.method === "GET" &&
-            request.path ===
-              `/api/v1/research/sessions/${hypothesis.createdBySessionId}/control-state`
-          ) {
-            return {
-              body: {
-                data: {
-                  sessionId: hypothesis.createdBySessionId,
-                  status: "running",
-                  finalizationStatus: "running",
-                  budget: {
-                    maxExperiments: 1,
-                    reservedCount: 0,
-                    terminalCount: 1,
-                    remainingCount: 0,
-                    terminalRemainingCount: 0,
-                    budgetSaturated: true,
-                    budgetExhausted: true,
-                    openReservationCount: 0,
-                    expiredReservationCount: 0,
-                  },
-                  finalization: {
-                    status: "running",
-                    reasons: [],
-                    terminalReason: null,
-                    releasedReservationCount: 0,
-                    expiredReservationCount: 0,
-                    unmeasuredSalvageCount: 0,
-                  },
-                  updatedAt: "2026-06-20T00:00:00.000Z",
-                },
-              },
-            }
-          }
-          throw new Error(
-            `Unexpected API call ${request.method} ${request.path}`
-          )
-        },
-        async () => {
-          const manifest = await finalizeHypothesisAttempt({
-            root,
-            worktree: root,
-            campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
-            hypothesis,
+      await writeState(root, {
+        projectPath: "",
+        activeCampaign: campaignName,
+        campaigns: {
+          [campaignStateKey("", campaignName)]: {
+            campaignId,
+            projectPath: "",
+            baseCommitSha,
+            metricName: "score",
+            metricUnit: null,
+            metricDirection: "maximize",
             sessionId: hypothesis.createdBySessionId,
-            workerId: "77777777-7777-4777-8777-777777777777",
-            workerBranch: "onyx/test/budget-exhausted",
-            args: { positional: ["worker", "run"], options: {} },
-            workerFailed: false,
-            pushWorkerBranch: pushWorkerBranchDirect,
-          })
+          },
+        },
+        sessions: {
+          [hypothesis.createdBySessionId]: {
+            campaignName,
+            campaignId,
+            experimentTarget: 1,
+            acceptedExperimentCount: 1,
+            remainingExperimentCount: 0,
+            status: "completed",
+            stopRequested: true,
+          },
+        },
+      })
 
-          expect(manifest.finalizationStatus).toBe(
-            "salvaged_unmeasured_budget_exhausted"
-          )
-          expect(manifest.commitSha).toBe(head)
-          expect(manifest.unloggedCommitCount).toBe(1)
-          expect(manifest.workerBranchPushStatus).toBe("pushed")
-          expect(manifest.error).toContain("budget saturated")
-        }
-      )
+      const manifest = await finalizeHypothesisAttempt({
+        root,
+        worktree: root,
+        campaign: testCampaign({ campaignId, campaignName, baseCommitSha }),
+        hypothesis,
+        sessionId: hypothesis.createdBySessionId,
+        workerId: "77777777-7777-4777-8777-777777777777",
+        workerBranch: "onyx/test/discarded-after-completion",
+        args: { positional: ["worker", "run"], options: {} },
+        workerFailed: false,
+        pushWorkerBranch: pushWorkerBranchDirect,
+      })
+
+      expect(manifest.finalizationStatus).toBe("discarded_after_completion")
+      expect(manifest.commitSha).toBe(head)
+      expect(manifest.unloggedCommitCount).toBe(1)
+      expect(manifest.workerBranchPushStatus).toBe("not_attempted")
+      expect(manifest.error).toContain("Session stop condition")
 
       expect(await listLocalAttempts(root)).toHaveLength(0)
     } finally {
@@ -1833,13 +1909,20 @@ describe("worker finalization", () => {
 
 describe("exp log", () => {
   test("logs explicit scoped run attempts once and clears local duplicates", async () => {
-    const { root, baseCommitSha, campaignId, campaignName } =
-      await writeResearchSmokeRepo()
-    const sessionId = "22222222-2222-4222-8222-222222222222"
-    const workerOneId = "77777777-7777-4777-8777-777777777771"
-    const workerTwoId = "77777777-7777-4777-8777-777777777772"
-    const hypothesisOneId = "88888888-8888-4888-8888-888888888881"
-    const hypothesisTwoId = "88888888-8888-4888-8888-888888888882"
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const local = await createLocalBudgetSessionFixture({
+      root,
+      campaignName,
+      baseCommitSha,
+      experimentTarget: 3,
+      workerCount: 2,
+    })
+    const campaignId = local.campaign.id
+    const sessionId = local.session.id
+    const workerOneId = local.workers[0]!.id
+    const workerTwoId = local.workers[1]!.id
+    const hypothesisOneId = local.hypotheses[0]!.id
+    const hypothesisTwoId = local.hypotheses[1]!.id
     const makeRun = (
       workerId: string,
       hypothesisId: string,
@@ -1960,11 +2043,18 @@ describe("exp log", () => {
   })
 
   test("logs the single worker-context local attempt without --run-ref", async () => {
-    const { root, baseCommitSha, campaignId, campaignName } =
+    const { root, baseCommitSha, campaignName } =
       await writeResearchSmokeRepo()
-    const sessionId = "22222222-2222-4222-8222-222222222222"
-    const workerId = "77777777-7777-4777-8777-777777777786"
-    const hypothesisId = "88888888-8888-4888-8888-888888888888"
+    const local = await createLocalBudgetSessionFixture({
+      root,
+      campaignName,
+      baseCommitSha,
+      experimentTarget: 2,
+    })
+    const campaignId = local.campaign.id
+    const sessionId = local.session.id
+    const workerId = local.workers[0]!.id
+    const hypothesisId = local.hypotheses[0]!.id
     await writeLocalAttempt({
       root,
       record: {
@@ -2283,7 +2373,6 @@ describe("research start", () => {
               workers: "1",
               agent: "claude",
               hypotheses: JSON.stringify([plan]),
-              "max-worker-iterations": "3",
               "max-minutes": "10",
             },
           })
@@ -2305,7 +2394,7 @@ describe("research start", () => {
       `onyx worker run --session ${generatedSessionId} --hypothesis `
     )
     expect(workerLine).toContain(
-      "--agent claude --max-worker-iterations 3 --max-minutes 10"
+      "--agent claude --max-minutes 10"
     )
   })
 
@@ -2367,6 +2456,7 @@ describe("research start", () => {
               options: {
                 campaign: campaignName,
                 hypotheses: path,
+                "max-minutes": "10",
               },
             })
           ).rejects.toThrow("--hypotheses must be an inline JSON array")
@@ -2488,7 +2578,6 @@ describe("automated research smoke", () => {
           workers: "1",
           hypotheses: JSON.stringify(supervisorPlans(1)),
           model: "openrouter/deepseek/deepseek-v3",
-          "max-worker-iterations": "2",
           "max-minutes": "5",
         },
       })
@@ -2556,7 +2645,7 @@ describe("automated research smoke", () => {
       state.sessions[session.session.id] = {
         campaignName,
         campaignId: campaign.id,
-        endTimeMs: Date.now() + 60_000,
+        deadlineAt: new Date(Date.now() + 60_000).toISOString(),
         status: "running",
       }
     })
@@ -2591,6 +2680,64 @@ describe("automated research smoke", () => {
       ).rejects.toThrow(
         "Research session already uses --model openrouter/qwen/qwen3-coder"
       )
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("research run rejects existing sessions owned by another scheduler site", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "existing-other-site"
+    const campaign = await createSupervisorRunCampaign({
+      root,
+      baseCommitSha,
+      campaignName,
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session",
+      workerTarget: 1,
+      schedulerSiteId: "other-site",
+      hypotheses: supervisorPlans(1),
+      metadata: { agentKind: "codex" },
+    })
+    await updateState(root, (state) => {
+      const key = campaignStateKey("", campaignName)
+      state.campaigns = state.campaigns ?? {}
+      state.campaigns[key] = {
+        ...(state.campaigns[key] ?? {}),
+        campaignId: campaign.id,
+        projectPath: "",
+        baseCommitSha,
+        metricName: "score",
+        metricDirection: "maximize",
+        sessionId: session.session.id,
+      }
+      state.sessions = state.sessions ?? {}
+      state.sessions[session.session.id] = {
+        campaignName,
+        campaignId: campaign.id,
+        schedulerSiteId: "other-site",
+        status: "running",
+      }
+    })
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            session: session.session.id,
+            workers: "1",
+            agent: "codex",
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow("single-machine scheduling")
     } finally {
       process.chdir(previousCwd)
     }
@@ -2835,7 +2982,7 @@ describe("automated research smoke", () => {
       name: "brief-session",
       workerTarget: 1,
       hypotheses: supervisorPlans(1),
-      maxIterations: 3,
+      experimentTarget: 3,
     })
     const hypothesis = session.hypotheses[0]!
     const worker = await registerLocalWorker({
@@ -2999,7 +3146,7 @@ describe("automated research smoke", () => {
     }
   })
 
-  test("research run caps fast custom workers and reserves unique hypotheses", async () => {
+  test("research run caps fast custom workers and assigns unique hypotheses", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
     await addBareOrigin(root)
     const campaignName = "capped-smoke"
@@ -3021,7 +3168,7 @@ describe("automated research smoke", () => {
           campaign: campaignName,
           workers: "5",
           "max-concurrency": "5",
-          "max-launches": "5",
+          experiments: "5",
           hypotheses: JSON.stringify(supervisorPlans(5)),
           "worker-command": fastWorkerCommand(),
           "max-minutes": "1",
@@ -3057,7 +3204,6 @@ describe("automated research smoke", () => {
     expect(sessionState.session.metadata).toMatchObject({
       agentKind: "custom",
       maxConcurrency: 5,
-      maxLaunches: 5,
     })
     expect(sessionState.workers).toHaveLength(5)
     expect(
@@ -3230,7 +3376,7 @@ describe("automated research smoke", () => {
     expect(sessionState.workers[0]?.status).toBe("failed")
   })
 
-  test("max-launches one stops a two-slot supervisor after one worker", async () => {
+  test("one experiment target stops a two-slot supervisor at one accepted experiment", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
     await addBareOrigin(root)
     const campaignName = "one-launch-smoke"
@@ -3250,7 +3396,7 @@ describe("automated research smoke", () => {
           campaign: campaignName,
           workers: "2",
           "max-concurrency": "2",
-          "max-launches": "1",
+          experiments: "1",
           hypotheses: JSON.stringify(supervisorPlans(2)),
           "worker-command": fastWorkerCommand(),
           "max-minutes": "1",
@@ -3276,99 +3422,14 @@ describe("automated research smoke", () => {
     if (!sessionId) throw new Error("expected session id")
     const sessionState = await getLocalSessionState(root, sessionId)
     expect(sessionState.session.status).toBe("completed")
-    expect(sessionState.workers).toHaveLength(1)
-    expect(sessionState.workers[0]?.status).toBe("completed")
-    expect(logs.join("\n")).toContain(
-      "Workers: target=2 concurrency=2 maxLaunches=1"
-    )
-    expect(logs.join("\n")).toContain("launched=1/1")
+    expect(sessionState.session.acceptedExperimentCount).toBe(1)
+    expect(sessionState.latestExperiments).toHaveLength(1)
+    expect(sessionState.latestExperiments[0]?.acceptedIndex).toBe(1)
+    expect(sessionState.workers.length).toBeGreaterThanOrEqual(1)
+    expect(logs.join("\n")).toContain("Workers: target=2 concurrency=2")
   }, 30_000)
 
-  test("max-launches caps only the current existing-session run", async () => {
-    const { root, baseCommitSha } = await writeResearchSmokeRepo()
-    await addBareOrigin(root)
-    const campaignName = "existing-session-smoke"
-    const campaign = await createSupervisorRunCampaign({
-      root,
-      baseCommitSha,
-      campaignName,
-    })
-    const session = await createLocalSession({
-      root,
-      campaignId: campaign.id,
-      name: "existing-session",
-      workerTarget: 2,
-      hypotheses: supervisorPlans(3),
-      maxIterations: 2,
-      endTimeMs: Date.now() + 60_000,
-    })
-    await writeState(root, {
-      projectPath: "",
-      activeCampaign: campaignName,
-      campaigns: {
-        [campaignStateKey("", campaignName)]: {
-          campaignId: campaign.id,
-          projectPath: "",
-          baseCommitSha,
-          metricName: "score",
-          metricUnit: null,
-          metricDirection: "maximize",
-          sessionId: session.session.id,
-        },
-      },
-      sessions: {
-        [session.session.id]: {
-          campaignName,
-          campaignId: campaign.id,
-          status: "running",
-          endTimeMs: Date.now() + 60_000,
-          maxIterations: 2,
-        },
-      },
-    })
-
-    const previousCwd = process.cwd()
-    const originalLog = console.log
-    console.log = () => {}
-    try {
-      process.chdir(root)
-      await commandResearchRun({
-        positional: ["research", "run"],
-        options: {
-          campaign: campaignName,
-          session: session.session.id,
-          workers: "2",
-          "max-concurrency": "2",
-          "max-launches": "2",
-          "worker-command": fastWorkerCommand(),
-          "worker-timeout": "20",
-          "startup-timeout": "0",
-          "sync-interval": "60",
-          "presence-interval": "60",
-          "final-sync-timeout": "1",
-          "stop-grace-seconds": "1",
-          offline: "true",
-          quiet: "true",
-          foreground: "true",
-        },
-      })
-    } finally {
-      process.chdir(previousCwd)
-      console.log = originalLog
-    }
-
-    const sessionState = await getLocalSessionState(root, session.session.id)
-    expect(sessionState.session.status).toBe("completed")
-    expect(sessionState.workers).toHaveLength(2)
-    expect(
-      new Set(sessionState.workers.map((worker) => worker.hypothesisId)).size
-    ).toBe(2)
-    expect(
-      sessionState.workers.every((worker) => worker.status === "completed")
-    ).toBe(true)
-  }, 30_000)
-
-  test("omitting max-launches preserves slot maintenance until stopped", async () => {
+  test("supervisor preserves slot maintenance until stopped", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
     await addBareOrigin(root)
     const campaignName = "uncapped-session-smoke"
@@ -3383,8 +3444,7 @@ describe("automated research smoke", () => {
       name: "uncapped-session",
       workerTarget: 1,
       hypotheses: supervisorPlans(2),
-      maxIterations: 2,
-      endTimeMs: Date.now() + 60_000,
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
     })
     await writeState(root, {
       projectPath: "",
@@ -3405,8 +3465,7 @@ describe("automated research smoke", () => {
           campaignName,
           campaignId: campaign.id,
           status: "running",
-          endTimeMs: Date.now() + 60_000,
-          maxIterations: 2,
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
         },
       },
     })
@@ -3474,7 +3533,6 @@ describe("automated research smoke", () => {
     )
     expect(finalSessionState.workers.length).toBeGreaterThanOrEqual(2)
     expect(logs.join("\n")).toContain("Workers: target=1 concurrency=1")
-    expect(logs.join("\n")).not.toContain("maxLaunches=")
   }, 30_000)
 
   test("exercises setup, campaign, worker, sync, status, finish, summaries, and knowledge with a mock worker", async () => {
@@ -3720,7 +3778,6 @@ describe("automated research smoke", () => {
               workers: "1",
               agent: "claude",
               hypotheses: JSON.stringify([plan]),
-              "max-worker-iterations": "2",
               "max-minutes": "1",
               "require-online": "true",
             },
@@ -4443,7 +4500,7 @@ describe("research status", () => {
       campaignId: campaign.id,
       name: "session",
       workerTarget: 3,
-      endTimeMs: Date.now() + 60_000,
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
       metadata: {
         launchBatchSize: 3,
         launchIntervalSeconds: 5,
@@ -4788,7 +4845,7 @@ describe("research status", () => {
           giveUpSignals: [],
         },
       ],
-      metadata: { agentKind: "claude", maxIterations: 10 },
+      metadata: { agentKind: "claude", maxMinutes: 10 },
     })
     const hypothesis = session.hypotheses[0]!
     await writeState(root, {
@@ -4809,8 +4866,10 @@ describe("research status", () => {
         [session.session.id]: {
           campaignName,
           campaignId: campaign.id,
-          maxIterations: 10,
-          endTimeMs: Date.now() + 60_000,
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          experimentTarget: 10,
+          acceptedExperimentCount: 0,
+          remainingExperimentCount: 10,
           status: "running",
         },
       },
@@ -4947,8 +5006,10 @@ describe("research status", () => {
         [session.session.id]: {
           campaignName,
           campaignId: campaign.id,
-          maxIterations: 10,
-          endTimeMs: Date.now() + 60_000,
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          experimentTarget: 10,
+          acceptedExperimentCount: 0,
+          remainingExperimentCount: 10,
           status: "running",
         },
       },
@@ -5133,7 +5194,7 @@ describe("research hypothesis add", () => {
       name: "session",
       status: "running",
       workerTarget: 2,
-      metadata: { agentKind: "claude", maxIterations: 10, maxMinutes: 5 },
+      metadata: { agentKind: "claude", maxMinutes: 5 },
     }
     const requests: Array<{ method: string; path: string; body: unknown }> = []
     const previousCwd = process.cwd()
@@ -5238,7 +5299,7 @@ describe("research hypothesis add", () => {
       "Hypothesis: Try scheduler smoothing: Try scheduler smoothing"
     )
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent claude --max-worker-iterations 10 --max-minutes 5`
+      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent claude --max-minutes 5`
     )
     const hypotheses = await listLocalHypotheses(root, campaignId)
     const stored = hypotheses.find(
@@ -5292,7 +5353,7 @@ describe("research hypothesis add", () => {
       name: "session",
       status: "running",
       workerTarget: 2,
-      metadata: { agentKind: "claude", maxIterations: 10, maxMinutes: 5 },
+      metadata: { agentKind: "claude", maxMinutes: 5 },
     }
     let createBody: unknown = null
     const previousCwd = process.cwd()
@@ -5388,7 +5449,7 @@ describe("research hypothesis add", () => {
     )
     expect(logs).toContain("Hypothesis: replacement: Replacement search")
     expect(logs).toContain(
-      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent codex --max-worker-iterations 10 --max-minutes 5`
+      `onyx worker run --session ${sessionId} --hypothesis ${generatedHypothesisId} --agent codex --max-minutes 5`
     )
   })
 })

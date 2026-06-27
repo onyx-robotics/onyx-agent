@@ -11,7 +11,6 @@ export type HypothesisWorkerPromptInput = {
     successSignals: string[]
     giveUpSignals: string[]
   }
-  maxIterations: number
   metricLabel: string
   minutesRemaining: number
   protectedPaths: string[]
@@ -51,7 +50,7 @@ You are an autonomous Onyx research hypothesis worker. Do not ask the user quest
 - Worker branch: ${input.workerBranch}
 - Worktree root: ${input.worktreeRoot}
 - Project root: ${input.projectRoot}
-- Per-worker iteration cap: ${input.maxIterations} maximum; stop earlier when the global experiment budget is exhausted, the hypothesis is exhausted, or a strong result is logged.
+- Session target: keep producing measured attempts until local stop checks ask you to stop, the hypothesis is exhausted, or the supervisor ends the session.
 - Time budget remaining at launch: ${input.minutesRemaining} minute(s)
 - Stop starting new research by: ${input.researchDeadlineIso}
 - Final shutdown deadline: ${input.shutdownDeadlineIso}
@@ -90,7 +89,7 @@ The supervisor launched this worker with \`onyx-worker\`, \`ONYX_WORKER_CONTEXT\
 
 ### Loop
 
-1. Check the stop condition by running \`onyx-worker research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json\`. Stop cleanly when the JSON output contains \`"shouldStop": true\`; budget exhaustion is a stop condition, and a nonzero exit means the stop check itself failed.
+1. Check the stop condition by running \`onyx-worker research should-stop --session "$ONYX_SESSION_ID" --json\`. Stop cleanly when the JSON output contains \`"shouldStop": true\`; a nonzero exit means the stop check itself failed.
 2. Start the experiment workflow by running \`onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto\`; the CLI should pause at the agent step to review the research state and edit the project files.
 3. Review the latest research state
   - Run \`onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"\` for current campaign memory. This is your single routine context source: it already includes campaign status, the best and most recent experiments, hypotheses, active workers, shared knowledge, and current summaries, so no need to re-fetch those each loop with separate \`onyx research status\`, \`onyx knowledge list\`, or \`onyx summary list\` calls. Add \`--json\` if you need machine-readable fields.
@@ -121,7 +120,7 @@ The supervisor launched this worker with \`onyx-worker\`, \`ONYX_WORKER_CONTEXT\
 - Crashes: fix trivial issues, otherwise log what failed and move on.
 - When stuck, slow down: re-read source, inspect eval output, search history with \`onyx-worker exp list --grep\`, study profiling or papers if useful, and reason from evidence instead of random variation.
 - Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: finish/log the current one-commit workflow if possible, inspect sync status, summarize, and exit before ${input.shutdownDeadlineIso}. Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow. Do not start new exploration after ${input.researchDeadlineIso}.
-- Keep going only while useful work remains and the iteration cap has not been reached. Stop when the hypothesis is exhausted, the budget is no longer useful, or \`onyx-worker research should-stop --json\` reports \`shouldStop: true\`. Do not ask whether to continue.
+- Keep going only while useful work remains. Stop when the hypothesis is exhausted or \`onyx-worker research should-stop --json\` reports \`shouldStop: true\`. If \`onyx-worker exp log\` says the attempt was discarded, treat the session as complete and exit cleanly.
 
 ### Git And State Rules
 
