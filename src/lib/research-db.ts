@@ -112,6 +112,15 @@ export type LocalWorkflowRun = {
   hypothesisId?: string
 }
 
+export type WorkflowRunSelector = {
+  campaignName?: string
+  projectPath?: string
+  sessionId?: string
+  workerId?: string
+  hypothesisId?: string
+  statuses?: LocalWorkflowRunStatus[]
+}
+
 export type LocalWorkflowStep = {
   runId: string
   stepId: string
@@ -2963,40 +2972,56 @@ export async function readLocalAttempt(
   root: string,
   selector: LastRunSelector
 ) {
-  const db = await openDb(root)
   if (selector.runRef) {
+    const db = await openDb(root)
     const row = db
       .query("SELECT * FROM local_attempts WHERE run_ref = ?")
       .get(selector.runRef) as Row | null
     return row ? attemptFromRow(row) : null
   }
 
+  const rows = await listLocalAttempts(root, selector)
+  return rows[0] ?? null
+}
+
+function matchesLocalAttemptSelector(
+  record: LastRunRecord,
+  selector: LastRunSelector
+) {
+  return (
+    (!selector.runRef || record.runRef === selector.runRef) &&
+    (!selector.campaignName || record.campaignName === selector.campaignName) &&
+    (selector.projectPath === undefined ||
+      record.projectPath === selector.projectPath) &&
+    (!selector.sessionId || record.sessionId === selector.sessionId) &&
+    (!selector.workerId || record.workerId === selector.workerId) &&
+    (!selector.hypothesisId || record.hypothesisId === selector.hypothesisId)
+  )
+}
+
+export async function listLocalAttempts(
+  root: string,
+  selector: LastRunSelector = {}
+) {
+  const db = await openDb(root)
+  if (selector.runRef) {
+    const row = db
+      .query("SELECT * FROM local_attempts WHERE run_ref = ?")
+      .get(selector.runRef) as Row | null
+    return row ? [attemptFromRow(row)] : []
+  }
+
   const rows = db
     .query(
       `
         SELECT * FROM local_attempts
-        WHERE campaign_name = ? AND project_path = ?
         ORDER BY updated_at DESC
       `
     )
-    .all(selector.campaignName ?? "", selector.projectPath ?? "") as Row[]
-  const match = rows.find((row) => {
-    if (selector.sessionId && row.session_id !== selector.sessionId)
-      return false
-    if (selector.workerId && row.worker_id !== selector.workerId) return false
-    if (selector.hypothesisId && row.hypothesis_id !== selector.hypothesisId) {
-      return false
-    }
-    return true
-  })
-  return match ? attemptFromRow(match) : null
-}
-
-export async function listLocalAttempts(root: string) {
-  const rows = (await openDb(root))
-    .query("SELECT * FROM local_attempts ORDER BY updated_at DESC")
     .all() as Row[]
-  return rows.map(attemptFromRow)
+  return rows.map(attemptFromRow).filter((record) =>
+    matchesLocalAttemptSelector(record, selector)
+  )
 }
 
 export async function clearLocalAttempt(
@@ -3174,6 +3199,43 @@ export async function readLatestActiveWorkflowRun({
     )
     .get(campaignName, projectPath) as Row | null
   return row ? workflowRunFromRow(row) : null
+}
+
+export async function listWorkflowRuns(
+  root: string,
+  selector: WorkflowRunSelector = {}
+) {
+  if (selector.statuses?.length === 0) return []
+  const where: string[] = []
+  const values: (string | number | null)[] = []
+  const add = (column: string, value: string | undefined) => {
+    if (value === undefined) return
+    where.push(`${column} = ?`)
+    values.push(value)
+  }
+
+  add("campaign_name", selector.campaignName)
+  add("project_path", selector.projectPath)
+  add("session_id", selector.sessionId)
+  add("worker_id", selector.workerId)
+  add("hypothesis_id", selector.hypothesisId)
+  if (selector.statuses && selector.statuses.length > 0) {
+    where.push(
+      `status IN (${selector.statuses.map(() => "?").join(", ")})`
+    )
+    values.push(...selector.statuses)
+  }
+
+  const rows = (await openDb(root))
+    .query(
+      `
+        SELECT * FROM workflow_runs
+        ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY updated_at DESC
+      `
+    )
+    .all(...values) as Row[]
+  return rows.map(workflowRunFromRow)
 }
 
 export async function readLatestBlockedWorkflowRun({

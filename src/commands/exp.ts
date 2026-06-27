@@ -40,25 +40,32 @@ import {
   listWorkflowSteps,
   listLocalAttempts,
   listLocalExperimentHistory,
+  listWorkflowRuns,
   localCampaignByName,
   getLocalSessionState,
   logLocalExperiment,
-  readLocalAttempt,
   readWorkflowRun,
   upsertWorkflowRun,
   upsertWorkflowStep,
   writeLocalAttempt,
   type LocalWorkflowRun,
+  type LocalWorkflowRunStatus,
   type LocalWorkflowStep,
 } from "../lib/research-db"
 import { renderExperimentTable } from "../lib/tui"
 import { runToolCommand, type ToolRunResult } from "../lib/tools"
 import { flushOutbox } from "../lib/sync"
+import {
+  resolveCampaignNameFromContext,
+  resolveWorkerWorkflowContext,
+  type WorkerWorkflowContext,
+} from "../lib/workflow-context"
 
 type ExperimentStatus = LocalResearchCampaignExperimentLoggedRecord["status"]
 type ChecksRecord = NonNullable<
   LocalResearchCampaignExperimentLoggedRecord["checks"]
 >
+const ACTIVE_WORKFLOW_STATUSES: LocalWorkflowRunStatus[] = ["running", "paused"]
 
 function numberOption(args: Args, name: string, fallback: number) {
   const value = args.options[name]
@@ -218,14 +225,7 @@ function setupCompliance({
 }
 
 async function resolveCampaignName(root: string, args: Args) {
-  const state = await readState(root)
-  const campaignName = args.options.campaign ?? state.activeCampaign
-  if (!campaignName) {
-    throw new Error(
-      "No active campaign. Run `onyx campaign use --name <name>` or pass `--campaign <name>`."
-    )
-  }
-  return campaignName
+  return resolveCampaignNameFromContext(root, args)
 }
 
 async function ensureCampaignMetadata({
@@ -366,6 +366,212 @@ async function readSetupFileFromCommit({
 
 async function gitStatus(root: string) {
   return (await git(["status", "--porcelain"], root)).trim()
+}
+
+function workflowRunLine(run: LocalWorkflowRun) {
+  return `- ${run.id}: ${run.status}, runRef ${run.runRef}, worker ${run.workerId ?? "none"}, hypothesis ${run.hypothesisId ?? "none"}`
+}
+
+function localAttemptLine(record: LastRunRecord) {
+  return `- ${record.runRef}: ${record.status}, worker ${record.workerId ?? "none"}, hypothesis ${record.hypothesisId ?? "none"}, result ${record.resultCommitSha}`
+}
+
+function candidateLines<T>(items: T[], format: (item: T) => string) {
+  return items.length > 0 ? `\n${items.map(format).join("\n")}` : ""
+}
+
+function workerWorkflowSelector({
+  campaignName,
+  projectPath,
+  context,
+  statuses,
+}: {
+  campaignName: string
+  projectPath: string
+  context: WorkerWorkflowContext
+  statuses: LocalWorkflowRunStatus[]
+}) {
+  if (!context.workerId) {
+    throw new Error(
+      "Cannot infer a workflow run without worker context. Pass --resume <workflowRunId>."
+    )
+  }
+  return {
+    campaignName,
+    projectPath,
+    sessionId: context.sessionId,
+    workerId: context.workerId,
+    hypothesisId: context.hypothesisId,
+    statuses,
+  }
+}
+
+async function resolveAutoResumeWorkflowRun({
+  root,
+  args,
+  projectPath,
+}: {
+  root: string
+  args: Args
+  projectPath: string
+}) {
+  const context = resolveWorkerWorkflowContext(args)
+  const campaignName = await resolveCampaignName(root, args)
+  const candidates = await listWorkflowRuns(
+    root,
+    workerWorkflowSelector({
+      campaignName,
+      projectPath,
+      context,
+      statuses: ACTIVE_WORKFLOW_STATUSES,
+    })
+  )
+  if (candidates.length !== 1) {
+    throw new Error(
+      [
+        `Cannot infer workflow to resume for worker ${context.workerId}: found ${candidates.length} active workflow runs.`,
+        "Pass --resume <workflowRunId> to choose explicitly.",
+        candidateLines(candidates, workflowRunLine),
+      ]
+        .filter(Boolean)
+        .join("\n")
+    )
+  }
+  return candidates[0]!
+}
+
+async function resolveFreshBaseCommitSha({
+  root,
+  args,
+  campaign,
+  context,
+}: {
+  root: string
+  args: Args
+  campaign: Awaited<ReturnType<typeof ensureCampaignMetadata>>
+  context: WorkerWorkflowContext
+}) {
+  if (args.options.base) return args.options.base
+  if (context.workerId) {
+    const dirty = await gitStatus(root)
+    if (dirty) {
+      throw new Error(
+        "Worker-context `onyx exp run` requires a clean git tree before opening a measured workflow."
+      )
+    }
+    return currentCommit(root)
+  }
+  return process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+}
+
+async function assertWorkerCanStartFreshWorkflow({
+  root,
+  campaignName,
+  projectPath,
+  context,
+}: {
+  root: string
+  campaignName: string
+  projectPath: string
+  context: WorkerWorkflowContext
+}) {
+  if (!context.workerId) return
+  const active = await listWorkflowRuns(root, {
+    campaignName,
+    projectPath,
+    sessionId: context.sessionId,
+    workerId: context.workerId,
+    statuses: ACTIVE_WORKFLOW_STATUSES,
+  })
+  if (active.length > 0) {
+    throw new Error(
+      [
+        `Worker ${context.workerId} already has an active workflow run; resume it before starting another.`,
+        candidateLines(active, workflowRunLine),
+      ].join("\n")
+    )
+  }
+
+  const attempts = await listLocalAttempts(root, {
+    campaignName,
+    projectPath,
+    sessionId: context.sessionId,
+    workerId: context.workerId,
+  })
+  if (attempts.length > 0) {
+    throw new Error(
+      [
+        `Worker ${context.workerId} has ${attempts.length} unlogged measured attempt(s); run \`onyx exp log\` before starting another workflow.`,
+        candidateLines(attempts, localAttemptLine),
+      ].join("\n")
+    )
+  }
+}
+
+async function resolveLocalAttemptForLog({
+  root,
+  campaignName,
+  projectPath,
+  runRef,
+  context,
+}: {
+  root: string
+  campaignName: string
+  projectPath: string
+  runRef?: string
+  context: WorkerWorkflowContext
+}) {
+  if (runRef) {
+    return (
+      await listLocalAttempts(root, {
+        runRef,
+      })
+    )[0]
+  }
+
+  if (context.workerId) {
+    const candidates = await listLocalAttempts(root, {
+      campaignName,
+      projectPath,
+      sessionId: context.sessionId,
+      workerId: context.workerId,
+      hypothesisId: context.hypothesisId,
+    })
+    if (candidates.length !== 1) {
+      throw new Error(
+        [
+          `Cannot infer measured run for worker ${context.workerId}: found ${candidates.length} unlogged local attempts.`,
+          "Pass --run-ref <ref> to choose explicitly.",
+          candidateLines(candidates, localAttemptLine),
+        ]
+          .filter(Boolean)
+          .join("\n")
+      )
+    }
+    return candidates[0]
+  }
+
+  const candidates = await listLocalAttempts(
+    root,
+    lastRunSelectorForContext({
+      campaignName,
+      projectPath,
+      sessionId: context.sessionId,
+      hypothesisId: context.hypothesisId,
+    })
+  )
+  if (candidates.length !== 1) {
+    throw new Error(
+      [
+        `Cannot infer measured run: found ${candidates.length} unlogged local attempts.`,
+        "Pass --run-ref <ref> to choose explicitly.",
+        candidateLines(candidates, localAttemptLine),
+      ]
+        .filter(Boolean)
+        .join("\n")
+    )
+  }
+  return candidates[0]
 }
 
 async function commitCountBetween({
@@ -601,7 +807,7 @@ async function writeTerminalAttempt({
     `Workflow complete: ${finalStatus} (${setup.metric.name}=${record.primaryMetricValue ?? "null"})`
   )
   console.log(
-    `Run \`onyx exp log --run-ref ${run.runRef} --description <text>\` to record this result.`
+    `Run \`onyx exp log --campaign ${run.campaignName} --description <text>\` to record this result.`
   )
   if (finalStatus !== "succeeded") process.exitCode = 1
   return {
@@ -621,6 +827,7 @@ async function createWorkflowRun({
   campaign,
   projectPath,
   setup,
+  baseCommitSha,
 }: {
   root: string
   args: Args
@@ -628,6 +835,7 @@ async function createWorkflowRun({
   campaign: Awaited<ReturnType<typeof ensureCampaignMetadata>>
   projectPath: string
   setup: ResearchSetupFile
+  baseCommitSha: string
 }) {
   const started = new Date().toISOString()
   const runRef = clientRunRef(campaignName)
@@ -637,14 +845,19 @@ async function createWorkflowRun({
     args.options.hypothesis ??
     process.env.ONYX_HYPOTHESIS_ID ??
     campaign.hypothesisId
-  const baseCommitSha =
-    args.options.base ?? process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+  await assertWorkerCanStartFreshWorkflow({
+    root,
+    campaignName,
+    projectPath,
+    context: { sessionId, workerId, hypothesisId },
+  })
   if (sessionId && (workerId || hypothesisId)) {
+    const blockedWorkflowHypothesisId = workerId ? null : hypothesisId
     const abandonedRunRefs = await abandonBlockedWorkflowRunsForSession({
       root,
       sessionId,
       workerId,
-      hypothesisId,
+      hypothesisId: blockedWorkflowHypothesisId,
       reason:
         "A new workflow run superseded this blocked workflow reservation.",
     }).catch(() => [])
@@ -1174,7 +1387,10 @@ export async function commandExpRun(args: Args) {
   let run: LocalWorkflowRun
   let setup: ResearchSetupFile
   if (args.options.resume) {
-    const existing = await readWorkflowRun(root, args.options.resume)
+    const existing =
+      args.options.resume === "true"
+        ? await resolveAutoResumeWorkflowRun({ root, args, projectPath })
+        : await readWorkflowRun(root, args.options.resume)
     if (!existing) {
       throw new Error(`Workflow run ${args.options.resume} was not found.`)
     }
@@ -1203,10 +1419,13 @@ export async function commandExpRun(args: Args) {
       projectPath,
       campaignName,
     })
-    const baseCommitSha =
-      args.options.base ??
-      process.env.ONYX_BASE_COMMIT ??
-      campaign.baseCommitSha
+    const context = resolveWorkerWorkflowContext(args)
+    const baseCommitSha = await resolveFreshBaseCommitSha({
+      root,
+      args,
+      campaign,
+      context,
+    })
     try {
       setup = await readSetupFileFromCommit({
         root,
@@ -1236,6 +1455,7 @@ export async function commandExpRun(args: Args) {
       campaign,
       projectPath,
       setup,
+      baseCommitSha,
     })
   }
 
@@ -1260,46 +1480,44 @@ export async function commandExpLog(args: Args) {
       `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
     )
   }
-  const contextSessionId = args.options.session ?? process.env.ONYX_SESSION_ID
-  const contextWorkerId = args.options.worker ?? process.env.ONYX_WORKER_ID
-  const contextHypothesisId =
-    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID
-  const lastRun = await readLocalAttempt(
-    root,
-    lastRunSelectorForContext({
-      campaignName,
-      projectPath,
-      runRef: args.options["run-ref"],
-      sessionId: contextSessionId,
-      workerId: contextWorkerId,
-      hypothesisId: contextHypothesisId,
-    })
-  )
+  const context = resolveWorkerWorkflowContext(args)
+  const explicitRunRef = args.options["run-ref"]
+  const allowUnmeasuredFailure =
+    !explicitRunRef &&
+    optionalFlag(args, "allow-unmeasured") &&
+    args.options.status === "failed"
+  const lastRun = allowUnmeasuredFailure
+    ? null
+    : await resolveLocalAttemptForLog({
+        root,
+        campaignName,
+        projectPath,
+        runRef: explicitRunRef,
+        context,
+      })
   const usableLastRun =
-    lastRun?.campaignName === campaignName &&
-    lastRun.projectPath === projectPath
+    lastRun?.campaignName === campaignName && lastRun.projectPath === projectPath
       ? lastRun
       : null
-  if (args.options["run-ref"]) {
+  if (explicitRunRef) {
     const localHistory = await listLocalExperimentHistory(root).catch(() => [])
     const logged = localHistory.find(
       (record) =>
-        record.runRef === args.options["run-ref"] &&
-        record.campaignName === campaignName
+        record.runRef === explicitRunRef && record.campaignName === campaignName
     )
     if (logged) {
       await clearLocalAttempt(root, {
-        runRef: args.options["run-ref"],
+        runRef: explicitRunRef,
       }).catch(() => {})
       console.log(
-        `Experiment ${args.options["run-ref"]} is already recorded for campaign ${campaignName}`
+        `Experiment ${explicitRunRef} is already recorded for campaign ${campaignName}`
       )
       return logged
     }
   }
-  if (args.options["run-ref"] && !usableLastRun) {
+  if (explicitRunRef && !usableLastRun) {
     throw new Error(
-      `No measured run found for --run-ref ${args.options["run-ref"]}. Run \`onyx exp list --json\` to inspect unlogged local runs.`
+      `No measured run found for --run-ref ${explicitRunRef}. Run \`onyx exp list --json\` to inspect unlogged local runs.`
     )
   }
   const resultCommitSha =

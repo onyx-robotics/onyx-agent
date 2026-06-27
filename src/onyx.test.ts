@@ -72,6 +72,7 @@ import {
   listLocalExperimentHistory,
   listLocalKnowledge,
   listLocalSummaries,
+  listWorkflowRuns,
   localCampaignByName,
   logLocalExperiment,
   pendingResearchSyncCount,
@@ -102,6 +103,26 @@ async function commitAll(root: string, message: string) {
     ],
     { cwd: root }
   )
+}
+
+async function withEnv<T>(
+  values: Record<string, string | undefined>,
+  fn: () => Promise<T>
+) {
+  const previous = new Map<string, string | undefined>()
+  for (const key of Object.keys(values)) previous.set(key, process.env[key])
+  try {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    return await fn()
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
 }
 
 async function writeResearchSmokeRepo() {
@@ -819,6 +840,65 @@ describe("exp run", () => {
     }
   })
 
+  test("non-worker fresh run preserves ONYX_BASE_COMMIT then campaign-base fallback", async () => {
+    const envRepo = await writeResearchSmokeRepo()
+    const campaignRepo = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(envRepo.root)
+      await writeFile(join(envRepo.root, "src", "env-base.txt"), "env\n", "utf8")
+      await commitAll(envRepo.root, "env base")
+      const envBaseCommitSha = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: envRepo.root })
+      ).stdout.trim()
+      await withEnv(
+        {
+          ONYX_BASE_COMMIT: envBaseCommitSha,
+          ONYX_SESSION_ID: undefined,
+          ONYX_WORKER_ID: undefined,
+          ONYX_HYPOTHESIS_ID: undefined,
+        },
+        async () => {
+          const paused = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: envRepo.campaignName, timeout: "5" },
+          })
+          expect(paused?.status).toBe("paused")
+          if (!paused || !("baseCommitSha" in paused)) {
+            throw new Error("expected paused workflow")
+          }
+          expect(paused.baseCommitSha).toBe(envBaseCommitSha)
+        }
+      )
+
+      process.chdir(campaignRepo.root)
+      await withEnv(
+        {
+          ONYX_BASE_COMMIT: undefined,
+          ONYX_SESSION_ID: undefined,
+          ONYX_WORKER_ID: undefined,
+          ONYX_HYPOTHESIS_ID: undefined,
+        },
+        async () => {
+          const paused = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: campaignRepo.campaignName, timeout: "5" },
+          })
+          expect(paused?.status).toBe("paused")
+          if (!paused || !("baseCommitSha" in paused)) {
+            throw new Error("expected paused workflow")
+          }
+          expect(paused.baseCommitSha).toBe(campaignRepo.baseCommitSha)
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
   test("pauses, resumes, and writes a terminal local attempt", async () => {
     const { root, baseCommitSha } = await writeResearchSmokeRepo()
     const previousCwd = process.cwd()
@@ -864,6 +944,351 @@ describe("exp run", () => {
       process.chdir(previousCwd)
       process.exitCode = previousExitCode
       console.log = originalLog
+    }
+  })
+
+  test("worker-context fresh run uses clean HEAD instead of stale ONYX_BASE_COMMIT", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await writeFile(join(root, "src", "baseline.txt"), "baseline\n", "utf8")
+      await commitAll(root, "worker baseline")
+      const workerHead = (
+        await runProcess("git", ["rev-parse", "HEAD"], { cwd: root })
+      ).stdout.trim()
+
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: "77777777-7777-4777-8777-777777777777",
+          ONYX_HYPOTHESIS_ID: "88888888-8888-4888-8888-888888888888",
+          ONYX_BASE_COMMIT: baseCommitSha,
+        },
+        async () => {
+          const paused = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: campaignName, timeout: "5" },
+          })
+          expect(paused?.status).toBe("paused")
+          if (!paused || !("baseCommitSha" in paused)) {
+            throw new Error("expected paused workflow")
+          }
+          expect(paused.baseCommitSha).toBe(workerHead)
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
+  test("explicit --base overrides worker-context auto base", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const previousExitCode = process.exitCode
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      process.exitCode = undefined
+      await writeFile(join(root, "src", "candidate.txt"), "candidate\n", "utf8")
+      await commitAll(root, "candidate before run")
+
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: "77777777-7777-4777-8777-777777777778",
+          ONYX_HYPOTHESIS_ID: "88888888-8888-4888-8888-888888888888",
+        },
+        async () => {
+          const completed = await commandExpRun({
+            positional: ["exp", "run"],
+            options: {
+              campaign: campaignName,
+              base: baseCommitSha,
+              timeout: "5",
+            },
+          })
+          expect(completed?.status).toBe("succeeded")
+          if (!completed || !("workflowRunId" in completed)) {
+            throw new Error("expected completed workflow")
+          }
+          const attempts = await listLocalAttempts(root)
+          expect(attempts[0]?.baseCommitSha).toBe(baseCommitSha)
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+      process.exitCode = previousExitCode
+      console.log = originalLog
+    }
+  })
+
+  test("worker-context fresh run requires a clean tree before reserving", async () => {
+    const { root, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await writeFile(join(root, "src", "dirty.txt"), "dirty\n", "utf8")
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: "77777777-7777-4777-8777-777777777779",
+          ONYX_HYPOTHESIS_ID: "88888888-8888-4888-8888-888888888888",
+        },
+        async () => {
+          await expect(
+            commandExpRun({
+              positional: ["exp", "run"],
+              options: { campaign: campaignName, timeout: "5" },
+            })
+          ).rejects.toThrow("requires a clean git tree")
+        }
+      )
+      expect(
+        await listWorkflowRuns(root, {
+          campaignName,
+          workerId: "77777777-7777-4777-8777-777777777779",
+        })
+      ).toHaveLength(0)
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("auto-resume resolves the active workflow for the current worker", async () => {
+    const { root, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const previousExitCode = process.exitCode
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      process.exitCode = undefined
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: "77777777-7777-4777-8777-777777777780",
+          ONYX_HYPOTHESIS_ID: "88888888-8888-4888-8888-888888888888",
+        },
+        async () => {
+          const paused = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: campaignName, timeout: "5" },
+          })
+          expect(paused?.status).toBe("paused")
+          if (!paused || !("id" in paused)) {
+            throw new Error("expected paused workflow")
+          }
+          await writeFile(
+            join(root, "src", "auto-resume.txt"),
+            "candidate\n",
+            "utf8"
+          )
+          await commitAll(root, "auto resume candidate")
+          const completed = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { resume: "true", timeout: "5" },
+          })
+          expect(completed?.status).toBe("succeeded")
+          if (!completed || !("workflowRunId" in completed)) {
+            throw new Error("expected completed workflow")
+          }
+          expect(completed.workflowRunId).toBe(paused.id)
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+      process.exitCode = previousExitCode
+      console.log = originalLog
+    }
+  })
+
+  test("worker-scoped workflow status separates concurrent workers on one hypothesis", async () => {
+    const { root, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    const hypothesisId = "88888888-8888-4888-8888-888888888888"
+    const workerOneId = "77777777-7777-4777-8777-777777777781"
+    const workerTwoId = "77777777-7777-4777-8777-777777777782"
+    try {
+      process.chdir(root)
+      let workerOneRunId = ""
+      let workerTwoRunId = ""
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: workerOneId,
+          ONYX_HYPOTHESIS_ID: hypothesisId,
+        },
+        async () => {
+          const paused = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: campaignName, timeout: "5" },
+          })
+          if (!paused || !("id" in paused)) {
+            throw new Error("expected worker one paused workflow")
+          }
+          workerOneRunId = paused.id
+        }
+      )
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: workerTwoId,
+          ONYX_HYPOTHESIS_ID: hypothesisId,
+        },
+        async () => {
+          const paused = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: campaignName, timeout: "5" },
+          })
+          if (!paused || !("id" in paused)) {
+            throw new Error("expected worker two paused workflow")
+          }
+          workerTwoRunId = paused.id
+        }
+      )
+
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: workerOneId,
+          ONYX_HYPOTHESIS_ID: hypothesisId,
+        },
+        async () => {
+          const status = await commandWorkflowStatus({
+            positional: ["workflow", "status"],
+            options: { active: "true", json: "true" },
+          })
+          expect(status?.run.id).toBe(workerOneRunId)
+        }
+      )
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: workerTwoId,
+          ONYX_HYPOTHESIS_ID: hypothesisId,
+        },
+        async () => {
+          const status = await commandWorkflowStatus({
+            positional: ["workflow", "status"],
+            options: { active: "true", json: "true" },
+          })
+          expect(status?.run.id).toBe(workerTwoRunId)
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
+  test("fresh worker run fails while the worker has an active workflow", async () => {
+    const { root, campaignName } = await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: "22222222-2222-4222-8222-222222222222",
+          ONYX_WORKER_ID: "77777777-7777-4777-8777-777777777783",
+          ONYX_HYPOTHESIS_ID: "88888888-8888-4888-8888-888888888888",
+        },
+        async () => {
+          await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: campaignName, timeout: "5" },
+          })
+          await expect(
+            commandExpRun({
+              positional: ["exp", "run"],
+              options: { campaign: campaignName, timeout: "5" },
+            })
+          ).rejects.toThrow("already has an active workflow run")
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
+  test("fresh worker run fails while the worker has an unlogged attempt", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const workerId = "77777777-7777-4777-8777-777777777784"
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const hypothesisId = "88888888-8888-4888-8888-888888888888"
+    try {
+      process.chdir(root)
+      await writeLocalAttempt({
+        root,
+        record: {
+          schemaVersion: 1,
+          createdAt: "2026-06-20T00:00:00.000Z",
+          runRef: "local/smoke/unlogged-worker",
+          campaignName,
+          projectPath: "",
+          baseCommitSha,
+          resultCommitSha: baseCommitSha,
+          resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/unlogged-worker`,
+          status: "succeeded",
+          setupCompliance: {
+            status: "passed",
+            protectedPathsChanged: [],
+            outOfScopePathsChanged: [],
+            setupPathsChanged: [],
+            notes: null,
+          },
+          primaryMetricName: "score",
+          primaryMetricValue: 1.25,
+          metrics: { score: 1.25 },
+          agentNotes: {},
+          checks: null,
+          durationMs: null,
+          startedAt: null,
+          completedAt: null,
+          outputSummary: null,
+          sessionId,
+          workerId,
+          hypothesisId,
+        },
+      })
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: sessionId,
+          ONYX_WORKER_ID: workerId,
+          ONYX_HYPOTHESIS_ID: hypothesisId,
+        },
+        async () => {
+          await expect(
+            commandExpRun({
+              positional: ["exp", "run"],
+              options: { campaign: campaignName, timeout: "5" },
+            })
+          ).rejects.toThrow("unlogged measured attempt")
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
     }
   })
 
@@ -913,6 +1338,68 @@ describe("exp run", () => {
         options: { campaign: campaignName, blocked: "true", json: "true" },
       })
       expect(blocked?.run.id).toBe("workflow-blocked")
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+  })
+
+  test("fresh worker run supersedes blocked workflow runs for the same worker", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const workerId = "77777777-7777-4777-8777-777777777785"
+    const blockedHypothesisId = "88888888-8888-4888-8888-888888888888"
+    const nextHypothesisId = "99999999-9999-4999-8999-999999999999"
+    try {
+      process.chdir(root)
+      await upsertWorkflowRun({
+        root,
+        run: {
+          id: "workflow-blocked-worker",
+          campaignId,
+          campaignName,
+          projectPath: "",
+          runRef: "local/smoke/blocked-worker",
+          baseCommitSha,
+          resultCommitSha: null,
+          resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/blocked-worker`,
+          setupHash: setupHash(await readSetupFile(root, "")),
+          status: "blocked",
+          currentStepIndex: 0,
+          metrics: {},
+          blockReason: "blocked attempt",
+          createdAt: "2026-06-20T00:00:00.000Z",
+          startedAt: "2026-06-20T00:00:00.000Z",
+          completedAt: null,
+          updatedAt: "2026-06-20T00:00:00.000Z",
+          sessionId,
+          workerId,
+          hypothesisId: blockedHypothesisId,
+        },
+      })
+
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: sessionId,
+          ONYX_WORKER_ID: workerId,
+          ONYX_HYPOTHESIS_ID: nextHypothesisId,
+        },
+        async () => {
+          const paused = await commandExpRun({
+            positional: ["exp", "run"],
+            options: { campaign: campaignName, offline: "true", timeout: "5" },
+          })
+          expect(paused?.status).toBe("paused")
+        }
+      )
+      const blocked = await readWorkflowRun(root, "workflow-blocked-worker")
+      expect(blocked?.status).toBe("abandoned")
+      expect(blocked?.blockReason).toContain("superseded")
     } finally {
       process.chdir(previousCwd)
       console.log = originalLog
@@ -1414,6 +1901,169 @@ describe("exp log", () => {
     expect(
       listed.filter((record) => record.runRef === workerTwo.runRef)
     ).toHaveLength(1)
+  })
+
+  test("logs the single worker-context local attempt without --run-ref", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const workerId = "77777777-7777-4777-8777-777777777786"
+    const hypothesisId = "88888888-8888-4888-8888-888888888888"
+    await writeLocalAttempt({
+      root,
+      record: {
+        schemaVersion: 1,
+        createdAt: "2026-06-20T00:00:00.000Z",
+        runRef: "local/smoke/context-log",
+        campaignName,
+        projectPath: "",
+        baseCommitSha,
+        resultCommitSha: baseCommitSha,
+        resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/context-log`,
+        status: "succeeded",
+        setupCompliance: {
+          status: "passed",
+          protectedPathsChanged: [],
+          outOfScopePathsChanged: [],
+          setupPathsChanged: [],
+          notes: null,
+        },
+        primaryMetricName: "score",
+        primaryMetricValue: 1.25,
+        metrics: { score: 1.25 },
+        agentNotes: {},
+        checks: null,
+        durationMs: 1,
+        startedAt: "2026-06-20T00:00:00.000Z",
+        completedAt: "2026-06-20T00:00:01.000Z",
+        outputSummary: "worker context",
+        sessionId,
+        workerId,
+        hypothesisId,
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      process.chdir(root)
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: sessionId,
+          ONYX_WORKER_ID: workerId,
+          ONYX_HYPOTHESIS_ID: hypothesisId,
+        },
+        async () => {
+          await commandExpLog({
+            positional: ["exp", "log"],
+            options: {
+              campaign: campaignName,
+              name: "context-log",
+              description: "logged without run ref",
+            },
+          })
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const history = await listLocalExperimentHistory(root)
+    expect(history[0]?.runRef).toBe("local/smoke/context-log")
+    expect(await listLocalAttempts(root)).toHaveLength(0)
+  })
+
+  test("ID-free exp log fails when multiple local attempts match", async () => {
+    const { root, baseCommitSha, campaignId, campaignName } =
+      await writeResearchSmokeRepo()
+    const sessionId = "22222222-2222-4222-8222-222222222222"
+    const workerId = "77777777-7777-4777-8777-777777777787"
+    const hypothesisId = "88888888-8888-4888-8888-888888888888"
+    for (const index of [1, 2]) {
+      await writeLocalAttempt({
+        root,
+        record: {
+          schemaVersion: 1,
+          createdAt: `2026-06-20T00:00:0${index}.000Z`,
+          runRef: `local/smoke/context-log-${index}`,
+          campaignName,
+          projectPath: "",
+          baseCommitSha,
+          resultCommitSha: baseCommitSha,
+          resultRef: `refs/onyx/experiments/${campaignId}/local/smoke/context-log-${index}`,
+          status: "succeeded",
+          setupCompliance: {
+            status: "passed",
+            protectedPathsChanged: [],
+            outOfScopePathsChanged: [],
+            setupPathsChanged: [],
+            notes: null,
+          },
+          primaryMetricName: "score",
+          primaryMetricValue: index,
+          metrics: { score: index },
+          agentNotes: {},
+          checks: null,
+          durationMs: index,
+          startedAt: "2026-06-20T00:00:00.000Z",
+          completedAt: `2026-06-20T00:00:0${index}.000Z`,
+          outputSummary: `attempt ${index}`,
+          sessionId,
+          workerId,
+          hypothesisId,
+        },
+      })
+    }
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: undefined,
+          ONYX_SESSION_ID: undefined,
+          ONYX_WORKER_ID: undefined,
+          ONYX_HYPOTHESIS_ID: undefined,
+        },
+        async () => {
+          await expect(
+            commandExpLog({
+              positional: ["exp", "log"],
+              options: {
+                campaign: campaignName,
+                name: "ambiguous",
+                description: "ambiguous",
+              },
+            })
+          ).rejects.toThrow("Cannot infer measured run: found 2")
+        }
+      )
+      await withEnv(
+        {
+          ONYX_CAMPAIGN_NAME: campaignName,
+          ONYX_SESSION_ID: sessionId,
+          ONYX_WORKER_ID: workerId,
+          ONYX_HYPOTHESIS_ID: hypothesisId,
+        },
+        async () => {
+          await expect(
+            commandExpLog({
+              positional: ["exp", "log"],
+              options: {
+                campaign: campaignName,
+                name: "ambiguous",
+                description: "ambiguous",
+              },
+            })
+          ).rejects.toThrow("found 2 unlogged local attempts")
+        }
+      )
+    } finally {
+      process.chdir(previousCwd)
+    }
   })
 
   test("--run-ref fails clearly when the measured run is missing", async () => {

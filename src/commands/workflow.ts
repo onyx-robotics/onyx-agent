@@ -1,24 +1,75 @@
 import type { Args } from "../lib/args"
 import { repoRoot } from "../lib/git"
-import { readState } from "../lib/outbox"
 import { resolveProjectPath } from "../lib/project"
 import {
   listWorkflowSteps,
+  listWorkflowRuns,
   readLatestActiveWorkflowRun,
   readLatestBlockedWorkflowRun,
   readLatestWorkflowRun,
   readWorkflowRun,
+  type LocalWorkflowRun,
+  type LocalWorkflowRunStatus,
 } from "../lib/research-db"
+import {
+  resolveCampaignNameFromContext,
+  resolveWorkerWorkflowContext,
+  type WorkerWorkflowContext,
+} from "../lib/workflow-context"
 
 async function activeCampaignName(root: string, args: Args) {
-  const state = await readState(root)
-  const campaignName = args.options.campaign ?? state.activeCampaign
-  if (!campaignName) {
+  return resolveCampaignNameFromContext(
+    root,
+    args,
+    "No active campaign. Pass --campaign <name> or --run <workflowRunId>."
+  )
+}
+
+function statusFilter(args: Args): LocalWorkflowRunStatus[] | undefined {
+  if (args.options.blocked === "true") return ["blocked"]
+  if (args.options.active === "true") return ["running", "paused"]
+  return undefined
+}
+
+function workflowRunLine(run: LocalWorkflowRun) {
+  return `- ${run.id}: ${run.status}, runRef ${run.runRef}, worker ${run.workerId ?? "none"}, hypothesis ${run.hypothesisId ?? "none"}`
+}
+
+async function readWorkerScopedWorkflowRun({
+  root,
+  args,
+  campaignName,
+  projectPath,
+  context,
+}: {
+  root: string
+  args: Args
+  campaignName: string
+  projectPath: string
+  context: WorkerWorkflowContext
+}) {
+  if (!context.workerId) return null
+  const statuses = statusFilter(args)
+  const runs = await listWorkflowRuns(root, {
+    campaignName,
+    projectPath,
+    sessionId: context.sessionId,
+    workerId: context.workerId,
+    hypothesisId: context.hypothesisId,
+    statuses,
+  })
+  if (
+    (args.options.active === "true" || args.options.blocked === "true") &&
+    runs.length > 1
+  ) {
     throw new Error(
-      "No active campaign. Pass --campaign <name> or --run <workflowRunId>."
+      [
+        `Worker ${context.workerId} has ${runs.length} matching workflow runs; pass --run <workflowRunId> to choose explicitly.`,
+        runs.map(workflowRunLine).join("\n"),
+      ].join("\n")
     )
   }
-  return campaignName
+  return runs[0] ?? null
 }
 
 export async function commandWorkflowStatus(args: Args) {
@@ -27,8 +78,22 @@ export async function commandWorkflowStatus(args: Args) {
   const campaignName = args.options.run
     ? null
     : await activeCampaignName(root, args)
+  const context = resolveWorkerWorkflowContext(args)
+  const shouldUseWorkerScope = Boolean(!args.options.run && context.workerId)
+  const workerScopedRun =
+    !shouldUseWorkerScope || !campaignName
+      ? null
+      : await readWorkerScopedWorkflowRun({
+          root,
+          args,
+          campaignName,
+          projectPath,
+          context,
+        })
   const run = args.options.run
     ? await readWorkflowRun(root, args.options.run)
+    : shouldUseWorkerScope
+      ? workerScopedRun
     : args.options.blocked === "true"
       ? await readLatestBlockedWorkflowRun({
           root,

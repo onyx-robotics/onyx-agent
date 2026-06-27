@@ -101,6 +101,19 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("Make one small, measured, logged attempt early")
     expect(prompt).toContain("Start the first measured workflow early")
     expect(prompt).toContain(
+      'onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto'
+    )
+    expect(prompt).toContain("onyx exp run --resume --auto")
+    expect(prompt).toContain("onyx workflow status --blocked")
+    expect(prompt).toContain(
+      'onyx exp log --campaign "$ONYX_CAMPAIGN_NAME"'
+    )
+    expect(prompt).not.toContain("onyx workflow status --active")
+    expect(prompt).not.toContain("<pre-edit-sha>")
+    expect(prompt).not.toContain("<workflowRunId>")
+    expect(prompt).not.toContain("--run-ref <runRef>")
+    expect(prompt).not.toContain("Pick one concrete research idea")
+    expect(prompt).toContain(
       "do not create an unmeasured restore-forward commit outside `onyx exp run`"
     )
     expect(prompt).toContain(
