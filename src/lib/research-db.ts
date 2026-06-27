@@ -2324,19 +2324,34 @@ function listLocalExperimentsForDb(db: Db, campaignId: string, limit?: number) {
   return rows.map(experimentFromRow)
 }
 
-export async function listLocalExperimentHistory(root: string) {
+export async function listLocalExperimentHistory(
+  root: string,
+  options: { campaignName?: string; limit?: number } = {}
+) {
   const db = await openDb(root)
+  const conditions = [visibleExperimentPredicateSql()]
+  const params: (string | number)[] = []
+  if (options.campaignName !== undefined) {
+    conditions.push("c.name = ?")
+    params.push(options.campaignName)
+  }
+  let limitClause = ""
+  if (options.limit !== undefined) {
+    limitClause = "LIMIT ?"
+    params.push(options.limit)
+  }
   const rows = db
     .query(
       `
         SELECT e.*, c.name AS campaign_name
         FROM experiments e
         INNER JOIN campaigns c ON c.id = e.campaign_id
-        WHERE ${visibleExperimentPredicateSql()}
+        WHERE ${conditions.join(" AND ")}
         ORDER BY e.created_at DESC
+        ${limitClause}
       `
     )
-    .all() as Row[]
+    .all(...params) as Row[]
   return rows.map((row) => {
     const experiment = experimentFromRow(row)
     return {
@@ -4236,16 +4251,25 @@ function renderLocalResearchBrief({
   if (workers.length === 0) {
     lines.push("- none yet")
   } else {
+    const shownWorkers = workers.slice(0, 15)
     lines.push(
-      ...workers.map(
+      ...shownWorkers.map(
         (worker) =>
           `- ${worker.workerName}: ${worker.status}${worker.hypothesisId ? ` on hypothesis ${worker.hypothesisId}` : ""}${worker.progressMessage ? ` - ${worker.progressMessage}` : ""}`
       )
     )
+    if (workers.length > shownWorkers.length) {
+      lines.push(
+        `- … ${workers.length - shownWorkers.length} more active worker(s)`
+      )
+    }
   }
 
   return lines.join("\n")
 }
+
+const BRIEF_SUMMARY_LIMIT = 50
+const BRIEF_KNOWLEDGE_LIMIT = 50
 
 export async function localResearchBrief({
   root,
@@ -4307,6 +4331,9 @@ export async function localResearchBrief({
     summaries = state.summaries
     knowledge = state.knowledge
   }
+
+  summaries = summaries.slice(0, BRIEF_SUMMARY_LIMIT)
+  knowledge = knowledge.slice(0, BRIEF_KNOWLEDGE_LIMIT)
 
   const currentHypothesis = hypothesisId
     ? (hypotheses.find((item) => item.id === hypothesisId) ?? null)

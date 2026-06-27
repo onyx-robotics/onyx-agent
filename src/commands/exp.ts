@@ -1666,7 +1666,16 @@ export async function commandExpLog(args: Args) {
 
 export async function commandExpList(args: Args) {
   const root = await repoRoot()
-  const sqliteRows = await listLocalExperimentHistory(root).catch(() => [])
+  const limit = numberOption(args, "limit", 50)
+  // Push the campaign filter into SQL so a large multi-campaign ledger is not
+  // scanned in full on every call. Only push the limit when no later in-memory
+  // filter (grep/status) runs and the limit is positive, otherwise the SQL
+  // slice could drop rows that still match those filters.
+  const canPushLimit = !args.options.grep && !args.options.status && limit > 0
+  const sqliteRows = await listLocalExperimentHistory(root, {
+    campaignName: args.options.campaign,
+    limit: canPushLimit ? limit : undefined,
+  }).catch(() => [])
   const rows: LocalResearchHistoryRecord[] = [...sqliteRows]
   const seenRunRefs = new Set(rows.map((row) => row.runRef))
   const loggedCommitKeys = new Set(
@@ -1743,7 +1752,6 @@ export async function commandExpList(args: Args) {
   filtered.sort((a, b) =>
     a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0
   )
-  const limit = numberOption(args, "limit", 50)
   const limited = filtered.slice(0, limit)
 
   if (optionalFlag(args, "json")) {

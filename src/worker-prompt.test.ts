@@ -73,12 +73,14 @@ describe("hypothesis worker prompt", () => {
       'Campaign brief command: `onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"`'
     )
     expect(prompt).toContain(
-      'Run `onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"` first'
+      'Run `onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"` for current campaign memory'
     )
-    expect(prompt).toContain("onyx research status --json")
-    expect(prompt).toContain("onyx exp list --json")
-    expect(prompt).toContain("onyx knowledge list --json")
-    expect(prompt).toContain("onyx summary list --json")
+    expect(prompt).toContain("single routine context source")
+    expect(prompt).toContain("onyx exp list --grep")
+    expect(prompt).not.toContain("onyx research status --json")
+    expect(prompt).not.toContain("onyx exp list --json")
+    expect(prompt).not.toContain("onyx knowledge list --json")
+    expect(prompt).not.toContain("onyx summary list --json")
     expect(prompt).toContain("Default to one measured candidate per workflow")
     expect(prompt).toContain(
       "Do not run tuning sweeps, grid searches, or batch candidate evaluation unless your hypothesis plan or the research spec explicitly calls for it"
@@ -118,9 +120,11 @@ describe("hypothesis worker prompt", () => {
       "allowed only inside a normal `onyx exp run` attempt"
     )
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
-    expect(prompt).toContain("Supervisor/harness sync owns durable pushes")
+    expect(prompt).toContain("Server sync is the supervisor/harness's job")
+    expect(prompt).toContain("Do not run `onyx push` or `onyx sync`")
     expect(prompt).toContain("onyx sync status")
-    expect(prompt).toContain(
+    expect(prompt).not.toContain("Supervisor/harness sync owns durable pushes")
+    expect(prompt).not.toContain(
       "run `onyx push` only when network access is clearly available"
     )
     expect(prompt).not.toContain("Run `onyx sync` or `onyx push` periodically")
