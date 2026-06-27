@@ -45,6 +45,7 @@ async function writeStandaloneCheckout(root: string) {
   await mkdir(join(root, "bin"), { recursive: true })
   await mkdir(join(root, "skills", "onyx"), { recursive: true })
   await writeFile(join(root, "bin", "onyx.js"), "#!/usr/bin/env bun\n")
+  await writeFile(join(root, "bin", "onyx-worker.js"), "#!/usr/bin/env bun\n")
   await writeFile(join(root, "skills", "onyx", "SKILL.md"), "dev skill\n")
 }
 
@@ -55,6 +56,10 @@ async function writeProductCheckout(root: string) {
   })
   await writeFile(
     join(root, "packages", "agent", "bin", "onyx.js"),
+    "#!/usr/bin/env bun\n"
+  )
+  await writeFile(
+    join(root, "packages", "agent", "bin", "onyx-worker.js"),
     "#!/usr/bin/env bun\n"
   )
   await writeFile(
@@ -83,11 +88,19 @@ describe("developer mode", () => {
       expect(await detectDeveloperCheckout(standalone)).toMatchObject({
         root: standaloneRoot,
         binPath: join(standaloneRoot, "bin", "onyx.js"),
+        workerBinPath: join(standaloneRoot, "bin", "onyx-worker.js"),
         skillPath: join(standaloneRoot, "skills", "onyx", "SKILL.md"),
       })
       expect(await detectDeveloperCheckout(product)).toMatchObject({
         root: productRoot,
         binPath: join(productRoot, "packages", "agent", "bin", "onyx.js"),
+        workerBinPath: join(
+          productRoot,
+          "packages",
+          "agent",
+          "bin",
+          "onyx-worker.js"
+        ),
         skillPath: join(
           productRoot,
           "packages",
@@ -129,6 +142,7 @@ describe("developer mode", () => {
       expect(config.developer.checkout).toMatchObject({
         root: checkoutRoot,
         binPath: join(checkoutRoot, "bin", "onyx.js"),
+        workerBinPath: join(checkoutRoot, "bin", "onyx-worker.js"),
         skillPath: join(checkoutRoot, "skills", "onyx", "SKILL.md"),
       })
     } finally {
@@ -393,6 +407,7 @@ describe("developer mode", () => {
         checkout: {
           root: "/missing",
           binPath: "/missing/bin/onyx.js",
+          workerBinPath: "/missing/bin/onyx-worker.js",
           skillPath: "/missing/skills/onyx/SKILL.md",
         },
       },

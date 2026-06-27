@@ -88,6 +88,8 @@ import { writeConfig } from "./lib/config"
 import { runProcess } from "./lib/process"
 import { writeWorkerLaunchManifest } from "./lib/worker-launcher"
 
+const packageRoot = import.meta.dir + "/.."
+
 async function commitAll(root: string, message: string) {
   await runProcess("git", ["add", "-A"], { cwd: root })
   await runProcess(
@@ -392,8 +394,53 @@ describe("campaign CLI surface", () => {
     expect(USAGE).toContain("onyx research finish")
     expect(USAGE).toContain("onyx knowledge list")
     expect(USAGE).toContain("onyx tools run")
+    expect(USAGE).toContain("onyx-worker research brief")
+    expect(USAGE).toContain("onyx-worker exp run")
     expect(USAGE).not.toContain("onyx campaign create")
     expect(USAGE).not.toContain("onyx branch create")
+  })
+
+  test("worker CLI exposes only worker-safe commands", async () => {
+    const help = await runProcess("bun", ["bin/onyx-worker.js", "--help"], {
+      cwd: packageRoot,
+      timeoutMs: 10_000,
+    })
+    expect(help.code).toBe(0)
+    expect(help.stdout).toContain("onyx-worker research brief")
+    expect(help.stdout).toContain("onyx-worker exp run")
+    expect(help.stdout).toContain("onyx-worker sync status")
+    expect(help.stdout).not.toContain("onyx-worker research run")
+    expect(help.stdout).not.toContain("onyx-worker profile")
+
+    const rejected = await runProcess(
+      "bun",
+      ["bin/onyx-worker.js", "profile", "use", "prod"],
+      {
+        cwd: packageRoot,
+        env: {
+          ...process.env,
+          ONYX_HOME: await mkdtemp(join(tmpdir(), "onyx-worker-cli-")),
+        },
+        timeoutMs: 10_000,
+      }
+    )
+    expect(rejected.code).toBe(1)
+    expect(rejected.stderr).toContain("Unknown worker command")
+  })
+
+  test("full CLI refuses operational commands in worker context", async () => {
+    const result = await runProcess("bun", ["bin/onyx.js", "profile", "list"], {
+      cwd: packageRoot,
+      env: {
+        ...process.env,
+        ONYX_WORKER_ID: "worker_123",
+        ONYX_HOME: await mkdtemp(join(tmpdir(), "onyx-worker-full-cli-")),
+      },
+      timeoutMs: 10_000,
+    })
+
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain("full `onyx` CLI is not available")
   })
 
   test("run refs are campaign scoped", () => {
@@ -1440,7 +1487,8 @@ describe("worker finalization", () => {
       workerModel: null,
       command: "codex",
       args: [],
-      onyxShimPath: null,
+      onyxWorkerPath: null,
+      workerContextPath: null,
       addedWritableRoots: [],
       cwd: root,
       promptPath: join(workerLogDir, "prompt.md"),
@@ -2388,7 +2436,7 @@ describe("automated research smoke", () => {
       'test -n "$ONYX_RESEARCH_SPEC_FILE"',
       'test -z "${ONYX_BRIEF_FILE:-}"',
       'test -z "${ONYX_SESSION_STATE_FILE:-}"',
-      'onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID" --json >/dev/null',
+      'onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID" --json >/dev/null',
       'printf "worker $ONYX_WORKER_ID\\n" >> src/controller.txt',
       "git add src/controller.txt",
       "git -c user.name='Onyx Test' -c user.email='onyx@example.com' commit -m \"smoke worker $ONYX_WORKER_ID\"",
@@ -4275,7 +4323,8 @@ describe("research status", () => {
       workerModel: null,
       command: "codex",
       args: [],
-      onyxShimPath: null,
+      onyxWorkerPath: null,
+      workerContextPath: null,
       addedWritableRoots: [],
       cwd: root,
       promptPath: join(manifestDir, "prompt.md"),

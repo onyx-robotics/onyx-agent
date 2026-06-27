@@ -31,6 +31,7 @@ export type DeveloperMode = "release" | "dev"
 export type DeveloperCheckout = {
   root: string
   binPath: string
+  workerBinPath: string
   skillPath: string
 }
 
@@ -58,9 +59,23 @@ export function emptyConfig(): Config {
 }
 
 export function configDir() {
+  if (process.env.ONYX_HOME) return join(process.env.ONYX_HOME, "config")
   return process.env.XDG_CONFIG_HOME
     ? join(process.env.XDG_CONFIG_HOME, "onyx")
     : join(homedir(), ".config", "onyx")
+}
+
+function inferWorkerBinPath(checkout: Pick<DeveloperCheckout, "root" | "binPath">) {
+  if (checkout.binPath.endsWith("/bin/onyx.js")) {
+    return checkout.binPath.replace(/\/bin\/onyx\.js$/, "/bin/onyx-worker.js")
+  }
+  if (checkout.binPath.endsWith("/packages/agent/bin/onyx.js")) {
+    return checkout.binPath.replace(
+      /\/packages\/agent\/bin\/onyx\.js$/,
+      "/packages/agent/bin/onyx-worker.js"
+    )
+  }
+  return join(checkout.root, "bin", "onyx-worker.js")
 }
 
 export function configPath() {
@@ -78,7 +93,16 @@ function normalizeDeveloperConfig(value: unknown): DeveloperConfig {
     typeof checkout.binPath === "string" &&
     typeof checkout.skillPath === "string"
   ) {
-    return { mode, checkout }
+    return {
+      mode,
+      checkout: {
+        ...checkout,
+        workerBinPath:
+          typeof checkout.workerBinPath === "string"
+            ? checkout.workerBinPath
+            : inferWorkerBinPath(checkout),
+      },
+    }
   }
   return { mode }
 }

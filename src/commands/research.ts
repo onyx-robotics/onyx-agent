@@ -106,17 +106,20 @@ import {
   buildWorkerInvocation,
   preflightWorkerInvocation,
   readWorkerLaunchManifests,
-  workerEnvironment,
+  workerRuntimeEnvironment,
+  workerRuntimePaths,
   workerGitWritableRoots,
   workerLaunchPaths,
-  writeWorkerOnyxShim,
+  writeWorkerCliWrapper,
   writeWorkerLaunchManifest,
+  writeWorkerRuntimeContext,
   type WorkerFinalizationManifest,
   type WorkerFinalizationStatus,
   type WorkerInvocation,
   type WorkerLaunchManifest,
   type WorkerAgentKind,
-  type WorkerOnyxShim,
+  type WorkerCliWrapper,
+  type WorkerRuntimePaths,
 } from "../lib/worker-launcher"
 import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
 
@@ -674,25 +677,6 @@ function workerOptions({ agentKind, workerModel }: WorkerSettings) {
 
 function workerModelMetadata(workerModel: string | null) {
   return workerModel ? { workerModel } : {}
-}
-
-async function createWorkerTempDir({
-  root,
-  sessionId,
-  workerId,
-}: {
-  root: string
-  sessionId: string
-  workerId: string
-}) {
-  const dir = join(
-    await onyxStateDir(root),
-    "worker-tmp",
-    safeFileSegment(sessionId),
-    safeFileSegment(workerId)
-  )
-  await mkdir(dir, { recursive: true })
-  return dir
 }
 
 function jsonTextFragments(value: unknown): string[] {
@@ -3031,7 +3015,8 @@ function workerMetadata({
     workerPromptPath: manifest.promptPath,
     lastOutputAt: manifest.lastOutputAt,
     version: manifest.version,
-    onyxShimPath: manifest.onyxShimPath,
+    onyxWorkerPath: manifest.onyxWorkerPath,
+    workerContextPath: manifest.workerContextPath,
     addedWritableRoots: manifest.addedWritableRoots,
     preflight: manifest.preflight,
   }
@@ -3071,7 +3056,8 @@ async function persistWorkerLaunchState({
         agentKind: manifest.agentKind,
         command: manifest.command,
         args: manifest.args,
-        onyxShimPath: manifest.onyxShimPath,
+        onyxWorkerPath: manifest.onyxWorkerPath,
+        workerContextPath: manifest.workerContextPath,
         latestStatePath: manifest.latestStatePath,
         addedWritableRoots: manifest.addedWritableRoots,
         ...workerModelMetadata(manifest.workerModel ?? null),
@@ -3147,12 +3133,13 @@ async function runHypothesisOnce({
     launchPersistQueue = write
     return write
   }
-  let workerShim: WorkerOnyxShim | null = null
-  let workerTempDir: string | null = null
-  const cleanupWorkerTempDir = async () => {
-    if (!workerTempDir) return
-    await rm(workerTempDir, { recursive: true, force: true }).catch(() => {})
-    workerTempDir = null
+  let workerCliWrapper: WorkerCliWrapper | null = null
+  let runtimePaths: WorkerRuntimePaths | null = null
+  const cleanupWorkerRuntimeTempDir = async () => {
+    if (!runtimePaths) return
+    await rm(runtimePaths.tempDir, { recursive: true, force: true }).catch(
+      () => {}
+    )
   }
 
   try {
@@ -3212,15 +3199,36 @@ async function runHypothesisOnce({
       maxIterations,
       endTimeMs,
     })
-    workerShim = await writeWorkerOnyxShim({ root, sessionId })
-    workerTempDir = await createWorkerTempDir({
+    runtimePaths = await workerRuntimePaths({
       root,
       sessionId,
       workerId: worker.id,
     })
-    const workerBaseEnv = workerEnvironment({
+    const projectRoot = projectPath ? join(worktree, projectPath) : worktree
+    await writeWorkerRuntimeContext({
+      paths: runtimePaths,
+      context: {
+        schemaVersion: 1,
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        sessionId,
+        hypothesisId: hypothesis.id,
+        hypothesisName: hypothesis.name,
+        workerId: worker.id,
+        workerBranch,
+        worktreeRoot: worktree,
+        projectPath,
+        projectRoot,
+        setupFile: setupPath(worktree, projectPath),
+        validationFile: validationPath(worktree, projectPath),
+        researchSpecFile: onyxPath(worktree, projectPath, "onyx.md"),
+      },
+    })
+    workerCliWrapper = await writeWorkerCliWrapper({ paths: runtimePaths })
+    const workerBaseEnv = workerRuntimeEnvironment({
       baseEnv: process.env,
-      shim: workerShim,
+      wrapper: workerCliWrapper,
+      paths: runtimePaths,
     })
     const workerApiEnv = await frozenWorkerApiEnv(args)
     const workerRunEnv = {
@@ -3237,13 +3245,10 @@ async function runHypothesisOnce({
       ONYX_RESEARCH_DB: await researchDbPath(root),
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
-      ONYX_PROJECT_ROOT: projectPath ? join(worktree, projectPath) : worktree,
+      ONYX_PROJECT_ROOT: projectRoot,
       ONYX_SETUP_FILE: setupPath(worktree, projectPath),
       ONYX_VALIDATION_FILE: validationPath(worktree, projectPath),
       ONYX_RESEARCH_SPEC_FILE: onyxPath(worktree, projectPath, "onyx.md"),
-      TMPDIR: workerTempDir,
-      TMP: workerTempDir,
-      TEMP: workerTempDir,
       ONYX_RESEARCH_DEADLINE_AT: new Date(
         prompt.researchDeadlineMs
       ).toISOString(),
@@ -3299,7 +3304,8 @@ async function runHypothesisOnce({
       workerModel: invocation.workerModel ?? null,
       command: invocation.command,
       args: invocation.redactedArgs,
-      onyxShimPath: workerShim.onyxPath,
+      onyxWorkerPath: workerCliWrapper.workerPath,
+      workerContextPath: runtimePaths.contextPath,
       addedWritableRoots: invocation.addedWritableRoots,
       cwd: worktree,
       promptPath: prompt.path,
@@ -3600,7 +3606,7 @@ async function runHypothesisOnce({
           finalization,
         },
       })
-      await cleanupWorkerTempDir()
+      await cleanupWorkerRuntimeTempDir()
       return {
         hypothesis,
         workerId: worker.id,
@@ -3661,7 +3667,7 @@ async function runHypothesisOnce({
         finalization,
       },
     })
-    await cleanupWorkerTempDir()
+    await cleanupWorkerRuntimeTempDir()
     return {
       hypothesis,
       workerId: worker.id,
@@ -3736,7 +3742,7 @@ async function runHypothesisOnce({
         },
       })
     }
-    await cleanupWorkerTempDir()
+    await cleanupWorkerRuntimeTempDir()
     return {
       hypothesis,
       workerId,

@@ -15,6 +15,7 @@ import { onyxStateDir } from "./outbox"
 import { readConfig, type BuiltInWorkerAgent } from "./config"
 import { gitCommonDir, gitDir } from "./git"
 import { pathExists, runProcess } from "./process"
+import type { WorkerRuntimeContext } from "./worker-context"
 
 const ONYX_LAUNCHER_BYPASS = "ONYX_LAUNCHER_BYPASS"
 
@@ -43,11 +44,19 @@ export type WorkerPreflightResult = {
   checks: WorkerPreflightCheck[]
 }
 
-export type WorkerOnyxShim = {
+export type WorkerCliWrapper = {
   binDir: string
-  onyxPath: string
+  workerPath: string
   mode: "dev" | "release" | "source"
   target: string
+}
+
+export type WorkerRuntimePaths = {
+  dir: string
+  contextPath: string
+  homeDir: string
+  binDir: string
+  tempDir: string
 }
 
 export type WorkerFinalizationStatus =
@@ -77,7 +86,8 @@ export type WorkerLaunchManifest = {
   workerModel: string | null
   command: string
   args: string[]
-  onyxShimPath: string | null
+  onyxWorkerPath: string | null
+  workerContextPath: string | null
   addedWritableRoots: string[]
   cwd: string
   promptPath: string
@@ -164,8 +174,10 @@ function closestModelIds(requested: string, candidates: string[]) {
     .map((item) => item.candidate)
 }
 
-async function sourceCheckoutOnyxBin() {
-  const binPath = fileURLToPath(new URL("../../bin/onyx.js", import.meta.url))
+async function sourceCheckoutOnyxWorkerBin() {
+  const binPath = fileURLToPath(
+    new URL("../../bin/onyx-worker.js", import.meta.url)
+  )
   return (await pathExists(binPath)) ? binPath : null
 }
 
@@ -173,38 +185,77 @@ export async function workerGitWritableRoots(worktree: string) {
   return unique([await gitDir(worktree), await gitCommonDir(worktree)])
 }
 
-export async function writeWorkerOnyxShim({
+export async function workerRuntimePaths({
   root,
   sessionId,
+  workerId,
 }: {
   root: string
   sessionId: string
-}): Promise<WorkerOnyxShim> {
-  const dir = join(await onyxStateDir(root), "worker-bin", sessionId)
-  await mkdir(dir, { recursive: true })
-  const onyxPath = join(dir, "onyx")
+  workerId: string
+}): Promise<WorkerRuntimePaths> {
+  const dir = join(
+    await onyxStateDir(root),
+    "worker-runtime",
+    safeSegment(sessionId),
+    safeSegment(workerId)
+  )
+  return {
+    dir,
+    contextPath: join(dir, "context.json"),
+    homeDir: join(dir, "home"),
+    binDir: join(dir, "bin"),
+    tempDir: join(dir, "tmp"),
+  }
+}
+
+export async function writeWorkerRuntimeContext({
+  paths,
+  context,
+}: {
+  paths: WorkerRuntimePaths
+  context: WorkerRuntimeContext
+}) {
+  await Promise.all([
+    mkdir(paths.dir, { recursive: true }),
+    mkdir(paths.homeDir, { recursive: true }),
+    mkdir(paths.tempDir, { recursive: true }),
+  ])
+  await writeFile(paths.contextPath, `${JSON.stringify(context, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+}
+
+export async function writeWorkerCliWrapper({
+  paths,
+}: {
+  paths: WorkerRuntimePaths
+}): Promise<WorkerCliWrapper> {
+  await mkdir(paths.binDir, { recursive: true })
+  const workerPath = join(paths.binDir, "onyx-worker")
   const config = await readConfig()
 
-  let mode: WorkerOnyxShim["mode"] = "release"
-  let target = "onyx"
+  let mode: WorkerCliWrapper["mode"] = "release"
+  let target = "onyx-worker"
   let script: string
   if (config.developer.mode === "dev" && config.developer.checkout) {
     const checkout = config.developer.checkout
-    if (!(await pathExists(checkout.binPath))) {
+    if (!(await pathExists(checkout.workerBinPath))) {
       throw new Error(
-        `Onyx developer mode is active, but the linked CLI entrypoint is missing: ${checkout.binPath}. Run \`onyx developer link <path>\` again or switch back with \`onyx developer use release\`.`
+        `Onyx developer mode is active, but the linked worker CLI entrypoint is missing: ${checkout.workerBinPath}. Run \`onyx developer link <path>\` again or switch back with \`onyx developer use release\`.`
       )
     }
     mode = "dev"
-    target = checkout.binPath
+    target = checkout.workerBinPath
     script = [
       "#!/usr/bin/env sh",
       "set -eu",
-      `exec env ${ONYX_LAUNCHER_BYPASS}=1 bun ${shellQuote(checkout.binPath)} "$@"`,
+      `exec env ${ONYX_LAUNCHER_BYPASS}=1 bun ${shellQuote(target)} "$@"`,
       "",
     ].join("\n")
   } else {
-    const sourceBinPath = await sourceCheckoutOnyxBin()
+    const sourceBinPath = await sourceCheckoutOnyxWorkerBin()
     if (sourceBinPath) {
       mode = "source"
       target = sourceBinPath
@@ -215,7 +266,7 @@ export async function writeWorkerOnyxShim({
         "",
       ].join("\n")
     } else {
-      const resolved = await runProcess("sh", ["-lc", "command -v onyx"], {
+      const resolved = await runProcess("sh", ["-lc", "command -v onyx-worker"], {
         timeoutMs: 5000,
       })
       const resolvedPath = resolved.stdout.trim().split("\n")[0]
@@ -229,27 +280,34 @@ export async function writeWorkerOnyxShim({
         ].join("\n")
       } else {
         throw new Error(
-          "Unable to resolve the Onyx CLI on PATH for worker launch. Install `onyx`, run from an Onyx agent source checkout, or use developer mode with `onyx developer link <path>`."
+          "Unable to resolve the Onyx worker CLI on PATH for worker launch. Install `onyx-worker`, run from an Onyx agent source checkout, or use developer mode with `onyx developer link <path>`."
         )
       }
     }
   }
 
-  await writeFile(onyxPath, script, "utf8")
-  await chmod(onyxPath, 0o755)
-  return { binDir: dir, onyxPath, mode, target }
+  await writeFile(workerPath, script, "utf8")
+  await chmod(workerPath, 0o755)
+  return { binDir: paths.binDir, workerPath, mode, target }
 }
 
-export function workerEnvironment({
+export function workerRuntimeEnvironment({
   baseEnv,
-  shim,
+  wrapper,
+  paths,
 }: {
   baseEnv: NodeJS.ProcessEnv
-  shim: WorkerOnyxShim
+  wrapper: WorkerCliWrapper
+  paths: WorkerRuntimePaths
 }) {
   return {
     ...baseEnv,
-    PATH: [shim.binDir, baseEnv.PATH ?? ""].filter(Boolean).join(delimiter),
+    PATH: [wrapper.binDir, baseEnv.PATH ?? ""].filter(Boolean).join(delimiter),
+    ONYX_WORKER_CONTEXT: paths.contextPath,
+    ONYX_HOME: paths.homeDir,
+    TMPDIR: paths.tempDir,
+    TMP: paths.tempDir,
+    TEMP: paths.tempDir,
   }
 }
 
@@ -517,47 +575,47 @@ export async function preflightWorkerInvocation(
     return result
   }
 
-  await runCheck("onyx developer status", "onyx", [
-    "developer",
-    "status",
-    "--json",
-  ])
-  await runCheck("onyx status", "onyx", ["status", "--json"])
   for (const probe of [
     {
-      name: "onyx exp run help",
+      name: "onyx-worker exp run help",
       args: ["exp", "run", "--help"],
     },
     {
-      name: "onyx worker run help",
-      args: ["worker", "run", "--help"],
+      name: "onyx-worker research brief help",
+      args: ["research", "brief", "--help"],
     },
     {
-      name: "onyx research should-stop help",
+      name: "onyx-worker research should-stop help",
       args: ["research", "should-stop", "--help"],
     },
     {
-      name: "onyx knowledge add help",
+      name: "onyx-worker knowledge add help",
       args: ["knowledge", "add", "--help"],
     },
     {
-      name: "onyx knowledge list help",
-      args: ["knowledge", "list", "--help"],
+      name: "onyx-worker tools run help",
+      args: ["tools", "run", "--help"],
     },
     {
-      name: "onyx summary upsert help",
+      name: "onyx-worker summary upsert help",
       args: ["summary", "upsert", "--help"],
     },
+    {
+      name: "onyx-worker sync status help",
+      args: ["sync", "status", "--help"],
+    },
   ]) {
-    await runCheck(probe.name, "onyx", probe.args)
+    await runCheck(probe.name, "onyx-worker", probe.args)
   }
   checks.push({
-    name: "onyx capability surface",
+    name: "onyx-worker capability surface",
     status: "passed",
     output: null,
   })
 
-  const versionResult = await runCheck("onyx version", "onyx", ["--version"])
+  const versionResult = await runCheck("onyx-worker version", "onyx-worker", [
+    "--version",
+  ])
   onyxVersion =
     [versionResult.stdout.trim(), versionResult.stderr.trim()]
       .filter(Boolean)
@@ -571,8 +629,8 @@ export async function preflightWorkerInvocation(
 
   if (options.sessionId) {
     await runCheck(
-      "onyx should-stop",
-      "onyx",
+      "onyx-worker should-stop",
+      "onyx-worker",
       [
         "research",
         "should-stop",

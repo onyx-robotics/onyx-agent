@@ -174,8 +174,11 @@ snapshots by default, a full worker snapshot every 60 seconds or final upload,
 and at most 250 worker snapshots per request.
 
 Codex, Claude, and OpenCode are first-class built-in launchers. All are spawned
-directly in non-interactive mode with the same Onyx CLI surface as the
-orchestrator, receive the worker prompt over stdin, and write raw stdout/stderr logs,
+directly in non-interactive mode, receive the worker prompt over stdin, and use
+the explicit `onyx-worker` CLI surface for worker-safe primitives while the full
+`onyx` CLI remains the user/orchestrator surface. Supervised workers get
+isolated `ONYX_HOME` plus `ONYX_WORKER_CONTEXT` under
+`.git/onyx/worker-runtime/<session>/<workerId>/`, and write raw stdout/stderr logs,
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
@@ -199,16 +202,16 @@ diagnostics.
 
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
 and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
-worker prompts and logs live under `.git/onyx/`. Workers run `onyx research brief`
-for current campaign memory, poll `onyx research should-stop`, run the setup workflow through `onyx exp run
---campaign <name> --base <sha> --auto` and `onyx exp run --resume <id> --auto`,
+worker prompts and logs live under `.git/onyx/`. Workers run `onyx-worker research brief`
+for current campaign memory, poll `onyx-worker research should-stop`, run the setup workflow through `onyx-worker exp run
+--campaign <name> --base <sha> --auto` and `onyx-worker exp run --resume <id> --auto`,
 push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment
 with setup/session/hypothesis/worker context. `onyx research hypothesis add`
 can create another campaign hypothesis at any time from a JSON plan file or inline
 focus/hypothesis flags; a running supervisor picks up new active hypotheses as
 soon as worker slots open. Workers
-publish shared learning with `onyx knowledge add` and read it back with
-`onyx knowledge list`, but successor hypothesis selection remains an
+publish shared learning with `onyx-worker knowledge add` and read it back through
+`onyx-worker research brief`, but successor hypothesis selection remains an
 orchestrator/human decision.
 After the agent exits, the worker harness performs one final best-effort
 commit, checks whether HEAD is already represented by a local experiment,

@@ -53,11 +53,19 @@ export async function detectDeveloperCheckout(
     {
       root: inputRoot,
       binPath: join(inputRoot, "bin", "onyx.js"),
+      workerBinPath: join(inputRoot, "bin", "onyx-worker.js"),
       skillPath: join(inputRoot, "skills", "onyx", "SKILL.md"),
     },
     {
       root: inputRoot,
       binPath: join(inputRoot, "packages", "agent", "bin", "onyx.js"),
+      workerBinPath: join(
+        inputRoot,
+        "packages",
+        "agent",
+        "bin",
+        "onyx-worker.js"
+      ),
       skillPath: join(
         inputRoot,
         "packages",
@@ -72,6 +80,7 @@ export async function detectDeveloperCheckout(
   for (const candidate of candidates) {
     if (
       (await existingPath(candidate.binPath)) &&
+      (await existingPath(candidate.workerBinPath)) &&
       (await existingPath(candidate.skillPath))
     ) {
       return candidate
@@ -79,7 +88,7 @@ export async function detectDeveloperCheckout(
   }
 
   throw new Error(
-    `No Onyx agent checkout found at ${inputRoot}. Expected either bin/onyx.js plus skills/onyx/SKILL.md, or packages/agent/bin/onyx.js plus packages/agent/skills/onyx/SKILL.md.`
+    `No Onyx agent checkout found at ${inputRoot}. Expected either bin/onyx.js, bin/onyx-worker.js, and skills/onyx/SKILL.md, or packages/agent/bin/onyx.js, packages/agent/bin/onyx-worker.js, and packages/agent/skills/onyx/SKILL.md.`
   )
 }
 
@@ -87,6 +96,11 @@ export async function validateDeveloperCheckout(checkout: DeveloperCheckout) {
   if (!(await existingPath(checkout.binPath))) {
     throw new Error(
       `Developer mode is linked to ${checkout.root}, but the CLI entrypoint is missing: ${checkout.binPath}. Run \`onyx developer link <path>\` again or switch back with \`onyx developer use release\`.`
+    )
+  }
+  if (!(await existingPath(checkout.workerBinPath))) {
+    throw new Error(
+      `Developer mode is linked to ${checkout.root}, but the worker CLI entrypoint is missing: ${checkout.workerBinPath}. Run \`onyx developer link <path>\` again or switch back with \`onyx developer use release\`.`
     )
   }
   if (!(await existingPath(checkout.skillPath))) {
@@ -166,6 +180,7 @@ export async function commandDeveloper(args: Args) {
     if (!isQuiet(args)) {
       console.log(`Linked developer checkout: ${checkout.root}`)
       console.log(`CLI: ${checkout.binPath}`)
+      console.log(`Worker CLI: ${checkout.workerBinPath}`)
       console.log(`Skill: ${checkout.skillPath}`)
       if (current.mode === "dev") {
         console.log("Developer mode is active; synced the managed skill.")
@@ -271,6 +286,7 @@ export async function commandDeveloper(args: Args) {
     if (current.checkout) {
       console.log(`Developer checkout: ${current.checkout.root}`)
       console.log(`Developer CLI: ${current.checkout.binPath}`)
+      console.log(`Developer worker CLI: ${current.checkout.workerBinPath}`)
       console.log(`Developer skill: ${current.checkout.skillPath}`)
     } else {
       console.log("Developer checkout: none")

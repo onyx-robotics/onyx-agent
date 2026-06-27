@@ -17,8 +17,11 @@ import { runProcess, runStreamingProcess } from "./lib/process"
 import {
   buildWorkerInvocation,
   preflightWorkerInvocation,
+  workerRuntimeEnvironment,
+  workerRuntimePaths,
   writeWorkerLaunchManifest,
-  writeWorkerOnyxShim,
+  writeWorkerCliWrapper,
+  writeWorkerRuntimeContext,
 } from "./lib/worker-launcher"
 
 async function writeFakeAgent(path: string, version: string) {
@@ -66,16 +69,16 @@ async function writeFakeOnyx(path: string) {
       '  echo "{\\"apiTarget\\":\\"http://localhost:3000\\",\\"project\\":null}"',
       "  exit 0",
       "fi",
-      'if [[ "${1:-}" == "tools" && "${2:-}" == "run" ]]; then',
-      '  echo "unexpected tools run: $*" >&2',
-      "  exit 99",
-      "fi",
       'for arg in "$@"; do',
       '  if [[ "$arg" == "--help" ]]; then',
       '    echo "onyx fake command help: $*"',
       "    exit 0",
       "  fi",
       "done",
+      'if [[ "${1:-}" == "tools" && "${2:-}" == "run" ]]; then',
+      '  echo "unexpected tools run: $*" >&2',
+      "  exit 99",
+      "fi",
       'if [[ "${1:-}" == "--help" ]]; then',
       '  echo "onyx research should-stop"',
       '  echo "onyx knowledge add"',
@@ -193,7 +196,7 @@ describe("worker launchers", () => {
     await mkdir(worktree)
     await runProcess("git", ["init"], { cwd: worktree })
     await writeFakeAgent(join(bin, "codex"), "codex fake 1.0")
-    await writeFakeOnyx(join(bin, "onyx"))
+    await writeFakeOnyx(join(bin, "onyx-worker"))
 
     const argsFile = join(root, "args.txt")
     const cwdFile = join(root, "cwd.txt")
@@ -318,7 +321,7 @@ describe("worker launchers", () => {
     await mkdir(worktree)
     await runProcess("git", ["init"], { cwd: worktree })
     await writeFakeAgent(join(bin, "claude"), "claude fake 2.0")
-    await writeFakeOnyx(join(bin, "onyx"))
+    await writeFakeOnyx(join(bin, "onyx-worker"))
 
     const env = {
       ...process.env,
@@ -386,7 +389,7 @@ describe("worker launchers", () => {
     await mkdir(worktree)
     await runProcess("git", ["init"], { cwd: worktree })
     await writeFakeAgent(join(bin, "codex"), "codex fake 1.0")
-    await writeFakeOnyx(join(bin, "onyx"))
+    await writeFakeOnyx(join(bin, "onyx-worker"))
 
     const invocation = buildWorkerInvocation({
       agentKind: "codex",
@@ -417,7 +420,8 @@ describe("worker launchers", () => {
       workerModel: null,
       command: "codex",
       args: ["exec"],
-      onyxShimPath: null,
+      onyxWorkerPath: null,
+      workerContextPath: null,
       addedWritableRoots: [],
       cwd: root,
       promptPath: join(root, "prompt.md"),
@@ -448,7 +452,57 @@ describe("worker launchers", () => {
     expect(await readFile(manifestPath, "utf8")).toContain('"schemaVersion": 1')
   })
 
-  test("dev-mode onyx shim dispatches through linked checkout with bypass", async () => {
+  test("creates isolated worker runtime context and environment", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-runtime-"))
+    await runProcess("git", ["init"], { cwd: root })
+    const paths = await workerRuntimePaths({
+      root,
+      sessionId: "session/one",
+      workerId: "worker/one",
+    })
+
+    await writeWorkerRuntimeContext({
+      paths,
+      context: {
+        schemaVersion: 1,
+        campaignId: "campaign-id",
+        campaignName: "campaign",
+        sessionId: "session/one",
+        hypothesisId: "hypothesis-id",
+        hypothesisName: "hypothesis",
+        workerId: "worker/one",
+        workerBranch: "onyx/session/worker",
+        worktreeRoot: join(root, "worktree"),
+        projectPath: "",
+        projectRoot: join(root, "worktree"),
+        setupFile: join(root, "worktree", "onyx", "setup.json"),
+        validationFile: join(root, "worktree", "onyx", "validation.json"),
+        researchSpecFile: join(root, "worktree", "onyx", "onyx.md"),
+      },
+    })
+
+    const wrapper = {
+      binDir: paths.binDir,
+      workerPath: join(paths.binDir, "onyx-worker"),
+      mode: "source" as const,
+      target: join(root, "bin", "onyx-worker.js"),
+    }
+    const env = workerRuntimeEnvironment({
+      baseEnv: { PATH: "/usr/bin" },
+      wrapper,
+      paths,
+    })
+
+    expect(await readFile(paths.contextPath, "utf8")).toContain(
+      '"campaignName": "campaign"'
+    )
+    expect(env.PATH).toBe(`${paths.binDir}${delimiter}/usr/bin`)
+    expect(env.ONYX_WORKER_CONTEXT).toBe(paths.contextPath)
+    expect(env.ONYX_HOME).toBe(paths.homeDir)
+    expect(env.TMPDIR).toBe(paths.tempDir)
+  })
+
+  test("dev-mode worker wrapper dispatches through linked checkout with bypass", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-shim-root-"))
     const configHome = await mkdtemp(join(tmpdir(), "onyx-worker-shim-config-"))
     const checkout = await mkdtemp(join(tmpdir(), "onyx-worker-shim-checkout-"))
@@ -456,17 +510,17 @@ describe("worker launchers", () => {
     await mkdir(join(checkout, "bin"), { recursive: true })
     await mkdir(join(checkout, "skills", "onyx"), { recursive: true })
     const binPath = join(checkout, "bin", "onyx.js")
+    const workerBinPath = join(checkout, "bin", "onyx-worker.js")
     await writeFile(
-      binPath,
+      workerBinPath,
       [
         "#!/usr/bin/env bun",
         'if (process.env.ONYX_LAUNCHER_BYPASS !== "1") process.exit(42)',
         'if (process.argv.includes("--help")) {',
-        '  console.log("onyx research should-stop")',
-        '  console.log("onyx knowledge add")',
-        '  console.log("onyx knowledge list")',
-        '  console.log("onyx summary upsert")',
-        '  console.log("onyx exp run [--campaign")',
+        '  console.log("onyx-worker research should-stop")',
+        '  console.log("onyx-worker knowledge add")',
+        '  console.log("onyx-worker summary upsert")',
+        '  console.log("onyx-worker exp run [--campaign")',
         "  process.exit(0)",
         "}",
         'console.log("linked checkout")',
@@ -474,7 +528,9 @@ describe("worker launchers", () => {
       ].join("\n"),
       "utf8"
     )
+    await writeFile(binPath, "#!/usr/bin/env bun\n", "utf8")
     await chmod(binPath, 0o755)
+    await chmod(workerBinPath, 0o755)
 
     const previousConfigHome = process.env.XDG_CONFIG_HOME
     process.env.XDG_CONFIG_HOME = configHome
@@ -487,21 +543,26 @@ describe("worker launchers", () => {
           checkout: {
             root: checkout,
             binPath,
+            workerBinPath,
             skillPath: join(checkout, "skills", "onyx", "SKILL.md"),
           },
         },
       })
 
-      const shim = await writeWorkerOnyxShim({ root, sessionId: "session" })
-      expect(shim.mode).toBe("dev")
-      expect(shim.target).toBe(binPath)
-      const help = await runProcess(shim.onyxPath, ["--help"], {
+      const paths = await workerRuntimePaths({
+        root,
+        sessionId: "session",
+        workerId: "worker",
+      })
+      const wrapper = await writeWorkerCliWrapper({ paths })
+      expect(wrapper.mode).toBe("dev")
+      expect(wrapper.target).toBe(workerBinPath)
+      const help = await runProcess(wrapper.workerPath, ["--help"], {
         timeoutMs: 5000,
       })
       expect(help.code).toBe(0)
-      expect(help.stdout).toContain("onyx research should-stop")
-      expect(help.stdout).toContain("onyx knowledge list")
-      expect(help.stdout).toContain("onyx summary upsert")
+      expect(help.stdout).toContain("onyx-worker research should-stop")
+      expect(help.stdout).toContain("onyx-worker summary upsert")
     } finally {
       if (previousConfigHome === undefined) {
         delete process.env.XDG_CONFIG_HOME
@@ -511,7 +572,7 @@ describe("worker launchers", () => {
     }
   })
 
-  test("onyx shim falls back to the source checkout when PATH has no onyx", async () => {
+  test("worker wrapper falls back to the source checkout when PATH has no onyx-worker", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-source-shim-"))
     const configHome = await mkdtemp(
       join(tmpdir(), "onyx-worker-source-config-")
@@ -529,16 +590,21 @@ describe("worker launchers", () => {
         developer: { mode: "release" },
       })
 
-      const shim = await writeWorkerOnyxShim({ root, sessionId: "session" })
-      expect(shim.mode).toBe("source")
-      expect(shim.target).toContain("/bin/onyx.js")
+      const paths = await workerRuntimePaths({
+        root,
+        sessionId: "session",
+        workerId: "worker",
+      })
+      const wrapper = await writeWorkerCliWrapper({ paths })
+      expect(wrapper.mode).toBe("source")
+      expect(wrapper.target).toContain("/bin/onyx-worker.js")
 
       if (previousPath !== undefined) process.env.PATH = previousPath
-      const help = await runProcess(shim.onyxPath, ["--help"], {
+      const help = await runProcess(wrapper.workerPath, ["--help"], {
         timeoutMs: 5000,
       })
       expect(help.code).toBe(0)
-      expect(help.stdout).toContain("onyx research run")
+      expect(help.stdout).toContain("onyx-worker research brief")
     } finally {
       if (previousConfigHome === undefined) {
         delete process.env.XDG_CONFIG_HOME
@@ -553,14 +619,14 @@ describe("worker launchers", () => {
     }
   })
 
-  test("onyx shim prefers the source checkout over an installed onyx", async () => {
+  test("worker wrapper prefers the source checkout over an installed onyx-worker", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-source-first-"))
     const configHome = await mkdtemp(
       join(tmpdir(), "onyx-worker-source-first-config-")
     )
     const bin = join(root, "bin")
     await mkdir(bin)
-    await writeFakeOnyx(join(bin, "onyx"))
+    await writeFakeOnyx(join(bin, "onyx-worker"))
     await runProcess("git", ["init"], { cwd: root })
     const previousConfigHome = process.env.XDG_CONFIG_HOME
     const previousPath = process.env.PATH
@@ -574,15 +640,20 @@ describe("worker launchers", () => {
         developer: { mode: "release" },
       })
 
-      const shim = await writeWorkerOnyxShim({ root, sessionId: "session" })
-      expect(shim.mode).toBe("source")
-      expect(shim.target).toContain("/bin/onyx.js")
+      const paths = await workerRuntimePaths({
+        root,
+        sessionId: "session",
+        workerId: "worker",
+      })
+      const wrapper = await writeWorkerCliWrapper({ paths })
+      expect(wrapper.mode).toBe("source")
+      expect(wrapper.target).toContain("/bin/onyx-worker.js")
 
-      const help = await runProcess(shim.onyxPath, ["--help"], {
+      const help = await runProcess(wrapper.workerPath, ["--help"], {
         timeoutMs: 5000,
       })
       expect(help.code).toBe(0)
-      expect(help.stdout).toContain("onyx research brief")
+      expect(help.stdout).toContain("onyx-worker research brief")
     } finally {
       if (previousConfigHome === undefined) {
         delete process.env.XDG_CONFIG_HOME

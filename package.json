@@ -14,7 +14,8 @@
     "url": "https://github.com/onyx-robotics/onyx-agent/issues"
   },
   "bin": {
-    "onyx": "bin/onyx.js"
+    "onyx": "bin/onyx.js",
+    "onyx-worker": "bin/onyx-worker.js"
   },
   "pi": {
     "skills": [

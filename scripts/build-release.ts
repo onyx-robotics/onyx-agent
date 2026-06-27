@@ -9,8 +9,8 @@ const targets = [
   "bun-linux-x64-baseline",
 ] as const
 
-function assetName(target: string) {
-  return target.replace(/^bun-/, "onyx-")
+function assetName(prefix: string, target: string) {
+  return target.replace(/^bun-/, `${prefix}-`)
 }
 
 async function run(command: string, args: string[]) {
@@ -28,14 +28,19 @@ async function run(command: string, args: string[]) {
 await mkdir("dist", { recursive: true })
 
 for (const target of targets) {
-  await run("bun", [
-    "build",
-    "./bin/onyx.js",
-    "--compile",
-    "--minify",
-    `--target=${target}`,
-    `--outfile=dist/${assetName(target)}`,
-  ])
+  for (const [prefix, entry] of [
+    ["onyx", "./bin/onyx.js"],
+    ["onyx-worker", "./bin/onyx-worker.js"],
+  ] as const) {
+    await run("bun", [
+      "build",
+      entry,
+      "--compile",
+      "--minify",
+      `--target=${target}`,
+      `--outfile=dist/${assetName(prefix, target)}`,
+    ])
+  }
 }
 
 await run("sh", [

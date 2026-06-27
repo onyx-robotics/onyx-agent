@@ -70,13 +70,13 @@ describe("hypothesis worker prompt", () => {
       "Treat `/repo/.git/onyx/worktrees/session-hypothesis` as the only project root"
     )
     expect(prompt).toContain(
-      'Campaign brief command: `onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"`'
+      'Campaign brief command: `onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"`'
     )
     expect(prompt).toContain(
-      'Run `onyx research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"` for current campaign memory'
+      'Run `onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"` for current campaign memory'
     )
     expect(prompt).toContain("single routine context source")
-    expect(prompt).toContain("onyx exp list --grep")
+    expect(prompt).toContain("onyx-worker exp list --grep")
     expect(prompt).not.toContain("onyx research status --json")
     expect(prompt).not.toContain("onyx exp list --json")
     expect(prompt).not.toContain("onyx knowledge list --json")
@@ -86,11 +86,11 @@ describe("hypothesis worker prompt", () => {
       "Do not run tuning sweeps, grid searches, or batch candidate evaluation unless your hypothesis plan or the research spec explicitly calls for it"
     )
     expect(prompt).toContain(
-      'onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
+      'onyx-worker summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
     )
-    expect(prompt).toContain("onyx knowledge add")
+    expect(prompt).toContain("onyx-worker knowledge add")
     expect(prompt).toContain(
-      'onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json'
+      'onyx-worker research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json'
     )
     expect(prompt).toContain('"shouldStop": true')
     expect(prompt).toContain(
@@ -98,19 +98,19 @@ describe("hypothesis worker prompt", () => {
     )
     expect(prompt).toContain("Make one small, measured, logged attempt early")
     expect(prompt).toContain(
-      "Do not spend more than a quick orientation pass before the first `onyx exp run`"
+      "Do not spend more than a quick orientation pass before the first `onyx-worker exp run`"
     )
     expect(prompt).toContain(
-      "The supervisor fixed this worker's Onyx API target and key in the environment"
+      "The supervisor launched this worker with `onyx-worker`, `ONYX_WORKER_CONTEXT`, and an isolated `ONYX_HOME`"
     )
-    expect(prompt).toContain("Do not run `onyx profile use`")
-    expect(prompt).toContain("mutate any global Onyx CLI profile/config files")
+    expect(prompt).toContain("the full `onyx` CLI is the user/orchestrator surface")
+    expect(prompt).not.toContain("Do not run `onyx profile use`")
     expect(prompt).toContain(
-      'onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto'
+      'onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto'
     )
-    expect(prompt).toContain("onyx exp run --resume --auto")
-    expect(prompt).toContain("onyx workflow status --blocked")
-    expect(prompt).toContain('onyx exp log --campaign "$ONYX_CAMPAIGN_NAME"')
+    expect(prompt).toContain("onyx-worker exp run --resume --auto")
+    expect(prompt).toContain("onyx-worker workflow status --blocked")
+    expect(prompt).toContain('onyx-worker exp log --campaign "$ONYX_CAMPAIGN_NAME"')
     expect(prompt).not.toContain("onyx workflow status --active")
     expect(prompt).not.toContain("<pre-edit-sha>")
     expect(prompt).not.toContain("<workflowRunId>")
@@ -120,14 +120,14 @@ describe("hypothesis worker prompt", () => {
       "Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow"
     )
     expect(prompt).toContain(
-      "allowed only inside a normal `onyx exp run` attempt"
+      "allowed only inside a normal `onyx-worker exp run` attempt"
     )
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
     expect(prompt).toContain("Do not edit `.git/onyx/research.db`")
     expect(prompt).toContain("never patch the ledger with SQLite")
     expect(prompt).toContain("Server sync is the supervisor/harness's job")
-    expect(prompt).toContain("Do not run `onyx push` or `onyx sync`")
-    expect(prompt).toContain("onyx sync status")
+    expect(prompt).toContain("Do not run `onyx push` or mutating sync commands")
+    expect(prompt).toContain("onyx-worker sync status")
     expect(prompt).not.toContain("Supervisor/harness sync owns durable pushes")
     expect(prompt).not.toContain(
       "run `onyx push` only when network access is clearly available"

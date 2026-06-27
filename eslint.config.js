@@ -16,7 +16,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["bin/onyx.js"],
+    files: ["bin/*.js"],
     languageOptions: {
       parserOptions: {
         projectService: false,

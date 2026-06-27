@@ -92,7 +92,7 @@ if [ -z "$out" ]; then
 fi
 case "$out" in
   */checksums.txt)
-    printf 'hash  onyx-linux-x64-baseline\\nhash  onyx-darwin-arm64\\n' > "$out"
+    printf 'hash  onyx-linux-x64-baseline\\nhash  onyx-worker-linux-x64-baseline\\nhash  onyx-darwin-arm64\\nhash  onyx-worker-darwin-arm64\\n' > "$out"
     ;;
   *)
     cp "$ONYX_FAKE_ASSET" "$out"
@@ -166,6 +166,7 @@ describe("install script", () => {
 
     expect(output).toContain("target=darwin-arm64")
     expect(output).toContain("asset=onyx-darwin-arm64")
+    expect(output).toContain("worker_asset=onyx-worker-darwin-arm64")
   })
 
   test("maps Linux x64 to the baseline asset", async () => {
@@ -173,6 +174,7 @@ describe("install script", () => {
 
     expect(output).toContain("target=linux-x64-baseline")
     expect(output).toContain("asset=onyx-linux-x64-baseline")
+    expect(output).toContain("worker_asset=onyx-worker-linux-x64-baseline")
   })
 
   test("installs to user-local bin by default", async () => {
@@ -188,12 +190,21 @@ describe("install script", () => {
       expect(result.stdout).toContain(
         `Installed onyx to ${fixture.home}/.local/bin/onyx`
       )
+      expect(result.stdout).toContain(
+        `Installed onyx-worker to ${fixture.home}/.local/bin/onyx-worker`
+      )
       expect(await readFile(`${fixture.home}/.local/bin/onyx`, "utf8")).toContain(
         "fake login complete"
       )
       expect(
+        await readFile(`${fixture.home}/.local/bin/onyx-worker`, "utf8")
+      ).toContain("fake login complete")
+      expect(
         await readFile(`${fixture.home}/.local/bin/.onyx-install`, "utf8")
       ).toContain(`path=${fixture.home}/.local/bin/onyx`)
+      expect(
+        await readFile(`${fixture.home}/.local/bin/.onyx-install`, "utf8")
+      ).toContain(`worker_path=${fixture.home}/.local/bin/onyx-worker`)
     })
   })
 

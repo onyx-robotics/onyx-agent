@@ -93,6 +93,14 @@ Usage:
   onyx sync export [--campaign <name>]
   onyx sync doctor
 
+Worker primitives are exposed through the separate worker-safe entrypoint:
+  onyx-worker research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
+  onyx-worker research should-stop [--session <id>] [--iteration <n>] [--json]
+  onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next]
+  onyx-worker exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>]
+  onyx-worker tools run <name> [args...]
+  onyx-worker sync status
+
 Results and research control-plane state are logged locally first in
 .git/onyx/research.db. \`onyx push\`, \`onyx sync\`, \`onyx sync --watch\`, and
 workers push immutable experiment refs and flush SQLite sync events. Pass
@@ -132,6 +140,12 @@ export async function main(argv = process.argv.slice(2)) {
     ) {
       console.log(USAGE)
       return
+    }
+
+    if (process.env.ONYX_WORKER_CONTEXT || process.env.ONYX_WORKER_ID) {
+      throw new Error(
+        "The full `onyx` CLI is not available inside a worker runtime. Use `onyx-worker` for worker-safe research commands."
+      )
     }
 
     if (command === "login") return commandLogin(args)

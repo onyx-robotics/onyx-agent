@@ -83,11 +83,13 @@ export {
   buildWorkerInvocation,
   preflightWorkerInvocation,
   readWorkerLaunchManifests,
-  workerEnvironment,
+  workerRuntimeEnvironment,
+  workerRuntimePaths,
   workerGitWritableRoots,
   workerLaunchPaths,
-  writeWorkerOnyxShim,
+  writeWorkerCliWrapper,
   writeWorkerLaunchManifest,
+  writeWorkerRuntimeContext,
   type WorkerInvocation,
   type WorkerLaunchManifest,
 } from "./lib/worker-launcher"
@@ -181,10 +183,18 @@ export {
   type ToolRunResult,
 } from "./lib/tools"
 export { USAGE, main } from "./main"
+export { WORKER_USAGE, workerMain } from "./worker-main"
+export {
+  ONYX_WORKER_CONTEXT,
+  assertWorkerContextArgs,
+  readWorkerRuntimeContext,
+  type WorkerRuntimeContext,
+} from "./lib/worker-context"
 export {
   ONYX_LAUNCHER_BYPASS,
   defaultDevCommandRunner,
   runCli,
   runLauncher,
+  runWorkerCli,
   type DevCommandRunner,
 } from "./launcher"

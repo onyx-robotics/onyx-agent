@@ -377,17 +377,29 @@ prepare_install_dir() {
   [ -w "$INSTALL_DIR" ] || die "Install directory is not writable: $INSTALL_DIR. Choose a user-writable directory with ONYX_INSTALL_DIR, or rerun with permissions."
 
   marker_path="$INSTALL_DIR/$INSTALL_MARKER"
-  if [ -e "$install_path" ] || [ -L "$install_path" ]; then
-    if [ -f "$marker_path" ] && grep -F "path=$install_path" "$marker_path" >/dev/null 2>&1; then
+  prepare_install_path "$install_path" "$HOME/.onyx/bin/onyx"
+  prepare_install_path "$worker_install_path" ""
+}
+
+prepare_install_path() {
+  target_path="$1"
+  legacy_link_target="$2"
+  marker_path="$INSTALL_DIR/$INSTALL_MARKER"
+
+  if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+    if [ -f "$marker_path" ] && {
+      grep -F "path=$target_path" "$marker_path" >/dev/null 2>&1 ||
+      grep -F "worker_path=$target_path" "$marker_path" >/dev/null 2>&1
+    }; then
       :
-    elif [ -L "$install_path" ] && [ "$(readlink "$install_path" 2>/dev/null || true)" = "$HOME/.onyx/bin/onyx" ]; then
+    elif [ -n "$legacy_link_target" ] && [ -L "$target_path" ] && [ "$(readlink "$target_path" 2>/dev/null || true)" = "$legacy_link_target" ]; then
       :
     else
-      die "Refusing to overwrite existing file: $install_path. Remove it, move it, or choose another directory with ONYX_INSTALL_DIR."
+      die "Refusing to overwrite existing file: $target_path. Remove it, move it, or choose another directory with ONYX_INSTALL_DIR."
     fi
 
-    if [ -L "$install_path" ]; then
-      rm -f "$install_path"
+    if [ -L "$target_path" ]; then
+      rm -f "$target_path"
     fi
   fi
 }
@@ -396,12 +408,15 @@ write_install_marker() {
   {
     echo "managed-by=onyx-installer"
     echo "path=$install_path"
+    echo "worker_path=$worker_install_path"
   } > "$INSTALL_DIR/$INSTALL_MARKER" 2>/dev/null || true
 }
 
 target="$(detect_target)"
 asset="onyx-$target"
+worker_asset="onyx-worker-$target"
 install_path="$INSTALL_DIR/onyx"
+worker_install_path="$INSTALL_DIR/onyx-worker"
 
 if [ "$VERSION" = "latest" ]; then
   download_base="$BASE_URL/latest/download"
@@ -410,12 +425,15 @@ else
 fi
 
 asset_url="$download_base/$asset"
+worker_asset_url="$download_base/$worker_asset"
 checksums_url="$download_base/checksums.txt"
 
 if [ "${ONYX_INSTALL_DRY_RUN:-}" = "1" ]; then
   echo "target=$target"
   echo "asset=$asset"
+  echo "worker_asset=$worker_asset"
   echo "asset_url=$asset_url"
+  echo "worker_asset_url=$worker_asset_url"
   echo "checksums_url=$checksums_url"
   echo "install_dir=$INSTALL_DIR"
   exit 0
@@ -457,28 +475,38 @@ mkdir -p "$tmp"
 
 status_line "Downloading Onyx agent $VERSION for $target..."
 curl -fsSL "$asset_url" -o "$tmp/$asset"
+curl -fsSL "$worker_asset_url" -o "$tmp/$worker_asset"
 curl -fsSL "$checksums_url" -o "$tmp/checksums.txt"
 status_success "Downloaded release assets."
 
-status_line "Verifying checksum..."
-expected="$(grep "  $asset\$" "$tmp/checksums.txt" | awk '{print $1}')"
-if [ -z "$expected" ]; then
-  echo "No checksum found for $asset" >&2
-  exit 1
-fi
+verify_asset_checksum() {
+  verify_asset="$1"
+  expected="$(grep "  $verify_asset\$" "$tmp/checksums.txt" | awk '{print $1}')"
+  if [ -z "$expected" ]; then
+    echo "No checksum found for $verify_asset" >&2
+    exit 1
+  fi
 
-actual="$($sha_cmd "$tmp/$asset" | awk '{print $1}')"
-if [ "$actual" != "$expected" ]; then
-  echo "Checksum mismatch for $asset" >&2
-  exit 1
-fi
+  actual="$($sha_cmd "$tmp/$verify_asset" | awk '{print $1}')"
+  if [ "$actual" != "$expected" ]; then
+    echo "Checksum mismatch for $verify_asset" >&2
+    exit 1
+  fi
+}
+
+status_line "Verifying checksums..."
+verify_asset_checksum "$asset"
+verify_asset_checksum "$worker_asset"
 status_success "Checksum verified."
 
-status_line "Installing onyx..."
+status_line "Installing onyx and onyx-worker..."
 cp "$tmp/$asset" "$install_path"
+cp "$tmp/$worker_asset" "$worker_install_path"
 chmod 0755 "$install_path"
+chmod 0755 "$worker_install_path"
 write_install_marker
 status_success "Installed onyx to $install_path"
+status_success "Installed onyx-worker to $worker_install_path"
 
 if [ "${ONYX_SKIP_SKILL:-}" != "1" ]; then
   if "$install_path" developer sync-skill --quiet; then
