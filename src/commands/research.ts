@@ -63,6 +63,7 @@ import {
   type ProcessResult,
   type StreamingProcessResult,
 } from "../lib/process"
+import { resolveOpenCodeModelId } from "../lib/opencode-models"
 import {
   abandonBlockedWorkflowRunsForSession,
   assertLocalSessionSchedulerSite,
@@ -583,16 +584,14 @@ function metadataString(metadata: Record<string, unknown>, key: string) {
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
-function validateWorkerModel(
+async function resolveWorkerModel(
   agentKind: BuiltInWorkerAgent,
-  model: string | null
+  model: string | null | undefined,
+  options: { cwd?: string } = {}
 ) {
   if (!model) return null
   if (agentKind === "opencode") {
-    const slash = model.indexOf("/")
-    if (slash <= 0 || slash === model.length - 1) {
-      throw new Error("--model for --agent opencode must use provider/model")
-    }
+    return resolveOpenCodeModelId(model, { cwd: options.cwd })
   }
   return model
 }
@@ -605,9 +604,11 @@ type WorkerSettings = {
 async function resolveWorkerSettings({
   args,
   sessionMetadata,
+  cwd,
 }: {
   args: Args
   sessionMetadata?: Record<string, unknown> | null
+  cwd?: string
 }): Promise<WorkerSettings> {
   const existingAgent = sessionMetadata
     ? metadataString(sessionMetadata, "agentKind")
@@ -622,7 +623,14 @@ async function resolveWorkerSettings({
         `Research session already uses --agent ${agentKind}; create a new session to use ${args.options.agent}.`
       )
     }
-    const requestedModel = normalizeWorkerModel(args.options.model)
+    const requestedModel =
+      args.options.model === undefined
+        ? undefined
+        : await resolveWorkerModel(
+            agentKind,
+            normalizeWorkerModel(args.options.model),
+            { cwd }
+          )
     if (args.options.model !== undefined && requestedModel !== existingModel) {
       throw new Error(
         existingModel
@@ -632,7 +640,7 @@ async function resolveWorkerSettings({
     }
     return {
       agentKind,
-      workerModel: validateWorkerModel(agentKind, existingModel),
+      workerModel: await resolveWorkerModel(agentKind, existingModel, { cwd }),
     }
   }
 
@@ -645,12 +653,13 @@ async function resolveWorkerSettings({
       profile?.worker?.agent ??
       "codex"
   )
-  const workerModel = validateWorkerModel(
+  const workerModel = await resolveWorkerModel(
     agentKind,
     normalizeWorkerModel(args.options.model) ??
       normalizeWorkerModel(process.env.ONYX_WORKER_MODEL) ??
       normalizeWorkerModel(profile?.worker?.models?.[agentKind]) ??
-      null
+      null,
+    { cwd }
   )
   return { agentKind, workerModel }
 }
@@ -2465,11 +2474,13 @@ function processFailure(
   result: ProcessResult | StreamingProcessResult,
   label: string
 ) {
-  if (result.timedOut) return `${label} timed out`
-  if (result.code === 0) return null
   const summary = compactProviderErrorSummary(
     result.stderr.trim() || result.stdout.trim() || "no output"
   )
+  if (result.timedOut) {
+    return `${label} timed out${summary === "no output" ? "" : `: ${summary}`}`
+  }
+  if (result.code === 0) return null
   const logPath = "logPath" in result ? result.logPath : null
   return `${label} failed (${result.code ?? "signal"}): ${summary}${
     logPath ? ` (log: ${logPath})` : ""
@@ -3228,6 +3239,10 @@ async function runHypothesisOnce({
             }
             void persistLaunchManifest(launchManifest).catch(() => {})
           },
+          terminateOnOutput:
+            invocation.agentKind === "opencode"
+              ? ({ text }) => shouldTerminateOpenCodeOnOutput(text)
+              : undefined,
         }),
       quiet,
       heartbeatSampleEveryMs,
@@ -3562,7 +3577,7 @@ export async function commandResearchStart(args: Args) {
     workerTargetOption === undefined && hypotheses
       ? hypotheses.length
       : positiveIntegerOption(args, "workers", Number(workerTargetOption ?? 1))
-  const workerSettings = await resolveWorkerSettings({ args })
+  const workerSettings = await resolveWorkerSettings({ args, cwd: root })
   const deadlineAt =
     maxMinutes === null
       ? null
@@ -3697,9 +3712,10 @@ export async function commandResearchHypothesisAdd(args: Args) {
   const workerModel =
     agentKind === "custom"
       ? null
-      : validateWorkerModel(
+      : await resolveWorkerModel(
           agentKind,
-          metadataString(sessionMetadata, "workerModel")
+          metadataString(sessionMetadata, "workerModel"),
+          { cwd: root }
         )
   const createdHypothesis = await createLocalHypothesis({
     root,
@@ -4288,6 +4304,24 @@ function activeSessionIdFromState({
   return undefined
 }
 
+function sessionStatusIsTerminal(status: ApiSession["status"]) {
+  return status === "completed" || status === "failed" || status === "stopped"
+}
+
+async function readRunSessionState({
+  root,
+  sessionId,
+  args,
+}: {
+  root: string
+  sessionId: string
+  args: Args
+}) {
+  return getLocalSessionState(root, sessionId).catch(() =>
+    getResearchSessionState(sessionId, args)
+  )
+}
+
 async function reconcileCampaignIntoLocalState({
   root,
   campaignId,
@@ -4847,9 +4881,7 @@ async function existingRunSession({
   sessionId: string
   args: Args
 }) {
-  const sessionState = await getLocalSessionState(root, sessionId).catch(() =>
-    getResearchSessionState(sessionId, args)
-  )
+  const sessionState = await readRunSessionState({ root, sessionId, args })
   if (sessionState.session.status !== "running") {
     throw new Error(
       `Research session ${sessionId} is ${sessionState.session.status}; cannot supervise new workers.`
@@ -4947,6 +4979,23 @@ export function providerBackoffReasonForResult(
     return "provider_degraded"
   }
   return null
+}
+
+function shouldTerminateOpenCodeOnOutput(text: string) {
+  const looksLikeStreamError =
+    /AI_APICallError|APICallError|message="stream error"|stream error/i.test(
+      text
+    )
+  if (!looksLikeStreamError) {
+    return false
+  }
+  return (
+    providerBackoffReasonForResult({
+      status: "failed",
+      error: text,
+      startupTimedOut: false,
+    }) !== null
+  )
 }
 
 export function providerBackoffDelayMs({
@@ -5184,13 +5233,35 @@ export async function commandResearchRun(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const requestedSessionId =
-    args.options.session ??
-    activeSessionIdFromState({
-      state,
-      projectPath,
-      campaignName: args.options.campaign,
+  const explicitSessionId = args.options.session
+  const cachedSessionId =
+    explicitSessionId === undefined
+      ? activeSessionIdFromState({
+          state,
+          projectPath,
+          campaignName: args.options.campaign,
+        })
+      : undefined
+  let requestedSessionId = explicitSessionId ?? cachedSessionId
+  if (cachedSessionId) {
+    const cachedSessionState = await readRunSessionState({
+      root,
+      sessionId: cachedSessionId,
+      args,
     })
+    if (sessionStatusIsTerminal(cachedSessionState.session.status)) {
+      requestedSessionId = undefined
+      if (args.options.json !== "true") {
+        console.error(
+          `Cached research session ${cachedSessionId} is ${cachedSessionState.session.status}; creating a fresh session.`
+        )
+      }
+    } else if (cachedSessionState.session.status === "stop_requested") {
+      throw new Error(
+        `Cached research session ${cachedSessionId} is stop_requested; finish or stop it before starting a new session.`
+      )
+    }
+  }
   const hypotheses = await hypothesisPlansOption(args)
   if (requestedSessionId && hypotheses) {
     throw new Error(
@@ -5225,6 +5296,7 @@ export async function commandResearchRun(args: Args) {
     : await resolveWorkerSettings({
         args,
         sessionMetadata: sessionState ? sessionMetadata : null,
+        cwd: root,
       })
   const agentKind = workerSettings.agentKind
   const workerModel = workerSettings.workerModel
@@ -6120,6 +6192,7 @@ export async function commandWorkerRun(args: Args) {
     : await resolveWorkerSettings({
         args,
         sessionMetadata,
+        cwd: root,
       })
   const deadlineMs = sessionState.session.deadlineAt
     ? Date.parse(sessionState.session.deadlineAt)

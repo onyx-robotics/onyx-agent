@@ -80,6 +80,7 @@ import {
   researchDbPath,
   registerLocalWorker,
   recordLocalWorkerHeartbeat,
+  stopLocalSession,
   upsertLocalSummary,
   upsertWorkflowRun,
   writeLocalAttempt,
@@ -2738,6 +2739,208 @@ describe("automated research smoke", () => {
           },
         })
       ).rejects.toThrow("single-machine scheduling")
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  async function expectRunReplacesTerminalCachedSession(
+    terminalStatus: "completed" | "failed" | "stopped"
+  ) {
+      const { root, baseCommitSha } = await writeResearchSmokeRepo()
+      await addBareOrigin(root)
+      const campaignName = `cached-${terminalStatus}`
+      const campaign = await createSupervisorRunCampaign({
+        root,
+        baseCommitSha,
+        campaignName,
+      })
+      const cached = await createLocalSession({
+        root,
+        campaignId: campaign.id,
+        name: "cached-session",
+        workerTarget: 1,
+        hypotheses: supervisorPlans(1),
+        metadata: { agentKind: "custom" },
+      })
+      await stopLocalSession({
+        root,
+        sessionId: cached.session.id,
+        status: terminalStatus,
+        finalizationStatus:
+          terminalStatus === "failed" ? "failed" : "complete",
+        terminalReason:
+          terminalStatus === "completed"
+            ? "experiment_target_reached"
+            : terminalStatus === "stopped"
+              ? "stop_requested"
+              : "failed",
+      })
+      await updateState(root, (state) => {
+        const key = campaignStateKey("", campaignName)
+        state.campaigns = state.campaigns ?? {}
+        state.campaigns[key] = {
+          ...(state.campaigns[key] ?? {}),
+          campaignId: campaign.id,
+          projectPath: "",
+          baseCommitSha,
+          metricName: "score",
+          metricDirection: "maximize",
+          sessionId: cached.session.id,
+        }
+      })
+
+      const previousCwd = process.cwd()
+      const originalLog = console.log
+      const originalError = console.error
+      console.log = () => {}
+      console.error = () => {}
+      try {
+        process.chdir(root)
+        await commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            workers: "1",
+            experiments: "1",
+            hypotheses: JSON.stringify(supervisorPlans(1)),
+            "worker-command": fastWorkerCommand(),
+            "max-minutes": "1",
+            "worker-timeout": "20",
+            "startup-timeout": "0",
+            "sync-interval": "60",
+            "presence-interval": "60",
+            "final-sync-timeout": "1",
+            "stop-grace-seconds": "1",
+            offline: "true",
+            quiet: "true",
+            foreground: "true",
+          },
+        })
+      } finally {
+        process.chdir(previousCwd)
+        console.log = originalLog
+        console.error = originalError
+      }
+
+      const state = await readState(root)
+      const freshSessionId =
+        state.campaigns?.[campaignStateKey("", campaignName)]?.sessionId
+      expect(freshSessionId).toBeTruthy()
+      expect(freshSessionId).not.toBe(cached.session.id)
+      const fresh = await getLocalSessionState(root, freshSessionId!)
+      expect(fresh.session.status).toBe("completed")
+      expect(fresh.hypotheses.map((item) => item.name)).toContain(
+        "hypothesis-2"
+      )
+  }
+
+  for (const terminalStatus of ["completed", "failed", "stopped"] as const) {
+    test(`research run creates a fresh session when cached campaign session is ${terminalStatus}`, async () => {
+      await expectRunReplacesTerminalCachedSession(terminalStatus)
+    })
+  }
+
+  test("research run keeps explicit terminal sessions strict", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "explicit-terminal"
+    const campaign = await createSupervisorRunCampaign({
+      root,
+      baseCommitSha,
+      campaignName,
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "terminal-session",
+      workerTarget: 1,
+      hypotheses: supervisorPlans(1),
+      metadata: { agentKind: "custom" },
+    })
+    await stopLocalSession({
+      root,
+      sessionId: session.session.id,
+      status: "completed",
+      finalizationStatus: "complete",
+      terminalReason: "experiment_target_reached",
+    })
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            session: session.session.id,
+            workers: "1",
+            "max-minutes": "1",
+            "worker-command": fastWorkerCommand(),
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow(
+        `Research session ${session.session.id} is completed; cannot supervise new workers.`
+      )
+    } finally {
+      process.chdir(previousCwd)
+    }
+  })
+
+  test("research run does not relaunch over cached stop_requested sessions", async () => {
+    const { root, baseCommitSha } = await writeResearchSmokeRepo()
+    const campaignName = "cached-stop-requested"
+    const campaign = await createSupervisorRunCampaign({
+      root,
+      baseCommitSha,
+      campaignName,
+    })
+    const session = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "stopping-session",
+      workerTarget: 1,
+      hypotheses: supervisorPlans(1),
+      metadata: { agentKind: "custom" },
+    })
+    await stopLocalSession({
+      root,
+      sessionId: session.session.id,
+      status: "stop_requested",
+      finalizationStatus: "running",
+      terminalReason: "stop_requested",
+    })
+    await updateState(root, (state) => {
+      const key = campaignStateKey("", campaignName)
+      state.campaigns = state.campaigns ?? {}
+      state.campaigns[key] = {
+        ...(state.campaigns[key] ?? {}),
+        campaignId: campaign.id,
+        projectPath: "",
+        baseCommitSha,
+        metricName: "score",
+        metricDirection: "maximize",
+        sessionId: session.session.id,
+      }
+    })
+
+    const previousCwd = process.cwd()
+    try {
+      process.chdir(root)
+      await expect(
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            campaign: campaignName,
+            workers: "1",
+            hypotheses: JSON.stringify(supervisorPlans(1)),
+            "worker-command": fastWorkerCommand(),
+            "max-minutes": "1",
+            offline: "true",
+          },
+        })
+      ).rejects.toThrow("is stop_requested")
     } finally {
       process.chdir(previousCwd)
     }

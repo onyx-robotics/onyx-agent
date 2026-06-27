@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises"
+import { chmod, mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -57,6 +57,40 @@ async function captureLogs(fn: () => Promise<void>) {
     console.log = previous
   }
   return logs.join("\n")
+}
+
+async function withFakeOpenCodeModels<T>(
+  models: string[],
+  fn: () => Promise<T>
+) {
+  const root = await mkdtemp(join(tmpdir(), "onyx-profile-opencode-"))
+  const bin = join(root, "opencode")
+  await writeFile(
+    bin,
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      'if [[ "${1:-}" == "models" ]]; then',
+      `  cat <<'MODELS'`,
+      models.join("\n"),
+      "MODELS",
+      "  exit 0",
+      "fi",
+      'echo "unexpected opencode command: $*" >&2',
+      "exit 2",
+      "",
+    ].join("\n"),
+    "utf8"
+  )
+  await chmod(bin, 0o755)
+  const previousPath = process.env.PATH
+  process.env.PATH = `${root}${previousPath ? `:${previousPath}` : ""}`
+  try {
+    return await fn()
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH
+    else process.env.PATH = previousPath
+  }
 }
 
 describe("CLI profiles", () => {
@@ -656,7 +690,39 @@ describe("CLI profiles", () => {
     expect(alpha?.worker).toBeUndefined()
   })
 
-  test("rejects invalid OpenCode profile model identifiers", async () => {
+  test("resolves OpenCode profile model display names before storing", async () => {
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: {
+        alpha: profile({ apiKey: "alpha-key" }),
+      },
+    })
+
+    await withFakeOpenCodeModels(
+      [
+        "opencode/deepseek-v4-flash",
+        "opencode/deepseek-v4-flash-free",
+      ],
+      () =>
+        captureLogs(() =>
+          commandProfile({
+            positional: ["profile", "worker", "set"],
+            options: {
+              agent: "opencode",
+              model: "DeepSeek V4 Flash Free",
+            },
+          })
+        )
+    )
+
+    const alpha = (await readConfig()).profiles.alpha
+    expect(alpha?.worker).toEqual({
+      agent: "opencode",
+      models: { opencode: "opencode/deepseek-v4-flash-free" },
+    })
+  })
+
+  test("rejects ambiguous OpenCode profile model display names", async () => {
     await writeConfig({
       currentProfile: "alpha",
       profiles: {
@@ -665,14 +731,46 @@ describe("CLI profiles", () => {
     })
 
     await expect(
+      withFakeOpenCodeModels(
+        [
+          "opencode/deepseek-v4-flash",
+          "opencode/deepseek-v4-flash-free",
+        ],
+        () =>
+          commandProfile({
+            positional: ["profile", "worker", "set"],
+            options: {
+              agent: "opencode",
+              model: "DeepSeek V4 Flash",
+            },
+          })
+      )
+    ).rejects.toThrow("matched multiple available model ids")
+  })
+
+  test("stores exact OpenCode profile model identifiers without probing", async () => {
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: {
+        alpha: profile({ apiKey: "alpha-key" }),
+      },
+    })
+
+    await captureLogs(() =>
       commandProfile({
         positional: ["profile", "worker", "set"],
         options: {
           agent: "opencode",
-          model: "qwen3-coder",
+          model: "opencode/deepseek-v4-flash-free",
         },
       })
-    ).rejects.toThrow("--model for --agent opencode must use provider/model")
+    )
+
+    const alpha = (await readConfig()).profiles.alpha
+    expect(alpha?.worker).toEqual({
+      agent: "opencode",
+      models: { opencode: "opencode/deepseek-v4-flash-free" },
+    })
   })
 
   test("deletes profiles without switching teams implicitly", async () => {

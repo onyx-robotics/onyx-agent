@@ -10,6 +10,7 @@ import {
   type CliProfile,
   type WorkerProfileConfig,
 } from "../lib/config"
+import { resolveOpenCodeModelId } from "../lib/opencode-models"
 
 const API_KEY_ENV_NAME = /^[A-Z_][A-Z0-9_]*$/
 const PROFILE_USAGE =
@@ -263,19 +264,17 @@ async function commandProfileWorkerSet(args: Args) {
     )
   }
   const agent = validateBuiltInWorkerAgent(rawAgent)
-  const model =
+  const rawModel =
     args.options.model === undefined
       ? undefined
       : normalizeWorkerModel(args.options.model)
-  if (args.options.model !== undefined && !model) {
+  if (args.options.model !== undefined && !rawModel) {
     throw new Error("--model must not be empty")
   }
-  if (agent === "opencode" && model) {
-    const slash = model.indexOf("/")
-    if (slash <= 0 || slash === model.length - 1) {
-      throw new Error("--model for --agent opencode must use provider/model")
-    }
-  }
+  const model =
+    agent === "opencode" && rawModel
+      ? await resolveOpenCodeModelId(rawModel, { cwd: process.cwd() })
+      : rawModel
 
   const config = await readConfig()
   const name = workerProfileOrCurrent({

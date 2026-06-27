@@ -416,6 +416,9 @@ export function buildWorkerInvocation({
       "--title",
       workerTitle ?? "onyx-worker",
       ...modelArgs,
+      "--print-logs",
+      "--log-level",
+      "ERROR",
       "--dangerously-skip-permissions",
     ]
     return {

@@ -181,6 +181,9 @@ describe("worker launchers", () => {
       "worker_123",
       "--model",
       "openrouter/qwen/qwen3-coder",
+      "--print-logs",
+      "--log-level",
+      "ERROR",
       "--dangerously-skip-permissions",
     ])
     expect(opencode.preflightArgs).toEqual(["run", "--help"])
@@ -281,6 +284,33 @@ describe("worker launchers", () => {
     expect(activity).toContain("[stdout] tool: bash")
     expect(activity).toContain("[stdout] step: finish")
     expect(activity).toContain("[stdout] error: provider failed")
+  })
+
+  test("can terminate streaming processes on matched provider output", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-provider-terminate-"))
+    const logPath = join(root, "worker.log")
+    const activityLogPath = join(root, "worker.activity.log")
+    const result = await runStreamingProcess(
+      "sh",
+      [
+        "-c",
+        "printf '%s\\n' 'AI_APICallError: Rate limit exceeded. Please try again later.' >&2; sleep 5",
+      ],
+      {
+        logPath,
+        activityLogPath,
+        timeoutMs: 5000,
+        startupTimeoutMs: 1000,
+        killGraceMs: 100,
+        terminateOnOutput: ({ text }) => text.includes("Rate limit exceeded"),
+      }
+    )
+
+    expect(result.timedOut).toBe(false)
+    expect(result.stderr).toContain("Rate limit exceeded")
+    expect(await readFile(activityLogPath, "utf8")).toContain(
+      "terminal provider output detected"
+    )
   })
 
   test("streams full output to logs while retaining only bounded tails", async () => {

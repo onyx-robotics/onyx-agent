@@ -207,6 +207,11 @@ export async function runStreamingProcess(
       at: string
       text: string
     }) => void
+    terminateOnOutput?: (event: {
+      stream: "stdout" | "stderr"
+      at: string
+      text: string
+    }) => boolean
   }
 ): Promise<StreamingProcessResult> {
   await mkdir(dirname(options.logPath), { recursive: true })
@@ -381,6 +386,12 @@ export async function runStreamingProcess(
         activityLog?.write(`[${at}] ${line}\n`)
       }
       options.onOutput?.({ stream, at, text })
+      if (options.terminateOnOutput?.({ stream, at, text })) {
+        activityLog?.write(
+          `[harness ${at}] terminal provider output detected; terminating provider process\n`
+        )
+        terminate({ markTimedOut: false })
+      }
     }
 
     child.stdout?.on("data", (chunk: Buffer) => recordOutput("stdout", chunk))

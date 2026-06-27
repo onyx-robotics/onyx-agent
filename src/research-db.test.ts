@@ -13,6 +13,7 @@ import {
   acceptOrDiscardLocalExperiment,
   cacheLocalCampaign,
   createLocalCampaign,
+  createLocalHypothesis,
   createLocalSession,
   clearLocalAttempt,
   cleanupExpiredResourceLeases,
@@ -248,6 +249,111 @@ describe("SQLite research ledger", () => {
 
     const state = await getLocalSessionState(root, session.session.id)
     expect(state.workers[0]?.status).toBe("completed")
+  })
+
+  test("creates campaign-unique default hypothesis names across sessions", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "unique-hypotheses",
+      description: "offline campaign",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const first = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session-one",
+      workerTarget: 1,
+      hypotheses: [
+        {
+          focus: "first",
+          statement: "First hypothesis.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+      metadata: { agentKind: "codex" },
+    })
+    const second = await createLocalSession({
+      root,
+      campaignId: campaign.id,
+      name: "session-two",
+      workerTarget: 2,
+      hypotheses: [
+        {
+          focus: "second",
+          statement: "Second hypothesis.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+        {
+          focus: "third",
+          statement: "Third hypothesis.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+      ],
+      metadata: { agentKind: "codex" },
+    })
+
+    expect(first.hypotheses.map((item) => item.name)).toEqual([
+      "hypothesis-1",
+    ])
+    expect(second.hypotheses.map((item) => item.name)).toEqual([
+      "hypothesis-2",
+      "hypothesis-3",
+    ])
+  })
+
+  test("reports duplicate hypothesis names with a friendly error", async () => {
+    const root = await fixtureRepo()
+    const campaign = await createLocalCampaign({
+      root,
+      name: "duplicate-hypotheses",
+      description: "offline campaign",
+      projectPath: "",
+      baseCommitSha: "abcdef1",
+      setup: setup(),
+      metricName: "score",
+      metricUnit: null,
+      metricDirection: "maximize",
+    })
+    const plan = {
+      focus: "same",
+      statement: "Same hypothesis name.",
+      startingPoints: [],
+      avoidList: [],
+      successSignals: [],
+      giveUpSignals: [],
+    }
+    await createLocalHypothesis({
+      root,
+      campaignId: campaign.id,
+      plan,
+      name: "duplicate-name",
+    })
+
+    await expect(
+      createLocalHypothesis({
+        root,
+        campaignId: campaign.id,
+        plan,
+        name: "duplicate-name",
+      })
+    ).rejects.toThrow(
+      'Hypothesis "duplicate-name" already exists for this campaign.'
+    )
   })
 
   test("rejects scheduling and experiment logs for sessions owned by another site", async () => {

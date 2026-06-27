@@ -1545,8 +1545,31 @@ export async function deleteLocalCampaignWithTombstone({
   })
 }
 
-function defaultHypothesisName(index: number) {
-  return `hypothesis-${index + 1}`
+function defaultHypothesisName(sequence: number) {
+  return `hypothesis-${sequence}`
+}
+
+function nextDefaultHypothesisSequence(db: Db, campaignId: string) {
+  const rows = db
+    .query("SELECT name FROM hypotheses WHERE campaign_id = ?")
+    .all(campaignId) as Row[]
+  let max = 0
+  for (const row of rows) {
+    const name = String(row.name ?? "")
+    const match = /^hypothesis-(\d+)$/.exec(name)
+    if (!match) continue
+    max = Math.max(max, Number(match[1]))
+  }
+  return max + 1
+}
+
+function isDuplicateHypothesisNameError(error: unknown) {
+  return (
+    error instanceof Error &&
+    /UNIQUE constraint failed: hypotheses\.campaign_id, hypotheses\.name/i.test(
+      error.message
+    )
+  )
 }
 
 export async function createLocalSession({
@@ -1610,12 +1633,16 @@ export async function createLocalSession({
           ),
         },
       })
+      const firstHypothesisSequence = nextDefaultHypothesisSequence(
+        db,
+        campaignId
+      )
       const createdHypotheses = (hypotheses ?? []).map((plan, index) =>
         insertLocalHypothesis(db, {
           campaignId,
           createdBySessionId: sessionId,
           plan,
-          name: defaultHypothesisName(index),
+          name: defaultHypothesisName(firstHypothesisSequence + index),
           description: plan.statement,
           baseCommitSha: null,
           metadata: {
@@ -1661,26 +1688,35 @@ function insertLocalHypothesis(
   const id = randomUUID()
   const at = nowIso()
   const name = input.name ?? input.plan.focus.slice(0, 80) ?? id
-  db.query(
-    `
-      INSERT INTO hypotheses (
-        id, campaign_id, created_by_session_id, name, description, status,
-        base_commit_sha, plan_json, metadata_json, created_at, updated_at
+  try {
+    db.query(
+      `
+        INSERT INTO hypotheses (
+          id, campaign_id, created_by_session_id, name, description, status,
+          base_commit_sha, plan_json, metadata_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+      `
+    ).run(
+      id,
+      input.campaignId,
+      createdBySessionId,
+      name,
+      input.description ?? input.plan.statement ?? null,
+      input.baseCommitSha ?? (campaign.base_commit_sha as string),
+      json(input.plan),
+      json(input.metadata ?? {}),
+      at,
+      at
+    )
+  } catch (error) {
+    if (isDuplicateHypothesisNameError(error)) {
+      throw new Error(
+        `Hypothesis "${name}" already exists for this campaign. Choose a different --name.`
       )
-      VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
-    `
-  ).run(
-    id,
-    input.campaignId,
-    createdBySessionId,
-    name,
-    input.description ?? input.plan.statement ?? null,
-    input.baseCommitSha ?? (campaign.base_commit_sha as string),
-    json(input.plan),
-    json(input.metadata ?? {}),
-    at,
-    at
-  )
+    }
+    throw error
+  }
   const row = db.query("SELECT * FROM hypotheses WHERE id = ?").get(id) as Row
   const hypothesis = hypothesisFromRow(row)
   enqueueSyncEvent({
