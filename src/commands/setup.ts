@@ -201,8 +201,15 @@ function defaultEvalScript(setup: ResearchSetupFile, args: Args) {
 
 function defaultInstructions(setup: ResearchSetupFile, args: Args) {
   const metric = `${setup.metric.name}${setup.metric.unit ? ` (${setup.metric.unit})` : ""}`
+  const metricStep = setup.workflow.find((step) => step.metric && step.run)
+  const metricTool = metricStep?.run ? setup.tools[metricStep.run] : undefined
+  const metricToolCommand = metricTool
+    ? [metricTool.command, ...(metricTool.args ?? [])].join(" ")
+    : undefined
   const evalCommand =
     args.options["eval-command"] ??
+    metricToolCommand ??
+    metricStep?.run ??
     "onyx/tools/evaluation/run.sh currently exits nonzero until you replace it with the real eval."
   const editable = setup.scope.editable.length
     ? setup.scope.editable
@@ -239,12 +246,15 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
     "",
     "## Protected Setup Surface",
     "",
-    markdownList(setup.scope.protected, "onyx/setup.json, onyx/validation.json, onyx/onyx.md, and onyx/tools/"),
+    markdownList(
+      setup.scope.protected,
+      "onyx/setup.json, onyx/validation.json, onyx/onyx.md, and onyx/tools/"
+    ),
     "",
     "## Evaluation",
     "",
     `- Canonical tool: evaluation.run`,
-    `- Command configured from setup init: ${evalCommand}`,
+    `- Configured metric command: ${evalCommand}`,
     "- Caveats: document project-specific assumptions, hardware limits, flaky checks, required services, and invalid shortcuts here.",
     "",
     "## Workflow And Tools",
@@ -301,8 +311,16 @@ async function buildValidation({
     const hasContext = text.trim().length >= 40
     checks.push(
       hasContext
-        ? check("research_spec", "passed", "onyx/onyx.md contains research spec context.")
-        : check("research_spec", "failed", "onyx/onyx.md research spec is too sparse.")
+        ? check(
+            "research_spec",
+            "passed",
+            "onyx/onyx.md contains research spec context."
+          )
+        : check(
+            "research_spec",
+            "failed",
+            "onyx/onyx.md research spec is too sparse."
+          )
     )
     if (hasContext) {
       const missingHints = [
@@ -502,7 +520,7 @@ async function buildValidation({
       check(
         "safety_warning",
         "warning",
-        "No safety-style workflow or tool step is declared."
+        "Recommendation: add a safety-style workflow or tool step for long-running or real-world research."
       )
     )
   }
@@ -511,7 +529,7 @@ async function buildValidation({
       check(
         "readiness_warning",
         "warning",
-        "No readiness/reset-style workflow or tool step is declared."
+        "Recommendation: add a readiness/reset-style workflow or tool step when experiments need environment cleanup."
       )
     )
   }
@@ -520,7 +538,7 @@ async function buildValidation({
       check(
         "reliability_warning",
         "warning",
-        "No reliability/check-style workflow or tool step is declared."
+        "Recommendation: add a reliability/check-style workflow or tool step when metric wins need extra guardrails."
       )
     )
   }

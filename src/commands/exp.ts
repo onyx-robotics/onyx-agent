@@ -951,11 +951,23 @@ async function reserveExperimentSlotForSession({
       response.reservationStatus === "budget_exhausted" ||
       response.reservationStatus === "session_terminal"
     ) {
+      if (
+        response.reservationStatus === "budget_exhausted" &&
+        response.budget.budgetSaturated &&
+        !response.budget.budgetExhausted
+      ) {
+        throw new Error("budget_saturated")
+      }
       throw new Error(response.reservationStatus)
     }
     return response
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    if (message === "budget_saturated") {
+      throw new Error(
+        `Experiment budget saturated for session ${sessionId}; open reservations or terminal attempts have consumed all slots, so the experiment was not reserved.`
+      )
+    }
     if (message === "budget_exhausted") {
       throw new Error(
         `Experiment budget exhausted for session ${sessionId}; the experiment was not reserved.`
@@ -1496,7 +1508,8 @@ export async function commandExpLog(args: Args) {
         context,
       })
   const usableLastRun =
-    lastRun?.campaignName === campaignName && lastRun.projectPath === projectPath
+    lastRun?.campaignName === campaignName &&
+    lastRun.projectPath === projectPath
       ? lastRun
       : null
   if (explicitRunRef) {
@@ -1517,7 +1530,7 @@ export async function commandExpLog(args: Args) {
   }
   if (explicitRunRef && !usableLastRun) {
     throw new Error(
-      `No measured run found for --run-ref ${explicitRunRef}. Run \`onyx exp list --json\` to inspect unlogged local runs.`
+      `No measured run found for --run-ref ${explicitRunRef}. Run \`onyx exp list --json\` to inspect unlogged local runs. Do not edit .git/onyx/research.db directly; rerun the workflow or leave unlogged salvage to the worker harness.`
     )
   }
   const resultCommitSha =
@@ -1546,7 +1559,7 @@ export async function commandExpLog(args: Args) {
     !optionalFlag(args, "allow-unmeasured")
   ) {
     throw new Error(
-      "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for failed unmeasured attempts."
+      "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for failed unmeasured attempts. Do not edit .git/onyx/research.db directly; rerun the workflow or leave unlogged salvage to the worker harness."
     )
   }
   if (
@@ -1685,7 +1698,9 @@ export async function commandExpList(args: Args) {
   for (const lastRun of lastRuns) {
     if (seenRunRefs.has(lastRun.runRef)) continue
     if (
-      loggedCommitKeys.has(`${lastRun.campaignName}\0${lastRun.resultCommitSha}`)
+      loggedCommitKeys.has(
+        `${lastRun.campaignName}\0${lastRun.resultCommitSha}`
+      )
     ) {
       continue
     }

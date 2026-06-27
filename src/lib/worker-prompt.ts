@@ -84,6 +84,8 @@ Your current working directory is the worker worktree. Treat \`${input.projectRo
 
 If you need scratch scripts or generated probes, create them inside this worktree and run them from the worktree. Do not place scripts in \`/tmp\` and import project modules from there; that often breaks local resolution and hides which checkout is being exercised. Remove disposable scratch files before the final commit unless they are intentionally part of the measured change.
 
+The supervisor fixed this worker's Onyx API target and key in the environment. Do not run \`onyx profile use\`, \`onyx profile delete\`, \`onyx profile set-api-key-env\`, or mutate any global Onyx CLI profile/config files. If an Onyx command reports a profile or auth problem, stop and summarize the exact error instead of switching profiles.
+
 ## Hypothesis Research Loop
 
 ### Loop
@@ -127,6 +129,7 @@ If you need scratch scripts or generated probes, create them inside this worktre
 - Do not use \`git reset --hard\`, force-push, or rewrite reported experiment history.
 - Restoring an earlier best with \`git checkout <best-sha> -- <scoped files>\` is allowed only inside a normal \`onyx exp run\` attempt that produces exactly one measured forward commit.
 - Do not delete campaigns or experiments. Deletion/tombstones are human/orchestrator actions.
+- Do not edit \`.git/onyx/research.db\`, \`.git/onyx/outbox.d\`, \`.git/onyx/history.jsonl\`, worker manifests, or latest-state JSON directly. Those files are owned by the Onyx CLI and supervisor. If an Onyx CLI command fails to log or sync, report the command, exit code, and error output; never patch the ledger with SQLite, Python, shell scripts, or ad hoc file writes.
 - Server sync is the supervisor/harness's job, not yours. It pushes durable experiment refs and worker branches and flushes the local sync ledger to the API through its own bounded, rate-limited queue; your committed attempts and \`onyx exp log\` records are written to the local ledger and pushed for you. Do not run \`onyx push\` or \`onyx sync\` (or pipe them) — they only contend with the supervisor for the same lock and bypass its backoff. Read-only \`onyx sync status\` to confirm your records are queued is fine.
 
 On stop: leave the worktree clean, make sure every committed attempt is logged, check \`onyx sync status\`, and summarize best result, failed ideas, and next promising ideas. The supervisor/harness will push durable experiment refs and sync events when network access is available. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, local experiment log, and worker-branch push.`

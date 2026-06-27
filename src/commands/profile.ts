@@ -15,6 +15,14 @@ const API_KEY_ENV_NAME = /^[A-Z_][A-Z0-9_]*$/
 const PROFILE_USAGE =
   "Usage: onyx profile list | onyx profile use <name> | onyx profile delete <name> | onyx profile set-api-key-env <name> <ENV_VAR> | onyx profile worker get [profile] | onyx profile worker set [profile] --agent codex|claude|opencode [--model <model>] | onyx profile worker clear [profile] (--all | --agent | --model codex|claude|opencode)"
 
+function assertProfileMutationAllowed() {
+  if (process.env.ONYX_WORKER_ID) {
+    throw new Error(
+      "Worker agents cannot mutate Onyx CLI profiles. The worker API target is fixed by the supervisor; use the provided ONYX_API_URL/ONYX_API_KEY environment."
+    )
+  }
+}
+
 export async function commandProfile(args: Args) {
   const sub = args.positional[1]
 
@@ -83,6 +91,7 @@ function workerListSummary(profile: CliProfile) {
 }
 
 export async function commandProfileUse(args: Args) {
+  assertProfileMutationAllowed()
   const requested = args.positional[2]
   if (!requested) {
     throw new Error("Usage: onyx profile use <name>")
@@ -106,6 +115,7 @@ export async function commandProfileUse(args: Args) {
 }
 
 export async function commandProfileDelete(args: Args) {
+  assertProfileMutationAllowed()
   const requested = args.positional[2]
   if (!requested) {
     throw new Error("Usage: onyx profile delete <name>")
@@ -140,6 +150,7 @@ export async function commandProfileDelete(args: Args) {
 }
 
 export async function commandProfileSetApiKeyEnv(args: Args) {
+  assertProfileMutationAllowed()
   const requested = args.positional[2]
   const envVarName = args.positional[3]
   if (!requested || !envVarName) {
@@ -191,11 +202,14 @@ function workerProfileOrCurrent({
 }) {
   if (requested) {
     const name = normalizeProfileName(requested)
-    if (!name) throw new Error("Profile name must contain at least one letter or number")
+    if (!name)
+      throw new Error("Profile name must contain at least one letter or number")
     return name
   }
   if (!currentProfile) {
-    throw new Error("Pass a profile name or select one with `onyx profile use <name>`.")
+    throw new Error(
+      "Pass a profile name or select one with `onyx profile use <name>`."
+    )
   }
   return currentProfile
 }
@@ -209,10 +223,7 @@ function requireProfile(
   return profile
 }
 
-function describeWorkerModel(
-  profile: CliProfile,
-  agent: BuiltInWorkerAgent
-) {
+function describeWorkerModel(profile: CliProfile, agent: BuiltInWorkerAgent) {
   return profile.worker?.models?.[agent] ?? "(default)"
 }
 
@@ -237,11 +248,14 @@ async function commandProfileWorkerGet(args: Args) {
   console.log(`Profile: ${name}`)
   console.log(`Worker agent: ${agent}`)
   for (const workerAgent of BUILT_IN_WORKER_AGENTS) {
-    console.log(`Model ${workerAgent}: ${describeWorkerModel(profile, workerAgent)}`)
+    console.log(
+      `Model ${workerAgent}: ${describeWorkerModel(profile, workerAgent)}`
+    )
   }
 }
 
 async function commandProfileWorkerSet(args: Args) {
+  assertProfileMutationAllowed()
   const rawAgent = args.options.agent
   if (!rawAgent || rawAgent === "true") {
     throw new Error(
@@ -295,6 +309,7 @@ async function commandProfileWorkerSet(args: Args) {
 }
 
 async function commandProfileWorkerClear(args: Args) {
+  assertProfileMutationAllowed()
   const clearAll = args.options.all === "true"
   const clearAgent = args.options.agent !== undefined
   const rawModelAgent = args.options.model
@@ -302,13 +317,19 @@ async function commandProfileWorkerClear(args: Args) {
     throw new Error("Pass --all, --agent, or --model codex|claude|opencode.")
   }
   if (clearAll && (clearAgent || rawModelAgent !== undefined)) {
-    throw new Error("Pass --all by itself, or clear --agent/--model separately.")
+    throw new Error(
+      "Pass --all by itself, or clear --agent/--model separately."
+    )
   }
   if (clearAgent && args.options.agent !== "true") {
-    throw new Error("Use --agent without a value when clearing the worker agent.")
+    throw new Error(
+      "Use --agent without a value when clearing the worker agent."
+    )
   }
   const modelAgent =
-    rawModelAgent === undefined ? null : validateBuiltInWorkerAgent(rawModelAgent)
+    rawModelAgent === undefined
+      ? null
+      : validateBuiltInWorkerAgent(rawModelAgent)
 
   const config = await readConfig()
   const name = workerProfileOrCurrent({
@@ -329,7 +350,8 @@ async function commandProfileWorkerClear(args: Args) {
   } else {
     if (clearAgent) delete worker.agent
     if (modelAgent) delete worker.models?.[modelAgent]
-    if (worker.models && Object.keys(worker.models).length === 0) delete worker.models
+    if (worker.models && Object.keys(worker.models).length === 0)
+      delete worker.models
   }
   const nextProfile = { ...profile, updatedAt: new Date().toISOString() }
   if (worker.agent || worker.models) nextProfile.worker = worker

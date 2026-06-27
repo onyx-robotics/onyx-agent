@@ -40,6 +40,8 @@ import {
   type ResearchSetupFile,
 } from "../lib/contract"
 import {
+  apiBaseUrl,
+  apiKey,
   normalizeWorkerModel,
   profileNameFromArgs,
   readConfig,
@@ -146,6 +148,21 @@ const PRESENCE_IGNORED_REASONS: IgnoredPresenceReason[] = [
   "session_not_found",
 ]
 const PRESENCE_IGNORED_RECENT_LIMIT = 20
+
+async function frozenWorkerApiEnv(args: Args) {
+  const env: Record<string, string> = {}
+  try {
+    env.ONYX_API_URL = await apiBaseUrl(args)
+  } catch {
+    // Offline/debug sessions can still use local ledger state.
+  }
+  try {
+    env.ONYX_API_KEY = await apiKey(args)
+  } catch {
+    // Leave auth unset when the caller is intentionally offline.
+  }
+  return env
+}
 
 type SessionFinalizationStatus = ApiSession["finalizationStatus"]
 type SessionTerminalReason =
@@ -403,9 +420,7 @@ function workerHardStopGraceMs(shutdownCushionMs: number) {
   )
 }
 
-export function minimumUsefulLaunchMs(
-  agentKind: WorkerAgentKind
-) {
+export function minimumUsefulLaunchMs(agentKind: WorkerAgentKind) {
   return agentKind === "custom"
     ? CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS
     : BUILTIN_AGENT_MIN_USEFUL_LAUNCH_MS
@@ -576,15 +591,15 @@ function workerBudgetOptions({
   return ` --max-worker-iterations ${maxWorkerIterations} --max-minutes ${maxMinutes}`
 }
 
-function metadataString(
-  metadata: Record<string, unknown>,
-  key: string
-) {
+function metadataString(metadata: Record<string, unknown>, key: string) {
   const value = metadata[key]
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
-function validateWorkerModel(agentKind: BuiltInWorkerAgent, model: string | null) {
+function validateWorkerModel(
+  agentKind: BuiltInWorkerAgent,
+  model: string | null
+) {
   if (!model) return null
   if (agentKind === "opencode") {
     const slash = model.indexOf("/")
@@ -653,10 +668,7 @@ async function resolveWorkerSettings({
   return { agentKind, workerModel }
 }
 
-function workerOptions({
-  agentKind,
-  workerModel,
-}: WorkerSettings) {
+function workerOptions({ agentKind, workerModel }: WorkerSettings) {
   return ` --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}`
 }
 
@@ -1079,9 +1091,8 @@ function createSyncSupervisor({
       })
       .catch((error) => {
         const message = error instanceof Error ? error.message : String(error)
-        const lockContention = /Timed out waiting for local Onyx research-sync lock/i.test(
-          message
-        )
+        const lockContention =
+          /Timed out waiting for local Onyx research-sync lock/i.test(message)
         if (!lockContention) lastSyncError = message
         void emitJobEvent(job, "sync_result", "SQLite sync failed", {
           error: message,
@@ -1209,10 +1220,13 @@ function createSyncSupervisor({
           enqueue({ kind: "flush", reason: "final-drain" }, { force: true })
         await waitForIdle(Math.max(1, deadline - Date.now()))
         const pending = await pendingResearchSyncCount(root)
+        lastPendingSyncCount = pending
         if (pending === 0) return 0
         await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
       } while (Date.now() < deadline)
-      return pendingResearchSyncCount(root)
+      const pending = await pendingResearchSyncCount(root)
+      lastPendingSyncCount = pending
+      return pending
     },
     stop() {
       stopped = true
@@ -1269,9 +1283,9 @@ function createPresenceSupervisor({
     )
     const observedAt = new Date().toISOString()
     const sync = syncTelemetry?.()
-    const pendingSyncCount =
-      sync?.pendingSyncCount ??
-      (await pendingResearchSyncCount(root).catch(() => 0))
+    const pendingSyncCount = await pendingResearchSyncCount(root).catch(
+      () => sync?.pendingSyncCount ?? 0
+    )
     const activeWorkerCount = state.workers.filter(
       (worker) =>
         worker.sessionId === sessionId &&
@@ -1470,6 +1484,9 @@ function createPresenceSupervisor({
     request() {
       if (!stopped) void run()
     },
+    async flush() {
+      await run(true).catch(() => {})
+    },
     async stop() {
       stopped = true
       if (timer) clearInterval(timer)
@@ -1533,22 +1550,39 @@ async function drainFinalSync({
   let batches = 0
   let lastDurationMs: number | null = null
   let lastError: string | null = null
+  let lockContentionLogged = false
   do {
-    const result = await flushOutbox(root, args, {
-      quiet: true,
-      maxBatches: 1,
-    })
-    accepted += result.flushed
-    offline = offline || result.offline
-    batches += result.batches
-    lastDurationMs = result.lastDurationMs
-    lastError = result.lastError
-    if (result.batches > 0) {
-      console.log(
-        `final sync batch ${batches}: accepted=${accepted} pending=${result.pending}${result.offline ? " offline=true" : ""}`
-      )
+    try {
+      const result = await flushOutbox(root, args, {
+        quiet: true,
+        maxBatches: 1,
+      })
+      accepted += result.flushed
+      offline = offline || result.offline
+      batches += result.batches
+      lastDurationMs = result.lastDurationMs
+      lastError = result.lastError
+      if (result.batches > 0) {
+        console.log(
+          `final sync batch ${batches}: accepted=${accepted} pending=${result.pending}${result.offline ? " offline=true" : ""}`
+        )
+      }
+      if (result.pending === 0 || result.offline) break
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const lockContention =
+        /Timed out waiting for local Onyx research-sync lock/i.test(message)
+      lastError = message
+      if (!lockContention) throw error
+      const pending = await pendingResearchSyncCount(root).catch(() => 0)
+      if (!lockContentionLogged) {
+        lockContentionLogged = true
+        console.warn(
+          `Final sync is waiting for another local Onyx sync drain to finish (${pending} pending event(s)).`
+        )
+      }
+      if (pending === 0) break
     }
-    if (result.pending === 0 || result.offline) break
     await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
   } while (Date.now() < deadline)
 
@@ -1589,7 +1623,9 @@ async function releaseUnloggedExperimentReservations({
   if (uniqueRunRefs.length === 0 || args.options.offline === "true") return
   const logged = await listLocalExperimentHistory(root).catch(() => [])
   const loggedRunRefs = new Set(logged.map((record) => record.runRef))
-  const releasable = uniqueRunRefs.filter((runRef) => !loggedRunRefs.has(runRef))
+  const releasable = uniqueRunRefs.filter(
+    (runRef) => !loggedRunRefs.has(runRef)
+  )
   if (releasable.length === 0) return
   try {
     await releaseResearchExperimentReservations(
@@ -1711,10 +1747,13 @@ async function computeSessionFinalizationStatus({
         )
         continue
       }
+      const cleanFinalizationStatus =
+        finalization.finalizationStatus === "measured_and_logged" ||
+        finalization.finalizationStatus === "already_logged" ||
+        finalization.finalizationStatus === "none"
       const hasUnresolvedSalvage =
         finalization.finalizationStatus.startsWith("salvaged_unmeasured") ||
-        (finalization.finalizationStatus !== "measured_and_logged" &&
-          (finalization.salvaged || finalization.unloggedCommitCount > 0))
+        (!cleanFinalizationStatus && finalization.unloggedCommitCount > 0)
       if (hasUnresolvedSalvage) {
         incompleteReasons.push(
           `worker ${manifest.workerId} has unlogged or salvaged work`
@@ -2272,6 +2311,8 @@ export async function finalizeHypothesisAttempt({
 
     if (analysis.kind === "already_logged") {
       manifest.finalizationStatus = "already_logged"
+      manifest.salvaged = false
+      manifest.unloggedCommitCount = 0
     } else if (analysis.kind === "salvage_only") {
       manifest.finalizationStatus = "salvaged_unmeasured"
       manifest.salvaged = true
@@ -2283,16 +2324,19 @@ export async function finalizeHypothesisAttempt({
         sessionId,
         args,
       }).catch(() => null)
-      if (stopCheck?.reasonCodes.includes("budget_exhausted")) {
+      if (
+        stopCheck?.reasonCodes.includes("budget_exhausted") ||
+        stopCheck?.reasonCodes.includes("budget_saturated")
+      ) {
         manifest.finalizationStatus = "salvaged_unmeasured_budget_exhausted"
         manifest.salvaged = true
         manifest.error =
-          "Experiment budget exhausted before worker harness finalization; pushed salvage branch without logging a measured attempt."
+          "Experiment budget saturated before worker harness finalization; pushed salvage branch without logging a measured attempt."
         if (activityManifest) {
           await appendWorkerActivityEvent(activityManifest, {
             type: "finalization",
             phase: "salvaged",
-            summary: "Budget exhausted before final measurement",
+            summary: "Budget saturated before final measurement",
             metadata: {
               finalizationStatus: manifest.finalizationStatus,
               measurementBaseCommitSha,
@@ -2587,6 +2631,7 @@ export type ResearchStopReasonCode =
   | "deadline_reached"
   | "time_budget_reached"
   | "iteration_budget_reached"
+  | "budget_saturated"
   | "budget_exhausted"
   | "reservation_expired"
 
@@ -2621,6 +2666,9 @@ function terminalReasonForStopCheck(
     return "stop_requested"
   }
   if (stopCheck.reasonCodes.includes("budget_exhausted")) {
+    return "max_experiments"
+  }
+  if (stopCheck.reasonCodes.includes("budget_saturated")) {
     return "max_experiments"
   }
   if (
@@ -2734,6 +2782,14 @@ export async function collectResearchStopReasons({
       (remote.budget.remainingCount !== null &&
         remote.budget.remainingCount <= 0 &&
         remote.budget.reservedCount === 0)
+    if (budgetSaturated) {
+      addStopReason(
+        "budget_saturated",
+        budgetExhausted
+          ? "experiment budget saturated"
+          : "experiment budget saturated by open reservations"
+      )
+    }
     if (budgetExhausted) {
       addStopReason("budget_exhausted", "experiment budget exhausted")
     }
@@ -2796,6 +2852,15 @@ export function createResearchSessionStopChecker({
       })
     },
   }
+}
+
+function isPureBudgetSaturation(stopCheck: ResearchStopCheck) {
+  return (
+    stopCheck.budgetSaturated &&
+    !stopCheck.budgetExhausted &&
+    stopCheck.reasonCodes.length > 0 &&
+    stopCheck.reasonCodes.every((code) => code === "budget_saturated")
+  )
 }
 
 async function harnessShouldStopSession({
@@ -3157,8 +3222,10 @@ async function runHypothesisOnce({
       baseEnv: process.env,
       shim: workerShim,
     })
+    const workerApiEnv = await frozenWorkerApiEnv(args)
     const workerRunEnv = {
       ...workerBaseEnv,
+      ...workerApiEnv,
       ONYX_CAMPAIGN_ID: campaign.id,
       ONYX_CAMPAIGN_NAME: campaign.name,
       ONYX_SESSION_ID: sessionId,
@@ -3827,7 +3894,9 @@ export async function commandResearchHypothesisAdd(args: Args) {
       ? sessionMetadata.agentKind
       : "codex")
   const agentKind =
-    rawAgentKind === "custom" ? "custom" : validateBuiltInWorkerAgent(rawAgentKind)
+    rawAgentKind === "custom"
+      ? "custom"
+      : validateBuiltInWorkerAgent(rawAgentKind)
   const workerModel =
     agentKind === "custom"
       ? null
@@ -4813,7 +4882,10 @@ export async function commandSummaryUpsert(args: Args) {
     title,
     body,
   })
-  if (args.options.offline !== "true") {
+  if (
+    args.options.offline !== "true" &&
+    (args.options["require-online"] === "true" || args.options.sync === "true")
+  ) {
     await flushOutbox(root, args, { quiet: true }).catch((error) => {
       if (args.options["require-online"] === "true") throw error
     })
@@ -4918,7 +4990,10 @@ export async function commandKnowledgeAdd(args: Args) {
         ? undefined
         : Number(args.options.confidence),
   })
-  if (args.options.offline !== "true") {
+  if (
+    args.options.offline !== "true" &&
+    (args.options["require-online"] === "true" || args.options.sync === "true")
+  ) {
     await flushOutbox(root, args, { quiet: true }).catch((error) => {
       if (args.options["require-online"] === "true") throw error
     })
@@ -5700,16 +5775,22 @@ export async function commandResearchRun(args: Args) {
         agentKind: sessionAgentKind,
       })
       const launchLimitReached = maxLaunches !== null && launched >= maxLaunches
-      if (stopCheck.shouldStop && !stopLogged) {
+      const stopShouldEndSupervisor =
+        stopCheck.shouldStop && !isPureBudgetSaturation(stopCheck)
+      if (stopShouldEndSupervisor && !stopLogged) {
         stopLogged = true
         terminalReason = terminalReasonForStopCheck(stopCheck)
         console.warn(
           `Stop requested for session ${sessionId}: ${stopCheck.reasons.join(", ")}`
         )
       }
-      if (stopCheck.shouldStop || launchCutoffReached || launchLimitReached) {
+      if (
+        stopShouldEndSupervisor ||
+        launchCutoffReached ||
+        launchLimitReached
+      ) {
         if (!terminalReason) {
-          terminalReason = stopCheck.shouldStop
+          terminalReason = stopShouldEndSupervisor
             ? terminalReasonForStopCheck(stopCheck)
             : "time_budget_reached"
         }
@@ -6227,6 +6308,7 @@ export async function commandResearchRun(args: Args) {
     providerBackoff: null,
     activeProcessCount: 0,
   })
+  await presenceSupervisor.flush()
 
   console.log(
     `Research run ${finalStatus}: launched=${launched}${

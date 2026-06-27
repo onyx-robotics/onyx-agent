@@ -142,6 +142,11 @@ export async function commandCampaignStatus(args: Args) {
   console.log(
     `base: ${localCampaign?.baseCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`
   )
+  const promotionRefName =
+    localCampaign?.promotionRefName ?? stateCampaign?.promotionRefName ?? null
+  if (promotionRefName) {
+    console.log(`configured promotion ref: ${promotionRefName}`)
+  }
   console.log(`session: ${stateCampaign?.sessionId ?? "(none)"}`)
 }
 

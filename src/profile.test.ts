@@ -66,6 +66,7 @@ describe("CLI profiles", () => {
     )
     delete process.env.ONYX_API_KEY
     delete process.env.ONYX_API_URL
+    delete process.env.ONYX_WORKER_ID
     delete process.env[ALPHA_API_KEY_ENV]
     delete process.env[BETA_API_KEY_ENV]
   })
@@ -524,6 +525,82 @@ describe("CLI profiles", () => {
       })
     )
     expect((await readConfig()).currentProfile).toBe("beta")
+  })
+
+  test("blocks profile mutations from worker agents", async () => {
+    await writeConfig({
+      currentProfile: "alpha",
+      profiles: {
+        alpha: profile({ apiKey: "alpha-key" }),
+        beta: profile({
+          apiKey: "beta-key",
+          teamId: "33333333-3333-4333-8333-333333333333",
+          teamName: "Beta Team",
+        }),
+      },
+    })
+
+    process.env.ONYX_WORKER_ID = "worker_123"
+    const message = "Worker agents cannot mutate Onyx CLI profiles"
+
+    try {
+      await expect(
+        commandProfileUse({
+          positional: ["profile", "use", "beta"],
+          options: {},
+        })
+      ).rejects.toThrow(message)
+      await expect(
+        commandProfileDelete({
+          positional: ["profile", "delete", "beta"],
+          options: {},
+        })
+      ).rejects.toThrow(message)
+      await expect(
+        commandProfileSetApiKeyEnv({
+          positional: [
+            "profile",
+            "set-api-key-env",
+            "alpha",
+            ALPHA_API_KEY_ENV,
+          ],
+          options: {},
+        })
+      ).rejects.toThrow(message)
+      await expect(
+        commandProfile({
+          positional: ["profile", "worker", "set"],
+          options: {
+            agent: "opencode",
+            model: "openrouter/qwen/qwen3-coder",
+          },
+        })
+      ).rejects.toThrow(message)
+      await expect(
+        commandProfile({
+          positional: ["profile", "worker", "clear"],
+          options: { agent: "true" },
+        })
+      ).rejects.toThrow(message)
+
+      expect(await captureLogs(commandProfileList)).toContain("* alpha")
+      expect(
+        await captureLogs(() =>
+          commandProfile({
+            positional: ["profile", "worker", "get"],
+            options: {},
+          })
+        )
+      ).toContain("Worker agent: codex")
+
+      const config = await readConfig()
+      expect(config.currentProfile).toBe("alpha")
+      expect(config.profiles.beta).toBeDefined()
+      expect(config.profiles.alpha?.apiKeyEnv).toBeUndefined()
+      expect(config.profiles.alpha?.worker).toBeUndefined()
+    } finally {
+      delete process.env.ONYX_WORKER_ID
+    }
   })
 
   test("gets, sets, and clears profile worker defaults", async () => {

@@ -848,7 +848,11 @@ describe("exp run", () => {
     console.log = () => {}
     try {
       process.chdir(envRepo.root)
-      await writeFile(join(envRepo.root, "src", "env-base.txt"), "env\n", "utf8")
+      await writeFile(
+        join(envRepo.root, "src", "env-base.txt"),
+        "env\n",
+        "utf8"
+      )
       await commitAll(envRepo.root, "env base")
       const envBaseCommitSha = (
         await runProcess("git", ["rev-parse", "HEAD"], { cwd: envRepo.root })
@@ -1625,11 +1629,12 @@ describe("worker finalization", () => {
         workerId: "77777777-7777-4777-8777-777777777777",
         workerBranch: "onyx/test/already-logged",
         args: { positional: ["worker", "run"], options: { offline: "true" } },
-        workerFailed: false,
+        workerFailed: true,
         pushWorkerBranch: pushWorkerBranchDirect,
       })
 
       expect(manifest.finalizationStatus).toBe("already_logged")
+      expect(manifest.salvaged).toBe(false)
       expect(manifest.commitSha).toBe(head)
       expect(manifest.unloggedCommitCount).toBe(0)
       const attempts = await listLocalAttempts(root)
@@ -1766,7 +1771,7 @@ describe("worker finalization", () => {
           expect(manifest.commitSha).toBe(head)
           expect(manifest.unloggedCommitCount).toBe(1)
           expect(manifest.workerBranchPushStatus).toBe("pushed")
-          expect(manifest.error).toContain("budget exhausted")
+          expect(manifest.error).toContain("budget saturated")
         }
       )
 
@@ -2444,9 +2449,11 @@ describe("automated research smoke", () => {
       console.log = originalLog
       if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
       else process.env.XDG_CONFIG_HOME = previousConfigHome
-      if (previousWorkerAgent === undefined) delete process.env.ONYX_WORKER_AGENT
+      if (previousWorkerAgent === undefined)
+        delete process.env.ONYX_WORKER_AGENT
       else process.env.ONYX_WORKER_AGENT = previousWorkerAgent
-      if (previousWorkerModel === undefined) delete process.env.ONYX_WORKER_MODEL
+      if (previousWorkerModel === undefined)
+        delete process.env.ONYX_WORKER_MODEL
       else process.env.ONYX_WORKER_MODEL = previousWorkerModel
     }
 
@@ -3845,6 +3852,76 @@ describe("automated research smoke", () => {
 })
 
 describe("summary CLI", () => {
+  test("writes worker mutations locally without flushing by default", async () => {
+    const { root, baseCommitSha, campaignName } = await writeResearchSmokeRepo()
+    const setup = await readSetupFile(root, "")
+    const campaign = await createLocalCampaign({
+      root,
+      name: campaignName,
+      description: "Improve score.",
+      projectPath: "",
+      baseCommitSha,
+      setup,
+      metricName: setup.metric.name,
+      metricUnit: setup.metric.unit,
+      metricDirection: setup.metric.direction,
+      humanFeedback: null,
+      promotionRefName: null,
+    })
+
+    const previousCwd = process.cwd()
+    const originalFetch = globalThis.fetch
+    const originalLog = console.log
+    const previousApiUrl = process.env.ONYX_API_URL
+    const previousApiKey = process.env.ONYX_API_KEY
+    let fetchCalls = 0
+    console.log = () => {}
+    process.env.ONYX_API_URL = "https://api.onyx.test"
+    process.env.ONYX_API_KEY = "test-key"
+    globalThis.fetch = (async (
+      _input: Parameters<typeof fetch>[0],
+      _init: Parameters<typeof fetch>[1]
+    ) => {
+      void _input
+      void _init
+      fetchCalls += 1
+      throw new Error("unexpected sync fetch")
+    }) as unknown as typeof fetch
+    try {
+      process.chdir(root)
+      await commandSummaryUpsert({
+        positional: ["summary", "upsert"],
+        options: {
+          campaign: campaignName,
+          title: "worker summary",
+          body: "local summary",
+        },
+      })
+      await commandKnowledgeAdd({
+        positional: ["knowledge", "add"],
+        options: {
+          campaign: campaignName,
+          kind: "insight",
+          title: "local insight",
+          body: "local knowledge",
+        },
+      })
+
+      expect(fetchCalls).toBe(0)
+      expect(await listLocalSummaries(root, campaign.id)).toHaveLength(1)
+      expect(await listLocalKnowledge(root, campaign.id)).toHaveLength(1)
+      expect(await pendingResearchSyncCount(root)).toBeGreaterThanOrEqual(3)
+    } finally {
+      process.chdir(previousCwd)
+      globalThis.fetch = originalFetch
+      console.log = originalLog
+      if (previousApiUrl === undefined) delete process.env.ONYX_API_URL
+      else process.env.ONYX_API_URL = previousApiUrl
+      if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
+      else process.env.ONYX_API_KEY = previousApiKey
+    }
+  })
+
   test("suggests hypothesis_summary for hypothesis summary kind", async () => {
     const { root, campaignName } = await writeResearchSmokeRepo()
     const previousCwd = process.cwd()

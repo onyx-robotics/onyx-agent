@@ -299,6 +299,62 @@ describe("research should-stop", () => {
     )
   })
 
+  test("stops workers when budget is saturated by open reservations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: "smoke",
+      sessions: {
+        session_123: {
+          campaignName: "smoke",
+          campaignId: "campaign_123",
+          endTimeMs: Date.now() + 60_000,
+          maxExperiments: 2,
+          status: "running",
+        },
+      },
+    })
+
+    const previousCwd = process.cwd()
+    const lines: string[] = []
+    const originalLog = console.log
+    console.log = (...items: unknown[]) => {
+      lines.push(items.join(" "))
+    }
+    try {
+      process.chdir(root)
+      await withMockApi(
+        () =>
+          remoteControlState({
+            reservedExperimentCount: 1,
+            terminalExperimentCount: 1,
+            expiredReservationCount: 0,
+          }),
+        () =>
+          commandResearchShouldStop({
+            positional: ["research", "should-stop"],
+            options: { session: "session_123", json: "true" },
+          })
+      )
+    } finally {
+      process.chdir(previousCwd)
+      console.log = originalLog
+    }
+
+    const payload = JSON.parse(lines.join("\n")) as {
+      shouldStop: boolean
+      reasonCodes: string[]
+      budgetSaturated: boolean
+      budgetExhausted: boolean
+    }
+    expect(payload.shouldStop).toBe(true)
+    expect(payload.budgetSaturated).toBe(true)
+    expect(payload.budgetExhausted).toBe(false)
+    expect(payload.reasonCodes).toContain("budget_saturated")
+    expect(payload.reasonCodes).not.toContain("budget_exhausted")
+  })
+
   test("shared session stop checker caches live budget reads", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-should-stop-"))
     await runProcess("git", ["init"], { cwd: root })

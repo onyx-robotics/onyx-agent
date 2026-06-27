@@ -101,13 +101,16 @@ describe("hypothesis worker prompt", () => {
       "Do not spend more than a quick orientation pass before the first `onyx exp run`"
     )
     expect(prompt).toContain(
+      "The supervisor fixed this worker's Onyx API target and key in the environment"
+    )
+    expect(prompt).toContain("Do not run `onyx profile use`")
+    expect(prompt).toContain("mutate any global Onyx CLI profile/config files")
+    expect(prompt).toContain(
       'onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto'
     )
     expect(prompt).toContain("onyx exp run --resume --auto")
     expect(prompt).toContain("onyx workflow status --blocked")
-    expect(prompt).toContain(
-      'onyx exp log --campaign "$ONYX_CAMPAIGN_NAME"'
-    )
+    expect(prompt).toContain('onyx exp log --campaign "$ONYX_CAMPAIGN_NAME"')
     expect(prompt).not.toContain("onyx workflow status --active")
     expect(prompt).not.toContain("<pre-edit-sha>")
     expect(prompt).not.toContain("<workflowRunId>")
@@ -120,6 +123,8 @@ describe("hypothesis worker prompt", () => {
       "allowed only inside a normal `onyx exp run` attempt"
     )
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
+    expect(prompt).toContain("Do not edit `.git/onyx/research.db`")
+    expect(prompt).toContain("never patch the ledger with SQLite")
     expect(prompt).toContain("Server sync is the supervisor/harness's job")
     expect(prompt).toContain("Do not run `onyx push` or `onyx sync`")
     expect(prompt).toContain("onyx sync status")

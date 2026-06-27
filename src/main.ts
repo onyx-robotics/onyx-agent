@@ -75,9 +75,9 @@ Usage:
   onyx research finish [--campaign <name>] [--session <id>] [--final-sync-timeout <seconds>] [--require-online]
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
-  onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text>
+  onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text> [--sync] [--require-online]
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
-  onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text>
+  onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--sync] [--require-online]
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
