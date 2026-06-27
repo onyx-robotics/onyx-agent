@@ -89,10 +89,6 @@ function defaultSetupFile(projectPath: string, args: Args): ResearchSetupFile {
       unit: args.options["metric-unit"] ?? null,
       direction: metricDirection,
     },
-    experimentPolicy: {
-      mode: "single_candidate",
-      maxDiagnosticSeconds: 30,
-    },
     resources: {},
     tools: {
       "evaluation.run": {

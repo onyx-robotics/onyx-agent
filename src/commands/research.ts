@@ -224,18 +224,9 @@ async function appendWorkerActivityEvent(
 
 const PIPED_ONYX_MUTATION_COMMAND =
   /\bonyx\s+(?:exp\s+run|exp\s+log|sync|push)\b[^\n|]*\|/i
-const MULTI_CANDIDATE_LOOP =
-  /\b(?:for|while)\b.{0,80}\b(?:candidate|candidates|params|parameter|grid|sweep)\b/i
-const CANDIDATE_ARRAY =
-  /\b(?:candidate|candidates|param(?:eter)?s|configs?)\s*=\s*\[[^\]]*,[^\]]*\]/i
-const EVALUATOR_OR_SIMULATOR_COMMAND =
-  /\b(?:onyx\/tools\/evaluation\/run\.sh|onyx\s+tools\s+run\s+\S*(?:eval|sim|metric)\S*|simulator|simulate)\b/i
-const SCRATCH_TUNING_SCRIPT =
-  /(?:^|\/)(?:scratch|tmp|probe|sweep|grid|tuning|tune|candidates?)[^/]*\.(?:py|sh|js|ts|mjs|cjs)$/i
 
 async function recordWorkerHarnessWarnings(
-  manifest: WorkerLaunchManifest | null | undefined,
-  options: { worktree?: string } = {}
+  manifest: WorkerLaunchManifest | null | undefined
 ) {
   if (!manifest) return []
   const log = await readFile(manifest.logPath, "utf8").catch(() => "")
@@ -247,48 +238,7 @@ async function recordWorkerHarnessWarnings(
         `piped Onyx mutation command detected: ${line.trim().slice(0, 240)}`
       )
     }
-    if (MULTI_CANDIDATE_LOOP.test(line)) {
-      warnings.push(
-        `possible single_candidate violation: multi-candidate loop: ${line
-          .trim()
-          .slice(0, 240)}`
-      )
-    }
-    if (CANDIDATE_ARRAY.test(line)) {
-      warnings.push(
-        `possible single_candidate violation: candidate array: ${line
-          .trim()
-          .slice(0, 240)}`
-      )
-    }
     if (warnings.length >= 20) break
-  }
-  const diagnosticCalls = lines.filter(
-    (line) =>
-      EVALUATOR_OR_SIMULATOR_COMMAND.test(line) &&
-      !/\bonyx\s+exp\s+run\b/i.test(line)
-  )
-  if (diagnosticCalls.length > 2) {
-    warnings.push(
-      `possible single_candidate violation: ${diagnosticCalls.length} evaluator/simulator invocations outside onyx exp run`
-    )
-  }
-  if (options.worktree) {
-    const committedFiles = (
-      await git(
-        ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-        options.worktree
-      ).catch(() => "")
-    )
-      .split(/\r?\n/)
-      .filter(Boolean)
-    for (const file of committedFiles) {
-      if (SCRATCH_TUNING_SCRIPT.test(file)) {
-        warnings.push(
-          `possible single_candidate violation: committed scratch tuning script ${file}`
-        )
-      }
-    }
   }
   const uniqueWarnings = [...new Set(warnings)].slice(0, 20)
   if (uniqueWarnings.length === 0) return []
@@ -306,9 +256,7 @@ async function recordWorkerHarnessWarnings(
       phase: "audit",
       summary: warning,
       metadata: {
-        detector: warning.startsWith("piped Onyx mutation command")
-          ? "piped_onyx_mutation_command"
-          : "worker_harness_policy_warning",
+        detector: "piped_onyx_mutation_command",
       },
     })
   }
@@ -2288,9 +2236,7 @@ export async function finalizeHypothesisAttempt({
   }
 
   try {
-    const warnings = await recordWorkerHarnessWarnings(activityManifest, {
-      worktree,
-    })
+    const warnings = await recordWorkerHarnessWarnings(activityManifest)
     if (warnings.length > 0) manifest.warnings = warnings
     const headBefore = await currentCommit(worktree)
     const dirty = (await git(["status", "--porcelain"], worktree)).trim()

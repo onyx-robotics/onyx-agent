@@ -1497,20 +1497,23 @@ describe("worker finalization", () => {
       })
 
       expect(finalization.finalizationStatus).toBe("none")
-      expect(manifest.warnings?.length).toBeGreaterThanOrEqual(7)
+      expect(manifest.warnings?.length).toBe(4)
       const warnings = manifest.warnings?.join("\n") ?? ""
       expect(warnings).toContain("onyx exp run")
       expect(warnings).toContain("onyx push")
-      expect(warnings).toContain("candidate array")
-      expect(warnings).toContain("multi-candidate loop")
-      expect(warnings).toContain("evaluator/simulator invocations")
+      // Candidate sweeps and evaluator runs are no longer policy violations;
+      // only piped mutation commands are flagged.
+      expect(warnings).not.toContain("candidate array")
+      expect(warnings).not.toContain("multi-candidate loop")
+      expect(warnings).not.toContain("evaluator/simulator invocations")
+      expect(warnings).not.toContain("single_candidate")
       expect(await readFile(manifest.activityLogPath, "utf8")).toContain(
         "[warning] piped Onyx mutation command detected"
       )
       const activityEvents = await readFile(manifest.activityJsonlPath, "utf8")
       expect(activityEvents).toContain('"type":"warning"')
       expect(activityEvents).toContain("piped_onyx_mutation_command")
-      expect(activityEvents).toContain("worker_harness_policy_warning")
+      expect(activityEvents).not.toContain("worker_harness_policy_warning")
     } finally {
       process.chdir(previousCwd)
     }
@@ -5350,7 +5353,7 @@ describe("setup workflow", () => {
         "The Onyx CLI enforces the workflow contract"
       )
       expect(instructions).toContain("## Project Guidance")
-      expect(instructions).toContain("## Setup Checklist")
+      expect(instructions).toContain("## Declared Tools")
       expect(instructions).not.toContain("onyx exp run")
       expect(USAGE).not.toContain("onyx setup require")
     } finally {

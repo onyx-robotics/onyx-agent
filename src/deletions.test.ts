@@ -23,10 +23,6 @@ const setup = {
     unit: null,
     direction: "maximize" as const,
   },
-  experimentPolicy: {
-    mode: "single_candidate" as const,
-    maxDiagnosticSeconds: 30,
-  },
   resources: {},
   tools: {
     "evaluation.run": {

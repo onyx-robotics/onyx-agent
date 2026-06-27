@@ -79,15 +79,9 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("onyx exp list --json")
     expect(prompt).toContain("onyx knowledge list --json")
     expect(prompt).toContain("onyx summary list --json")
-    expect(prompt).toContain("In `single_candidate` mode")
+    expect(prompt).toContain("Default to one measured candidate per workflow")
     expect(prompt).toContain(
-      "Before the first workflow only, you may run at most one tiny pre-workflow sanity check comparing the baseline against one candidate"
-    )
-    expect(prompt).toContain(
-      "After the first workflow starts, every new candidate must be measured through a fresh Onyx workflow"
-    )
-    expect(prompt).toContain(
-      "Do not evaluate arrays/lists of candidates outside `onyx exp run`"
+      "Do not run tuning sweeps, grid searches, or batch candidate evaluation unless your hypothesis plan or the research spec explicitly calls for it"
     )
     expect(prompt).toContain(
       'onyx summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
@@ -97,9 +91,13 @@ describe("hypothesis worker prompt", () => {
       'onyx research should-stop --session "$ONYX_SESSION_ID" --iteration <n> --json'
     )
     expect(prompt).toContain('"shouldStop": true')
-    expect(prompt).toContain("maximum cap, not a target count")
+    expect(prompt).toContain(
+      "stop earlier when the global experiment budget is exhausted"
+    )
     expect(prompt).toContain("Make one small, measured, logged attempt early")
-    expect(prompt).toContain("Start the first measured workflow early")
+    expect(prompt).toContain(
+      "Do not spend more than a quick orientation pass before the first `onyx exp run`"
+    )
     expect(prompt).toContain(
       'onyx exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto'
     )
@@ -114,7 +112,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).not.toContain("--run-ref <runRef>")
     expect(prompt).not.toContain("Pick one concrete research idea")
     expect(prompt).toContain(
-      "do not create an unmeasured restore-forward commit outside `onyx exp run`"
+      "Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow"
     )
     expect(prompt).toContain(
       "allowed only inside a normal `onyx exp run` attempt"
