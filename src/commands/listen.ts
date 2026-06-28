@@ -9,8 +9,6 @@ import {
   getLocalSessionState,
   listLocalAttempts,
   listLocalExperimentHistory,
-  pendingResearchSyncCount,
-  researchSyncConflictCount,
 } from "../lib/research-db"
 import {
   formatAge,
@@ -88,14 +86,15 @@ async function buildModel(root: string): Promise<ListenModel> {
     }
     rows.push({
       schemaVersion: 1,
-      source: "local",
+      type: "campaign_experiment_logged",
       campaignName: lastRun.campaignName,
       runRef: lastRun.runRef,
+      projectPath: lastRun.projectPath,
       baseCommitSha: lastRun.baseCommitSha,
       resultCommitSha: lastRun.resultCommitSha,
       resultRef: lastRun.resultRef,
-      gitStatus: undefined,
       status: lastRun.status,
+      setupCompliance: lastRun.setupCompliance,
       name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
       description: null,
       primaryMetricName: lastRun.primaryMetricName,
@@ -111,8 +110,6 @@ async function buildModel(root: string): Promise<ListenModel> {
         : null,
       durationMs: lastRun.durationMs ?? null,
       outputSummary: lastRun.outputSummary ?? null,
-      campaignId: "",
-      experimentId: "",
       sessionId: lastRun.sessionId,
       workerId: lastRun.workerId,
       hypothesisId: lastRun.hypothesisId,
@@ -139,7 +136,7 @@ async function buildModel(root: string): Promise<ListenModel> {
       )
     : null
 
-  // Activity: latest commit on HEAD; research activity comes from SQLite rows.
+  // Activity: latest commit on HEAD; research activity comes from remote rows.
   const nowMs = Date.now()
   const head = await headCommitInfo(root)
   const activity = head
@@ -151,10 +148,6 @@ async function buildModel(root: string): Promise<ListenModel> {
   const active =
     Number.isFinite(commitMs) && nowMs - commitMs < ACTIVE_WINDOW_MS
 
-  const [pendingOutbox, conflictCount] = await Promise.all([
-    pendingResearchSyncCount(root),
-    researchSyncConflictCount(root),
-  ])
   const manifestByWorker = new Map(
     manifests.map((manifest) => [manifest.workerId, manifest])
   )
@@ -243,11 +236,8 @@ async function buildModel(root: string): Promise<ListenModel> {
       active ||
       workers.some((worker) =>
         ["registered", "running", "starting"].includes(worker.status)
-      ),
+    ),
     rows,
-    pendingOutbox,
-    conflictOutbox: conflictCount,
-    syncedCount: 0,
     providerBackoff: activeSessionId
       ? (state.sessions?.[activeSessionId]?.providerBackoff ?? null)
       : null,
@@ -262,8 +252,7 @@ function frameText(lines: string[], live: boolean) {
 }
 
 /**
- * Live, read-only view of the current repo's research session: tails
- * `.git/onyx/research.db` and polls git for new commits. With no TTY it
+ * Live, read-only view of the current repo's research session. With no TTY it
  * prints a single snapshot and exits.
  */
 export async function commandListen() {

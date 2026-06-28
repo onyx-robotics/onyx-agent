@@ -501,6 +501,7 @@ describe("worker launchers", () => {
         hypothesisId: "hypothesis-id",
         hypothesisName: "hypothesis",
         workerId: "worker/one",
+        workerLeaseToken: "lease-token",
         workerBranch: "onyx/session/worker",
         worktreeRoot: join(root, "worktree"),
         projectPath: "",

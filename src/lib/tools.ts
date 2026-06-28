@@ -10,7 +10,7 @@ import {
 } from "./contract"
 import { onyxPath, resolveProjectPath, scopedRoot } from "./project"
 import { runProcess, type ProcessResult } from "./process"
-import { acquireLocalResourceLease } from "./research-db"
+import { acquireFileResourceLease } from "./resource-locks"
 
 export type ToolCommand = ResearchSetupTool
 export type ToolApi = Pick<
@@ -110,7 +110,7 @@ async function acquireResourceSlot({
   timeoutMs: number
   leaseMs: number
 }) {
-  return acquireLocalResourceLease({
+  return acquireFileResourceLease({
     root,
     resourceName,
     slots,

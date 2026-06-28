@@ -8,7 +8,10 @@ import type {
 } from "../protocol"
 
 import {
+  getCampaignOverview,
+  listCampaignExperiments,
   listProjectCampaigns,
+  reportCampaignExperiment,
   resolveProject,
 } from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
@@ -21,6 +24,7 @@ import {
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, repoRoot } from "../lib/git"
+import { apiExperimentToHistory } from "../lib/history"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
 import {
   clientRunRef,
@@ -32,15 +36,11 @@ import {
 } from "../lib/outbox"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import {
-  cacheLocalCampaign,
   clearLocalAttempt,
   abandonBlockedWorkflowRunsForSession,
   listWorkflowSteps,
   listLocalAttempts,
-  listLocalExperimentHistory,
   listWorkflowRuns,
-  localCampaignByName,
-  acceptOrDiscardLocalExperiment,
   readWorkflowRun,
   upsertWorkflowRun,
   upsertWorkflowStep,
@@ -51,7 +51,6 @@ import {
 } from "../lib/research-db"
 import { renderExperimentTable } from "../lib/tui"
 import { runToolCommand, type ToolRunResult } from "../lib/tools"
-import { flushOutbox } from "../lib/sync"
 import {
   resolveCampaignNameFromContext,
   resolveWorkerWorkflowContext,
@@ -72,6 +71,10 @@ function numberOption(args: Args, name: string, fallback: number) {
     throw new Error(`--${name} must be a positive number`)
   }
   return parsed
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function validateStatus(value: string): ExperimentStatus {
@@ -236,60 +239,10 @@ async function ensureCampaignMetadata({
   projectPath: string
   campaignName: string
 }) {
-  const localCampaign = await localCampaignByName({
-    root,
-    projectPath,
-    name: campaignName,
-  })
-  if (localCampaign) {
-    const state = await readState(root)
-    const key = campaignStateKey(projectPath, campaignName)
-    state.projectPath = projectPath
-    state.activeCampaign = campaignName
-    state.campaigns = state.campaigns ?? {}
-    state.campaigns[key] = {
-      ...state.campaigns[key],
-      campaignId: localCampaign.id,
-      projectPath,
-      baseCommitSha: localCampaign.baseCommitSha,
-      description: localCampaign.description,
-      metricName: localCampaign.metricName,
-      metricUnit: localCampaign.metricUnit,
-      metricDirection: localCampaign.metricDirection,
-      promotionRefName: localCampaign.promotionRefName,
-    }
-    await writeState(root, state)
-    return {
-      campaignId: localCampaign.id,
-      hypothesisId: state.campaigns[key]?.hypothesisId,
-      metricName: localCampaign.metricName,
-      baseCommitSha: localCampaign.baseCommitSha,
-    }
-  }
-
   const state = await readState(root)
   const key = campaignStateKey(projectPath, campaignName)
   const cached = state.campaigns?.[key]
   if (cached?.campaignId && cached.metricName && cached.baseCommitSha) {
-    await cacheLocalCampaign({
-      root,
-      projectPath,
-      setup: cached.setup ?? {},
-      campaign: {
-        id: cached.campaignId,
-        projectId: state.projectId ?? "local",
-        name: campaignName,
-        description: cached.description ?? null,
-        baseCommitSha: cached.baseCommitSha,
-        metricName: cached.metricName,
-        metricUnit: cached.metricUnit ?? null,
-        metricDirection: cached.metricDirection ?? "maximize",
-        bestMetricValue: null,
-        bestCommitSha: null,
-        experimentCount: 0,
-        promotionRefName: cached.promotionRefName ?? null,
-      },
-    }).catch(() => null)
     return {
       campaignId: cached.campaignId,
       hypothesisId: cached.hypothesisId,
@@ -305,7 +258,7 @@ async function ensureCampaignMetadata({
   )
   if (!campaign) {
     throw new Error(
-      `Campaign ${campaignName} is not synced. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/setup.json, then \`onyx sync\`.`
+      `Campaign ${campaignName} was not found in the Onyx API. Run \`onyx campaign setup --name ${campaignName}\` after creating onyx/setup.json.`
     )
   }
 
@@ -325,12 +278,6 @@ async function ensureCampaignMetadata({
     promotionRefName: campaign.promotionRefName,
   }
   await writeState(root, state)
-  await cacheLocalCampaign({
-    root,
-    campaign,
-    projectPath,
-    setup: state.campaigns[key]?.setup ?? {},
-  }).catch(() => null)
 
   return {
     campaignId: campaign.id,
@@ -1396,25 +1343,18 @@ export async function commandExpLog(args: Args) {
     lastRun.projectPath === projectPath
       ? lastRun
       : null
-  if (explicitRunRef) {
-    const localHistory = await listLocalExperimentHistory(root).catch(() => [])
-    const logged = localHistory.find(
-      (record) =>
-        record.runRef === explicitRunRef && record.campaignName === campaignName
+  if (
+    args.options.offline === "true" ||
+    args.options["defer-sync"] === "true" ||
+    process.env.ONYX_DEFER_EXP_LOG_SYNC === "1"
+  ) {
+    throw new Error(
+      "`--offline`, `--defer-sync`, and ONYX_DEFER_EXP_LOG_SYNC were removed. `onyx exp log` pushes the result ref and reports directly to the Onyx API."
     )
-    if (logged) {
-      await clearLocalAttempt(root, {
-        runRef: explicitRunRef,
-      }).catch(() => {})
-      console.log(
-        `Experiment ${explicitRunRef} is already recorded for campaign ${campaignName}`
-      )
-      return logged
-    }
   }
   if (explicitRunRef && !usableLastRun) {
     throw new Error(
-      `No measured run found for --run-ref ${explicitRunRef}. Run \`onyx exp list --json\` to inspect unlogged local runs. Do not edit .git/onyx/research.db directly; rerun the workflow or leave unlogged salvage to the worker harness.`
+      `No measured run found for --run-ref ${explicitRunRef}. Rerun the workflow or leave unlogged salvage to the worker harness.`
     )
   }
   const resultCommitSha =
@@ -1443,7 +1383,7 @@ export async function commandExpLog(args: Args) {
     !optionalFlag(args, "allow-unmeasured")
   ) {
     throw new Error(
-      "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for failed unmeasured attempts. Do not edit .git/onyx/research.db directly; rerun the workflow or leave unlogged salvage to the worker harness."
+      "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for failed unmeasured attempts. Rerun the workflow or leave unlogged salvage to the worker harness."
     )
   }
   if (
@@ -1528,26 +1468,54 @@ export async function commandExpLog(args: Args) {
     workerId,
     hypothesisId,
   }
-  const result = await acceptOrDiscardLocalExperiment({ root, record })
-  await clearLocalAttempt(root, { runRef }).catch(() => {})
-  if (result.outcome === "discarded") {
-    console.log(
-      `Discarded ${record.name} for campaign ${campaignName}: ${result.discarded.reason}`
-    )
-    return {
-      ...record,
-      discarded: true,
-      discardReason: result.discarded.reason,
+  await git(["push", "origin", `${resultCommitSha}:${resultRef}`], root).catch(
+    (error) => {
+      throw new Error(
+        `Failed to push experiment ref ${resultRef}. The local commit is ${resultCommitSha}; push it with \`git push origin ${resultCommitSha}:${resultRef}\` before retrying. ${errorMessage(error)}`
+      )
     }
-  }
-  const deferSync =
-    args.options["defer-sync"] === "true" ||
-    process.env.ONYX_DEFER_EXP_LOG_SYNC === "1"
-  if (args.options.offline !== "true" && !deferSync) {
-    await flushOutbox(root, args, { quiet: true }).catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-    })
-  }
+  )
+  const report = await reportCampaignExperiment(
+    campaign.campaignId,
+    {
+      sessionId,
+      hypothesisId,
+      workerId,
+      name: record.name,
+      ...(record.description ? { description: record.description } : {}),
+      runRef,
+      baseCommitSha,
+      resultCommitSha,
+      resultRef,
+      status: loggedStatus,
+      setupCompliance: loggedCompliance,
+      primaryMetricName: metricName,
+      ...(metricValue === null ? {} : { primaryMetricValue: metricValue }),
+      secondaryMetrics: metrics,
+      artifactRefs: {},
+      agentNotes: record.agentNotes,
+      ...(checks
+        ? {
+            checks: {
+              status: checks.status,
+              durationMs: checks.durationMs ?? null,
+              outputSummary: checks.outputSummary ?? null,
+            },
+          }
+        : {}),
+      ...(record.durationMs === null ? {} : { durationMs: record.durationMs }),
+      ...(record.outputSummary ? { outputSummary: record.outputSummary } : {}),
+      ...(record.startedAt ? { startedAt: record.startedAt } : {}),
+      completedAt: record.completedAt ?? completedAt,
+      provenance: [],
+    },
+    args
+  ).catch((error) => {
+    throw new Error(
+      `Experiment ref ${resultRef} was pushed, but API reporting failed. Retry \`onyx exp log --campaign ${campaignName} --run-ref ${runRef}\` after checking the Onyx API. ${errorMessage(error)}`
+    )
+  })
+  await clearLocalAttempt(root, { runRef }).catch(() => {})
   await emitEvent(root, {
     type: "exp_logged",
     campaignName,
@@ -1558,75 +1526,68 @@ export async function commandExpLog(args: Args) {
     message: `${record.name} (${loggedStatus})`,
   })
   console.log(
-    `Recorded ${record.name} (${loggedStatus}) for campaign ${campaignName}${
-      result.experiment.acceptedIndex
-        ? ` as #${result.experiment.acceptedIndex}`
+    `${report.outcome}: ${record.name} (${report.experiment.status}) for campaign ${campaignName}${
+      report.experiment.acceptedIndex
+        ? ` as #${report.experiment.acceptedIndex}`
         : ""
     }`
   )
-  return result.experiment
+  return report.experiment
 }
 
 export async function commandExpList(args: Args) {
-  const root = await repoRoot()
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
   const limit = numberOption(args, "limit", 50)
-  // Push the campaign filter into SQL so a large multi-campaign ledger is not
-  // scanned in full on every call. Only push the limit when no later in-memory
-  // filter (grep/status) runs and the limit is positive, otherwise the SQL
-  // slice could drop rows that still match those filters.
-  const canPushLimit = !args.options.grep && !args.options.status && limit > 0
-  const sqliteRows = await listLocalExperimentHistory(root, {
-    campaignName: args.options.campaign,
-    limit: canPushLimit ? limit : undefined,
-  }).catch(() => [])
-  const rows: LocalResearchHistoryRecord[] = [...sqliteRows]
-  const seenRunRefs = new Set(rows.map((row) => row.runRef))
-  const loggedCommitKeys = new Set(
-    rows.map((row) => `${row.campaignName}\0${row.resultCommitSha}`)
-  )
-  const lastRuns = await listLocalAttempts(root)
-  for (const lastRun of lastRuns) {
-    if (seenRunRefs.has(lastRun.runRef)) continue
-    if (
-      loggedCommitKeys.has(
-        `${lastRun.campaignName}\0${lastRun.resultCommitSha}`
-      )
-    ) {
-      continue
-    }
-    rows.push({
-      schemaVersion: 1,
-      source: "local",
-      campaignName: lastRun.campaignName,
-      runRef: lastRun.runRef,
-      baseCommitSha: lastRun.baseCommitSha,
-      resultCommitSha: lastRun.resultCommitSha,
-      resultRef: lastRun.resultRef,
-      status: lastRun.status,
-      name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
-      description: null,
-      primaryMetricName: lastRun.primaryMetricName,
-      primaryMetricValue: lastRun.primaryMetricValue,
-      metrics: lastRun.metrics,
-      agentNotes: lastRun.agentNotes,
-      checks: lastRun.checks ?? null,
-      durationMs: lastRun.durationMs ?? null,
-      startedAt: lastRun.startedAt ?? null,
-      completedAt: lastRun.completedAt ?? null,
-      createdAt: lastRun.createdAt,
-      sessionId: lastRun.sessionId,
-      workerId: lastRun.workerId,
-      hypothesisId: lastRun.hypothesisId,
-    })
-    seenRunRefs.add(lastRun.runRef)
+  if (args.options.offline === "true") {
+    throw new Error(
+      "`--offline` was removed. Experiments are listed from the Onyx API."
+    )
+  }
+  const state = await readState(root)
+  const campaignName = args.options.campaign ?? state.activeCampaign
+  const campaigns = campaignName
+    ? [
+        {
+          campaign: (
+            await getCampaignOverview(
+              (
+                await ensureCampaignMetadata({
+                  root,
+                  args,
+                  projectPath,
+                  campaignName,
+                })
+              ).campaignId,
+              args
+            )
+          ).campaign,
+        },
+      ]
+    : await resolveProject(root, args)
+        .then((project) => listProjectCampaigns(project.id, args))
+        .then((items) => items.map((campaign) => ({ campaign })))
+  const rows: LocalResearchHistoryRecord[] = []
+  for (const { campaign } of campaigns) {
+    let cursor: string | null = null
+    do {
+      const page = await listCampaignExperiments(campaign.id, args, {
+        limit: Math.min(100, Math.max(limit, 1)),
+        cursor: cursor ?? undefined,
+      })
+      for (const experiment of page.items) {
+        const row = apiExperimentToHistory(campaign, experiment)
+        if (row) rows.push(row)
+      }
+      cursor = page.page.nextCursor
+    } while (
+      cursor &&
+      rows.length < Math.max(limit, 100) &&
+      (args.options.grep || args.options.status)
+    )
   }
 
   let filtered = rows
-  if (args.options.campaign) {
-    filtered = filtered.filter(
-      (row) => row.campaignName === args.options.campaign
-    )
-  }
   if (args.options.status) {
     const status = validateStatus(args.options.status)
     filtered = filtered.filter((row) => row.status === status)
@@ -1667,7 +1628,7 @@ export async function commandExpList(args: Args) {
   if (limited.length === 0) {
     console.log(
       rows.length === 0
-        ? "No local experiments recorded yet. Run `onyx sync` to hydrate from the Onyx app, or `onyx exp run`/`onyx exp log` to create one locally."
+        ? "No experiments recorded in the Onyx API yet."
         : "No experiments matched the given filters."
     )
     return

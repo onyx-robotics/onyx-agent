@@ -13,18 +13,27 @@ import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
   getCampaignOverview,
+  acquireResearchWorkerLease,
+  createCampaignHypothesis,
+  createCampaignSession,
+  createCampaignKnowledge,
   getResearchSessionControlState,
+  getResearchSessionBrief,
   getResearchSessionLive,
   getResearchSessionState,
+  heartbeatWorker,
+  listCampaignKnowledge,
   listProjectCampaigns,
   reconcileCampaign,
   stopCampaignSession,
-  syncResearchPresence,
+  upsertCampaignSummary,
+  upsertResearchPresence,
   resolveProject,
   type ApiCampaign,
   type ApiHypothesis,
   type ApiResearchPresenceResponse,
   type ApiSession,
+  type ApiSessionBrief,
   type ApiSessionLive,
   type ApiSummary,
   type ApiWorker,
@@ -68,33 +77,18 @@ import {
   abandonBlockedWorkflowRunsForSession,
   assertLocalSessionSchedulerSite,
   cacheLocalCampaign,
+  cacheResearchSessionState,
   applyRemoteProjectionDeltas,
   completeLocalCampaign,
-  createLocalHypothesis,
-  createLocalKnowledge,
-  createLocalSession,
-  getActiveLocalCampaignName,
   getLocalSessionState,
   listLocalAttempts,
   listLocalExperimentHistory,
-  listLocalKnowledge,
-  listLocalSummaries,
-  listResearchSyncConflicts,
-  localResearchBrief,
-  localCampaignByName,
-  pendingResearchSyncCount,
-  pendingResearchSyncEvents,
-  researchSyncConflictCount,
   recordLocalWorkerHeartbeat,
-  registerLocalWorker,
   getResearchSiteId,
-  researchDbPath,
   stopLocalSession,
   upsertWorkerLaunch,
-  upsertLocalSummary,
 } from "../lib/research-db"
 import { assertSetupCommitted } from "../lib/setup-git"
-import { flushOutbox } from "../lib/sync"
 import { protectedToolPaths } from "../lib/tools"
 import { formatAge } from "../lib/tui"
 import {
@@ -130,9 +124,8 @@ const BUILTIN_AGENT_MIN_USEFUL_LAUNCH_MS = 5 * 60_000
 const CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS = 30_000
 const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
 const MAX_LOCAL_SUPERVISOR_WORKERS = 250
-const DEFAULT_SYNC_QUEUE_CONCURRENCY = 4
-const DEFAULT_SYNC_DRAIN_BATCHES_PER_INTERVAL = 4
-const MAX_SYNC_QUEUE_DEPTH = 500
+const DEFAULT_REF_PUSH_QUEUE_CONCURRENCY = 4
+const MAX_REF_PUSH_QUEUE_DEPTH = 500
 const SUPERVISOR_TELEMETRY_STALE_MS = 45_000
 const SUPERVISOR_LOG_DIR = "supervisor-logs"
 
@@ -157,7 +150,7 @@ async function frozenWorkerApiEnv(args: Args) {
   try {
     env.ONYX_API_URL = await apiBaseUrl(args)
   } catch {
-    // Offline/debug sessions can still use local ledger state.
+    // Leave API URL unset only for low-level local debugging.
   }
   try {
     env.ONYX_API_KEY = await apiKey(args)
@@ -193,14 +186,7 @@ type WorkerActivityEvent = {
   metadata?: Record<string, unknown>
 }
 
-type SyncQueueFlushJob = {
-  kind: "flush"
-  reason: string
-  manifest?: WorkerLaunchManifest | null
-}
-
-type SyncQueuePushRefJob = {
-  kind: "push-ref"
+type RefPushQueueJob = {
   reason: string
   cwd: string
   sourceRef: string
@@ -208,8 +194,6 @@ type SyncQueuePushRefJob = {
   manifest?: WorkerLaunchManifest | null
   resolve: (result: ProcessResult) => void
 }
-
-type SyncQueueJob = SyncQueueFlushJob | SyncQueuePushRefJob
 
 type WorkerBranchPusher = (input: {
   cwd: string
@@ -952,61 +936,32 @@ function optionalUuid(value: string | undefined, label: string) {
   return value
 }
 
-function createSyncSupervisor({
-  root,
-  args,
-  intervalMs,
-}: {
-  root: string
-  args: Args
-  intervalMs: number
-}) {
+function createRefPushQueue({ args }: { args: Args }) {
   const maxConcurrency = positiveIntegerOption(
     args,
-    "sync-concurrency",
-    DEFAULT_SYNC_QUEUE_CONCURRENCY
+    "ref-push-concurrency",
+    DEFAULT_REF_PUSH_QUEUE_CONCURRENCY
   )
-  const maxBatchesPerFlush = positiveIntegerOption(
-    args,
-    "sync-drain-batches",
-    DEFAULT_SYNC_DRAIN_BATCHES_PER_INTERVAL
-  )
-  const queue: SyncQueueJob[] = []
+  const queue: RefPushQueueJob[] = []
   const idleWaiters = new Set<() => void>()
   let active = 0
   let stopped = false
-  let timer: ReturnType<typeof setInterval> | null = null
-  let lastPendingSyncCount = 0
-  let lastOldestPendingAgeMs: number | null = null
-  let lastSyncDurationMs: number | null = null
-  let lastSyncError: string | null = null
-  let lastSyncOffline = false
-  let flushActive = false
 
   const depth = () => queue.length + active
-  const syncTelemetry = () => ({
-    pendingSyncCount: lastPendingSyncCount,
-    oldestPendingAgeMs: lastOldestPendingAgeMs,
-    lastDurationMs: lastSyncDurationMs,
-    lastError: lastSyncError,
-    offline: lastSyncOffline,
-    queueDepth: depth(),
-  })
   const notifyIdle = () => {
     if (depth() > 0) return
     for (const resolve of idleWaiters) resolve()
     idleWaiters.clear()
   }
   const emitJobEvent = async (
-    job: SyncQueueJob,
-    type: "push_result" | "sync_result",
+    job: RefPushQueueJob,
     summary: string,
     metadata: Record<string, unknown>
   ) => {
     if (!job.manifest) return
     await appendWorkerActivityEvent(job.manifest, {
-      type,
-      phase: "syncing",
+      type: "push_result",
+      phase: "pushing",
       summary,
       metadata: {
         reason: job.reason,
@@ -1020,68 +975,33 @@ function createSyncSupervisor({
     stderr: message,
     timedOut: false,
   })
-  const runFlushJob = async (job: SyncQueueFlushJob) => {
-    flushActive = true
-    await flushOutbox(root, args, {
-      quiet: true,
-      maxBatches: maxBatchesPerFlush,
-    })
-      .then(async (result) => {
-        lastPendingSyncCount = result.pending
-        lastOldestPendingAgeMs = result.oldestPendingAgeMs
-        lastSyncDurationMs = result.lastDurationMs
-        lastSyncError = result.lastError
-        lastSyncOffline = result.offline
-        await emitJobEvent(job, "push_result", "Experiment refs pushed", {
-          flushed: result.flushed,
-          pending: result.pending,
-          offline: result.offline,
-          conflicts: result.conflicts,
-          skippedDeleted: result.skippedDeleted,
-          batches: result.batches,
-        })
-        await emitJobEvent(job, "sync_result", "SQLite sync flushed", {
-          flushed: result.flushed,
-          pending: result.pending,
-          offline: result.offline,
-          conflicts: result.conflicts,
-          skippedDeleted: result.skippedDeleted,
-          batches: result.batches,
-          lastDurationMs: result.lastDurationMs,
-          oldestPendingAgeMs: result.oldestPendingAgeMs,
-          lastError: result.lastError,
-        })
-      })
-      .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error)
-        const lockContention =
-          /Timed out waiting for local Onyx research-sync lock/i.test(message)
-        if (!lockContention) lastSyncError = message
-        void emitJobEvent(job, "sync_result", "SQLite sync failed", {
-          error: message,
-          lockContention,
-        })
-        if (!lockContention) console.warn(`Background sync skipped: ${message}`)
-      })
-      .finally(() => {
-        flushActive = false
-      })
-  }
-  const runPushRefJob = async (job: SyncQueuePushRefJob) => {
+  const runPushRefJob = async (job: RefPushQueueJob) => {
     try {
       const result = await gitResult(
         ["push", "origin", `${job.sourceRef}:${job.targetRef}`],
         job.cwd
       )
+      if (result.code === 0 && !result.timedOut) {
+        await emitJobEvent(job, "Git ref pushed", {
+          ref: job.targetRef,
+        })
+      } else {
+        await emitJobEvent(job, "Git ref push failed", {
+          ref: job.targetRef,
+          error: result.stderr.trim() || result.stdout.trim(),
+        })
+      }
       job.resolve(result)
     } catch (error) {
+      await emitJobEvent(job, "Git ref push failed", {
+        ref: job.targetRef,
+        error: errorMessage(error),
+      })
       job.resolve(failedProcessResult(errorMessage(error)))
     }
   }
-  const runJob = async (job: SyncQueueJob) => {
-    await (
-      job.kind === "push-ref" ? runPushRefJob(job) : runFlushJob(job)
-    ).finally(() => {
+  const runJob = async (job: RefPushQueueJob) => {
+    await runPushRefJob(job).finally(() => {
       active -= 1
       pump()
       notifyIdle()
@@ -1094,15 +1014,9 @@ function createSyncSupervisor({
       void runJob(job)
     }
   }
-  const enqueue = (job: SyncQueueJob, options: { force?: boolean } = {}) => {
-    if (stopped && !options.force) return null
-    if (
-      job.kind === "flush" &&
-      (flushActive || queue.some((item) => item.kind === "flush"))
-    ) {
-      return depth()
-    }
-    if (depth() >= MAX_SYNC_QUEUE_DEPTH) return null
+  const enqueue = (job: RefPushQueueJob) => {
+    if (stopped) return null
+    if (depth() >= MAX_REF_PUSH_QUEUE_DEPTH) return null
     queue.push(job)
     pump()
     return depth()
@@ -1121,21 +1035,7 @@ function createSyncSupervisor({
     return depth()
   }
 
-  timer = setInterval(() => {
-    if (!stopped && depth() === 0)
-      enqueue({ kind: "flush", reason: "interval" })
-  }, intervalMs)
-
   return {
-    request(job: Partial<SyncQueueJob> = {}) {
-      return (
-        enqueue({
-          kind: "flush",
-          reason: job.reason ?? "requested",
-          manifest: job.manifest,
-        }) ?? depth()
-      )
-    },
     pushRef({
       cwd,
       sourceRef,
@@ -1151,7 +1051,6 @@ function createSyncSupervisor({
     }) {
       return new Promise<ProcessResult>((resolve) => {
         const accepted = enqueue({
-          kind: "push-ref",
           reason,
           cwd,
           sourceRef,
@@ -1160,40 +1059,18 @@ function createSyncSupervisor({
           resolve,
         })
         if (accepted === null) {
-          resolve(failedProcessResult("sync queue rejected push job"))
+          resolve(failedProcessResult("ref push queue rejected job"))
         }
       })
     },
     depth,
-    telemetry: syncTelemetry,
     waitForIdle,
     async drain(timeoutMs: number) {
       stopped = true
-      if (timer) clearInterval(timer)
-      if (args.options.offline === "true") {
-        await waitForIdle(timeoutMs)
-        const pending = await pendingResearchSyncCount(root)
-        lastPendingSyncCount = pending
-        lastSyncOffline = true
-        return pending
-      }
-      const deadline = Date.now() + timeoutMs
-      do {
-        if (depth() === 0)
-          enqueue({ kind: "flush", reason: "final-drain" }, { force: true })
-        await waitForIdle(Math.max(1, deadline - Date.now()))
-        const pending = await pendingResearchSyncCount(root)
-        lastPendingSyncCount = pending
-        if (pending === 0) return 0
-        await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
-      } while (Date.now() < deadline)
-      const pending = await pendingResearchSyncCount(root)
-      lastPendingSyncCount = pending
-      return pending
+      return waitForIdle(timeoutMs)
     },
     stop() {
       stopped = true
-      if (timer) clearInterval(timer)
     },
   }
 }
@@ -1203,22 +1080,11 @@ function createPresenceSupervisor({
   args,
   sessionId,
   intervalMs,
-  syncQueueDepth,
-  syncTelemetry,
 }: {
   root: string
   args: Args
   sessionId: string
   intervalMs: number
-  syncQueueDepth?: () => number
-  syncTelemetry?: () => {
-    pendingSyncCount: number
-    oldestPendingAgeMs: number | null
-    lastDurationMs: number | null
-    lastError: string | null
-    offline: boolean
-    queueDepth: number
-  }
 }) {
   const lastSent = new Map<string, string>()
   const supervisorRunId = randomUUID()
@@ -1245,10 +1111,6 @@ function createPresenceSupervisor({
       )
     )
     const observedAt = new Date().toISOString()
-    const sync = syncTelemetry?.()
-    const pendingSyncCount = await pendingResearchSyncCount(root).catch(
-      () => sync?.pendingSyncCount ?? 0
-    )
     const activeWorkerCount = state.workers.filter(
       (worker) =>
         worker.sessionId === sessionId &&
@@ -1322,19 +1184,14 @@ function createPresenceSupervisor({
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index] ?? []
       sequence += 1
-      const response = await syncResearchPresence(
+      const response = await upsertResearchPresence(
         {
           siteId,
           supervisorRunId,
           sequence,
           sessionId,
           site: {
-            pendingSyncCount,
-            pushQueueDepth: sync?.queueDepth ?? syncQueueDepth?.() ?? 0,
             activeWorkerCount,
-            oldestPendingAgeMs: sync?.oldestPendingAgeMs ?? null,
-            lastSyncDurationMs: sync?.lastDurationMs ?? null,
-            lastSyncError: sync?.lastError ?? null,
             uploadedWorkerCount: selectedWorkers.length,
             unchangedWorkerCount,
             droppedOrDeferredWorkerCount,
@@ -1347,7 +1204,6 @@ function createPresenceSupervisor({
             metadata: {
               splitIndex: index + 1,
               splitCount,
-              syncOffline: sync?.offline ?? false,
             },
           },
           workers: chunk.map((worker) => worker.snapshot),
@@ -1411,11 +1267,11 @@ function createPresenceSupervisor({
       }
       const reasonSummary = formatPresenceReasonCounts(ignoredPresence.byReason)
       console.warn(
-        `Presence sync ignored ${aggregateResponse.ignoredCount} worker update(s): ${reasonSummary}.`
+        `Presence upload ignored ${aggregateResponse.ignoredCount} worker update(s): ${reasonSummary}.`
       )
       if (responses.some(hasPresenceMismatch)) {
         console.warn(
-          "Presence sync saw project_mismatch or session_mismatch; check worker/session wiring."
+          "Presence upload saw project_mismatch or session_mismatch; check worker/session wiring."
         )
       }
     }
@@ -1427,7 +1283,7 @@ function createPresenceSupervisor({
       .catch((error) => {
         if (!stopped) {
           console.warn(
-            `Presence sync skipped: ${
+            `Presence upload skipped: ${
               error instanceof Error ? error.message : String(error)
             }`
           )
@@ -1458,32 +1314,18 @@ function createPresenceSupervisor({
   }
 }
 
-export type StartupSyncSupervisor = {
-  request(job?: { reason?: string }): number | null
-  waitForIdle(timeoutMs: number): Promise<number>
-}
-
-export async function waitForStartupSessionSync({
+export async function waitForStartupSessionReady({
   args,
   sessionId,
-  syncSupervisor,
   timeoutMs = 30_000,
 }: {
   args: Args
   sessionId: string
-  syncSupervisor: StartupSyncSupervisor
   timeoutMs?: number
 }) {
   if (args.options.offline === "true") return
   const deadline = Date.now() + timeoutMs
-  syncSupervisor.request({ reason: "startup" })
-  const pending = await syncSupervisor.waitForIdle(timeoutMs)
   let lastError: unknown = null
-  if (pending > 0) {
-    lastError = new Error(
-      `startup sync queue still has ${pending} pending job(s)`
-    )
-  }
   while (Date.now() < deadline) {
     try {
       await getResearchSessionControlState(sessionId, args)
@@ -1494,132 +1336,29 @@ export async function waitForStartupSessionSync({
     }
   }
   throw new Error(
-    `Startup session sync was not confirmed before launch (${errorMessage(lastError)}).`
+    `Startup session was not readable before launch (${errorMessage(lastError)}).`
   )
-}
-
-async function drainFinalSync({
-  root,
-  args,
-  timeoutMs,
-}: {
-  root: string
-  args: Args
-  timeoutMs: number
-}) {
-  const deadline = Date.now() + timeoutMs
-  let accepted = 0
-  let offline = false
-  let batches = 0
-  let lastDurationMs: number | null = null
-  let lastError: string | null = null
-  let lockContentionLogged = false
-  do {
-    try {
-      const result = await flushOutbox(root, args, {
-        quiet: true,
-        maxBatches: 1,
-      })
-      accepted += result.flushed
-      offline = offline || result.offline
-      batches += result.batches
-      lastDurationMs = result.lastDurationMs
-      lastError = result.lastError
-      if (result.batches > 0) {
-        console.log(
-          `final sync batch ${batches}: accepted=${accepted} pending=${result.pending}${result.offline ? " offline=true" : ""}`
-        )
-      }
-      if (result.pending === 0 || result.offline) break
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const lockContention =
-        /Timed out waiting for local Onyx research-sync lock/i.test(message)
-      lastError = message
-      if (!lockContention) throw error
-      const pending = await pendingResearchSyncCount(root).catch(() => 0)
-      if (!lockContentionLogged) {
-        lockContentionLogged = true
-        console.warn(
-          `Final sync is waiting for another local Onyx sync drain to finish (${pending} pending event(s)).`
-        )
-      }
-      if (pending === 0) break
-    }
-    await sleep(Math.min(1000, Math.max(0, deadline - Date.now())))
-  } while (Date.now() < deadline)
-
-  const [pending, conflicts] = await Promise.all([
-    pendingResearchSyncCount(root).catch(() => 0),
-    researchSyncConflictCount(root).catch(() => 0),
-  ])
-  const [firstConflict] = await listResearchSyncConflicts(root).catch(() => [])
-  const [firstPendingError] = (
-    await pendingResearchSyncEvents(root, 20).catch(() => [])
-  ).filter((event) => event.lastError)
-  return {
-    accepted,
-    pending,
-    conflicts,
-    offline,
-    batches,
-    lastDurationMs,
-    lastError,
-    firstFailed: firstConflict ?? firstPendingError ?? null,
-  }
-}
-
-function printFinalSyncReport(
-  report: Awaited<ReturnType<typeof drainFinalSync>>
-) {
-  console.log(
-    `final sync: accepted=${report.accepted} pending=${report.pending} conflicts=${report.conflicts} batches=${report.batches}${
-      report.offline ? " offline=true" : ""
-    }`
-  )
-  if (report.firstFailed) {
-    console.warn(
-      `first failed sync event: ${report.firstFailed.type}/${report.firstFailed.entityType}/${report.firstFailed.entityId}: ${
-        report.firstFailed.lastError ?? "sync conflict"
-      }`
-    )
-  }
 }
 
 type SessionFinalizationComputation = {
   status: SessionFinalizationStatus
   reasons: string[]
   live: ApiSessionLive | null
-  pendingSyncCount: number
-  conflictCount: number
 }
 
 async function computeSessionFinalizationStatus({
   root,
   sessionId,
-  pendingSyncCount,
-  requireOnline,
 }: {
   root: string
   sessionId: string
-  pendingSyncCount: number
-  requireOnline: boolean
 }): Promise<SessionFinalizationComputation> {
   const failedReasons: string[] = []
   const incompleteReasons: string[] = []
-  const [conflictCount, manifests] = await Promise.all([
-    researchSyncConflictCount(root).catch(() => 0),
+  const [manifests] = await Promise.all([
     readWorkerLaunchManifests(root, sessionId).catch(() => []),
   ])
 
-  if (pendingSyncCount > 0) {
-    const message = `${pendingSyncCount} pending sync event(s)`
-    if (requireOnline) failedReasons.push(message)
-    else incompleteReasons.push(message)
-  }
-  if (conflictCount > 0) {
-    incompleteReasons.push(`${conflictCount} sync conflict(s)`)
-  }
   for (let index = 0; index < manifests.length; index += 25) {
     const batch = manifests.slice(index, index + 25)
     if (manifests.length > 25) {
@@ -1689,8 +1428,6 @@ async function computeSessionFinalizationStatus({
           : "complete",
     reasons,
     live,
-    pendingSyncCount,
-    conflictCount,
   }
 }
 
@@ -1703,10 +1440,7 @@ async function campaignForName(
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
   const campaignName =
-    args.options.campaign ??
-    state.activeCampaign ??
-    (await getActiveLocalCampaignName(root)) ??
-    args.options.name
+    args.options.campaign ?? state.activeCampaign ?? args.options.name
   if (!campaignName) {
     throw new Error(
       "Pass --campaign <name> or run `onyx campaign use --name <name>`."
@@ -1714,43 +1448,6 @@ async function campaignForName(
   }
 
   const key = campaignStateKey(projectPath, campaignName)
-  const localCampaign = await localCampaignByName({
-    root,
-    projectPath,
-    name: campaignName,
-  })
-  if (localCampaign) {
-    if (persistState) {
-      state.projectPath = projectPath
-      state.activeCampaign = localCampaign.name
-      state.campaigns = state.campaigns ?? {}
-      state.campaigns[key] = {
-        ...state.campaigns[key],
-        campaignId: localCampaign.id,
-        projectPath,
-        baseCommitSha: localCampaign.baseCommitSha,
-        description: localCampaign.description,
-        metricName: localCampaign.metricName,
-        metricUnit: localCampaign.metricUnit,
-        metricDirection: localCampaign.metricDirection,
-        promotionRefName: localCampaign.promotionRefName,
-      }
-      await writeState(root, state)
-    }
-    return {
-      projectPath,
-      campaign: localCampaign,
-      overview: {
-        campaign: localCampaign,
-        summaries: await listLocalSummaries(root, localCampaign.id),
-        knowledge: await listLocalKnowledge(root, localCampaign.id),
-        latestExperiments: [],
-        workers: [],
-        hypotheses: [],
-      },
-    }
-  }
-
   const cached = state.campaigns?.[key]
   if (cached?.campaignId) {
     try {
@@ -1772,12 +1469,6 @@ async function campaignForName(
           promotionRefName: campaign.promotionRefName,
         }
         await writeState(root, state)
-        await cacheLocalCampaign({
-          root,
-          campaign,
-          projectPath,
-          setup: state.campaigns[key]?.setup ?? {},
-        }).catch(() => null)
       }
       return { projectPath, campaign, overview }
     } catch {
@@ -1820,12 +1511,6 @@ async function campaignForName(
       promotionRefName: campaign.promotionRefName,
     }
     await writeState(root, state)
-    await cacheLocalCampaign({
-      root,
-      campaign: overview.campaign,
-      projectPath,
-      setup: state.campaigns[key]?.setup ?? {},
-    }).catch(() => null)
   }
 
   return { projectPath, campaign: overview.campaign, overview }
@@ -2256,7 +1941,6 @@ export async function finalizeHypothesisAttempt({
               hypothesis: hypothesis.id,
               session: sessionId,
               worker: workerId,
-              "defer-sync": "true",
               ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
               ...(measurementError
                 ? { status: "failed", "allow-unmeasured": "true" }
@@ -2277,18 +1961,22 @@ export async function finalizeHypothesisAttempt({
           })
         )
           .then(async (record) => {
-            if (record && "discarded" in record && record.discarded) {
+            if (
+              record &&
+              record.status === "rejected" &&
+              record.acceptedIndex === null
+            ) {
               manifest.finalizationStatus = "discarded_after_completion"
               manifest.salvaged = false
-              manifest.error = `experiment log discarded: ${record.discardReason}`
+              manifest.error = "experiment report rejected by server acceptance state"
               if (activityManifest) {
                 await appendWorkerActivityEvent(activityManifest, {
                   type: "finalization",
                   phase: "discarded",
-                  summary: "Experiment log discarded",
+                  summary: "Experiment report rejected",
                   metadata: {
                     runRef: record.runRef,
-                    discardReason: record.discardReason,
+                    experimentId: record.id,
                   },
                 })
               }
@@ -2624,14 +2312,46 @@ export function createResearchSessionStopChecker({
   sessionId: string
   args: Args
 }) {
-  void args
   return {
-    check({ nowMs = Date.now() }: { nowMs?: number } = {}) {
-      return collectResearchStopReasons({
-        root,
-        sessionId,
-        nowMs,
-      })
+    async check({ nowMs = Date.now() }: { nowMs?: number } = {}) {
+      try {
+        const control = await getResearchSessionControlState(sessionId, args)
+        const reasons: string[] = []
+        const reasonCodes = new Set<ResearchStopReasonCode>()
+        const add = (code: ResearchStopReasonCode, reason: string) =>
+          addResearchStopReason(reasonCodes, reasons, code, reason)
+        if (control.status !== "running") {
+          add(
+            control.progress.terminalReason === "experiment_target_reached" ||
+              control.progress.terminalReason === "deadline_reached" ||
+              control.progress.terminalReason === "stop_requested"
+              ? control.progress.terminalReason
+              : "session_terminal",
+            `session ${control.status}`
+          )
+        }
+        if (
+          control.progress.deadlineAt &&
+          nowMs >= Date.parse(control.progress.deadlineAt)
+        ) {
+          add("deadline_reached", "deadline reached")
+        }
+        if (control.progress.remainingExperimentCount === 0) {
+          add("experiment_target_reached", "experiment target reached")
+        }
+        return {
+          shouldStop: reasons.length > 0,
+          sessionId,
+          reasonCodes: [...reasonCodes],
+          reasons,
+        }
+      } catch {
+        return collectResearchStopReasons({
+          root,
+          sessionId,
+          nowMs,
+        })
+      }
     },
   }
 }
@@ -2647,7 +2367,9 @@ async function harnessShouldStopSession({
 
 async function withWorkerHeartbeat<T>({
   root,
+  args,
   workerId,
+  leaseToken,
   sessionId,
   hypothesisId,
   latestStatePath,
@@ -2660,7 +2382,9 @@ async function withWorkerHeartbeat<T>({
   run,
 }: {
   root: string
+  args: Args
   workerId: string
+  leaseToken?: string
   sessionId: string
   hypothesisId: string
   latestStatePath?: string | null
@@ -2672,6 +2396,7 @@ async function withWorkerHeartbeat<T>({
   heartbeatSampleEveryMs?: number
   run: () => Promise<T>
 }): Promise<T> {
+  void root
   let lastConsoleAt = 0
   let lastSampleAt = Date.now()
   const publishProgress = async (sample: boolean) => {
@@ -2701,9 +2426,8 @@ async function withWorkerHeartbeat<T>({
       }).catch(() => {})
     }
     if (shouldSample) {
-      void recordLocalWorkerHeartbeat({
-        root,
-        workerId,
+      void heartbeatWorker(workerId, {
+        leaseToken,
         status: "running",
         sessionId,
         hypothesisId,
@@ -2711,7 +2435,7 @@ async function withWorkerHeartbeat<T>({
         event: "heartbeat_sampled",
         progressMessage: message,
         metadata: snapshotMetadata,
-      }).catch(() => {})
+      }, args).catch(() => {})
     }
     if (!quiet && now - lastConsoleAt >= consoleEveryMs) {
       lastConsoleAt = now
@@ -2737,10 +2461,6 @@ function errorMessage(error: unknown) {
 
 async function mainWorktreeStatus(root: string) {
   return (await git(["status", "--porcelain"], root)).trim()
-}
-
-function finalizationLoggedExperiment(status: WorkerFinalizationStatus) {
-  return status === "measured_and_logged"
 }
 
 export function finalizationStatusLabel(status: WorkerFinalizationStatus) {
@@ -2882,7 +2602,7 @@ async function runHypothesisOnce({
   startupTimeoutMs,
   stopGraceMs,
   quiet,
-  syncSupervisor,
+  refPushQueue,
   onRegistered,
   args,
 }: {
@@ -2901,11 +2621,12 @@ async function runHypothesisOnce({
   startupTimeoutMs: number
   stopGraceMs: number
   quiet: boolean
-  syncSupervisor: ReturnType<typeof createSyncSupervisor>
+  refPushQueue: ReturnType<typeof createRefPushQueue>
   onRegistered?: (worker: { workerId: string; hypothesisId: string }) => void
   args: Args
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
+  let leaseToken: string | undefined
   let resultCommitSha: string | undefined
   let workerBranch = "unknown"
   let launchManifest: WorkerLaunchManifest | null = null
@@ -2931,21 +2652,27 @@ async function runHypothesisOnce({
 
   try {
     const effectiveAgentKind = workerCommand ? "custom" : agentKind
-    const worker = await registerLocalWorker({
-      root,
-      campaignId: campaign.id,
+    const lease = await acquireResearchWorkerLease(
       sessionId,
-      hypothesisId: hypothesis.id,
-      workerName: `${hypothesis.name}-${effectiveAgentKind}`,
-      agentKind: effectiveAgentKind,
-      runtime: "local",
-      metadata: workerModelMetadata(workerModel),
-    })
+      {
+        siteId: await getResearchSiteId(root),
+        supervisorRunId:
+          process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`,
+        workerName: `${hypothesis.name}-${effectiveAgentKind}`,
+        agentKind: effectiveAgentKind,
+        runtime: "local",
+        leaseSeconds: 180,
+        metadata: workerModelMetadata(workerModel),
+      },
+      args
+    )
+    const worker = lease.worker
+    leaseToken = lease.leaseToken
+    hypothesis = lease.hypothesis
     workerId = worker.id
     onRegistered?.({ workerId: worker.id, hypothesisId: hypothesis.id })
-    await recordLocalWorkerHeartbeat({
-      root,
-      workerId: worker.id,
+    await heartbeatWorker(worker.id, {
+      leaseToken,
       status: "running",
       sessionId,
       hypothesisId: hypothesis.id,
@@ -2953,7 +2680,7 @@ async function runHypothesisOnce({
       event: "hypothesis_started",
       progressMessage: `Preparing ${hypothesis.name} worker preflight`,
       metadata: workerModelMetadata(workerModel),
-    })
+    }, args)
 
     const worktreeInfo = await ensureWorktree({
       root,
@@ -3001,6 +2728,7 @@ async function runHypothesisOnce({
         hypothesisId: hypothesis.id,
         hypothesisName: hypothesis.name,
         workerId: worker.id,
+        workerLeaseToken: leaseToken,
         workerBranch,
         worktreeRoot: worktree,
         projectPath,
@@ -3027,8 +2755,7 @@ async function runHypothesisOnce({
       ONYX_HYPOTHESIS_NAME: hypothesis.name,
       ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
-      ONYX_DEFER_EXP_LOG_SYNC: "1",
-      ONYX_RESEARCH_DB: await researchDbPath(root),
+      ONYX_WORKER_LEASE_TOKEN: leaseToken,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
       ONYX_PROJECT_ROOT: projectRoot,
@@ -3060,9 +2787,8 @@ async function runHypothesisOnce({
       workerModel,
       workerTitle: worker.id,
     })
-    await recordLocalWorkerHeartbeat({
-      root,
-      workerId: worker.id,
+    await heartbeatWorker(worker.id, {
+      leaseToken,
       status: "running",
       sessionId,
       hypothesisId: hypothesis.id,
@@ -3070,7 +2796,7 @@ async function runHypothesisOnce({
       event: "context_ready",
       progressMessage: `Worker context files are ready for ${hypothesis.name}`,
       metadata: workerModelMetadata(workerModel),
-    })
+    }, args)
     const preflight = await preflightWorkerInvocation(invocation, {
       cwd: worktree,
       env: workerRunEnv,
@@ -3156,9 +2882,8 @@ async function runHypothesisOnce({
         void hasWorkerLoggedAttempt({ root, workerId: worker.id })
           .then((hasAttempt) => {
             if (hasAttempt) return
-            return recordLocalWorkerHeartbeat({
-              root,
-              workerId: worker.id,
+            return heartbeatWorker(worker.id, {
+              leaseToken,
               status: "running",
               sessionId,
               hypothesisId: hypothesis.id,
@@ -3169,7 +2894,7 @@ async function runHypothesisOnce({
               metadata: {
                 warningAfterSeconds: Math.round(firstAttemptWarningMs / 1000),
               },
-            })
+            }, args)
           })
           .catch(() => {})
       }, firstAttemptWarningMs)
@@ -3187,7 +2912,9 @@ async function runHypothesisOnce({
     })
     const workerResult = await withWorkerHeartbeat({
       root,
+      args,
       workerId: worker.id,
+      leaseToken,
       sessionId,
       hypothesisId: hypothesis.id,
       latestStatePath:
@@ -3282,9 +3009,8 @@ async function runHypothesisOnce({
       workerResult,
       `Worker process for ${hypothesis.name}`
     )
-    await recordLocalWorkerHeartbeat({
-      root,
-      workerId: worker.id,
+    await heartbeatWorker(worker.id, {
+      leaseToken,
       status: "running",
       sessionId,
       hypothesisId: hypothesis.id,
@@ -3292,7 +3018,7 @@ async function runHypothesisOnce({
       event: "finalization_started",
       progressMessage: `Finalizing ${hypothesis.name} worker output`,
       gitLabel: resultCommitSha ?? null,
-    })
+    }, args)
     if (launchManifest) {
       await appendWorkerActivityEvent(launchManifest, {
         type: "phase_change",
@@ -3311,7 +3037,7 @@ async function runHypothesisOnce({
       activityManifest: launchManifest,
       args,
       workerFailed: Boolean(workerFailure) || stoppedByHarness,
-      pushWorkerBranch: syncSupervisor.pushRef,
+      pushWorkerBranch: refPushQueue.pushRef,
     })
     if (finalization.commitSha) resultCommitSha = finalization.commitSha
     if (launchManifest) {
@@ -3334,12 +3060,6 @@ async function runHypothesisOnce({
         },
       })
     }
-    if (finalizationLoggedExperiment(finalization.finalizationStatus)) {
-      syncSupervisor.request({
-        reason: "worker-finalization",
-        manifest: launchManifest,
-      })
-    }
     if (finalization.rootDriftStatus === "dirty") {
       throw new Error(
         finalization.error ??
@@ -3355,9 +3075,8 @@ async function runHypothesisOnce({
           summary: "Worker stopped after session stop request",
         })
       }
-      await recordLocalWorkerHeartbeat({
-        root,
-        workerId: worker.id,
+      await heartbeatWorker(worker.id, {
+        leaseToken,
         status: "stopped",
         sessionId,
         hypothesisId: hypothesis.id,
@@ -3365,10 +3084,8 @@ async function runHypothesisOnce({
         event: "stop_requested",
         progressMessage: `${hypothesis.name} stopped after session stop request`,
         gitLabel: resultCommitSha,
-      })
-      await upsertLocalSummary({
-        root,
-        campaignId: campaign.id,
+      }, args)
+      await upsertCampaignSummary(campaign.id, {
         sessionId,
         hypothesisId: hypothesis.id,
         authoredByWorkerId: worker.id,
@@ -3395,7 +3112,7 @@ async function runHypothesisOnce({
           resultCommitSha: resultCommitSha ?? null,
           finalization,
         },
-      })
+      }, args)
       await cleanupWorkerRuntimeTempDir()
       return {
         hypothesis,
@@ -3416,9 +3133,8 @@ async function runHypothesisOnce({
       )
     }
 
-    await recordLocalWorkerHeartbeat({
-      root,
-      workerId: worker.id,
+    await heartbeatWorker(worker.id, {
+      leaseToken,
       status: "completed",
       sessionId,
       hypothesisId: hypothesis.id,
@@ -3426,10 +3142,8 @@ async function runHypothesisOnce({
       event: "hypothesis_completed",
       progressMessage: `${hypothesis.name} completed`,
       gitLabel: resultCommitSha,
-    })
-    await upsertLocalSummary({
-      root,
-      campaignId: campaign.id,
+    }, args)
+    await upsertCampaignSummary(campaign.id, {
       sessionId,
       hypothesisId: hypothesis.id,
       authoredByWorkerId: worker.id,
@@ -3456,7 +3170,7 @@ async function runHypothesisOnce({
         resultCommitSha: resultCommitSha ?? null,
         finalization,
       },
-    })
+    }, args)
     await cleanupWorkerRuntimeTempDir()
     return {
       hypothesis,
@@ -3486,9 +3200,8 @@ async function runHypothesisOnce({
             launcher: launchManifest.agentKind,
           }
         : undefined
-      await recordLocalWorkerHeartbeat({
-        root,
-        workerId,
+      await heartbeatWorker(workerId, {
+        leaseToken,
         status: "failed",
         sessionId,
         hypothesisId: hypothesis.id,
@@ -3497,12 +3210,10 @@ async function runHypothesisOnce({
         progressMessage: message.slice(0, 1000),
         gitLabel: resultCommitSha ?? null,
         metadata,
-      }).catch(() => {})
+      }, args).catch(() => {})
     }
     if (workerId) {
-      await upsertLocalSummary({
-        root,
-        campaignId: campaign.id,
+      await upsertCampaignSummary(campaign.id, {
         sessionId,
         hypothesisId: hypothesis.id,
         authoredByWorkerId: workerId,
@@ -3530,7 +3241,7 @@ async function runHypothesisOnce({
           outcome: "failed",
           resultCommitSha: resultCommitSha ?? null,
         },
-      })
+      }, args).catch(() => {})
     }
     await cleanupWorkerRuntimeTempDir()
     return {
@@ -3583,15 +3294,13 @@ export async function commandResearchStart(args: Args) {
       ? null
       : new Date(Date.now() + maxMinutes * 60_000).toISOString()
   const schedulerSiteId = await getResearchSiteId(root)
-  const result = await createLocalSession({
-    root,
-    campaignId: campaign.id,
+  const result = await createCampaignSession(campaign.id, {
     name: args.options.name ?? `research-${new Date().toISOString()}`,
     workerTarget,
     hypotheses,
-    experimentTarget,
-    deadlineAt,
-    schedulerSiteId,
+    ...(experimentTarget === null ? {} : { experimentTarget }),
+    ...(deadlineAt === null ? {} : { deadlineAt }),
+    ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
     metadata: {
       startedBy: "onyx-research",
       experimentTarget,
@@ -3599,7 +3308,13 @@ export async function commandResearchStart(args: Args) {
       agentKind: workerSettings.agentKind,
       ...workerModelMetadata(workerSettings.workerModel),
     },
-  })
+  }, args)
+  await cacheResearchSessionState({
+    root,
+    campaign,
+    session: result.session,
+    hypotheses: result.hypotheses,
+  }).catch(() => {})
   const state = await readState(root)
   const key = campaignStateKey(projectPath, campaign.name)
   state.campaigns = state.campaigns ?? {}
@@ -3627,12 +3342,6 @@ export async function commandResearchStart(args: Args) {
     sessionId: result.session.id,
     message: `${workerTarget} worker slot(s), ${result.hypotheses.length} hypothesis(s)`,
   })
-  if (args.options.offline !== "true") {
-    await flushOutbox(root, args, { quiet: true }).catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-    })
-  }
-
   console.log(`Research session: ${result.session.id}`)
   console.log(`Campaign: ${campaign.name}`)
   console.log(`Workers: 0/${workerTarget}`)
@@ -3717,19 +3426,34 @@ export async function commandResearchHypothesisAdd(args: Args) {
           metadataString(sessionMetadata, "workerModel"),
           { cwd: root }
         )
-  const createdHypothesis = await createLocalHypothesis({
-    root,
-    campaignId: campaign.id,
-    createdBySessionId: sessionId ?? null,
+  const created = await createCampaignHypothesis(campaign.id, {
     plan,
     name: args.options.name,
-    description: args.options.description,
+    description: args.options.description ?? undefined,
     baseCommitSha: args.options.base,
     metadata: {
       createdBy: "onyx-research",
       ...(sessionId ? { createdBySessionId: sessionId } : {}),
     },
-  })
+  }, args)
+  const createdHypothesis = created.hypothesis
+  if (before?.session) {
+    await cacheResearchSessionState({
+      root,
+      campaign,
+      session: before.session,
+      hypotheses: [
+        ...before.hypotheses.filter(
+          (hypothesis) => hypothesis.id !== createdHypothesis.id
+        ),
+        createdHypothesis,
+      ],
+      workers: before.workers,
+      experiments: before.latestExperiments,
+      summaries: before.summaries,
+      knowledge: before.knowledge,
+    }).catch(() => {})
+  }
 
   const maxMinutes =
     typeof sessionMetadata.maxMinutes === "number"
@@ -3765,11 +3489,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
       status: "running",
     }
   }
-  if (args.options.offline !== "true") {
-    await flushOutbox(root, args, { quiet: true }).catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-    })
-  }
   const key = campaignStateKey(projectPath, campaign.name)
   state.campaigns = state.campaigns ?? {}
   state.campaigns[key] = {
@@ -3799,26 +3518,7 @@ export async function commandResearchBrief(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const campaignName =
-    args.options.campaign ??
-    state.activeCampaign ??
-    (await getActiveLocalCampaignName(root))
-  if (!campaignName) {
-    throw new Error(
-      "Pass --campaign <name>, run `onyx campaign use --name <name>`, or sync/start a local campaign first."
-    )
-  }
-
-  const campaign = await localCampaignByName({
-    root,
-    projectPath,
-    name: campaignName,
-  })
-  if (!campaign) {
-    throw new Error(
-      `Local campaign ${campaignName} was not found. Run \`onyx sync\` or start/select a campaign first.`
-    )
-  }
+  const { campaign, overview } = await campaignForName(root, args)
 
   const sessionId =
     args.options.session ??
@@ -3827,21 +3527,24 @@ export async function commandResearchBrief(args: Args) {
       state,
       projectPath,
       campaignName: campaign.name,
-    })
+    }) ??
+    overview.sessions?.find((session) =>
+      ["running", "stop_requested"].includes(session.status)
+    )?.id
+  if (!sessionId) {
+    throw new Error(
+      "Pass --session <id> or start/select a campaign with an active research session."
+    )
+  }
   const hypothesisId =
     args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID ?? undefined
-  const brief = await localResearchBrief({
-    root,
-    campaignId: campaign.id,
-    sessionId,
-    hypothesisId,
-  })
+  const brief = await getResearchSessionBrief(sessionId, args, { hypothesisId })
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(brief, null, 2))
     return
   }
-  console.log(brief.markdown)
+  console.log(renderSessionBrief(brief))
 }
 
 export async function commandResearchStatus(args: Args) {
@@ -3920,8 +3623,6 @@ export async function commandResearchStatus(args: Args) {
     (activeSessionId
       ? Boolean(state.sessions?.[activeSessionId]?.stopRequested)
       : false)
-  const pendingSync = await pendingResearchSyncCount(root).catch(() => 0)
-  const conflicts = await researchSyncConflictCount(root).catch(() => 0)
   const live = activeSessionId
     ? await getResearchSessionLive(activeSessionId, args).catch(() => null)
     : null
@@ -4071,19 +3772,11 @@ export async function commandResearchStatus(args: Args) {
           activeWorkers,
           terminalWorkers,
           ignoredPresence,
-          pendingSync,
           bestExperiment,
           providerBackoff,
           recentFailedLaunches,
           failures: failureSummary,
-          sync: {
-            pendingSync,
-            conflicts,
-            oldestPendingAgeMs: live?.sync?.oldestPendingAgeMs ?? null,
-            lastDurationMs: live?.sync?.lastDurationMs ?? null,
-            lastError: live?.sync?.lastError ?? null,
-            sites: live?.sites ?? [],
-          },
+          sites: live?.sites ?? [],
           finalization: live?.finalization ?? null,
           localUnloggedAttempts: {
             count: localUnloggedAttempts.length,
@@ -4104,15 +3797,8 @@ export async function commandResearchStatus(args: Args) {
   if (activeSessionId) {
     console.log(`session: ${activeSessionId} ${sessionStatus ?? ""}`.trim())
   }
-  console.log(
-    `sync: ${pendingSync} SQLite event(s) pending${
-      conflicts ? `, ${conflicts} conflict(s)` : ""
-    }`
-  )
-  if (live?.sync) {
-    console.log(
-      `sync telemetry: oldestPending=${live.sync.oldestPendingAgeMs ?? "-"}ms lastDuration=${live.sync.lastDurationMs ?? "-"}ms lastError=${live.sync.lastError ?? "-"}`
-    )
+  if (live?.sites?.length) {
+    console.log(`sites: ${live.sites.length} reporting`)
   }
   if (providerBackoff) {
     console.log(`provider backoff: ${JSON.stringify(providerBackoff)}`)
@@ -4304,6 +3990,59 @@ function activeSessionIdFromState({
   return undefined
 }
 
+function renderSessionBrief(brief: ApiSessionBrief) {
+  const lines: string[] = [
+    `# ${brief.campaign.name}`,
+    "",
+    `Session: ${brief.session.id} (${brief.session.status})`,
+    `Accepted: ${brief.session.acceptedExperimentCount}${brief.session.experimentTarget === null ? "" : `/${brief.session.experimentTarget}`}`,
+    `Metric: ${brief.campaign.metricName} (${brief.campaign.metricDirection})`,
+  ]
+  if (brief.hypothesis) {
+    lines.push("", "## Assigned Hypothesis", brief.hypothesis.name)
+    if (brief.hypothesis.description) lines.push(brief.hypothesis.description)
+  }
+  if (brief.bestExperiment) {
+    lines.push(
+      "",
+      "## Best Experiment",
+      `${brief.bestExperiment.name}: ${brief.bestExperiment.primaryMetricName}=${brief.bestExperiment.primaryMetricValue ?? "n/a"} (${brief.bestExperiment.status})`
+    )
+  }
+  if (brief.activeHypotheses.length > 0) {
+    lines.push("", "## Active Hypotheses")
+    for (const hypothesis of brief.activeHypotheses.slice(0, 10)) {
+      lines.push(`- ${hypothesis.name}: ${hypothesis.description ?? ""}`.trim())
+    }
+  }
+  if (brief.latestExperiments.length > 0) {
+    lines.push("", "## Recent Experiments")
+    for (const experiment of brief.latestExperiments.slice(0, 10)) {
+      lines.push(
+        `- ${experiment.name}: ${experiment.primaryMetricName}=${experiment.primaryMetricValue ?? "n/a"} ${experiment.status}`
+      )
+    }
+  }
+  if (brief.summaries.length > 0) {
+    lines.push("", "## Summaries")
+    for (const summary of brief.summaries.slice(0, 8)) {
+      lines.push(`- ${summary.summaryKind}: ${summary.title}`)
+      const preview = summary.body.replace(/\s+/g, " ").trim().slice(0, 240)
+      if (preview) lines.push(`  ${preview}`)
+    }
+  }
+  if (brief.knowledge.length > 0) {
+    lines.push("", "## Knowledge")
+    for (const item of brief.knowledge.slice(0, 12)) {
+      lines.push(`- ${item.kind}: ${item.title}`)
+      const preview = item.body.replace(/\s+/g, " ").trim().slice(0, 240)
+      if (preview) lines.push(`  ${preview}`)
+    }
+  }
+  lines.push("", `Updated: ${brief.updatedAt}`)
+  return lines.join("\n")
+}
+
 function sessionStatusIsTerminal(status: ApiSession["status"]) {
   return status === "completed" || status === "failed" || status === "stopped"
 }
@@ -4317,9 +4056,22 @@ async function readRunSessionState({
   sessionId: string
   args: Args
 }) {
-  return getLocalSessionState(root, sessionId).catch(() =>
-    getResearchSessionState(sessionId, args)
-  )
+  try {
+    const remote = await getResearchSessionState(sessionId, args)
+    await cacheResearchSessionState({
+      root,
+      campaign: remote.campaign,
+      session: remote.session,
+      hypotheses: remote.hypotheses,
+      workers: remote.workers,
+      experiments: remote.latestExperiments,
+      summaries: remote.summaries,
+      knowledge: remote.knowledge,
+    }).catch(() => {})
+    return remote
+  } catch {
+    return getLocalSessionState(root, sessionId)
+  }
 }
 
 async function reconcileCampaignIntoLocalState({
@@ -4374,18 +4126,36 @@ export async function commandResearchShouldStop(args: Args) {
     return
   }
 
-  const result = await collectResearchStopReasons({
-    root,
-    sessionId,
-  })
+  const control = await getResearchSessionControlState(sessionId, args)
+  const reasons: string[] = []
+  const reasonCodes: string[] = []
+  if (control.status !== "running") {
+    reasonCodes.push(
+      control.progress.terminalReason ?? control.status ?? "session_terminal"
+    )
+    reasons.push(`session ${control.status}`)
+  }
+  if (
+    control.progress.deadlineAt &&
+    Date.now() >= Date.parse(control.progress.deadlineAt)
+  ) {
+    reasonCodes.push("deadline_reached")
+    reasons.push("deadline reached")
+  }
+  if (control.progress.remainingExperimentCount === 0) {
+    reasonCodes.push("experiment_target_reached")
+    reasons.push("experiment target reached")
+  }
+  const shouldStop = reasons.length > 0
   if (args.options.json === "true") {
     console.log(
       JSON.stringify(
         {
-          shouldStop: result.shouldStop,
+          shouldStop,
           sessionId,
-          reasonCodes: result.reasonCodes,
-          reasons: result.reasons,
+          reasonCodes,
+          reasons,
+          controlState: control,
         },
         null,
         2
@@ -4393,8 +4163,8 @@ export async function commandResearchShouldStop(args: Args) {
     )
   } else {
     console.log(
-      result.shouldStop
-        ? `stop: ${result.reasons.join(", ")}`
+      shouldStop
+        ? `stop: ${reasons.join(", ")}`
         : `continue: session ${sessionId}`
     )
   }
@@ -4414,6 +4184,11 @@ export async function commandResearchStop(args: Args) {
   if (!sessionId) {
     throw new Error("Pass --session <id> or start a research session first.")
   }
+  if (args.options.offline === "true") {
+    throw new Error(
+      "`--offline` was removed. Research stop is applied directly through the Onyx API."
+    )
+  }
 
   const campaignId =
     state.sessions?.[sessionId]?.campaignId ??
@@ -4430,37 +4205,20 @@ export async function commandResearchStop(args: Args) {
   await writeState(root, state)
 
   if (campaignId) {
-    await stopLocalSession({
-      root,
+    await stopCampaignSession(
       sessionId,
-      status: "stop_requested",
-      terminalReason: "stop_requested",
-      reason: args.options.reason ?? "stop requested",
-    }).catch(() => {})
-    if (args.options.offline !== "true") {
-      await flushOutbox(root, args, { quiet: true }).catch(() => {})
-      await reconcileCampaignIntoLocalState({
-        root,
+      {
         campaignId,
-        projectPath,
-        args,
-      }).catch(() => {})
-      await stopCampaignSession(
-        sessionId,
-        {
-          campaignId,
-          status: "stop_requested",
-          reason: args.options.reason ?? "stop requested",
-        },
-        args
-      ).catch((error) => {
-        console.warn(
-          `Remote stop request skipped: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
-      })
-    }
+        status: "stop_requested",
+        reason: args.options.reason ?? "stop requested",
+      },
+      args
+    )
+  } else {
+    const control = await getResearchSessionControlState(sessionId, args)
+    throw new Error(
+      `Could not resolve campaign id for session ${sessionId} (remote status ${control.status}). Pass --campaign <name>.`
+    )
   }
   await emitEvent(root, {
     type: "session_stopped",
@@ -4477,6 +4235,18 @@ function safeBranchSegment(value: string) {
 
 export async function commandResearchFinish(args: Args) {
   const root = await repoRoot(args.options.cwd)
+  if (
+    args.options.offline === "true" ||
+    args.options["sync-interval"] !== undefined ||
+    args.options["sync-concurrency"] !== undefined ||
+    args.options["sync-drain-batches"] !== undefined ||
+    args.options["sync-batch-size"] !== undefined ||
+    args.options["final-sync-timeout"] !== undefined
+  ) {
+    throw new Error(
+      "Offline and sync finalization flags were removed. Research finish reads and writes directly through the Onyx API."
+    )
+  }
   const campaignInfo = await campaignForName(root, args)
   const { campaign } = campaignInfo
   const state = await readState(root)
@@ -4534,76 +4304,28 @@ export async function commandResearchFinish(args: Args) {
         }).catch(() => {})
       }
     }
-    if (args.options.offline !== "true") {
-      await stopCampaignSession(
-        sessionId,
-        {
-          campaignId: campaign.id,
-          status: "completed",
-          reason: "finalized",
-        },
-        args
-      ).catch((error) => {
-        if (args.options["require-online"] === "true") throw error
-      })
-    }
+    await stopCampaignSession(
+      sessionId,
+      {
+        campaignId: campaign.id,
+        status: "completed",
+        reason: "finalized",
+      },
+      args
+    )
   }
 
-  if (args.options.offline !== "true") {
-    try {
-      const report = await drainFinalSync({
-        root,
-        args,
-        timeoutMs: positiveNumberOption(args, "final-sync-timeout", 120) * 1000,
-      })
-      printFinalSyncReport(report)
-      if (
-        args.options["require-online"] === "true" &&
-        (report.offline || report.pending > 0 || report.conflicts > 0)
-      ) {
-        throw new Error(
-          "Final sync did not acknowledge every pending record before timeout."
-        )
-      }
-    } catch (error) {
-      const [pending, conflicts, pendingEvents, conflictEvents] =
-        await Promise.all([
-          pendingResearchSyncCount(root).catch(() => 0),
-          researchSyncConflictCount(root).catch(() => 0),
-          pendingResearchSyncEvents(root, 20).catch(() => []),
-          listResearchSyncConflicts(root).catch(() => []),
-        ])
-      printFinalSyncReport({
-        accepted: 0,
-        pending,
-        conflicts,
-        offline: false,
-        batches: 0,
-        lastDurationMs: null,
-        lastError: null,
-        firstFailed:
-          conflictEvents[0] ??
-          pendingEvents.find((event) => event.lastError) ??
-          null,
-      })
+  const overview = await reconcileCampaignIntoLocalState({
+    root,
+    campaignId: campaign.id,
+    projectPath: campaignInfo.projectPath,
+    args,
+  })
+    .then(() => getCampaignOverview(campaign.id, args))
+    .catch((error) => {
       if (args.options["require-online"] === "true") throw error
-    }
-  }
-
-  const overview =
-    args.options.offline === "true"
-      ? campaignInfo.overview
-      : await reconcileCampaignIntoLocalState({
-          root,
-          campaignId: campaign.id,
-          projectPath: campaignInfo.projectPath,
-          args,
-        })
-          .then(() => getCampaignOverview(campaign.id, args))
-          .catch((error) => {
-            if (args.options["require-online"] === "true") throw error
-            return campaignInfo.overview
-          })
+      return campaignInfo.overview
+    })
 
   const branches: string[] = []
   const campaignSegment = safeBranchSegment(campaign.name)
@@ -4655,32 +4377,14 @@ export async function commandResearchFinish(args: Args) {
       ? branches.map((branch) => `- ${branch}`)
       : ["- none"]),
   ].join("\n")
-  await upsertLocalSummary({
-    root,
-    campaignId: campaign.id,
+  await upsertCampaignSummary(campaign.id, {
     sessionId,
     summaryKind: "campaign_brief",
     title: `${campaign.name} final results`,
     body,
-  }).catch((error) => {
-    if (args.options["require-online"] === "true") throw error
-  })
-  if (args.options.offline !== "true") {
-    const report = await drainFinalSync({
-      root,
-      args,
-      timeoutMs: positiveNumberOption(args, "final-sync-timeout", 120) * 1000,
-    })
-    printFinalSyncReport(report)
-    if (
-      args.options["require-online"] === "true" &&
-      (report.offline || report.pending > 0 || report.conflicts > 0)
-    ) {
-      throw new Error(
-        "Final summary sync did not acknowledge every pending record before timeout."
-      )
-    }
-  }
+    isCurrent: true,
+    metadata: { authoredBy: "onyx-research-finish" },
+  }, args)
   console.log(body)
 }
 
@@ -4703,25 +4407,24 @@ export async function commandSummaryUpsert(args: Args) {
     args.options.worker ?? process.env.ONYX_WORKER_ID,
     "--worker"
   )
-  await upsertLocalSummary({
-    root,
-    campaignId: campaign.id,
+  if (args.options.sync === "true" || args.options.offline === "true") {
+    throw new Error(
+      "`--sync` and `--offline` were removed. Summaries are written directly to the Onyx API."
+    )
+  }
+  const summary = await upsertCampaignSummary(campaign.id, {
     sessionId,
     hypothesisId,
     authoredByWorkerId,
     summaryKind: kind,
     title,
     body,
-  })
-  if (
-    args.options.offline !== "true" &&
-    (args.options["require-online"] === "true" || args.options.sync === "true")
-  ) {
-    await flushOutbox(root, args, { quiet: true }).catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-    })
+  }, args)
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(summary, null, 2))
+    return
   }
-  console.log(`Updated ${kind} for ${campaign.name}`)
+  console.log(`Updated ${summary.summaryKind} for ${campaign.name}`)
 }
 
 function summaryScope(summary: ApiSummary) {
@@ -4741,12 +4444,14 @@ export async function commandSummaryList(args: Args) {
     ? summaryKindOption(args, "hypothesis_summary")
     : null
   const limit = positiveIntegerOption(args, "limit", 20)
-  let sourceSummaries = await listLocalSummaries(root, campaign.id)
-  if (sourceSummaries.length === 0 && args.options.offline !== "true") {
-    sourceSummaries = await getCampaignOverview(campaign.id, args)
-      .then((overview) => overview.summaries)
-      .catch(() => sourceSummaries)
+  if (args.options.offline === "true") {
+    throw new Error(
+      "`--offline` was removed. Summaries are read directly from the Onyx API."
+    )
   }
+  const sourceSummaries = await getCampaignOverview(campaign.id, args).then(
+    (overview) => overview.summaries
+  )
   const matchingSummaries = sourceSummaries.filter(
     (summary) => !kind || summary.summaryKind === kind
   )
@@ -4806,9 +4511,12 @@ export async function commandKnowledgeAdd(args: Args) {
   if (!title) throw new Error("Pass --title <text>.")
   if (!body) throw new Error("Pass --body <text>.")
 
-  await createLocalKnowledge({
-    root,
-    campaignId: campaign.id,
+  if (args.options.sync === "true" || args.options.offline === "true") {
+    throw new Error(
+      "`--sync` and `--offline` were removed. Knowledge is written directly to the Onyx API."
+    )
+  }
+  const item = await createCampaignKnowledge(campaign.id, {
     sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
     hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
     authoredByWorkerId:
@@ -4820,26 +4528,24 @@ export async function commandKnowledgeAdd(args: Args) {
       args.options.confidence === undefined
         ? undefined
         : Number(args.options.confidence),
-  })
-  if (
-    args.options.offline !== "true" &&
-    (args.options["require-online"] === "true" || args.options.sync === "true")
-  ) {
-    await flushOutbox(root, args, { quiet: true }).catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-    })
+  }, args)
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(item, null, 2))
+    return
   }
-  console.log(`Added ${kind} knowledge for ${campaign.name}`)
+  console.log(`Added ${item.kind} knowledge for ${campaign.name}`)
 }
 
 export async function commandKnowledgeList(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const { campaign } = await campaignForName(root, args)
   const limit = positiveIntegerOption(args, "limit", 50)
-  const knowledge = (await listLocalKnowledge(root, campaign.id)).slice(
-    0,
-    limit
-  )
+  if (args.options.offline === "true") {
+    throw new Error(
+      "`--offline` was removed. Knowledge is read directly from the Onyx API."
+    )
+  }
+  const knowledge = (await listCampaignKnowledge(campaign.id, args)).slice(0, limit)
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(knowledge, null, 2))
@@ -5384,7 +5090,17 @@ export async function commandResearchRun(args: Args) {
     nonnegativeNumberOption(args, "startup-timeout", 90) * 1000
   const stopGraceMs =
     nonnegativeNumberOption(args, "stop-grace-seconds", 30) * 1000
-  const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
+  if (
+    args.options["sync-interval"] !== undefined ||
+    args.options["sync-concurrency"] !== undefined ||
+    args.options["sync-drain-batches"] !== undefined ||
+    args.options["sync-batch-size"] !== undefined ||
+    args.options["final-sync-timeout"] !== undefined
+  ) {
+    throw new Error(
+      "Sync tuning flags were removed. Workers now push refs and report directly to the Onyx API."
+    )
+  }
   const presenceIntervalMs =
     positiveNumberOption(
       args,
@@ -5408,22 +5124,20 @@ export async function commandResearchRun(args: Args) {
   }
   const providerBackoffMs =
     positiveNumberOption(args, "provider-backoff-seconds", 30) * 1000
-  const finalSyncTimeoutMs =
-    positiveNumberOption(args, "final-sync-timeout", 120) * 1000
+  const finalRefPushTimeoutMs =
+    positiveNumberOption(args, "final-ref-push-timeout", 120) * 1000
 
   let sessionId = requestedSessionId
   let schedulerSiteId = sessionState?.session.schedulerSiteId ?? null
   if (!sessionId) {
     schedulerSiteId = await getResearchSiteId(root)
-    const result = await createLocalSession({
-      root,
-      campaignId: campaign.id,
+    const result = await createCampaignSession(campaign.id, {
       name: args.options.name ?? `research-${new Date().toISOString()}`,
       workerTarget,
       hypotheses,
-      experimentTarget,
-      deadlineAt,
-      schedulerSiteId,
+      ...(experimentTarget === null ? {} : { experimentTarget }),
+      ...(deadlineAt === null ? {} : { deadlineAt }),
+      ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
       metadata: {
         startedBy: "onyx-research-supervisor",
         experimentTarget,
@@ -5434,10 +5148,15 @@ export async function commandResearchRun(args: Args) {
         launchBatchSize,
         launchIntervalSeconds: launchIntervalMs / 1000,
         presenceIntervalSeconds: presenceIntervalMs / 1000,
-        syncIntervalSeconds: syncIntervalMs / 1000,
       },
-    })
+    }, args)
     sessionId = result.session.id
+    await cacheResearchSessionState({
+      root,
+      campaign,
+      session: result.session,
+      hypotheses: result.hypotheses,
+    }).catch(() => {})
   }
 
   const nextState = await readState(root)
@@ -5489,19 +5208,14 @@ export async function commandResearchRun(args: Args) {
     return
   }
 
-  const syncSupervisor = createSyncSupervisor({
-    root,
-    args,
-    intervalMs: syncIntervalMs,
-  })
+  const refPushQueue = createRefPushQueue({ args })
   try {
-    await waitForStartupSessionSync({
+    await waitForStartupSessionReady({
       args,
       sessionId,
-      syncSupervisor,
     })
   } catch (error) {
-    const reason = `startup session sync failed: ${errorMessage(error)}`
+    const reason = `startup session readiness failed: ${errorMessage(error)}`
     await stopLocalSession({
       root,
       sessionId,
@@ -5514,11 +5228,7 @@ export async function commandResearchRun(args: Args) {
         finalizationReasons: [reason],
       },
     }).catch(() => {})
-    await syncSupervisor
-      .drain(Math.min(finalSyncTimeoutMs, 30_000))
-      .catch(() => {
-        syncSupervisor.stop()
-      })
+    refPushQueue.stop()
     throw new Error(reason)
   }
   const presenceSupervisor = createPresenceSupervisor({
@@ -5526,8 +5236,6 @@ export async function commandResearchRun(args: Args) {
     args,
     sessionId,
     intervalMs: presenceIntervalMs,
-    syncQueueDepth: syncSupervisor.depth,
-    syncTelemetry: syncSupervisor.telemetry,
   })
   presenceSupervisor.request()
 
@@ -5619,7 +5327,6 @@ export async function commandResearchRun(args: Args) {
     }`
   )
   console.log(`Presence: every ${presenceIntervalMs / 1000}s`)
-  console.log(`Sync: every ${syncIntervalMs / 1000}s`)
 
   let supervisorLoopCompleted = false
   try {
@@ -5753,7 +5460,7 @@ export async function commandResearchRun(args: Args) {
           startupTimeoutMs,
           stopGraceMs,
           quiet: args.options.quiet === "true",
-          syncSupervisor,
+          refPushQueue,
           args,
         })
           .then(async (result) => {
@@ -5765,8 +5472,8 @@ export async function commandResearchRun(args: Args) {
                 sessionId,
                 hypothesisId: result.hypothesis.id,
                 phase: result.status,
-                event: "final_sync_started",
-                progressMessage: `Final sync queued after ${result.hypothesis.name}`,
+                event: "worker_finished",
+                progressMessage: `Worker finished ${result.hypothesis.name}`,
                 gitLabel: result.resultCommitSha ?? null,
               }).catch(() => {})
             }
@@ -5886,7 +5593,6 @@ export async function commandResearchRun(args: Args) {
               force: true,
               activeProcessCount: activeRuns.size,
             })
-            syncSupervisor.request({ reason: "worker-finished" })
             presenceSupervisor.request()
           })
         activeRuns.set(runKey, run)
@@ -5928,7 +5634,7 @@ export async function commandResearchRun(args: Args) {
   } finally {
     presenceSupervisor.request()
     await presenceSupervisor.stop()
-    if (!supervisorLoopCompleted) syncSupervisor.stop()
+    if (!supervisorLoopCompleted) refPushQueue.stop()
   }
 
   const finalState = await readState(root)
@@ -5979,18 +5685,10 @@ export async function commandResearchRun(args: Args) {
         : "research run completed",
     metadata: initialTerminalMetadata,
   }).catch(() => {})
-  await syncSupervisor.drain(finalSyncTimeoutMs)
-  const preFinalizationSync = await drainFinalSync({
-    root,
-    args,
-    timeoutMs: finalSyncTimeoutMs,
-  })
-  printFinalSyncReport(preFinalizationSync)
+  await refPushQueue.drain(finalRefPushTimeoutMs)
   const finalization = await computeSessionFinalizationStatus({
     root,
     sessionId,
-    pendingSyncCount: preFinalizationSync.pending,
-    requireOnline: args.options["require-online"] === "true",
   })
   if (finalization.reasons.length > 0) {
     console.warn(
@@ -6036,55 +5734,7 @@ export async function commandResearchRun(args: Args) {
       finalizationReasons: finalization.reasons,
     },
   }).catch(() => {})
-  const finalSync = await drainFinalSync({
-    root,
-    args,
-    timeoutMs: finalSyncTimeoutMs,
-  })
-  printFinalSyncReport(finalSync)
-  let reportedFinalizationStatus = finalization.status
-  const finalSyncHasDebt =
-    finalSync.pending > 0 || finalSync.conflicts > 0 || finalSync.offline
-  if (
-    finalSyncHasDebt &&
-    (reportedFinalizationStatus === "complete" ||
-      args.options["require-online"] === "true")
-  ) {
-    reportedFinalizationStatus =
-      args.options["require-online"] === "true" ? "failed" : "incomplete"
-    const adjustedState = await readState(root)
-    adjustedState.sessions = adjustedState.sessions ?? {}
-    adjustedState.sessions[sessionId] = {
-      ...(adjustedState.sessions[sessionId] ?? {}),
-      finalizationStatus: reportedFinalizationStatus,
-    }
-    await writeState(root, adjustedState)
-    if (reportedFinalizationStatus === "failed") {
-      finalStatus = "failed"
-      terminalReason = "failed"
-    }
-    await stopLocalSession({
-      root,
-      sessionId,
-      status: finalStatus,
-      finalizationStatus: reportedFinalizationStatus,
-      terminalReason,
-      reason:
-        args.options["require-online"] === "true"
-          ? "final session sync failed with --require-online"
-          : "final session sync remains pending",
-      metadata: {
-        terminalReason,
-        providerFailure: providerTerminalFailure,
-        finalizationReasons: [
-          ...finalization.reasons,
-          args.options["require-online"] === "true"
-            ? "final session sync failed with --require-online"
-            : "final session sync remains pending",
-        ],
-      },
-    }).catch(() => {})
-  }
+  const reportedFinalizationStatus = finalization.status
   const completionLive = await getResearchSessionLive(sessionId, args).catch(
     () => null
   )
@@ -6124,7 +5774,7 @@ export async function commandResearchRun(args: Args) {
     `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
   )
   console.log(
-    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount} pendingSync=${finalSync.pending}.`
+    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount}.`
   )
 }
 
@@ -6219,14 +5869,20 @@ export async function commandWorkerRun(args: Args) {
     nonnegativeNumberOption(args, "startup-timeout", 90) * 1000
   const stopGraceMs =
     nonnegativeNumberOption(args, "stop-grace-seconds", 30) * 1000
-  const syncIntervalMs = positiveNumberOption(args, "sync-interval", 5) * 1000
-  const finalSyncTimeoutMs =
-    positiveNumberOption(args, "final-sync-timeout", 120) * 1000
-  const syncSupervisor = createSyncSupervisor({
-    root,
-    args,
-    intervalMs: syncIntervalMs,
-  })
+  if (
+    args.options["sync-interval"] !== undefined ||
+    args.options["sync-concurrency"] !== undefined ||
+    args.options["sync-drain-batches"] !== undefined ||
+    args.options["sync-batch-size"] !== undefined ||
+    args.options["final-sync-timeout"] !== undefined
+  ) {
+    throw new Error(
+      "Sync tuning flags were removed. Workers now push refs and report directly to the Onyx API."
+    )
+  }
+  const finalRefPushTimeoutMs =
+    positiveNumberOption(args, "final-ref-push-timeout", 120) * 1000
+  const refPushQueue = createRefPushQueue({ args })
 
   const result = await runHypothesisOnce({
     root,
@@ -6250,7 +5906,7 @@ export async function commandWorkerRun(args: Args) {
     startupTimeoutMs,
     stopGraceMs,
     quiet: args.options.quiet === "true",
-    syncSupervisor,
+    refPushQueue,
     args,
   })
   if (result.workerId) {
@@ -6260,19 +5916,19 @@ export async function commandWorkerRun(args: Args) {
       status: result.status,
       sessionId,
       hypothesisId: hypothesis.id,
-      phase: "syncing",
-      event: "final_sync_started",
-      progressMessage: `Draining final sync for ${hypothesis.name}`,
+      phase: result.status,
+      event: "worker_finished",
+      progressMessage: `Worker finished ${hypothesis.name}`,
       gitLabel: result.resultCommitSha ?? null,
     }).catch(() => {})
   }
-  const pending = await syncSupervisor.drain(finalSyncTimeoutMs)
+  const pendingRefPushes = await refPushQueue.drain(finalRefPushTimeoutMs)
   if (result.status === "failed") {
     throw new Error(
       `Worker failed for ${hypothesis.name}: ${result.error ?? "unknown error"}`
     )
   }
   console.log(
-    `Worker ${result.status} ${hypothesis.name} at ${result.resultCommitSha ?? "unknown"}; ${pending} sync record(s) pending.`
+    `Worker ${result.status} ${hypothesis.name} at ${result.resultCommitSha ?? "unknown"}; ${pendingRefPushes} ref push(es) pending.`
   )
 }

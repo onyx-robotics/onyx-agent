@@ -26,14 +26,14 @@ const checksSchema = z.object({
   outputSummary: z.string().trim().max(4000).nullable().optional(),
 })
 
-export const localResearchSyncMetadataSchema = z.object({
+export const localResearchRemoteMetadataSchema = z.object({
   projectId: z.uuid().optional(),
   campaignId: z.uuid().optional(),
   experimentId: z.uuid().optional(),
   workerId: z.uuid().optional(),
   hypothesisId: z.uuid().optional(),
   sessionId: z.uuid().optional(),
-  syncedAt: z.iso.datetime().optional(),
+  reportedAt: z.iso.datetime().optional(),
 })
 
 export const localResearchCampaignStartedRecordSchema = z.object({
@@ -50,7 +50,7 @@ export const localResearchCampaignStartedRecordSchema = z.object({
   metricDirection: researchMetricDirectionSchema,
   humanFeedback: z.string().trim().max(4000).nullable().optional(),
   promotionRefName: z.string().trim().min(1).max(300).nullable().optional(),
-  sync: localResearchSyncMetadataSchema.optional(),
+  remote: localResearchRemoteMetadataSchema.optional(),
 })
 
 export const localResearchCampaignExperimentLoggedRecordSchema = z.object({
@@ -85,7 +85,7 @@ export const localResearchCampaignExperimentLoggedRecordSchema = z.object({
   sessionId: z.uuid().optional(),
   workerId: z.uuid().optional(),
   hypothesisId: z.uuid().optional(),
-  sync: localResearchSyncMetadataSchema.optional(),
+  remote: localResearchRemoteMetadataSchema.optional(),
 })
 
 export const localResearchRecordSchema = z.union([
@@ -96,9 +96,9 @@ export const localResearchRecordSchema = z.union([
 export const localResearchJsonlSchema = z.array(localResearchRecordSchema)
 
 /**
- * One experiment in `.git/onyx/history.jsonl`, the permanent offline cache of
- * campaign research history. The Onyx API remains the source of truth; this
- * cache is keyed by runRef and rewritten from the API on `onyx sync`.
+ * One experiment in a local runtime history export. The Onyx API remains the
+ * source of truth; this cache is keyed by runRef and refreshed from direct API
+ * reads.
  */
 export const localResearchHistoryRecordSchema = z.object({
   schemaVersion: z.literal(1),
@@ -173,8 +173,8 @@ export const localResearchEventSchema = z.object({
   message: z.string().max(1000).optional(),
 })
 
-export type LocalResearchSyncMetadata = z.infer<
-  typeof localResearchSyncMetadataSchema
+export type LocalResearchRemoteMetadata = z.infer<
+  typeof localResearchRemoteMetadataSchema
 >
 export type LocalResearchCampaignStartedRecord = z.infer<
   typeof localResearchCampaignStartedRecordSchema

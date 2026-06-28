@@ -603,10 +603,6 @@ export async function preflightWorkerInvocation(
       name: "onyx-worker summary upsert help",
       args: ["summary", "upsert", "--help"],
     },
-    {
-      name: "onyx-worker sync status help",
-      args: ["sync", "status", "--help"],
-    },
   ]) {
     await runCheck(probe.name, "onyx-worker", probe.args)
   }

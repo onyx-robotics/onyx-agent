@@ -12,6 +12,7 @@ export type WorkerRuntimeContext = {
   hypothesisId: string
   hypothesisName: string
   workerId: string
+  workerLeaseToken: string
   workerBranch: string
   worktreeRoot: string
   projectPath: string
@@ -51,6 +52,7 @@ export async function readWorkerRuntimeContext() {
     hypothesisId: stringField(record, "hypothesisId") ?? "",
     hypothesisName: stringField(record, "hypothesisName") ?? "",
     workerId: stringField(record, "workerId") ?? "",
+    workerLeaseToken: stringField(record, "workerLeaseToken") ?? "",
     workerBranch: stringField(record, "workerBranch") ?? "",
     worktreeRoot: stringField(record, "worktreeRoot") ?? "",
     projectPath: stringField(record, "projectPath") ?? "",

@@ -8,13 +8,11 @@ import {
 } from "../protocol"
 
 import {
-  getProjectDeletions,
   listCampaignExperiments,
   listProjectCampaigns,
   resolveProject,
   type ApiCampaign,
   type ApiCampaignExperiment,
-  type ApiProjectDeletions,
 } from "./api"
 import type { Args } from "./args"
 import { isHistoryRecordDeleted } from "./deletions"
@@ -104,11 +102,11 @@ export function experimentRecordToHistory(
     startedAt: record.startedAt ?? null,
     completedAt: record.completedAt ?? null,
     createdAt: record.createdAt,
-    campaignId: record.sync?.campaignId,
-    experimentId: record.sync?.experimentId,
-    sessionId: record.sessionId ?? record.sync?.sessionId,
-    workerId: record.workerId ?? record.sync?.workerId,
-    hypothesisId: record.hypothesisId ?? record.sync?.hypothesisId,
+    campaignId: record.remote?.campaignId,
+    experimentId: record.remote?.experimentId,
+    sessionId: record.sessionId ?? record.remote?.sessionId,
+    workerId: record.workerId ?? record.remote?.workerId,
+    hypothesisId: record.hypothesisId ?? record.remote?.hypothesisId,
   }
 }
 
@@ -215,12 +213,7 @@ export async function hydrateHistoryFromApi(
   const state = await readState(root)
   const projectId = state.projectId ?? (await resolveProject(root, args)).id
   const campaigns = await listProjectCampaigns(projectId, args)
-  let deletions: ApiProjectDeletions | null = null
-  try {
-    deletions = await getProjectDeletions(projectId, args)
-  } catch {
-    deletions = null
-  }
+  const deletions = null
 
   const canonical: LocalResearchHistoryRecord[] = []
   for (const campaign of campaigns) {

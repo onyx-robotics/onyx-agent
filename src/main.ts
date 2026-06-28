@@ -53,7 +53,7 @@ Usage:
   onyx profile worker get [profile]
   onyx profile worker set [profile] --agent codex|claude|opencode [--model <model>]
   onyx profile worker clear [profile] (--all | --agent | --model codex|claude|opencode)
-  onyx campaign setup --name <name> [--description <text>] [--project-path <path>] [--offline] [--require-online]
+  onyx campaign setup --name <name> [--description <text>] [--project-path <path>]
       (creates a campaign and draft setup; each measured experiment is pushed
       as an immutable refs/onyx/experiments/* ref; setup comes from onyx/setup.json)
   onyx tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
@@ -65,19 +65,19 @@ Usage:
   onyx campaign delete --name <name> [--project-path <path>]
   onyx research start --campaign <name> [--workers <n>] [--agent codex|claude|opencode] [--model <model>] [--hypotheses <json-array>] (--experiments <n> | --max-minutes <n>)
       (creates an async research session and prints low-level worker launch commands)
-  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--launch-batch-size <n>] [--launch-interval-seconds <n>] [--provider-backoff-seconds <n>] [--heartbeat-sample-interval <seconds>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--experiments <n>] [--max-minutes <n>] [--sync-interval <seconds>] [--sync-batch-size <1..100>] [--sync-drain-batches <n>] [--presence-interval <seconds>] [--final-sync-timeout <seconds>] [--foreground] [--json]
+  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--launch-batch-size <n>] [--launch-interval-seconds <n>] [--provider-backoff-seconds <n>] [--heartbeat-sample-interval <seconds>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--experiments <n>] [--max-minutes <n>] [--presence-interval <seconds>] [--foreground] [--json]
       (starts the local supervisor detached by default; use --foreground to attach)
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude|opencode]
-  onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--sync-interval <seconds>] [--final-sync-timeout <seconds>] [--quiet]
+  onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--quiet]
   onyx research should-stop [--session <id>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
-  onyx research finish [--campaign <name>] [--session <id>] [--final-sync-timeout <seconds>] [--require-online]
+  onyx research finish [--campaign <name>] [--session <id>] [--require-online]
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
-  onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text> [--sync] [--require-online]
+  onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text> [--require-online]
   onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
-  onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--sync] [--require-online]
+  onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--require-online]
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
@@ -85,13 +85,6 @@ Usage:
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
   onyx status [--json]
-  onyx push
-  onyx sync [--watch] [--interval <seconds>] [--sync-batch-size <1..100>] [--project <id>] [--repository-url <url>] [--project-path <path>] [--offline] [--require-online]
-  onyx sync status
-  onyx sync conflicts [--json]
-  onyx sync retry
-  onyx sync export [--campaign <name>]
-  onyx sync doctor
 
 Worker primitives are exposed through the separate worker-safe entrypoint:
   onyx-worker research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
@@ -99,20 +92,16 @@ Worker primitives are exposed through the separate worker-safe entrypoint:
   onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next]
   onyx-worker exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>]
   onyx-worker tools run <name> [args...]
-  onyx-worker sync status
 
-Results and research control-plane state are logged locally first in
-.git/onyx/research.db. \`onyx push\`, \`onyx sync\`, \`onyx sync --watch\`, and
-workers push immutable experiment refs and flush SQLite sync events. Pass
-\`--offline\` to suppress network attempts, or \`--require-online\` when a command
-must fail unless the app acknowledges the local events. \`onyx exp list\`
-searches the local SQLite projection offline; \`onyx listen\` is a live
-read-only view of the current repo's research session.
+Research control-plane state is remote-first through /api/v1. Local files under
+.git/onyx/ hold runtime logs, workflow runs, attempt manifests, resource locks,
+and convenience state only. Workers push immutable experiment refs before
+reporting results; \`onyx exp list\`, \`onyx research status\`, summaries, and
+knowledge read from the remote API.
 
 Env:
   ONYX_API_KEY   overrides the selected profile API key
   ONYX_API_URL   overrides the selected profile API URL
-  ONYX_RESEARCH_DB overrides the local SQLite research ledger path
   Profiles may store a key locally or read it from apiKeyEnv
 `
 

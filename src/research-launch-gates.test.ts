@@ -6,7 +6,7 @@ import {
   minimumUsefulLaunchMs,
   providerBackoffDelayMs,
   providerBackoffReasonForResult,
-  waitForStartupSessionSync,
+  waitForStartupSessionReady,
 } from "./commands/research"
 
 describe("research supervisor launch gates", () => {
@@ -144,12 +144,10 @@ describe("research supervisor launch gates", () => {
     expect(summary.length).toBeLessThanOrEqual(500)
   })
 
-  test("startup sync must confirm remote control state before launching", async () => {
+  test("startup readiness must confirm remote control state before launching", async () => {
     const originalFetch = globalThis.fetch
     const previousApiUrl = process.env.ONYX_API_URL
     const previousApiKey = process.env.ONYX_API_KEY
-    let requested = false
-    let waited = false
     process.env.ONYX_API_URL = "https://api.onyx.test"
     process.env.ONYX_API_KEY = "test-key"
     globalThis.fetch = (async () =>
@@ -160,24 +158,12 @@ describe("research supervisor launch gates", () => {
 
     try {
       await expect(
-        waitForStartupSessionSync({
+        waitForStartupSessionReady({
           args: { positional: [], options: {} },
           sessionId: "11111111-1111-4111-8111-111111111111",
           timeoutMs: 20,
-          syncSupervisor: {
-            request(job) {
-              requested = job?.reason === "startup"
-              return 1
-            },
-            async waitForIdle() {
-              waited = true
-              return 0
-            },
-          },
         })
-      ).rejects.toThrow("Startup session sync was not confirmed")
-      expect(requested).toBe(true)
-      expect(waited).toBe(true)
+      ).rejects.toThrow("Startup session was not readable")
     } finally {
       globalThis.fetch = originalFetch
       if (previousApiUrl === undefined) delete process.env.ONYX_API_URL

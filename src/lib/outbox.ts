@@ -170,15 +170,11 @@ export async function outboxPath(root: string) {
 }
 
 export async function outboxSpoolDir(root: string) {
-  const dir = join(await onyxStateDir(root), "outbox.d", "pending")
-  await mkdir(dir, { recursive: true })
-  return dir
+  return join(await onyxStateDir(root), "outbox.d", "pending")
 }
 
 export async function outboxConflictDir(root: string) {
-  const dir = join(await onyxStateDir(root), "outbox.d", "conflicts")
-  await mkdir(dir, { recursive: true })
-  return dir
+  return join(await onyxStateDir(root), "outbox.d", "conflicts")
 }
 
 export async function statePath(root: string) {
@@ -271,125 +267,54 @@ export function clientRunRef(campaignName: string) {
 }
 
 export async function appendOutbox(root: string, record: LocalResearchRecord) {
-  const validated = localResearchRecordSchema.parse(record)
-  const dir = await outboxSpoolDir(root)
-  const name = `${Date.now()}-${process.pid}-${randomUUID()}.json`
-  const path = join(dir, name)
-  const tmp = uniqueTempPath(path)
-  await writeFile(tmp, `${JSON.stringify(validated)}\n`, "utf8")
-  await rename(tmp, path)
+  localResearchRecordSchema.parse(record)
+  await rm(await outboxPath(root), { force: true }).catch(() => {})
+  await rm(join(await onyxStateDir(root), "outbox.d"), {
+    recursive: true,
+    force: true,
+  }).catch(() => {})
 }
 
 export async function quarantineOutboxRecord(
-  root: string,
+  _root: string,
   record: LocalResearchRecord,
-  reason: string
+  _reason: string
 ) {
-  const dir = await outboxConflictDir(root)
-  const name = `${Date.now()}-${process.pid}-${randomUUID()}.json`
-  const path = join(dir, name)
-  const tmp = uniqueTempPath(path)
-  await writeFile(
-    tmp,
-    `${JSON.stringify({ reason, record }, null, 2)}\n`,
-    "utf8"
-  )
-  await rename(tmp, path)
+  void _root
+  void _reason
+  localResearchRecordSchema.parse(record)
 }
 
-export async function readOutboxConflictCount(root: string) {
-  const files = await readdir(await outboxConflictDir(root)).catch(() => [])
-  return files.filter((file) => file.endsWith(".json")).length
+export async function readOutboxConflictCount(_root: string) {
+  void _root
+  return 0
 }
 
-/**
- * Reads queued records. Corrupt or partially-written lines are skipped and
- * counted rather than thrown, so a crash mid-append never wedges the outbox.
- */
 export async function readOutbox(
-  root: string
+  _root: string
 ): Promise<{ records: LocalResearchRecord[]; corrupt: number }> {
-  const records: LocalResearchRecord[] = []
-  let corrupt = 0
-
-  let text = ""
-  try {
-    text = await readFile(await outboxPath(root), "utf8")
-  } catch {
-    text = ""
-  }
-
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(trimmed)
-    } catch {
-      corrupt += 1
-      continue
-    }
-    const result = localResearchRecordSchema.safeParse(parsed)
-    if (result.success) {
-      records.push(result.data)
-    } else {
-      corrupt += 1
-    }
-  }
-
-  let files: string[] = []
-  try {
-    files = await readdir(await outboxSpoolDir(root))
-  } catch {
-    files = []
-  }
-
-  for (const file of files.sort()) {
-    if (!file.endsWith(".json")) continue
-    try {
-      const parsed = JSON.parse(
-        await readFile(join(await outboxSpoolDir(root), file), "utf8")
-      )
-      const result = localResearchRecordSchema.safeParse(parsed)
-      if (result.success) {
-        records.push(result.data)
-      } else {
-        corrupt += 1
-      }
-    } catch {
-      corrupt += 1
-    }
-  }
-
-  return { records, corrupt }
+  void _root
+  return { records: [], corrupt: 0 }
 }
 
-/** Atomically replaces the offline queue with the still-pending records. */
 export async function rewriteOutbox(
   root: string,
-  records: LocalResearchRecord[]
+  _records: LocalResearchRecord[]
 ) {
-  await withOnyxLock(root, "outbox", () => rewriteOutboxUnlocked(root, records))
+  void _records
+  await withOnyxLock(root, "outbox", () => rewriteOutboxUnlocked(root, []))
 }
 
 export async function rewriteOutboxUnlocked(
   root: string,
-  records: LocalResearchRecord[]
+  _records: LocalResearchRecord[]
 ) {
-  const legacyPath = await outboxPath(root)
-  await unlink(legacyPath).catch(() => {})
-
-  const spool = await outboxSpoolDir(root)
-  const files = await readdir(spool).catch(() => [])
-  await Promise.all(
-    files
-      .filter((file) => file.endsWith(".json"))
-      .map((file) => unlink(join(spool, file)).catch(() => {}))
-  )
-
-  for (const record of records) {
-    await appendOutbox(root, record)
-  }
+  void _records
+  await unlink(await outboxPath(root)).catch(() => {})
+  await rm(join(await onyxStateDir(root), "outbox.d"), {
+    recursive: true,
+    force: true,
+  }).catch(() => {})
 }
 
 export async function readState(root: string): Promise<CliState> {

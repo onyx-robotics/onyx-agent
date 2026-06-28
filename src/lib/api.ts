@@ -123,6 +123,10 @@ export type ApiWorker = {
   phase: string | null
   progressMessage: string | null
   gitLabel: string | null
+  siteId?: string | null
+  supervisorRunId?: string | null
+  leaseExpiresAt?: string | null
+  leaseReleasedAt?: string | null
   lastSeenAt: string
   startedAt: string
   metadata: Record<string, unknown>
@@ -230,11 +234,6 @@ export type ApiSessionLive = {
     terminalReason: ApiSession["terminalReason"]
     warning?: string | null
   }
-  sync?: {
-    oldestPendingAgeMs: number | null
-    lastDurationMs: number | null
-    lastError: string | null
-  }
   finalization?: {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
@@ -269,13 +268,12 @@ export type ApiSessionLive = {
     liveness?: "active" | "stale" | "lost"
     status?: "active" | "stale" | "inactive"
     lastSequence: number
-    pendingSyncCount: number
-    pushQueueDepth: number
     activeWorkerCount: number
+    launchedWorkerCount: number
+    failedLaunchCount: number
     uploadedWorkerCount?: number
     unchangedWorkerCount?: number
     droppedOrDeferredWorkerCount?: number
-    syncLagMs: number | null
     providerBackoff: Record<string, unknown> | null
     ignoredPresence: Record<string, unknown>
     lastUploadAt: string | null
@@ -283,7 +281,6 @@ export type ApiSessionLive = {
   }>
   unmatchedPresenceCount: number
   ignoredPresence: Record<string, unknown>
-  syncLagMs: number | null
   providerBackoff: Record<string, unknown> | null
   recentExperiments: ApiCampaignExperiment[]
   recentTerminalWorkers: Array<{
@@ -330,68 +327,57 @@ export type ApiSessionControlState = {
   updatedAt: string
 }
 
+export type ApiSessionBrief = {
+  session: ApiSession
+  campaign: ApiCampaign
+  project: ApiProject
+  hypothesis: ApiHypothesis | null
+  latestExperiments: ApiCampaignExperiment[]
+  bestExperiment: ApiCampaignExperiment | null
+  activeHypotheses: ApiHypothesis[]
+  summaries: ApiSummary[]
+  knowledge: ApiKnowledge[]
+  updatedAt: string
+}
+
 export type ApiCampaignUpsertResult = {
   project: ApiProject
   campaign: ApiCampaign
 }
 
-export type ApiProjectDeletions = {
-  campaigns: Array<{
-    campaignId: string
-    name: string
-    deletedAt: string
-  }>
-  experiments: Array<{
-    experimentId: string
-    runRef: string
-    campaignId: string
-    campaignName: string
-    deletedAt: string
-  }>
+export type ApiExperimentReportResult = {
+  outcome: "accepted" | "duplicate" | "rejected"
+  experiment: ApiCampaignExperiment
+  session: ApiSession | null
 }
 
-export type ApiResearchSyncEvent = {
-  eventId: string
-  sequence: number
-  type: string
-  entityType: string
-  entityId: string
-  payload: Record<string, unknown>
-  createdAt: string
+export type ApiWorkerLease = {
+  worker: ApiWorker
+  leaseToken: string
+  leaseExpiresAt: string
+  hypothesis: ApiHypothesis
+  session: ApiSession
+  campaign: ApiCampaign
+  project: ApiProject
 }
 
-export type ApiResearchSyncResponse = {
-  accepted: number
-  duplicate: number
-  conflicts: number
-  invalid: number
-  acknowledgements: Array<{
-    eventId: string
-    sequence: number
-    status: "acked" | "duplicate" | "conflict" | "invalid"
-    code: string
-    entityType: string
-    entityId: string | null
-    message: string | null
-    details: Record<string, unknown>
-  }>
-  tombstones: Array<{
-    entityType: string
-    entityId: string
-    campaignId: string | null
-    name: string | null
-    runRef: string | null
-    deletedAt: string
-    reason: string | null
-  }>
-  projectionDeltas: {
-    campaigns: ApiCampaign[]
-    sessions: ApiSession[]
-    hypotheses: ApiHypothesis[]
-    workers: ApiWorker[]
-    experiments: ApiCampaignExperiment[]
-    summaries: ApiSummary[]
-    knowledge: ApiKnowledge[]
+export type ApiWorkerHeartbeatResponse = {
+  worker: ApiWorker
+  heartbeat: {
+    id: string
+    workerId: string
+    campaignId: string
+    sessionId: string | null
+    hypothesisId: string
+    experimentId: string | null
+    status: ApiWorker["status"]
+    phase: string | null
+    event: string | null
+    progressMessage: string | null
+    gitLabel: string | null
+    resourceStats: Record<string, unknown>
+    metadata: Record<string, unknown>
+    createdAt: string
   }
 }
 
@@ -645,8 +631,8 @@ export async function reportCampaignExperiment(
   campaignId: string,
   body: CreateResearchCampaignExperimentRequest,
   args?: Args
-): Promise<ApiCampaignExperiment> {
-  return apiData<ApiCampaignExperiment>(
+): Promise<ApiExperimentReportResult> {
+  return apiData<ApiExperimentReportResult>(
     await callApi(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/experiments`,
@@ -663,7 +649,7 @@ export async function reportCampaignExperimentsBatch(
 ): Promise<{
   results: Array<{
     runRef: string
-    status: "created" | "duplicate" | "deleted" | "invalid"
+    status: "accepted" | "duplicate" | "rejected" | "deleted" | "invalid"
     experiment: ApiCampaignExperiment | null
     error: { code: string; message: string } | null
   }>
@@ -671,7 +657,7 @@ export async function reportCampaignExperimentsBatch(
   return apiData<{
     results: Array<{
       runRef: string
-      status: "created" | "duplicate" | "deleted" | "invalid"
+      status: "accepted" | "duplicate" | "rejected" | "deleted" | "invalid"
       experiment: ApiCampaignExperiment | null
       error: { code: string; message: string } | null
     }>
@@ -826,6 +812,24 @@ export async function getResearchSessionControlState(
   )
 }
 
+export async function getResearchSessionBrief(
+  sessionId: string,
+  args?: Args,
+  options: { hypothesisId?: string } = {}
+): Promise<ApiSessionBrief> {
+  const params = new URLSearchParams()
+  if (options.hypothesisId) params.set("hypothesisId", options.hypothesisId)
+  const suffix = params.size > 0 ? `?${params.toString()}` : ""
+  return apiData<ApiSessionBrief>(
+    await callApi(
+      "GET",
+      `/api/v1/research/sessions/${sessionId}/brief${suffix}`,
+      undefined,
+      args
+    )
+  )
+}
+
 export async function reconcileCampaign(
   campaignId: string,
   args?: Args
@@ -862,9 +866,33 @@ export async function registerCampaignWorker(
   )
 }
 
+export async function acquireResearchWorkerLease(
+  sessionId: string,
+  body: {
+    siteId: string
+    supervisorRunId: string
+    workerName: string
+    agentKind?: string
+    runtime?: "local" | "hosted"
+    leaseSeconds?: number
+    metadata?: Record<string, unknown>
+  },
+  args?: Args
+): Promise<ApiWorkerLease> {
+  return apiData<ApiWorkerLease>(
+    await callApi(
+      "POST",
+      `/api/v1/research/sessions/${sessionId}/worker-leases`,
+      body,
+      args
+    )
+  )
+}
+
 export async function heartbeatWorker(
   workerId: string,
   body: {
+    leaseToken?: string
     status?: "registered" | "running" | "completed" | "failed" | "stopped"
     sessionId?: string
     hypothesisId?: string
@@ -877,8 +905,8 @@ export async function heartbeatWorker(
     metadata?: Record<string, unknown>
   },
   args?: Args
-): Promise<{ worker: ApiWorker }> {
-  return apiData<{ worker: ApiWorker }>(
+): Promise<ApiWorkerHeartbeatResponse> {
+  return apiData<ApiWorkerHeartbeatResponse>(
     await callApi(
       "POST",
       `/api/v1/research/workers/${workerId}/heartbeat`,
@@ -965,41 +993,7 @@ export async function requestProjectSync(projectId: string, args?: Args) {
   )
 }
 
-export async function getProjectDeletions(
-  projectId: string,
-  args?: Args
-): Promise<ApiProjectDeletions> {
-  return apiData<ApiProjectDeletions>(
-    await callApi(
-      "GET",
-      `/api/v1/research/projects/${projectId}/deletions`,
-      undefined,
-      args
-    )
-  )
-}
-
-export async function syncResearchEvents(
-  body: {
-    siteId: string
-    repositoryUrl: string
-    projectPath: string
-    pushedExperimentRefs?: Array<{
-      campaignId: string
-      runRef: string
-      resultRef: string
-      resultCommitSha: string
-    }>
-    events: ApiResearchSyncEvent[]
-  },
-  args?: Args
-): Promise<ApiResearchSyncResponse> {
-  return apiData<ApiResearchSyncResponse>(
-    await callApi("POST", "/api/v1/research/sync", body, args)
-  )
-}
-
-export async function syncResearchPresence(
+export async function upsertResearchPresence(
   body: {
     siteId: string
     supervisorRunId: string
@@ -1007,14 +1001,10 @@ export async function syncResearchPresence(
     sessionId: string
     site?: {
       providerBackoff?: Record<string, unknown> | null
-      syncLagMs?: number | null
-      oldestPendingAgeMs?: number | null
-      lastSyncDurationMs?: number | null
-      lastSyncError?: string | null
-      pendingSyncCount?: number
-      pushQueueDepth?: number
       ignoredPresence?: Record<string, unknown>
       activeWorkerCount?: number
+      launchedWorkerCount?: number
+      failedLaunchCount?: number
       uploadedWorkerCount?: number
       unchangedWorkerCount?: number
       droppedOrDeferredWorkerCount?: number

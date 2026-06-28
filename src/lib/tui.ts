@@ -279,9 +279,6 @@ export type ListenModel = {
   active: boolean
   /** Ascending by recency — the most recent experiment renders at the bottom. */
   rows: ExperimentRow[]
-  pendingOutbox: number
-  conflictOutbox: number
-  syncedCount: number
   providerBackoff?: {
     reason: string
     until: string
@@ -445,7 +442,7 @@ export function renderFrame(
   )}`
   const footer = dim(
     truncate(
-      ` outbox ${model.pendingOutbox} pending · ${model.conflictOutbox} conflict(s) · ${model.syncedCount} synced · q quit`,
+      " q quit",
       columns
     ),
     color

@@ -124,11 +124,11 @@ describe("hypothesis worker prompt", () => {
       "allowed only inside a normal `onyx-worker exp run` attempt"
     )
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
-    expect(prompt).toContain("Do not edit `.git/onyx/research.db`")
-    expect(prompt).toContain("never patch the ledger with SQLite")
-    expect(prompt).toContain("Server sync is the supervisor/harness's job")
-    expect(prompt).toContain("Do not run `onyx push` or mutating sync commands")
-    expect(prompt).toContain("onyx-worker sync status")
+    expect(prompt).toContain("Product state is remote-first")
+    expect(prompt).toContain("call the Onyx API directly")
+    expect(prompt).toContain("pushes the immutable experiment ref before it reports")
+    expect(prompt).not.toContain("onyx-worker sync status")
+    expect(prompt).not.toContain(".git/onyx/research.db")
     expect(prompt).not.toContain("Supervisor/harness sync owns durable pushes")
     expect(prompt).not.toContain(
       "run `onyx push` only when network access is clearly available"

@@ -1,18 +1,17 @@
 import { descriptionOption, nameOption, type Args } from "../lib/args"
+import {
+  deleteCampaign,
+  getCampaignOverview,
+  listProjectCampaigns,
+  resolveProject,
+  upsertCampaign,
+} from "../lib/api"
 import { readSetupFile } from "../lib/contract"
 import { emitEvent } from "../lib/events"
-import { currentCommit, repoRoot } from "../lib/git"
+import { currentCommit, normalizeRepositoryUrl, repoRoot, repositoryUrl } from "../lib/git"
 import { readState, writeState } from "../lib/outbox"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
-import {
-  createLocalCampaign,
-  deleteLocalCampaignWithTombstone,
-  getActiveLocalCampaignName,
-  localCampaignByName,
-  setActiveLocalCampaign,
-} from "../lib/research-db"
 import { assertSetupCommitted } from "../lib/setup-git"
-import { flushOutbox } from "../lib/sync"
 
 export async function commandCampaignCreate(args: Args) {
   const root = await repoRoot()
@@ -31,30 +30,44 @@ export async function commandCampaignCreate(args: Args) {
   const humanFeedback = args.options["human-feedback"] ?? null
   const promotionRefName =
     args.options["promotion-ref"] ?? `refs/heads/onyx/${name}/best`
+  if (args.options.offline === "true") {
+    throw new Error(
+      "`--offline` was removed. Campaign setup writes directly to the Onyx API."
+    )
+  }
 
-  const localCampaign = await createLocalCampaign({
-    root,
+  const result = await upsertCampaign({
+    repositoryUrl: normalizeRepositoryUrl(
+      await repositoryUrl(root, args.options["repository-url"])
+    ),
     name,
-    description,
     projectPath,
+    ...(description ? { description } : {}),
     baseCommitSha,
     setup,
-    metricName: setup.metric.name,
-    metricUnit: setup.metric.unit,
-    metricDirection: setup.metric.direction,
-    humanFeedback,
+    ...(humanFeedback ? { humanFeedback } : {}),
     promotionRefName,
-  })
+  }, args)
 
   const state = await readState(root)
   const key = campaignStateKey(projectPath, name)
+  state.projectId = result.project.id
+  state.projectCache = {
+    id: result.project.id,
+    name: result.project.name,
+    repositoryUrl: result.project.repositoryUrl,
+    repositoryFullName: result.project.repositoryFullName,
+    defaultBranch: result.project.defaultBranch,
+    projectPath: result.project.projectPath,
+    resolvedAt: new Date().toISOString(),
+  }
   state.projectPath = projectPath
   state.activeCampaign = name
   state.campaigns = {
     ...(state.campaigns ?? {}),
     [key]: {
       ...(state.campaigns ?? {})[key],
-      campaignId: localCampaign.id,
+      campaignId: result.campaign.id,
       projectPath,
       baseCommitSha,
       description,
@@ -71,48 +84,49 @@ export async function commandCampaignCreate(args: Args) {
   await emitEvent(root, {
     type: "campaign_created",
     campaignName: name,
+    campaignId: result.campaign.id,
     commitSha: baseCommitSha,
     message: name,
   })
   console.log(`Created campaign ${name}`)
+  console.log(`Campaign id: ${result.campaign.id}`)
   console.log(`Base commit: ${baseCommitSha}`)
-
-  if (args.options.offline === "true") {
-    console.log("Saved locally in SQLite; sync skipped by --offline.")
-    return
-  }
-
-  const syncResult = await flushOutbox(root, args).catch((error) => {
-    if (args.options["require-online"] === "true") throw error
-    console.warn(
-      `Campaign sync skipped: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-    return null
-  })
-  if (syncResult && syncResult.pending > 0) {
-    console.warn(
-      [
-        "Campaign setup is saved locally but not fully synced.",
-        "If the server says the base commit is missing, push the base commit to the repository remote, then run `onyx sync`.",
-      ].join(" ")
-    )
-  }
 }
 
 export async function commandCampaignUse(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const name = nameOption(args)
-  await setActiveLocalCampaign({ root, projectPath, campaignName: name })
+  const project = await resolveProject(root, args)
+  const campaigns = await listProjectCampaigns(project.id, args)
+  const campaign = campaigns.find((candidate) => candidate.name === name)
+  if (!campaign) throw new Error(`Campaign ${name} was not found.`)
   const state = await readState(root)
+  state.projectId = project.id
+  state.projectCache = {
+    id: project.id,
+    name: project.name,
+    repositoryUrl: project.repositoryUrl,
+    repositoryFullName: project.repositoryFullName,
+    defaultBranch: project.defaultBranch,
+    projectPath: project.projectPath,
+    resolvedAt: new Date().toISOString(),
+  }
   state.projectPath = projectPath
   state.activeCampaign = name
   state.campaigns = state.campaigns ?? {}
-  state.campaigns[campaignStateKey(projectPath, name)] = state.campaigns[
-    campaignStateKey(projectPath, name)
-  ] ?? { projectPath }
+  const key = campaignStateKey(projectPath, name)
+  state.campaigns[key] = {
+    ...(state.campaigns[key] ?? {}),
+    campaignId: campaign.id,
+    projectPath,
+    baseCommitSha: campaign.baseCommitSha,
+    description: campaign.description,
+    metricName: campaign.metricName,
+    metricUnit: campaign.metricUnit,
+    metricDirection: campaign.metricDirection,
+    promotionRefName: campaign.promotionRefName,
+  }
   await writeState(root, state)
   console.log(`Using campaign ${name}`)
 }
@@ -121,29 +135,31 @@ export async function commandCampaignStatus(args: Args) {
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const name =
-    args.options.name ??
-    state.activeCampaign ??
-    (await getActiveLocalCampaignName(root)) ??
-    undefined
+  const name = args.options.name ?? state.activeCampaign ?? undefined
   if (!name) {
     console.log("campaign: none")
     return
   }
-  const localCampaign = await localCampaignByName({ root, projectPath, name })
   const stateCampaign = state.campaigns?.[campaignStateKey(projectPath, name)]
+  let campaign = null
+  if (stateCampaign?.campaignId) {
+    campaign = await getCampaignOverview(stateCampaign.campaignId, args)
+      .then((overview) => overview.campaign)
+      .catch(() => null)
+  }
+  if (!campaign) {
+    const project = await resolveProject(root, args)
+    campaign =
+      (await listProjectCampaigns(project.id, args)).find(
+        (candidate) => candidate.name === name
+      ) ?? null
+  }
   console.log(`campaign: ${name}`)
-  console.log(
-    `id: ${localCampaign?.id ?? stateCampaign?.campaignId ?? "(not synced)"}`
-  )
-  console.log(
-    `metric: ${localCampaign?.metricName ?? stateCampaign?.metricName ?? "(unknown)"}`
-  )
-  console.log(
-    `base: ${localCampaign?.baseCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`
-  )
+  console.log(`id: ${campaign?.id ?? stateCampaign?.campaignId ?? "(unknown)"}`)
+  console.log(`metric: ${campaign?.metricName ?? stateCampaign?.metricName ?? "(unknown)"}`)
+  console.log(`base: ${campaign?.baseCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`)
   const promotionRefName =
-    localCampaign?.promotionRefName ?? stateCampaign?.promotionRefName ?? null
+    campaign?.promotionRefName ?? stateCampaign?.promotionRefName ?? null
   if (promotionRefName) {
     console.log(`configured promotion ref: ${promotionRefName}`)
   }
@@ -156,12 +172,19 @@ export async function commandCampaignDelete(args: Args) {
   const name = nameOption(args)
   const state = await readState(root)
   const key = campaignStateKey(projectPath, name)
-  const result = await deleteLocalCampaignWithTombstone({
-    root,
-    projectPath,
-    name,
-    reason: args.options.reason ?? "campaign deleted locally",
-  })
+  if (args.options.offline === "true") {
+    throw new Error(
+      "`--offline` was removed. Campaign deletion is applied directly through the Onyx API."
+    )
+  }
+  const cachedCampaignId = state.campaigns?.[key]?.campaignId
+  const campaignId =
+    cachedCampaignId ??
+    (await resolveProject(root, args)
+      .then((project) => listProjectCampaigns(project.id, args))
+      .then((campaigns) => campaigns.find((campaign) => campaign.name === name)?.id))
+  if (!campaignId) throw new Error(`Campaign ${name} was not found.`)
+  const result = await deleteCampaign(campaignId, args)
 
   state.campaigns = state.campaigns ?? {}
   delete state.campaigns[key]
@@ -173,15 +196,5 @@ export async function commandCampaignDelete(args: Args) {
     campaignId: result.campaignId,
     message: `${result.deletedExperimentCount} experiment(s)`,
   })
-  if (args.options.offline !== "true") {
-    await flushOutbox(root, args, { quiet: true }).catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-      console.warn(
-        `Campaign delete sync skipped: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      )
-    })
-  }
   console.log(`Deleted campaign ${name}`)
 }

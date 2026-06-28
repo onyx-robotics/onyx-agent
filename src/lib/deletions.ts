@@ -1,10 +1,23 @@
 import type { LocalResearchRecord } from "../protocol"
 
-import type { ApiProjectDeletions } from "./api"
+export type LegacyProjectDeletions = {
+  campaigns: Array<{
+    campaignId: string
+    name: string
+    deletedAt: string
+  }>
+  experiments: Array<{
+    experimentId: string
+    campaignId: string
+    campaignName: string
+    runRef: string
+    deletedAt: string
+  }>
+}
 
 function matchesCampaignTombstone(
   record: { campaignName: string; createdAt: string },
-  deletions: ApiProjectDeletions
+  deletions: LegacyProjectDeletions
 ) {
   return deletions.campaigns.some(
     (tombstone) =>
@@ -15,7 +28,7 @@ function matchesCampaignTombstone(
 
 export function isHistoryRecordDeleted(
   record: { runRef: string; campaignName: string; createdAt: string },
-  deletions: ApiProjectDeletions | null
+  deletions: LegacyProjectDeletions | null
 ): boolean {
   if (!deletions) return false
   if (
@@ -30,7 +43,7 @@ export function isHistoryRecordDeleted(
 
 export function filterDeletedOutboxRecords(
   records: LocalResearchRecord[],
-  deletions: ApiProjectDeletions | null
+  deletions: LegacyProjectDeletions | null
 ): { kept: LocalResearchRecord[]; dropped: number } {
   if (!deletions) {
     return { kept: records, dropped: 0 }

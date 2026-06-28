@@ -466,7 +466,6 @@ export const createResearchCampaignExperimentRequestSchema = z
     sessionId: z.uuid().optional(),
     hypothesisId: z.uuid().optional(),
     workerId: z.uuid().optional(),
-    acceptedIndex: z.number().int().positive().optional(),
     name: z.string().trim().min(1).max(160),
     description: z.string().trim().max(2000).optional(),
     runRef: z.string().trim().min(1).max(240),
@@ -502,6 +501,7 @@ export const createResearchCampaignExperimentRequestSchema = z
       )
       .default([]),
   })
+  .strict()
   .refine(
     (value) =>
       (value.status !== "succeeded" && value.status !== "accepted") ||
@@ -529,8 +529,9 @@ export const batchResearchCampaignExperimentRequestSchema = z.object({
 })
 
 export const batchResearchCampaignExperimentResultStatusSchema = z.enum([
-  "created",
+  "accepted",
   "duplicate",
+  "rejected",
   "deleted",
   "invalid",
 ])
@@ -686,6 +687,10 @@ export const researchWorkerSchema = z.object({
   phase: z.string().nullable(),
   progressMessage: z.string().nullable(),
   gitLabel: z.string().nullable(),
+  siteId: z.uuid().nullable().optional(),
+  supervisorRunId: z.string().nullable().optional(),
+  leaseExpiresAt: z.iso.datetime().nullable().optional(),
+  leaseReleasedAt: z.iso.datetime().nullable().optional(),
   metadata: metadataSchema,
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -717,16 +722,42 @@ export const researchWorkerHeartbeatSchema = z.object({
   createdAt: z.iso.datetime(),
 })
 
-export const researchWorkerHeartbeatRequestSchema = z.object({
-  status: researchWorkerStatusSchema.default("running"),
-  sessionId: z.uuid().optional(),
-  hypothesisId: z.uuid().optional(),
-  experimentId: z.uuid().nullable().optional(),
-  phase: z.string().trim().max(120).nullable().optional(),
-  event: z.string().trim().max(160).nullable().optional(),
-  progressMessage: z.string().trim().max(1000).nullable().optional(),
-  gitLabel: z.string().trim().max(240).nullable().optional(),
-  resourceStats: metadataSchema.default({}),
+export const researchWorkerHeartbeatRequestSchema = z
+  .object({
+    leaseToken: z.string().trim().min(16).max(200).optional(),
+    status: researchWorkerStatusSchema.default("running"),
+    sessionId: z.uuid().optional(),
+    hypothesisId: z.uuid().optional(),
+    experimentId: z.uuid().nullable().optional(),
+    phase: z.string().trim().max(120).nullable().optional(),
+    event: z.string().trim().max(160).nullable().optional(),
+    progressMessage: z.string().trim().max(1000).nullable().optional(),
+    gitLabel: z.string().trim().max(240).nullable().optional(),
+    resourceStats: metadataSchema.default({}),
+    metadata: metadataSchema.default({}),
+  })
+  .superRefine((value, ctx) => {
+    if (
+      value.status !== "completed" &&
+      value.status !== "failed" &&
+      value.status !== "stopped" &&
+      !value.leaseToken
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["leaseToken"],
+        message: "leaseToken is required for nonterminal worker heartbeats",
+      })
+    }
+  })
+
+export const acquireResearchWorkerLeaseRequestSchema = z.object({
+  siteId: z.uuid(),
+  supervisorRunId: z.string().trim().min(1).max(120),
+  workerName: z.string().trim().min(1).max(160),
+  agentKind: z.string().trim().min(1).max(80).default("codex"),
+  runtime: researchWorkerRuntimeSchema.default("local"),
+  leaseSeconds: z.number().int().min(30).max(3600).default(300),
   metadata: metadataSchema.default({}),
 })
 
@@ -745,14 +776,10 @@ export const researchPresenceWorkerSnapshotSchema = z.object({
 
 export const researchPresenceSiteSnapshotSchema = z.object({
   providerBackoff: metadataSchema.nullable().optional(),
-  syncLagMs: z.number().int().nonnegative().nullable().optional(),
-  oldestPendingAgeMs: z.number().int().nonnegative().nullable().optional(),
-  lastSyncDurationMs: z.number().int().nonnegative().nullable().optional(),
-  lastSyncError: z.string().trim().max(1000).nullable().optional(),
-  pendingSyncCount: z.number().int().nonnegative().default(0),
-  pushQueueDepth: z.number().int().nonnegative().default(0),
   ignoredPresence: metadataSchema.default({}),
   activeWorkerCount: z.number().int().nonnegative().default(0),
+  launchedWorkerCount: z.number().int().nonnegative().default(0),
+  failedLaunchCount: z.number().int().nonnegative().default(0),
   uploadedWorkerCount: z.number().int().nonnegative().default(0),
   unchangedWorkerCount: z.number().int().nonnegative().default(0),
   droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
@@ -761,16 +788,16 @@ export const researchPresenceSiteSnapshotSchema = z.object({
   metadata: metadataSchema.default({}),
 })
 
-export const syncResearchPresenceRequestSchema = z.object({
+export const upsertResearchPresenceRequestSchema = z.object({
   siteId: z.uuid(),
   supervisorRunId: z.string().trim().min(1).max(120),
   sequence: z.number().int().nonnegative(),
   sessionId: z.uuid(),
   site: researchPresenceSiteSnapshotSchema.default({
-    pendingSyncCount: 0,
-    pushQueueDepth: 0,
     ignoredPresence: {},
     activeWorkerCount: 0,
+    launchedWorkerCount: 0,
+    failedLaunchCount: 0,
     uploadedWorkerCount: 0,
     unchangedWorkerCount: 0,
     droppedOrDeferredWorkerCount: 0,
@@ -793,7 +820,7 @@ export const researchPresenceIgnoredWorkerSchema = z.object({
   message: z.string().trim().min(1),
 })
 
-export const syncResearchPresenceResponseSchema = z.object({
+export const upsertResearchPresenceResponseSchema = z.object({
   data: z.object({
     ignoredWorkers: z.array(researchPresenceIgnoredWorkerSchema).default([]),
     ignoredByReason: z.object({
@@ -813,434 +840,6 @@ export const syncResearchPresenceResponseSchema = z.object({
     deferredStartupTelemetryCount: z.number().int().nonnegative().default(0),
     splitCount: z.number().int().nonnegative().default(1),
     siteAccepted: z.boolean(),
-  }),
-})
-
-export const researchSyncEventTypeSchema = z.enum([
-  "campaign.upserted",
-  "session.started",
-  "session.stopped",
-  "hypothesis.upserted",
-  "worker.registered",
-  "worker.heartbeat",
-  "experiment.logged",
-  "summary.upserted",
-  "knowledge.created",
-  "entity.deleted",
-])
-
-const syncOriginSchema = z
-  .object({
-    siteId: z.uuid(),
-    sequence: z.number().int().positive(),
-    eventId: z.string().trim().min(1).max(240),
-  })
-  .strict()
-
-const syncPayloadBaseSchema = z.object({
-  origin: syncOriginSchema.optional(),
-})
-
-const researchSyncCampaignPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    campaign: researchCampaignSchema
-      .pick({
-        id: true,
-        projectId: true,
-        name: true,
-        description: true,
-        baseCommitSha: true,
-        status: true,
-        metricName: true,
-        metricUnit: true,
-        metricDirection: true,
-        promotionRefName: true,
-        createdAt: true,
-        updatedAt: true,
-      })
-      .extend({
-        projectId: z
-          .uuid()
-          .optional()
-          .default("00000000-0000-0000-0000-000000000000"),
-      })
-      .strict(),
-  })
-  .strict()
-
-const researchSyncSessionPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    session: researchSessionSchema
-      .pick({
-        id: true,
-        campaignId: true,
-        name: true,
-        status: true,
-        workerTarget: true,
-        experimentTarget: true,
-        acceptedExperimentCount: true,
-        remainingExperimentCount: true,
-        deadlineAt: true,
-        terminalReason: true,
-        schedulerSiteId: true,
-        finalizationStatus: true,
-        metadata: true,
-        startedAt: true,
-        completedAt: true,
-        createdAt: true,
-        updatedAt: true,
-      })
-      .partial({
-        startedAt: true,
-        completedAt: true,
-        createdAt: true,
-        updatedAt: true,
-      })
-      .strict(),
-    reason: z.string().trim().max(1000).nullable().optional(),
-  })
-  .strict()
-
-const researchSyncHypothesisPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    hypothesis: researchHypothesisSchema
-      .pick({
-        id: true,
-        campaignId: true,
-        createdBySessionId: true,
-        name: true,
-        description: true,
-        status: true,
-        baseCommitSha: true,
-        bestExperimentId: true,
-        bestMetricValue: true,
-        lastWorkedAt: true,
-        plan: true,
-        metadata: true,
-        createdAt: true,
-        updatedAt: true,
-      })
-      .strict(),
-  })
-  .strict()
-
-const researchSyncWorkerPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    worker: researchWorkerSchema
-      .pick({
-        id: true,
-        campaignId: true,
-        sessionId: true,
-        hypothesisId: true,
-        workerName: true,
-        agentKind: true,
-        runtime: true,
-        status: true,
-        liveness: true,
-        startedAt: true,
-        lastSeenAt: true,
-        currentExperimentId: true,
-        phase: true,
-        progressMessage: true,
-        gitLabel: true,
-        metadata: true,
-        createdAt: true,
-        updatedAt: true,
-      })
-      .partial({
-        startedAt: true,
-        createdAt: true,
-        updatedAt: true,
-      })
-      .strict(),
-  })
-  .strict()
-
-const researchSyncWorkerHeartbeatPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    workerId: z.uuid(),
-    heartbeatId: z.uuid(),
-    campaignId: z.uuid(),
-    sessionId: z.uuid().nullable(),
-    hypothesisId: z.uuid(),
-    experimentId: z.uuid().nullable(),
-    status: researchWorkerStatusSchema,
-    phase: z.string().trim().max(120).nullable(),
-    event: z.string().trim().max(160).nullable(),
-    progressMessage: z.string().trim().max(1000).nullable(),
-    gitLabel: z.string().trim().max(240).nullable(),
-    resourceStats: metadataSchema,
-    metadata: metadataSchema,
-    createdAt: z.iso.datetime(),
-  })
-  .strict()
-
-const researchSyncExperimentPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    experiment: researchCampaignExperimentSchema
-      .pick({
-        id: true,
-        campaignId: true,
-        sessionId: true,
-        hypothesisId: true,
-        workerId: true,
-        acceptedIndex: true,
-        runRef: true,
-        name: true,
-        description: true,
-        baseCommitSha: true,
-        resultCommitSha: true,
-        resultRef: true,
-        status: true,
-        setupCompliance: true,
-        gitStatus: true,
-        gitVerifiedAt: true,
-        gitStatusReason: true,
-        primaryMetricName: true,
-        primaryMetricValue: true,
-        secondaryMetrics: true,
-        artifactRefs: true,
-        agentNotes: true,
-        checks: true,
-        durationMs: true,
-        outputSummary: true,
-        startedAt: true,
-        completedAt: true,
-        createdAt: true,
-        updatedAt: true,
-      })
-      .partial({
-        updatedAt: true,
-      })
-      .strict(),
-    campaignName: z.string().trim().min(1).max(120),
-    projectPath: projectPathSchema.default(""),
-    fingerprint: z.string().trim().min(32).max(128),
-  })
-  .strict()
-
-const researchSyncSummaryPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    summary: researchSummarySchema.strict(),
-    metadata: metadataSchema.optional(),
-  })
-  .strict()
-
-const researchSyncKnowledgePayloadSchema = syncPayloadBaseSchema
-  .extend({
-    knowledge: researchKnowledgeSchema.strict(),
-  })
-  .strict()
-
-const researchSyncDeletedPayloadSchema = syncPayloadBaseSchema
-  .extend({
-    entityType: z.enum([
-      "campaign",
-      "experiment",
-      "hypothesis",
-      "summary",
-      "knowledge",
-    ]),
-    entityId: z.uuid(),
-    campaignId: z.uuid().nullable().default(null),
-    name: z.string().trim().min(1).max(240).nullable().default(null),
-    runRef: z.string().trim().min(1).max(240).nullable().default(null),
-    deletedAt: z.iso.datetime(),
-    reason: z.string().trim().max(1000).nullable().default(null),
-  })
-  .strict()
-
-export const researchSyncEventSchema = z.discriminatedUnion("type", [
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("campaign.upserted"),
-      entityType: z.literal("campaign"),
-      entityId: z.uuid(),
-      payload: researchSyncCampaignPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("session.started"),
-      entityType: z.literal("session"),
-      entityId: z.uuid(),
-      payload: researchSyncSessionPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("session.stopped"),
-      entityType: z.literal("session"),
-      entityId: z.uuid(),
-      payload: researchSyncSessionPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("hypothesis.upserted"),
-      entityType: z.literal("hypothesis"),
-      entityId: z.uuid(),
-      payload: researchSyncHypothesisPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("worker.registered"),
-      entityType: z.literal("worker"),
-      entityId: z.uuid(),
-      payload: researchSyncWorkerPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("worker.heartbeat"),
-      entityType: z.literal("worker"),
-      entityId: z.uuid(),
-      payload: researchSyncWorkerHeartbeatPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("experiment.logged"),
-      entityType: z.literal("experiment"),
-      entityId: z.uuid(),
-      payload: researchSyncExperimentPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("summary.upserted"),
-      entityType: z.literal("summary"),
-      entityId: z.uuid(),
-      payload: researchSyncSummaryPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("knowledge.created"),
-      entityType: z.literal("knowledge"),
-      entityId: z.uuid(),
-      payload: researchSyncKnowledgePayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-  z
-    .object({
-      eventId: z.string().trim().min(1).max(240),
-      sequence: z.number().int().positive(),
-      type: z.literal("entity.deleted"),
-      entityType: z.enum([
-        "campaign",
-        "experiment",
-        "hypothesis",
-        "summary",
-        "knowledge",
-      ]),
-      entityId: z.uuid(),
-      payload: researchSyncDeletedPayloadSchema,
-      createdAt: z.iso.datetime(),
-    })
-    .strict(),
-])
-
-export const syncResearchRequestSchema = z.object({
-  siteId: z.uuid(),
-  repositoryUrl: z.string().trim().min(1).max(2000),
-  projectPath: projectPathSchema.default(""),
-  pushedExperimentRefs: z
-    .array(
-      z
-        .object({
-          campaignId: z.uuid(),
-          runRef: z.string().trim().min(1).max(500),
-          resultRef: z.string().trim().min(1).max(500),
-          resultCommitSha: gitShaSchema,
-        })
-        .strict()
-    )
-    .max(500)
-    .default([]),
-  events: z.array(researchSyncEventSchema).min(1).max(500),
-})
-
-export const researchSyncEventAckSchema = z.object({
-  eventId: z.string().min(1),
-  sequence: z.number().int().positive(),
-  status: z.enum(["acked", "duplicate", "conflict", "invalid"]),
-  code: z.string().trim().min(1),
-  entityType: z.string().min(1),
-  entityId: z.uuid().nullable(),
-  message: z.string().nullable(),
-  details: metadataSchema.default({}),
-})
-
-export const syncResearchResponseSchema = z.object({
-  data: z.object({
-    accepted: z.number().int().nonnegative(),
-    duplicate: z.number().int().nonnegative(),
-    conflicts: z.number().int().nonnegative(),
-    invalid: z.number().int().nonnegative(),
-    acknowledgements: z.array(researchSyncEventAckSchema),
-    tombstones: z
-      .array(
-        z
-          .object({
-            entityType: z.string().min(1),
-            entityId: z.uuid(),
-            campaignId: z.uuid().nullable(),
-            name: z.string().nullable(),
-            runRef: z.string().nullable(),
-            deletedAt: z.iso.datetime(),
-            reason: z.string().nullable(),
-          })
-          .strict()
-      )
-      .default([]),
-    projectionDeltas: z
-      .object({
-        campaigns: z.array(researchCampaignSchema).default([]),
-        sessions: z.array(researchSessionSchema).default([]),
-        hypotheses: z.array(researchHypothesisSchema).default([]),
-        workers: z.array(researchWorkerSchema).default([]),
-        experiments: z.array(researchCampaignExperimentSchema).default([]),
-        summaries: z.array(researchSummarySchema).default([]),
-        knowledge: z.array(researchKnowledgeSchema).default([]),
-      })
-      .default({
-        campaigns: [],
-        sessions: [],
-        hypotheses: [],
-        workers: [],
-        experiments: [],
-        summaries: [],
-        knowledge: [],
-      }),
   }),
 })
 
@@ -1281,7 +880,11 @@ export const listResearchCampaignsResponseSchema = z.object({
 })
 
 export const createResearchCampaignExperimentResponseSchema = z.object({
-  data: researchCampaignExperimentSchema,
+  data: z.object({
+    outcome: z.enum(["accepted", "duplicate", "rejected"]),
+    experiment: researchCampaignExperimentSchema,
+    session: researchSessionSchema.nullable(),
+  }),
 })
 
 export const researchCampaignExperimentSummarySchema = z.object({
@@ -1490,6 +1093,25 @@ export const researchSessionStateResponseSchema = z.object({
   }),
 })
 
+export const researchSessionBriefResponseSchema = z.object({
+  data: z.object({
+    session: researchSessionSchema,
+    campaign: researchCampaignSchema,
+    project: researchProjectSchema,
+    hypothesis: researchHypothesisSchema.nullable(),
+    latestExperiments: z.array(researchCampaignExperimentSummarySchema),
+    bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
+    activeHypotheses: z.array(researchHypothesisSchema),
+    summaries: z.array(researchSummarySchema),
+    knowledge: z.array(researchKnowledgeSchema),
+    updatedAt: z.iso.datetime(),
+  }),
+})
+
+export const researchSessionBriefQuerySchema = z.object({
+  hypothesisId: z.uuid().optional(),
+})
+
 export const researchSessionSiteSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
@@ -1498,11 +1120,10 @@ export const researchSessionSiteSchema = z.object({
   supervisorRunId: z.string().min(1),
   status: z.enum(["active", "stale", "inactive"]),
   providerBackoff: metadataSchema.nullable(),
-  syncLagMs: z.number().int().nonnegative().nullable(),
-  pendingSyncCount: z.number().int().nonnegative(),
-  pushQueueDepth: z.number().int().nonnegative(),
   ignoredPresence: metadataSchema,
   activeWorkerCount: z.number().int().nonnegative(),
+  launchedWorkerCount: z.number().int().nonnegative().default(0),
+  failedLaunchCount: z.number().int().nonnegative().default(0),
   uploadedWorkerCount: z.number().int().nonnegative().default(0),
   unchangedWorkerCount: z.number().int().nonnegative().default(0),
   droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
@@ -1557,13 +1178,6 @@ export const researchSessionLiveResponseSchema = z.object({
       ...researchSessionProgressSchema.shape,
       warning: z.string().nullable().optional(),
     }),
-    sync: z
-      .object({
-        oldestPendingAgeMs: z.number().int().nonnegative().nullable(),
-        lastDurationMs: z.number().int().nonnegative().nullable(),
-        lastError: z.string().nullable(),
-      })
-      .optional(),
     finalization: researchSessionFinalizationSummarySchema.optional(),
     livenessCounts: z.record(researchWorkerLivenessSchema, z.number().int()),
     phaseCounts: z.record(z.string(), z.number().int().nonnegative()),
@@ -1571,7 +1185,6 @@ export const researchSessionLiveResponseSchema = z.object({
     sites: z.array(researchSessionSiteSchema),
     unmatchedPresenceCount: z.number().int().nonnegative(),
     ignoredPresence: metadataSchema,
-    syncLagMs: z.number().int().nonnegative().nullable(),
     providerBackoff: metadataSchema.nullable(),
     recentExperiments: z.array(researchCampaignExperimentSummarySchema),
     recentTerminalWorkers: z.array(researchLiveWorkerSummarySchema),
@@ -1620,6 +1233,18 @@ export const stopResearchSessionResponseSchema = z.object({
 
 export const registerResearchWorkerResponseSchema = z.object({
   data: researchWorkerSchema,
+})
+
+export const acquireResearchWorkerLeaseResponseSchema = z.object({
+  data: z.object({
+    worker: researchWorkerSchema,
+    leaseToken: z.string().min(16),
+    leaseExpiresAt: z.iso.datetime(),
+    hypothesis: researchHypothesisSchema,
+    session: researchSessionSchema,
+    campaign: researchCampaignSchema,
+    project: researchProjectSchema,
+  }),
 })
 
 export const researchWorkerHeartbeatResponseSchema = z.object({
@@ -1788,27 +1413,6 @@ export const deleteResearchCampaignExperimentResponseSchema = z.object({
   }),
 })
 
-export const researchProjectDeletionsResponseSchema = z.object({
-  data: z.object({
-    campaigns: z.array(
-      z.object({
-        campaignId: z.uuid(),
-        name: z.string().min(1),
-        deletedAt: z.iso.datetime(),
-      })
-    ),
-    experiments: z.array(
-      z.object({
-        experimentId: z.uuid(),
-        runRef: z.string().min(1),
-        campaignId: z.uuid(),
-        campaignName: z.string().min(1),
-        deletedAt: z.iso.datetime(),
-      })
-    ),
-  }),
-})
-
 export type ResearchMetricDirection = z.infer<
   typeof researchMetricDirectionSchema
 >
@@ -1964,6 +1568,12 @@ export type UpdateResearchHypothesisResponse = z.infer<
 export type ResearchSessionStateResponse = z.infer<
   typeof researchSessionStateResponseSchema
 >
+export type ResearchSessionBriefResponse = z.infer<
+  typeof researchSessionBriefResponseSchema
+>
+export type ResearchSessionBriefQuery = z.infer<
+  typeof researchSessionBriefQuerySchema
+>
 export type StopResearchSessionRequest = z.infer<
   typeof stopResearchSessionRequestSchema
 >
@@ -1995,6 +1605,12 @@ export type RegisterResearchWorkerRequest = z.infer<
 export type RegisterResearchWorkerResponse = z.infer<
   typeof registerResearchWorkerResponseSchema
 >
+export type AcquireResearchWorkerLeaseRequest = z.infer<
+  typeof acquireResearchWorkerLeaseRequestSchema
+>
+export type AcquireResearchWorkerLeaseResponse = z.infer<
+  typeof acquireResearchWorkerLeaseResponseSchema
+>
 export type ResearchWorkerHeartbeat = z.infer<
   typeof researchWorkerHeartbeatSchema
 >
@@ -2013,11 +1629,11 @@ export type ResearchPresenceWorkerSnapshot = z.infer<
 export type ResearchPresenceIgnoredWorker = z.infer<
   typeof researchPresenceIgnoredWorkerSchema
 >
-export type SyncResearchPresenceRequest = z.infer<
-  typeof syncResearchPresenceRequestSchema
+export type UpsertResearchPresenceRequest = z.infer<
+  typeof upsertResearchPresenceRequestSchema
 >
-export type SyncResearchPresenceResponse = z.infer<
-  typeof syncResearchPresenceResponseSchema
+export type UpsertResearchPresenceResponse = z.infer<
+  typeof upsertResearchPresenceResponseSchema
 >
 export type ResearchSessionSite = z.infer<typeof researchSessionSiteSchema>
 export type ResearchLiveWorkerSummary = z.infer<
@@ -2035,11 +1651,6 @@ export type ResearchSessionFinalizationSummary = z.infer<
 export type ResearchSessionControlStateResponse = z.infer<
   typeof researchSessionControlStateResponseSchema
 >
-export type ResearchSyncEventType = z.infer<typeof researchSyncEventTypeSchema>
-export type ResearchSyncEvent = z.infer<typeof researchSyncEventSchema>
-export type SyncResearchRequest = z.infer<typeof syncResearchRequestSchema>
-export type ResearchSyncEventAck = z.infer<typeof researchSyncEventAckSchema>
-export type SyncResearchResponse = z.infer<typeof syncResearchResponseSchema>
 export type ResearchCampaignFileTreeResponse = z.infer<
   typeof researchCampaignFileTreeResponseSchema
 >
@@ -2066,9 +1677,6 @@ export type DeleteResearchCampaignResponse = z.infer<
 >
 export type DeleteResearchCampaignExperimentResponse = z.infer<
   typeof deleteResearchCampaignExperimentResponseSchema
->
-export type ResearchProjectDeletionsResponse = z.infer<
-  typeof researchProjectDeletionsResponseSchema
 >
 
 export const researchProjectUpsertedEventSchema = z.object({

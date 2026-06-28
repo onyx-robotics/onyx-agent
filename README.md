@@ -87,8 +87,11 @@ onyx research run --campaign fast-eval --workers 4
 onyx listen
 ```
 
-The CLI stores local research state and retry events in `.git/onyx/research.db`
-and flushes them to `/api/v1` when connectivity and credentials are available.
+The CLI writes research product state directly to `/api/v1`. Supabase/API owns
+campaigns, sessions, hypotheses, worker leases, experiments, summaries,
+knowledge, stop state, and accepted experiment ordering. Local `.git/onyx/`
+files are runtime artifacts: logs, manifests, workflow runs, attempts,
+resource locks, and a small `state.json` convenience cache.
 Transient diagnostics use `onyx tools run <tool-id>`, which executes declared
 setup tools without creating workflow or measured-attempt state.
 
@@ -109,22 +112,18 @@ editable scope, evaluation caveats, declared tools, and project-specific
 constraints. Workers use CLI commands for live structured state instead of
 generated per-worker state files.
 
-Local research state is SQLite-first. The agent stores campaigns, sessions,
-hypotheses, workers, experiments, summaries, knowledge, resource leases, and
-pending sync events in `.git/onyx/research.db`. Commands write this ledger
-before attempting network sync, so setup, research execution, experiment
-logging, summaries, and knowledge publishing work offline and can be uploaded
-later with `onyx sync`.
-Use `onyx sync status`, `onyx sync conflicts`, `onyx sync retry`,
-`onyx sync export`, and `onyx sync doctor` to inspect and repair the local
-ledger.
+Research commands require API access. Workers use server-assigned leases and
+lease-token heartbeats, push immutable experiment refs before reporting, and
+receive server outcomes (`accepted`, `duplicate`, or `rejected`). `onyx exp
+list`, `onyx research status`, `onyx listen`, `knowledge list`, and `summary
+list` read remote API state instead of offline local projections.
 
 `onyx campaign setup` and `onyx research run` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
 declared workflow tools. GitHub-backed campaigns also require that base commit
 to be present on the repository remote; the CLI warns when it is missing, while
-the bundled `/onyx` skill pushes the setup base before campaign sync.
+the bundled `/onyx` skill pushes the setup base before campaign setup.
 
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
@@ -162,16 +161,14 @@ For large local runs, the supervisor ramps launches in batches
 (`--launch-batch-size`, default up to 10) separated by
 `--launch-interval-seconds` (default 5), backs off with capped exponential
 jitter when provider startup, rate-limit, overload, auth, or degraded-service
-failures happen, and keeps launching up to the worker target until the local
-SQLite session becomes terminal. `onyx exp log` accepts the first N terminal
-attempts and discards late attempts idempotently after completion.
+failures happen, and asks the server for a worker lease before each launch.
+The server enforces the worker target, assigns hypotheses, assigns accepted
+indexes, and rejects late attempts idempotently after completion.
 
-Sync and presence are bounded for large sessions: `onyx sync` defaults to 50
-events per request (`--sync-batch-size`, max 100), the supervisor drains at
-most 4 sync batches per interval by default (`--sync-drain-batches`), and
-presence sends site telemetry every interval while uploading changed worker
-snapshots by default, a full worker snapshot every 60 seconds or final upload,
-and at most 250 worker snapshots per request.
+Presence is bounded for large sessions: the supervisor sends site telemetry
+every interval while uploading changed worker snapshots by default, a full
+worker snapshot every 60 seconds or final upload, and at most 250 worker
+snapshots per request.
 
 Codex, Claude, and OpenCode are first-class built-in launchers. All are spawned
 directly in non-interactive mode, receive the worker prompt over stdin, and use
@@ -182,9 +179,8 @@ isolated `ONYX_HOME` plus `ONYX_WORKER_CONTEXT` under
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-the supervisor-owned push/sync queue with default concurrency 4, adaptive
-coalesced presence updates, sampled durable heartbeats, stop handling, and
-final sync for the session. `onyx research status --json` reports fresh
+server lease acquisition, adaptive coalesced presence updates, remote
+heartbeats, stop handling, and local child cleanup. `onyx research status --json` reports fresh
 supervisor telemetry when available, including active process count, launch
 rate, provider backoff, recent launch failures, PID, and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
 as a low-level debugging and recovery primitive.
@@ -212,14 +208,17 @@ publish shared learning with `onyx-worker knowledge add` and read it back throug
 `onyx-worker research brief`, but successor hypothesis selection remains an
 orchestrator/human decision.
 After the agent exits, the worker harness performs one final best-effort
-commit, checks whether HEAD is already represented by a local experiment,
-measures/logs exactly one unlogged HEAD commit using that commit's parent as
-the workflow base when the session is still accepting experiments, and pushes
-the worker branch so useful offline work is not lost. If the session is already
-terminal, finalization records `discarded_after_completion` locally and does not
-create an experiment, ranking input, sync event, result ref, or recovery
-artifact. Multi-commit, restore-forward, or dirty salvage preserves the branch
-without producing a measured experiment or blocked workflow run. Worker
+commit, checks whether HEAD is already represented by a reported experiment,
+measures/logs exactly one unreported HEAD commit using that commit's parent as
+the workflow base when the session is still accepting experiments, pushes the
+immutable experiment ref, reports directly to `/api/v1`, and pushes the worker
+branch for recovery. If git push or API reporting fails, the manifest records
+the pushed/missing refs and retry instructions; it does not create local
+product state. If the session is already terminal, finalization records
+`discarded_after_completion` locally and does not create an experiment, ranking
+input, result ref, or recovery artifact. Multi-commit, restore-forward, or
+dirty salvage preserves the branch without producing a measured experiment or
+blocked workflow run. Worker
 manifests report `finalizationStatus` as `none`, `already_logged`,
 `measured_and_logged`, `salvaged_unmeasured`,
 `discarded_after_completion`, or `failed`. If
@@ -235,8 +234,8 @@ onyx research stop --session <id>
 onyx research finish --campaign fast-eval
 ```
 
-`finish` reconciles state, drains final sync, prints accepted/pending/conflict
-counts, and prints local extraction branches such as `onyx/fast-eval/best`.
+`finish` reads remote state, writes the final campaign summary through
+`/api/v1`, and prints local extraction branches such as `onyx/fast-eval/best`.
 
 To delete a research direction entirely — the campaign record with all its
 experiments and matching local cache rows:
@@ -245,11 +244,9 @@ experiments and matching local cache rows:
 onyx campaign delete --name fast-eval
 ```
 
-Deletion writes a local tombstone and sync event first, so it can be queued
-offline and replayed safely. The server also tombstones deleted campaigns and
-experiments so stale SQLite sync events cannot resurrect them. Recreating a
-campaign with the same name later is fine because tombstones only match records
-created before the deletion.
+Deletion is applied directly through `/api/v1`; the server owns tombstones for
+deleted campaigns and experiments. Recreating a campaign with the same name
+later is fine because tombstones only match records created before deletion.
 
 ## Development
 
