@@ -10,7 +10,7 @@ import {
   readWorkflowRun,
   type LocalWorkflowRun,
   type LocalWorkflowRunStatus,
-} from "../lib/research-db"
+} from "../lib/research-runtime"
 import {
   resolveCampaignNameFromContext,
   resolveWorkerWorkflowContext,
@@ -94,23 +94,23 @@ export async function commandWorkflowStatus(args: Args) {
     ? await readWorkflowRun(root, args.options.run)
     : shouldUseWorkerScope
       ? workerScopedRun
-    : args.options.blocked === "true"
-      ? await readLatestBlockedWorkflowRun({
-          root,
-          campaignName: campaignName!,
-          projectPath,
-        })
-      : args.options.active === "true"
-      ? await readLatestActiveWorkflowRun({
-          root,
-          campaignName: campaignName!,
-          projectPath,
-        })
-      : await readLatestWorkflowRun({
-          root,
-          campaignName: campaignName!,
-          projectPath,
-        })
+      : args.options.blocked === "true"
+        ? await readLatestBlockedWorkflowRun({
+            root,
+            campaignName: campaignName!,
+            projectPath,
+          })
+        : args.options.active === "true"
+          ? await readLatestActiveWorkflowRun({
+              root,
+              campaignName: campaignName!,
+              projectPath,
+            })
+          : await readLatestWorkflowRun({
+              root,
+              campaignName: campaignName!,
+              projectPath,
+            })
   if (!run) {
     throw new Error(
       args.options.run
@@ -118,8 +118,8 @@ export async function commandWorkflowStatus(args: Args) {
         : args.options.blocked === "true"
           ? `No blocked workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
           : args.options.active === "true"
-          ? `No active workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
-          : `No workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
+            ? `No active workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
+            : `No workflow runs exist for campaign ${campaignName} in project path "${projectPath}".`
     )
   }
   const steps = await listWorkflowSteps(root, run.id)

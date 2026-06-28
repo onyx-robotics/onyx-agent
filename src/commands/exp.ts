@@ -28,12 +28,10 @@ import { apiExperimentToHistory } from "../lib/history"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
 import {
   clientRunRef,
-  onyxStateDir,
-  readState,
-  writeState,
-  type LastRunSelector,
-  type LastRunRecord,
-} from "../lib/outbox"
+  type CachedAttemptRecord,
+  type CachedAttemptSelector,
+} from "../lib/local-attempt-cache"
+import { onyxStateDir, readState, writeState } from "../lib/runtime-state"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import {
   clearLocalAttempt,
@@ -48,7 +46,7 @@ import {
   type LocalWorkflowRun,
   type LocalWorkflowRunStatus,
   type LocalWorkflowStep,
-} from "../lib/research-db"
+} from "../lib/research-runtime"
 import { renderExperimentTable } from "../lib/tui"
 import { runToolCommand, type ToolRunResult } from "../lib/tools"
 import {
@@ -129,8 +127,8 @@ function lastRunSelectorForContext({
   sessionId?: string
   workerId?: string
   hypothesisId?: string
-}): LastRunSelector {
-  const selector: LastRunSelector = { campaignName, projectPath }
+}): CachedAttemptSelector {
+  const selector: CachedAttemptSelector = { campaignName, projectPath }
   if (runRef) {
     selector.runRef = runRef
     return selector
@@ -138,7 +136,7 @@ function lastRunSelectorForContext({
   if (sessionId) selector.sessionId = sessionId
   if (workerId) selector.workerId = workerId
   if (hypothesisId) selector.hypothesisId = hypothesisId
-  if (!sessionId && !workerId && !hypothesisId) selector.legacyOnly = true
+  if (!sessionId && !workerId && !hypothesisId) selector.unscopedOnly = true
   return selector
 }
 
@@ -316,7 +314,7 @@ function workflowRunLine(run: LocalWorkflowRun) {
   return `- ${run.id}: ${run.status}, runRef ${run.runRef}, worker ${run.workerId ?? "none"}, hypothesis ${run.hypothesisId ?? "none"}`
 }
 
-function localAttemptLine(record: LastRunRecord) {
+function localAttemptLine(record: CachedAttemptRecord) {
   return `- ${record.runRef}: ${record.status}, worker ${record.workerId ?? "none"}, hypothesis ${record.hypothesisId ?? "none"}, result ${record.resultCommitSha}`
 }
 
@@ -705,7 +703,7 @@ async function writeTerminalAttempt({
   })
   const finalStatus =
     compliance.status === "setup_violation" ? "setup_violation" : status
-  const record: LastRunRecord = {
+  const record: CachedAttemptRecord = {
     schemaVersion: 1,
     createdAt: completed.toISOString(),
     runRef: run.runRef,
@@ -802,8 +800,7 @@ async function createWorkflowRun({
       sessionId,
       workerId,
       hypothesisId: blockedWorkflowHypothesisId,
-      reason:
-        "A new workflow run superseded this blocked workflow attempt.",
+      reason: "A new workflow run superseded this blocked workflow attempt.",
     }).catch(() => [])
   }
   const run: LocalWorkflowRun = {
@@ -1338,7 +1335,7 @@ export async function commandExpLog(args: Args) {
         runRef: explicitRunRef,
         context,
       })
-  const usableLastRun =
+  const usableAttempt =
     lastRun?.campaignName === campaignName &&
     lastRun.projectPath === projectPath
       ? lastRun
@@ -1352,33 +1349,33 @@ export async function commandExpLog(args: Args) {
       "`--offline`, `--defer-sync`, and ONYX_DEFER_EXP_LOG_SYNC were removed. `onyx exp log` pushes the result ref and reports directly to the Onyx API."
     )
   }
-  if (explicitRunRef && !usableLastRun) {
+  if (explicitRunRef && !usableAttempt) {
     throw new Error(
       `No measured run found for --run-ref ${explicitRunRef}. Rerun the workflow or leave unlogged salvage to the worker harness.`
     )
   }
   const resultCommitSha =
     args.options.commit ??
-    usableLastRun?.resultCommitSha ??
+    usableAttempt?.resultCommitSha ??
     (await currentCommit(root))
   const baseCommitSha =
-    args.options.base ?? usableLastRun?.baseCommitSha ?? campaign.baseCommitSha
+    args.options.base ?? usableAttempt?.baseCommitSha ?? campaign.baseCommitSha
   const metricName =
     args.options["metric-name"] ??
-    usableLastRun?.primaryMetricName ??
+    usableAttempt?.primaryMetricName ??
     campaign.metricName
   const metricValue =
     args.options.metric === undefined
-      ? (usableLastRun?.primaryMetricValue ?? null)
+      ? (usableAttempt?.primaryMetricValue ?? null)
       : Number(args.options.metric)
   if (metricValue !== null && !Number.isFinite(metricValue)) {
     throw new Error("--metric must be a finite number")
   }
   const status = validateStatus(
-    args.options.status ?? usableLastRun?.status ?? "succeeded"
+    args.options.status ?? usableAttempt?.status ?? "succeeded"
   )
   if (
-    !usableLastRun &&
+    !usableAttempt &&
     status !== "failed" &&
     !optionalFlag(args, "allow-unmeasured")
   ) {
@@ -1394,7 +1391,7 @@ export async function commandExpLog(args: Args) {
       `Cannot record ${status} without a metric for "${metricName}".`
     )
   }
-  const checks = usableLastRun?.checks ?? null
+  const checks = usableAttempt?.checks ?? null
   if (
     checks &&
     checks.status !== "passed" &&
@@ -1407,28 +1404,28 @@ export async function commandExpLog(args: Args) {
   const completedAt = new Date().toISOString()
   const metrics =
     args.options.metric === undefined
-      ? (usableLastRun?.metrics ?? {})
+      ? (usableAttempt?.metrics ?? {})
       : metricValue === null
         ? {}
-        : { ...(usableLastRun?.metrics ?? {}), [metricName]: metricValue }
-  const runRef = usableLastRun?.runRef ?? clientRunRef(campaignName)
+        : { ...(usableAttempt?.metrics ?? {}), [metricName]: metricValue }
+  const runRef = usableAttempt?.runRef ?? clientRunRef(campaignName)
   const resultRef =
     args.options["result-ref"] ??
-    usableLastRun?.resultRef ??
+    usableAttempt?.resultRef ??
     `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
   const hypothesisId =
     args.options.hypothesis ??
-    usableLastRun?.hypothesisId ??
+    usableAttempt?.hypothesisId ??
     process.env.ONYX_HYPOTHESIS_ID ??
     campaign.hypothesisId
   const sessionId =
     args.options.session ??
-    usableLastRun?.sessionId ??
+    usableAttempt?.sessionId ??
     process.env.ONYX_SESSION_ID
   const workerId =
-    args.options.worker ?? usableLastRun?.workerId ?? process.env.ONYX_WORKER_ID
+    args.options.worker ?? usableAttempt?.workerId ?? process.env.ONYX_WORKER_ID
   const loggedCompliance =
-    usableLastRun?.setupCompliance ??
+    usableAttempt?.setupCompliance ??
     setupCompliance({
       setup,
       changedPaths: await changedProjectPaths({
@@ -1460,10 +1457,10 @@ export async function commandExpLog(args: Args) {
     metrics,
     agentNotes: parseAgentNotes(args.options["agent-notes"]),
     checks,
-    durationMs: usableLastRun?.durationMs ?? null,
-    startedAt: usableLastRun?.startedAt ?? null,
-    completedAt: usableLastRun?.completedAt ?? completedAt,
-    outputSummary: usableLastRun?.outputSummary ?? null,
+    durationMs: usableAttempt?.durationMs ?? null,
+    startedAt: usableAttempt?.startedAt ?? null,
+    completedAt: usableAttempt?.completedAt ?? completedAt,
+    outputSummary: usableAttempt?.outputSummary ?? null,
     sessionId,
     workerId,
     hypothesisId,

@@ -11,7 +11,7 @@ import { delimiter } from "node:path"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { onyxStateDir } from "./outbox"
+import { onyxStateDir } from "./runtime-state"
 import { readConfig, type BuiltInWorkerAgent } from "./config"
 import { gitCommonDir, gitDir } from "./git"
 import { pathExists, runProcess } from "./process"
@@ -151,9 +151,17 @@ function opencodeModelIds(output: string) {
 }
 
 function modelSimilarity(left: string, right: string) {
-  const leftParts = new Set(left.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))
+  const leftParts = new Set(
+    left
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean)
+  )
   const rightParts = new Set(
-    right.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+    right
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean)
   )
   let overlap = 0
   for (const part of leftParts) {
@@ -266,9 +274,13 @@ export async function writeWorkerCliWrapper({
         "",
       ].join("\n")
     } else {
-      const resolved = await runProcess("sh", ["-lc", "command -v onyx-worker"], {
-        timeoutMs: 5000,
-      })
+      const resolved = await runProcess(
+        "sh",
+        ["-lc", "command -v onyx-worker"],
+        {
+          timeoutMs: 5000,
+        }
+      )
       const resolvedPath = resolved.stdout.trim().split("\n")[0]
       if (resolved.code === 0 && resolvedPath) {
         target = resolvedPath
@@ -630,13 +642,7 @@ export async function preflightWorkerInvocation(
     await runCheck(
       "onyx-worker should-stop",
       "onyx-worker",
-      [
-        "research",
-        "should-stop",
-        "--session",
-        options.sessionId,
-        "--json",
-      ],
+      ["research", "should-stop", "--session", options.sessionId, "--json"],
       { allowExitCodes: [0] }
     )
   }

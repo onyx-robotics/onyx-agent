@@ -29,9 +29,10 @@ import {
   commandWorkerRun,
 } from "./commands/research"
 import { commandSetupInit, commandSetupValidate } from "./commands/setup"
-import { commandPush, commandStatus, commandSync } from "./commands/sync"
+import { commandStatus } from "./commands/status"
 import { commandToolsRun } from "./commands/tools"
 import { commandWorkflowStatus } from "./commands/workflow"
+import { removedResearchSyncCommandMessage } from "./lib/removed-commands"
 
 export const USAGE = `onyx - research workflow CLI
 
@@ -198,8 +199,10 @@ export async function main(argv = process.argv.slice(2)) {
       return commandWorkflowStatus(args)
     if (command === "listen") return commandListen()
     if (command === "status") return commandStatus(args)
-    if (command === "push") return commandPush(args)
-    if (command === "sync") return commandSync(args)
+    if (command === "push")
+      throw new Error(removedResearchSyncCommandMessage("push"))
+    if (command === "sync")
+      throw new Error(removedResearchSyncCommandMessage("sync"))
 
     console.error(`Unknown command: ${args.positional.join(" ")}`)
     console.error(USAGE)

@@ -1,7 +1,7 @@
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
-import { onyxStateDir } from "./outbox"
+import { onyxStateDir } from "./runtime-state"
 
 type ResourceLockRecord = {
   ownerId: string
@@ -41,7 +41,9 @@ async function resourceLockDir(root: string, resourceName: string) {
 
 async function readLock(path: string) {
   try {
-    return JSON.parse(await readFile(path, "utf8")) as Partial<ResourceLockRecord>
+    return JSON.parse(
+      await readFile(path, "utf8")
+    ) as Partial<ResourceLockRecord>
   } catch {
     return null
   }
@@ -53,7 +55,8 @@ async function removeStaleLock(path: string, nowMs: number) {
     await unlink(path).catch(() => {})
     return
   }
-  const expiresAt = typeof lock.expiresAt === "string" ? Date.parse(lock.expiresAt) : 0
+  const expiresAt =
+    typeof lock.expiresAt === "string" ? Date.parse(lock.expiresAt) : 0
   const pid = typeof lock.pid === "number" ? lock.pid : 0
   if (expiresAt <= nowMs || !pidIsAlive(pid)) {
     await unlink(path).catch(() => {})

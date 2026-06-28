@@ -8,7 +8,7 @@ import type {
 import type { Args } from "./args"
 import { apiBaseUrl, apiKey } from "./config"
 import { normalizeRepositoryUrl, repositoryUrl } from "./git"
-import { readState, updateState } from "./outbox"
+import { readState, updateState } from "./runtime-state"
 import { resolveProjectPath } from "./project"
 
 export type ApiProject = {

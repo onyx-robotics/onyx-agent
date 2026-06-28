@@ -2,14 +2,14 @@ import { watch, type FSWatcher } from "node:fs"
 import { basename } from "node:path"
 
 import { gitResult, repoRoot } from "../lib/git"
-import { onyxStateDir, readState } from "../lib/outbox"
+import { onyxStateDir, readState } from "../lib/runtime-state"
 import { campaignStateKey } from "../lib/project"
 import {
   getActiveLocalCampaignName,
   getLocalSessionState,
   listLocalAttempts,
   listLocalExperimentHistory,
-} from "../lib/research-db"
+} from "../lib/research-runtime"
 import {
   formatAge,
   renderFrame,
@@ -162,10 +162,7 @@ async function buildModel(root: string): Promise<ListenModel> {
       hypothesis,
     ])
   )
-  const workerIds = new Set([
-    ...workersById.keys(),
-    ...manifestByWorker.keys(),
-  ])
+  const workerIds = new Set([...workersById.keys(), ...manifestByWorker.keys()])
   const workers: ListenWorkerRow[] = [...workerIds]
     .map((workerId) => {
       const worker = workersById.get(workerId)
@@ -181,7 +178,8 @@ async function buildModel(root: string): Promise<ListenModel> {
         workerId,
         workerName: worker?.workerName ?? manifest?.workerName ?? null,
         hypothesisName,
-        status: latest?.status ?? worker?.status ?? manifest?.status ?? "running",
+        status:
+          latest?.status ?? worker?.status ?? manifest?.status ?? "running",
         phase: latest?.phase ?? worker?.phase ?? null,
         progressMessage:
           latest?.progressMessage ?? worker?.progressMessage ?? null,
@@ -190,8 +188,7 @@ async function buildModel(root: string): Promise<ListenModel> {
         lastOutputAt: manifest?.lastOutputAt ?? null,
         startedAt: manifest?.startedAt ?? null,
         completedAt: manifest?.completedAt ?? null,
-        finalizationStatus:
-          manifest?.finalization?.finalizationStatus ?? null,
+        finalizationStatus: manifest?.finalization?.finalizationStatus ?? null,
         activityLogPath: manifest?.activityLogPath ?? null,
         logPath: manifest?.logPath ?? null,
       }
@@ -236,7 +233,7 @@ async function buildModel(root: string): Promise<ListenModel> {
       active ||
       workers.some((worker) =>
         ["registered", "running", "starting"].includes(worker.status)
-    ),
+      ),
     rows,
     providerBackoff: activeSessionId
       ? (state.sessions?.[activeSessionId]?.providerBackoff ?? null)

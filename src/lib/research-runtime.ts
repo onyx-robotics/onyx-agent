@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto"
-import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises"
 import { dirname, join } from "node:path"
 
 import type {
@@ -23,26 +30,12 @@ import {
   readState,
   updateState,
   withOnyxLock,
-  type LastRunRecord,
-  type LastRunSelector,
-} from "./outbox"
+} from "./runtime-state"
+import {
+  type CachedAttemptRecord,
+  type CachedAttemptSelector,
+} from "./local-attempt-cache"
 import { acquireFileResourceLease } from "./resource-locks"
-
-export type ResearchSyncEventStatus = "pending" | "acked" | "conflict"
-
-export type ResearchSyncEvent = {
-  eventId: string
-  sequence: number
-  type: string
-  entityType: string
-  entityId: string
-  payload: Record<string, unknown>
-  status: ResearchSyncEventStatus
-  attempts: number
-  lastError: string | null
-  createdAt: string
-  updatedAt: string
-}
 
 export type LocalCampaign = ApiCampaign & {
   status: "active" | "completed" | "archived"
@@ -224,7 +217,10 @@ async function readCampaigns(root: string) {
   return jsonFile<Record<string, LocalCampaign>>(await campaignsPath(root), {})
 }
 
-async function writeCampaigns(root: string, campaigns: Record<string, LocalCampaign>) {
+async function writeCampaigns(
+  root: string,
+  campaigns: Record<string, LocalCampaign>
+) {
   await writeJson(await campaignsPath(root), campaigns)
 }
 
@@ -396,7 +392,9 @@ async function writeSessionRecord(root: string, record: LocalSessionRecord) {
 }
 
 function attemptPathForRunRef(root: string, runRef: string) {
-  return attemptsDir(root).then((dir) => join(dir, `${safeSegment(runRef)}.json`))
+  return attemptsDir(root).then((dir) =>
+    join(dir, `${safeSegment(runRef)}.json`)
+  )
 }
 
 async function workflowRunDir(root: string, id: string) {
@@ -422,21 +420,29 @@ async function listJsonFiles<T>(dir: string): Promise<T[]> {
   return values
 }
 
-function matchesAttempt(record: LastRunRecord, selector: LastRunSelector) {
+function matchesAttempt(
+  record: CachedAttemptRecord,
+  selector: CachedAttemptSelector
+) {
   return (
     (!selector.runRef || record.runRef === selector.runRef) &&
     (!selector.campaignName || record.campaignName === selector.campaignName) &&
-    (selector.projectPath === undefined || record.projectPath === selector.projectPath) &&
+    (selector.projectPath === undefined ||
+      record.projectPath === selector.projectPath) &&
     (!selector.sessionId || record.sessionId === selector.sessionId) &&
     (!selector.workerId || record.workerId === selector.workerId) &&
     (!selector.hypothesisId || record.hypothesisId === selector.hypothesisId)
   )
 }
 
-function matchesWorkflowRun(run: LocalWorkflowRun, selector: WorkflowRunSelector) {
+function matchesWorkflowRun(
+  run: LocalWorkflowRun,
+  selector: WorkflowRunSelector
+) {
   return (
     (!selector.campaignName || run.campaignName === selector.campaignName) &&
-    (selector.projectPath === undefined || run.projectPath === selector.projectPath) &&
+    (selector.projectPath === undefined ||
+      run.projectPath === selector.projectPath) &&
     (!selector.sessionId || run.sessionId === selector.sessionId) &&
     (!selector.workerId || run.workerId === selector.workerId) &&
     (!selector.hypothesisId || run.hypothesisId === selector.hypothesisId) &&
@@ -444,7 +450,7 @@ function matchesWorkflowRun(run: LocalWorkflowRun, selector: WorkflowRunSelector
   )
 }
 
-export async function researchDbPath(root: string) {
+export async function researchRuntimeStatePath(root: string) {
   return join(await runtimeDir(root), "runtime-state.json")
 }
 
@@ -571,7 +577,9 @@ export async function completeLocalCampaign({
   campaignId: string
 }) {
   const campaigns = await readCampaigns(root)
-  const entry = Object.entries(campaigns).find(([, campaign]) => campaign.id === campaignId)
+  const entry = Object.entries(campaigns).find(
+    ([, campaign]) => campaign.id === campaignId
+  )
   if (!entry) throw new Error("Local campaign not found")
   const [key, campaign] = entry
   campaigns[key] = { ...campaign, status: "completed", updatedAt: nowIso() }
@@ -593,8 +601,9 @@ export async function localCampaignByName({
 
 export async function localCampaignById(root: string, campaignId: string) {
   return (
-    Object.values(await readCampaigns(root)).find((campaign) => campaign.id === campaignId) ??
-    null
+    Object.values(await readCampaigns(root)).find(
+      (campaign) => campaign.id === campaignId
+    ) ?? null
   )
 }
 
@@ -644,7 +653,8 @@ export async function createLocalSession({
   deadlineAt?: string | null
   schedulerSiteId?: string | null
 }) {
-  const campaign = (await localCampaignById(root, campaignId)) ??
+  const campaign =
+    (await localCampaignById(root, campaignId)) ??
     campaignFromInput({
       id: campaignId,
       name: `campaign-${campaignId.slice(0, 8)}`,
@@ -730,9 +740,11 @@ export async function cacheResearchSessionState({
   const record: LocalSessionRecord = {
     campaign,
     session,
-    hypotheses: hypotheses.length > 0 ? hypotheses : (existing?.hypotheses ?? []),
+    hypotheses:
+      hypotheses.length > 0 ? hypotheses : (existing?.hypotheses ?? []),
     workers: workers.length > 0 ? workers : (existing?.workers ?? []),
-    experiments: experiments.length > 0 ? experiments : (existing?.experiments ?? []),
+    experiments:
+      experiments.length > 0 ? experiments : (existing?.experiments ?? []),
     summaries: summaries.length > 0 ? summaries : (existing?.summaries ?? []),
     knowledge: knowledge.length > 0 ? knowledge : (existing?.knowledge ?? []),
   }
@@ -776,7 +788,10 @@ export async function createLocalHypothesis(input: {
 }) {
   const hypothesis = defaultHypothesis(input)
   if (input.createdBySessionId) {
-    const record = await readSessionRecord(input.root, input.createdBySessionId).catch(() => null)
+    const record = await readSessionRecord(
+      input.root,
+      input.createdBySessionId
+    ).catch(() => null)
     if (record) {
       record.hypotheses.push(hypothesis)
       await writeSessionRecord(input.root, record)
@@ -785,14 +800,26 @@ export async function createLocalHypothesis(input: {
   return hypothesis
 }
 
-export async function getLocalSessionState(root: string, sessionId: string): Promise<ApiSessionState> {
+export async function getLocalSessionState(
+  root: string,
+  sessionId: string
+): Promise<ApiSessionState> {
   const record = await readSessionRecord(root, sessionId)
-  return { ...record, latestExperiments: record.experiments, bestExperiment: record.experiments[0] ?? null, updatedAt: nowIso() }
+  return {
+    ...record,
+    latestExperiments: record.experiments,
+    bestExperiment: record.experiments[0] ?? null,
+    updatedAt: nowIso(),
+  }
 }
 
 export async function listLocalHypotheses(root: string, campaignId: string) {
-  const sessions = await listJsonFiles<LocalSessionRecord>(await sessionsDir(root))
-  return sessions.flatMap((session) => session.hypotheses).filter((hypothesis) => hypothesis.campaignId === campaignId)
+  const sessions = await listJsonFiles<LocalSessionRecord>(
+    await sessionsDir(root)
+  )
+  return sessions
+    .flatMap((session) => session.hypotheses)
+    .filter((hypothesis) => hypothesis.campaignId === campaignId)
 }
 
 export async function registerLocalWorker({
@@ -897,7 +924,10 @@ export async function recordLocalWorkerHeartbeat({
     metadata: { ...(existing?.metadata ?? {}), ...metadata },
     updatedAt: at,
   }
-  record.workers = [...record.workers.filter((item) => item.id !== workerId), worker]
+  record.workers = [
+    ...record.workers.filter((item) => item.id !== workerId),
+    worker,
+  ]
   await writeSessionRecord(root, record)
   return worker
 }
@@ -925,7 +955,10 @@ export async function stopLocalSession({
     finalizationStatus: finalizationStatus ?? record.session.finalizationStatus,
     terminalReason: terminalReason ?? record.session.terminalReason,
     metadata: { ...record.session.metadata, ...(metadata ?? {}) },
-    completedAt: status === "running" || status === "stop_requested" ? record.session.completedAt : nowIso(),
+    completedAt:
+      status === "running" || status === "stop_requested"
+        ? record.session.completedAt
+        : nowIso(),
     updatedAt: nowIso(),
   }
   await writeSessionRecord(root, record)
@@ -1034,29 +1067,45 @@ export async function writeLocalAttempt({
   record,
 }: {
   root: string
-  record: LastRunRecord
+  record: CachedAttemptRecord
 }) {
   await writeJson(await attemptPathForRunRef(root, record.runRef), record)
 }
 
-export async function readLocalAttempt(root: string, selector: LastRunSelector) {
+export async function readLocalAttempt(
+  root: string,
+  selector: CachedAttemptSelector
+) {
   return (await listLocalAttempts(root, selector))[0] ?? null
 }
 
-export async function listLocalAttempts(root: string, selector: LastRunSelector = {}) {
-  const attempts = await listJsonFiles<LastRunRecord>(await attemptsDir(root))
+export async function listLocalAttempts(
+  root: string,
+  selector: CachedAttemptSelector = {}
+) {
+  const attempts = await listJsonFiles<CachedAttemptRecord>(
+    await attemptsDir(root)
+  )
   return attempts
     .filter((attempt) => matchesAttempt(attempt, selector))
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
 }
 
-export async function clearLocalAttempt(root: string, selector: LastRunSelector) {
+export async function clearLocalAttempt(
+  root: string,
+  selector: CachedAttemptSelector
+) {
   if (selector.runRef) {
-    await unlink(await attemptPathForRunRef(root, selector.runRef)).catch(() => {})
+    await unlink(await attemptPathForRunRef(root, selector.runRef)).catch(
+      () => {}
+    )
     return
   }
   const attempt = await readLocalAttempt(root, selector)
-  if (attempt) await unlink(await attemptPathForRunRef(root, attempt.runRef)).catch(() => {})
+  if (attempt)
+    await unlink(await attemptPathForRunRef(root, attempt.runRef)).catch(
+      () => {}
+    )
 }
 
 export async function upsertWorkflowRun({
@@ -1073,10 +1122,16 @@ export async function upsertWorkflowRun({
 }
 
 export async function readWorkflowRun(root: string, id: string) {
-  return jsonFile<LocalWorkflowRun | null>(await workflowRunPath(root, id), null)
+  return jsonFile<LocalWorkflowRun | null>(
+    await workflowRunPath(root, id),
+    null
+  )
 }
 
-export async function listWorkflowRuns(root: string, selector: WorkflowRunSelector = {}) {
+export async function listWorkflowRuns(
+  root: string,
+  selector: WorkflowRunSelector = {}
+) {
   const dirs = await readdir(await workflowRunsDir(root)).catch(() => [])
   const runs: LocalWorkflowRun[] = []
   for (const dir of dirs) {
@@ -1086,7 +1141,9 @@ export async function listWorkflowRuns(root: string, selector: WorkflowRunSelect
     )
     if (run && matchesWorkflowRun(run, selector)) runs.push(run)
   }
-  return runs.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  return runs.sort((left, right) =>
+    right.updatedAt.localeCompare(left.updatedAt)
+  )
 }
 
 export async function readLatestActiveWorkflowRun(input: {
@@ -1095,12 +1152,14 @@ export async function readLatestActiveWorkflowRun(input: {
   projectPath: string
 }) {
   return (
-    await listWorkflowRuns(input.root, {
-      campaignName: input.campaignName,
-      projectPath: input.projectPath,
-      statuses: ["running", "paused"],
-    })
-  )[0] ?? null
+    (
+      await listWorkflowRuns(input.root, {
+        campaignName: input.campaignName,
+        projectPath: input.projectPath,
+        statuses: ["running", "paused"],
+      })
+    )[0] ?? null
+  )
 }
 
 export async function readLatestBlockedWorkflowRun(input: {
@@ -1109,12 +1168,14 @@ export async function readLatestBlockedWorkflowRun(input: {
   projectPath: string
 }) {
   return (
-    await listWorkflowRuns(input.root, {
-      campaignName: input.campaignName,
-      projectPath: input.projectPath,
-      statuses: ["blocked"],
-    })
-  )[0] ?? null
+    (
+      await listWorkflowRuns(input.root, {
+        campaignName: input.campaignName,
+        projectPath: input.projectPath,
+        statuses: ["blocked"],
+      })
+    )[0] ?? null
+  )
 }
 
 export async function readLatestWorkflowRun(input: {
@@ -1123,11 +1184,13 @@ export async function readLatestWorkflowRun(input: {
   projectPath: string
 }) {
   return (
-    await listWorkflowRuns(input.root, {
-      campaignName: input.campaignName,
-      projectPath: input.projectPath,
-    })
-  )[0] ?? null
+    (
+      await listWorkflowRuns(input.root, {
+        campaignName: input.campaignName,
+        projectPath: input.projectPath,
+      })
+    )[0] ?? null
+  )
 }
 
 export async function abandonBlockedWorkflowRunsForSession({
@@ -1260,74 +1323,18 @@ export async function listLocalKnowledge(
   return []
 }
 
-export async function pendingResearchSyncEvents(
-  _root: string,
-  _limit = 100
-): Promise<ResearchSyncEvent[]> {
-  void _root
-  void _limit
-  return []
-}
-
-export async function markResearchSyncAcked(_input: {
+export async function applyRemoteTombstones(_input: {
   root: string
-  eventId: string
-  serverStatus: string
-  serverEntityId?: string | null
-  details?: Record<string, unknown>
+  tombstones: unknown[]
 }) {
   void _input
 }
 
-export async function applyRemoteTombstones(_input: { root: string; tombstones: unknown[] }) {
-  void _input
-}
-
-export async function applyProjectDeletions(_input: { root: string; deletions: unknown }) {
-  void _input
-}
-
-export async function markResearchSyncError(_input: {
+export async function applyProjectDeletions(_input: {
   root: string
-  eventIds: string[]
-  message: string
+  deletions: unknown
 }) {
   void _input
-}
-
-export async function markResearchSyncConflict(_input: {
-  root: string
-  eventId: string
-  message: string
-}) {
-  void _input
-}
-
-export async function pendingResearchSyncCount(_root: string) {
-  void _root
-  return 0
-}
-
-export async function oldestPendingResearchSyncAgeMs(_root: string) {
-  void _root
-  return null
-}
-
-export async function researchSyncConflictCount(_root: string) {
-  void _root
-  return 0
-}
-
-export async function listResearchSyncConflicts(
-  _root: string
-): Promise<ResearchSyncEvent[]> {
-  void _root
-  return []
-}
-
-export async function retryResearchSyncConflicts(_root: string) {
-  void _root
-  return 0
 }
 
 export async function upsertWorkerLaunch(_input: {
@@ -1356,22 +1363,6 @@ export async function upsertWorkerLaunch(_input: {
   }
 }) {
   void _input
-}
-
-export async function researchSyncStatus(_root: string) {
-  void _root
-  return {
-    path: null,
-    pending: 0,
-    conflicts: 0,
-    oldestPendingAgeMs: null,
-    lastAckedAt: null,
-  }
-}
-
-export async function researchDbDoctor(_root: string) {
-  void _root
-  return { ok: true, sqlite: false }
 }
 
 export async function acquireLocalResourceLease(input: {
@@ -1421,7 +1412,8 @@ export type LocalResearchBrief = {
 
 export async function localResearchBrief(): Promise<LocalResearchBrief> {
   return {
-    markdown: "Remote research brief is available through `onyx research brief`.",
+    markdown:
+      "Remote research brief is available through `onyx research brief`.",
     campaign: null,
     session: null,
     hypothesis: null,
@@ -1431,10 +1423,14 @@ export async function localResearchBrief(): Promise<LocalResearchBrief> {
   }
 }
 
-export async function campaignRecordToLocal(record: LocalResearchCampaignExperimentLoggedRecord) {
+export async function campaignRecordToLocal(
+  record: LocalResearchCampaignExperimentLoggedRecord
+) {
   return record
 }
 
-export async function createCampaignFromSetup(input: Parameters<typeof createLocalCampaign>[0]) {
+export async function createCampaignFromSetup(
+  input: Parameters<typeof createLocalCampaign>[0]
+) {
   return createLocalCampaign(input)
 }

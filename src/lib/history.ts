@@ -16,7 +16,7 @@ import {
 } from "./api"
 import type { Args } from "./args"
 import { isHistoryRecordDeleted } from "./deletions"
-import { onyxStateDir, readOutbox, readState } from "./outbox"
+import { onyxStateDir, readState } from "./runtime-state"
 
 export async function historyPath(root: string) {
   return join(await onyxStateDir(root), "history.jsonl")
@@ -239,16 +239,6 @@ export async function hydrateHistoryFromApi(
       !canonicalRunRefs.has(record.runRef) &&
       !isHistoryRecordDeleted(record, deletions)
   )
-  const seen = new Set(localCandidates.map((record) => record.runRef))
-  const { records: outbox } = await readOutbox(root)
-  for (const record of outbox) {
-    if (record.type !== "campaign_experiment_logged") continue
-    if (canonicalRunRefs.has(record.runRef) || seen.has(record.runRef)) continue
-    if (isHistoryRecordDeleted(record, deletions)) continue
-    localCandidates.push(experimentRecordToHistory(record))
-    seen.add(record.runRef)
-  }
-
   const merged = mergeHistory(canonical, localCandidates)
   await rewriteHistory(root, merged)
 

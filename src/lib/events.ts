@@ -7,7 +7,7 @@ import {
   type LocalResearchEventType,
 } from "../protocol"
 
-import { onyxStateDir } from "./outbox"
+import { onyxStateDir } from "./runtime-state"
 
 const TRUNCATE_BYTES = 256 * 1024
 const TRUNCATE_KEEP = 500

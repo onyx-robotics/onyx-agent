@@ -12,6 +12,7 @@ import {
 import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
+  ApiError,
   getCampaignOverview,
   acquireResearchWorkerLease,
   createCampaignHypothesis,
@@ -64,7 +65,7 @@ import {
   withOnyxLock,
   writeState,
   type CliState,
-} from "../lib/outbox"
+} from "../lib/runtime-state"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
   pathExists,
@@ -87,7 +88,7 @@ import {
   getResearchSiteId,
   stopLocalSession,
   upsertWorkerLaunch,
-} from "../lib/research-db"
+} from "../lib/research-runtime"
 import { assertSetupCommitted } from "../lib/setup-git"
 import { protectedToolPaths } from "../lib/tools"
 import { formatAge } from "../lib/tui"
@@ -1968,7 +1969,8 @@ export async function finalizeHypothesisAttempt({
             ) {
               manifest.finalizationStatus = "discarded_after_completion"
               manifest.salvaged = false
-              manifest.error = "experiment report rejected by server acceptance state"
+              manifest.error =
+                "experiment report rejected by server acceptance state"
               if (activityManifest) {
                 await appendWorkerActivityEvent(activityManifest, {
                   type: "finalization",
@@ -2054,10 +2056,13 @@ export async function finalizeHypothesisAttempt({
       }
     } else {
       manifest.workerBranchPushStatus = "failed"
-      manifest.error =
+      const workerBranchPushError =
         workerBranchPush.stderr.trim() ||
         workerBranchPush.stdout.trim() ||
         "worker branch push failed"
+      manifest.error = [manifest.error, workerBranchPushError]
+        .filter(Boolean)
+        .join("; ")
       if (activityManifest) {
         await appendWorkerActivityEvent(activityManifest, {
           type: "push_result",
@@ -2271,7 +2276,9 @@ export async function collectResearchStopReasons({
       localSessionState.session.terminalReason === "experiment_target_reached"
     ) {
       addStopReason("experiment_target_reached", "experiment target reached")
-    } else if (localSessionState.session.terminalReason === "deadline_reached") {
+    } else if (
+      localSessionState.session.terminalReason === "deadline_reached"
+    ) {
       addStopReason("deadline_reached", "deadline reached")
     }
     addStopReason(
@@ -2426,16 +2433,20 @@ async function withWorkerHeartbeat<T>({
       }).catch(() => {})
     }
     if (shouldSample) {
-      void heartbeatWorker(workerId, {
-        leaseToken,
-        status: "running",
-        sessionId,
-        hypothesisId,
-        phase,
-        event: "heartbeat_sampled",
-        progressMessage: message,
-        metadata: snapshotMetadata,
-      }, args).catch(() => {})
+      void heartbeatWorker(
+        workerId,
+        {
+          leaseToken,
+          status: "running",
+          sessionId,
+          hypothesisId,
+          phase,
+          event: "heartbeat_sampled",
+          progressMessage: message,
+          metadata: snapshotMetadata,
+        },
+        args
+      ).catch(() => {})
     }
     if (!quiet && now - lastConsoleAt >= consoleEveryMs) {
       lastConsoleAt = now
@@ -2583,7 +2594,18 @@ type HypothesisRunResult = {
   resultCommitSha?: string
   status: "completed" | "failed" | "stopped"
   error?: string
+  leaseUnavailable?: boolean
   startupTimedOut?: boolean
+}
+
+function isLeaseUnavailableError(error: unknown) {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    /no_worker_slots|session_not_running|session_deadline_reached|experiment_target_reached/i.test(
+      error.message
+    )
+  )
 }
 
 async function runHypothesisOnce({
@@ -2665,22 +2687,39 @@ async function runHypothesisOnce({
         metadata: workerModelMetadata(workerModel),
       },
       args
-    )
+    ).catch((error) => {
+      if (isLeaseUnavailableError(error)) {
+        return null
+      }
+      throw error
+    })
+    if (!lease) {
+      return {
+        hypothesis,
+        status: "stopped",
+        leaseUnavailable: true,
+        error: "server did not grant a worker lease",
+      }
+    }
     const worker = lease.worker
     leaseToken = lease.leaseToken
     hypothesis = lease.hypothesis
     workerId = worker.id
     onRegistered?.({ workerId: worker.id, hypothesisId: hypothesis.id })
-    await heartbeatWorker(worker.id, {
-      leaseToken,
-      status: "running",
-      sessionId,
-      hypothesisId: hypothesis.id,
-      phase: "starting",
-      event: "hypothesis_started",
-      progressMessage: `Preparing ${hypothesis.name} worker preflight`,
-      metadata: workerModelMetadata(workerModel),
-    }, args)
+    await heartbeatWorker(
+      worker.id,
+      {
+        leaseToken,
+        status: "running",
+        sessionId,
+        hypothesisId: hypothesis.id,
+        phase: "starting",
+        event: "hypothesis_started",
+        progressMessage: `Preparing ${hypothesis.name} worker preflight`,
+        metadata: workerModelMetadata(workerModel),
+      },
+      args
+    )
 
     const worktreeInfo = await ensureWorktree({
       root,
@@ -2787,16 +2826,20 @@ async function runHypothesisOnce({
       workerModel,
       workerTitle: worker.id,
     })
-    await heartbeatWorker(worker.id, {
-      leaseToken,
-      status: "running",
-      sessionId,
-      hypothesisId: hypothesis.id,
-      phase: "orienting",
-      event: "context_ready",
-      progressMessage: `Worker context files are ready for ${hypothesis.name}`,
-      metadata: workerModelMetadata(workerModel),
-    }, args)
+    await heartbeatWorker(
+      worker.id,
+      {
+        leaseToken,
+        status: "running",
+        sessionId,
+        hypothesisId: hypothesis.id,
+        phase: "orienting",
+        event: "context_ready",
+        progressMessage: `Worker context files are ready for ${hypothesis.name}`,
+        metadata: workerModelMetadata(workerModel),
+      },
+      args
+    )
     const preflight = await preflightWorkerInvocation(invocation, {
       cwd: worktree,
       env: workerRunEnv,
@@ -2882,19 +2925,23 @@ async function runHypothesisOnce({
         void hasWorkerLoggedAttempt({ root, workerId: worker.id })
           .then((hasAttempt) => {
             if (hasAttempt) return
-            return heartbeatWorker(worker.id, {
-              leaseToken,
-              status: "running",
-              sessionId,
-              hypothesisId: hypothesis.id,
-              phase: "orienting",
-              event: "first_attempt_delayed",
-              progressMessage:
-                "No logged workflow attempt yet; worker may still be orienting or sweeping.",
-              metadata: {
-                warningAfterSeconds: Math.round(firstAttemptWarningMs / 1000),
+            return heartbeatWorker(
+              worker.id,
+              {
+                leaseToken,
+                status: "running",
+                sessionId,
+                hypothesisId: hypothesis.id,
+                phase: "orienting",
+                event: "first_attempt_delayed",
+                progressMessage:
+                  "No logged workflow attempt yet; worker may still be orienting or sweeping.",
+                metadata: {
+                  warningAfterSeconds: Math.round(firstAttemptWarningMs / 1000),
+                },
               },
-            }, args)
+              args
+            )
           })
           .catch(() => {})
       }, firstAttemptWarningMs)
@@ -3009,16 +3056,20 @@ async function runHypothesisOnce({
       workerResult,
       `Worker process for ${hypothesis.name}`
     )
-    await heartbeatWorker(worker.id, {
-      leaseToken,
-      status: "running",
-      sessionId,
-      hypothesisId: hypothesis.id,
-      phase: "finalizing",
-      event: "finalization_started",
-      progressMessage: `Finalizing ${hypothesis.name} worker output`,
-      gitLabel: resultCommitSha ?? null,
-    }, args)
+    await heartbeatWorker(
+      worker.id,
+      {
+        leaseToken,
+        status: "running",
+        sessionId,
+        hypothesisId: hypothesis.id,
+        phase: "finalizing",
+        event: "finalization_started",
+        progressMessage: `Finalizing ${hypothesis.name} worker output`,
+        gitLabel: resultCommitSha ?? null,
+      },
+      args
+    )
     if (launchManifest) {
       await appendWorkerActivityEvent(launchManifest, {
         type: "phase_change",
@@ -3075,44 +3126,54 @@ async function runHypothesisOnce({
           summary: "Worker stopped after session stop request",
         })
       }
-      await heartbeatWorker(worker.id, {
-        leaseToken,
-        status: "stopped",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "stopped",
-        event: "stop_requested",
-        progressMessage: `${hypothesis.name} stopped after session stop request`,
-        gitLabel: resultCommitSha,
-      }, args)
-      await upsertCampaignSummary(campaign.id, {
-        sessionId,
-        hypothesisId: hypothesis.id,
-        authoredByWorkerId: worker.id,
-        summaryKind: "hypothesis_summary",
-        title: `${hypothesis.name} worker stopped`,
-        body: [
-          `Outcome: stopped`,
-          `Latest commit: ${resultCommitSha ?? "n/a"}`,
-          `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
-          finalization.workerBranchPushStatus === "failed"
-            ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-            : `Worker branch push: ${finalization.workerBranchPushStatus}`,
-          finalization.error ? `Finalization note: ${finalization.error}` : "",
-          `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
-          `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
-          `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        isCurrent: false,
-        metadata: {
-          authoredBy: "worker-harness",
-          outcome: "stopped",
-          resultCommitSha: resultCommitSha ?? null,
-          finalization,
+      await heartbeatWorker(
+        worker.id,
+        {
+          leaseToken,
+          status: "stopped",
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: "stopped",
+          event: "stop_requested",
+          progressMessage: `${hypothesis.name} stopped after session stop request`,
+          gitLabel: resultCommitSha,
         },
-      }, args)
+        args
+      )
+      await upsertCampaignSummary(
+        campaign.id,
+        {
+          sessionId,
+          hypothesisId: hypothesis.id,
+          authoredByWorkerId: worker.id,
+          summaryKind: "hypothesis_summary",
+          title: `${hypothesis.name} worker stopped`,
+          body: [
+            `Outcome: stopped`,
+            `Latest commit: ${resultCommitSha ?? "n/a"}`,
+            `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
+            finalization.workerBranchPushStatus === "failed"
+              ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
+              : `Worker branch push: ${finalization.workerBranchPushStatus}`,
+            finalization.error
+              ? `Finalization note: ${finalization.error}`
+              : "",
+            `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
+            `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
+            `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          isCurrent: false,
+          metadata: {
+            authoredBy: "worker-harness",
+            outcome: "stopped",
+            resultCommitSha: resultCommitSha ?? null,
+            finalization,
+          },
+        },
+        args
+      )
       await cleanupWorkerRuntimeTempDir()
       return {
         hypothesis,
@@ -3133,44 +3194,52 @@ async function runHypothesisOnce({
       )
     }
 
-    await heartbeatWorker(worker.id, {
-      leaseToken,
-      status: "completed",
-      sessionId,
-      hypothesisId: hypothesis.id,
-      phase: "completed",
-      event: "hypothesis_completed",
-      progressMessage: `${hypothesis.name} completed`,
-      gitLabel: resultCommitSha,
-    }, args)
-    await upsertCampaignSummary(campaign.id, {
-      sessionId,
-      hypothesisId: hypothesis.id,
-      authoredByWorkerId: worker.id,
-      summaryKind: "hypothesis_summary",
-      title: `${hypothesis.name} worker finalization`,
-      body: [
-        `Outcome: completed`,
-        `Latest commit: ${resultCommitSha ?? "n/a"}`,
-        `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
-        finalization.workerBranchPushStatus === "failed"
-          ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-          : `Worker branch push: ${finalization.workerBranchPushStatus}`,
-        finalization.error ? `Finalization note: ${finalization.error}` : "",
-        `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
-        `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
-        `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      isCurrent: false,
-      metadata: {
-        authoredBy: "worker-harness",
-        outcome: "completed",
-        resultCommitSha: resultCommitSha ?? null,
-        finalization,
+    await heartbeatWorker(
+      worker.id,
+      {
+        leaseToken,
+        status: "completed",
+        sessionId,
+        hypothesisId: hypothesis.id,
+        phase: "completed",
+        event: "hypothesis_completed",
+        progressMessage: `${hypothesis.name} completed`,
+        gitLabel: resultCommitSha,
       },
-    }, args)
+      args
+    )
+    await upsertCampaignSummary(
+      campaign.id,
+      {
+        sessionId,
+        hypothesisId: hypothesis.id,
+        authoredByWorkerId: worker.id,
+        summaryKind: "hypothesis_summary",
+        title: `${hypothesis.name} worker finalization`,
+        body: [
+          `Outcome: completed`,
+          `Latest commit: ${resultCommitSha ?? "n/a"}`,
+          `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
+          finalization.workerBranchPushStatus === "failed"
+            ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
+            : `Worker branch push: ${finalization.workerBranchPushStatus}`,
+          finalization.error ? `Finalization note: ${finalization.error}` : "",
+          `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
+          `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
+          `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        isCurrent: false,
+        metadata: {
+          authoredBy: "worker-harness",
+          outcome: "completed",
+          resultCommitSha: resultCommitSha ?? null,
+          finalization,
+        },
+      },
+      args
+    )
     await cleanupWorkerRuntimeTempDir()
     return {
       hypothesis,
@@ -3200,48 +3269,56 @@ async function runHypothesisOnce({
             launcher: launchManifest.agentKind,
           }
         : undefined
-      await heartbeatWorker(workerId, {
-        leaseToken,
-        status: "failed",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "failed",
-        event: "worker_failed",
-        progressMessage: message.slice(0, 1000),
-        gitLabel: resultCommitSha ?? null,
-        metadata,
-      }, args).catch(() => {})
+      await heartbeatWorker(
+        workerId,
+        {
+          leaseToken,
+          status: "failed",
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: "failed",
+          event: "worker_failed",
+          progressMessage: message.slice(0, 1000),
+          gitLabel: resultCommitSha ?? null,
+          metadata,
+        },
+        args
+      ).catch(() => {})
     }
     if (workerId) {
-      await upsertCampaignSummary(campaign.id, {
-        sessionId,
-        hypothesisId: hypothesis.id,
-        authoredByWorkerId: workerId,
-        summaryKind: "hypothesis_summary",
-        title: `${hypothesis.name} worker finalization failed`,
-        body: [
-          `Outcome: failed`,
-          `Error: ${message}`,
-          resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
-          launchManifest?.manifestPath
-            ? `Worker manifest: ${launchManifest.manifestPath}`
-            : "",
-          launchManifest?.activityLogPath
-            ? `Worker activity log: ${launchManifest.activityLogPath}`
-            : "",
-          launchManifest?.logPath
-            ? `Worker raw log: ${launchManifest.logPath}`
-            : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        isCurrent: false,
-        metadata: {
-          authoredBy: "worker-harness",
-          outcome: "failed",
-          resultCommitSha: resultCommitSha ?? null,
+      await upsertCampaignSummary(
+        campaign.id,
+        {
+          sessionId,
+          hypothesisId: hypothesis.id,
+          authoredByWorkerId: workerId,
+          summaryKind: "hypothesis_summary",
+          title: `${hypothesis.name} worker finalization failed`,
+          body: [
+            `Outcome: failed`,
+            `Error: ${message}`,
+            resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
+            launchManifest?.manifestPath
+              ? `Worker manifest: ${launchManifest.manifestPath}`
+              : "",
+            launchManifest?.activityLogPath
+              ? `Worker activity log: ${launchManifest.activityLogPath}`
+              : "",
+            launchManifest?.logPath
+              ? `Worker raw log: ${launchManifest.logPath}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          isCurrent: false,
+          metadata: {
+            authoredBy: "worker-harness",
+            outcome: "failed",
+            resultCommitSha: resultCommitSha ?? null,
+          },
         },
-      }, args).catch(() => {})
+        args
+      ).catch(() => {})
     }
     await cleanupWorkerRuntimeTempDir()
     return {
@@ -3294,21 +3371,25 @@ export async function commandResearchStart(args: Args) {
       ? null
       : new Date(Date.now() + maxMinutes * 60_000).toISOString()
   const schedulerSiteId = await getResearchSiteId(root)
-  const result = await createCampaignSession(campaign.id, {
-    name: args.options.name ?? `research-${new Date().toISOString()}`,
-    workerTarget,
-    hypotheses,
-    ...(experimentTarget === null ? {} : { experimentTarget }),
-    ...(deadlineAt === null ? {} : { deadlineAt }),
-    ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
-    metadata: {
-      startedBy: "onyx-research",
-      experimentTarget,
-      maxMinutes,
-      agentKind: workerSettings.agentKind,
-      ...workerModelMetadata(workerSettings.workerModel),
+  const result = await createCampaignSession(
+    campaign.id,
+    {
+      name: args.options.name ?? `research-${new Date().toISOString()}`,
+      workerTarget,
+      hypotheses,
+      ...(experimentTarget === null ? {} : { experimentTarget }),
+      ...(deadlineAt === null ? {} : { deadlineAt }),
+      ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
+      metadata: {
+        startedBy: "onyx-research",
+        experimentTarget,
+        maxMinutes,
+        agentKind: workerSettings.agentKind,
+        ...workerModelMetadata(workerSettings.workerModel),
+      },
     },
-  }, args)
+    args
+  )
   await cacheResearchSessionState({
     root,
     campaign,
@@ -3426,16 +3507,20 @@ export async function commandResearchHypothesisAdd(args: Args) {
           metadataString(sessionMetadata, "workerModel"),
           { cwd: root }
         )
-  const created = await createCampaignHypothesis(campaign.id, {
-    plan,
-    name: args.options.name,
-    description: args.options.description ?? undefined,
-    baseCommitSha: args.options.base,
-    metadata: {
-      createdBy: "onyx-research",
-      ...(sessionId ? { createdBySessionId: sessionId } : {}),
+  const created = await createCampaignHypothesis(
+    campaign.id,
+    {
+      plan,
+      name: args.options.name,
+      description: args.options.description ?? undefined,
+      baseCommitSha: args.options.base,
+      metadata: {
+        createdBy: "onyx-research",
+        ...(sessionId ? { createdBySessionId: sessionId } : {}),
+      },
     },
-  }, args)
+    args
+  )
   const createdHypothesis = created.hypothesis
   if (before?.session) {
     await cacheResearchSessionState({
@@ -3834,7 +3919,7 @@ export async function commandResearchStatus(args: Args) {
   }
 
   if (activeSessionId) {
-    const progress = live?.progress ?? (sessionState?.session ?? null)
+    const progress = live?.progress ?? sessionState?.session ?? null
     if (progress) {
       console.log(
         `experiments: accepted=${progress.acceptedExperimentCount}${
@@ -4377,14 +4462,18 @@ export async function commandResearchFinish(args: Args) {
       ? branches.map((branch) => `- ${branch}`)
       : ["- none"]),
   ].join("\n")
-  await upsertCampaignSummary(campaign.id, {
-    sessionId,
-    summaryKind: "campaign_brief",
-    title: `${campaign.name} final results`,
-    body,
-    isCurrent: true,
-    metadata: { authoredBy: "onyx-research-finish" },
-  }, args)
+  await upsertCampaignSummary(
+    campaign.id,
+    {
+      sessionId,
+      summaryKind: "campaign_brief",
+      title: `${campaign.name} final results`,
+      body,
+      isCurrent: true,
+      metadata: { authoredBy: "onyx-research-finish" },
+    },
+    args
+  )
   console.log(body)
 }
 
@@ -4412,14 +4501,18 @@ export async function commandSummaryUpsert(args: Args) {
       "`--sync` and `--offline` were removed. Summaries are written directly to the Onyx API."
     )
   }
-  const summary = await upsertCampaignSummary(campaign.id, {
-    sessionId,
-    hypothesisId,
-    authoredByWorkerId,
-    summaryKind: kind,
-    title,
-    body,
-  }, args)
+  const summary = await upsertCampaignSummary(
+    campaign.id,
+    {
+      sessionId,
+      hypothesisId,
+      authoredByWorkerId,
+      summaryKind: kind,
+      title,
+      body,
+    },
+    args
+  )
   if (args.options.json === "true") {
     console.log(JSON.stringify(summary, null, 2))
     return
@@ -4516,19 +4609,23 @@ export async function commandKnowledgeAdd(args: Args) {
       "`--sync` and `--offline` were removed. Knowledge is written directly to the Onyx API."
     )
   }
-  const item = await createCampaignKnowledge(campaign.id, {
-    sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-    hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
-    authoredByWorkerId:
-      args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
-    kind,
-    title,
-    body,
-    confidence:
-      args.options.confidence === undefined
-        ? undefined
-        : Number(args.options.confidence),
-  }, args)
+  const item = await createCampaignKnowledge(
+    campaign.id,
+    {
+      sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
+      hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
+      authoredByWorkerId:
+        args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+      kind,
+      title,
+      body,
+      confidence:
+        args.options.confidence === undefined
+          ? undefined
+          : Number(args.options.confidence),
+    },
+    args
+  )
   if (args.options.json === "true") {
     console.log(JSON.stringify(item, null, 2))
     return
@@ -4545,7 +4642,10 @@ export async function commandKnowledgeList(args: Args) {
       "`--offline` was removed. Knowledge is read directly from the Onyx API."
     )
   }
-  const knowledge = (await listCampaignKnowledge(campaign.id, args)).slice(0, limit)
+  const knowledge = (await listCampaignKnowledge(campaign.id, args)).slice(
+    0,
+    limit
+  )
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(knowledge, null, 2))
@@ -5070,7 +5170,9 @@ export async function commandResearchRun(args: Args) {
   if (!requestedSessionId && experimentTarget === null && deadlineAt === null) {
     throw new Error("Pass --experiments <n> or --max-minutes <n>.")
   }
-  const endTimeMs = deadlineAt ? Date.parse(deadlineAt) : Number.POSITIVE_INFINITY
+  const endTimeMs = deadlineAt
+    ? Date.parse(deadlineAt)
+    : Number.POSITIVE_INFINITY
   const defaultWorkerBudgetMs = 120 * 60_000
   const sessionBudgetMs = Number.isFinite(endTimeMs)
     ? Math.max(1, endTimeMs - now)
@@ -5131,25 +5233,29 @@ export async function commandResearchRun(args: Args) {
   let schedulerSiteId = sessionState?.session.schedulerSiteId ?? null
   if (!sessionId) {
     schedulerSiteId = await getResearchSiteId(root)
-    const result = await createCampaignSession(campaign.id, {
-      name: args.options.name ?? `research-${new Date().toISOString()}`,
-      workerTarget,
-      hypotheses,
-      ...(experimentTarget === null ? {} : { experimentTarget }),
-      ...(deadlineAt === null ? {} : { deadlineAt }),
-      ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
-      metadata: {
-        startedBy: "onyx-research-supervisor",
-        experimentTarget,
-        maxMinutes,
-        agentKind: sessionAgentKind,
-        ...workerModelMetadata(workerModel),
-        maxConcurrency,
-        launchBatchSize,
-        launchIntervalSeconds: launchIntervalMs / 1000,
-        presenceIntervalSeconds: presenceIntervalMs / 1000,
+    const result = await createCampaignSession(
+      campaign.id,
+      {
+        name: args.options.name ?? `research-${new Date().toISOString()}`,
+        workerTarget,
+        hypotheses,
+        ...(experimentTarget === null ? {} : { experimentTarget }),
+        ...(deadlineAt === null ? {} : { deadlineAt }),
+        ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
+        metadata: {
+          startedBy: "onyx-research-supervisor",
+          experimentTarget,
+          maxMinutes,
+          agentKind: sessionAgentKind,
+          ...workerModelMetadata(workerModel),
+          maxConcurrency,
+          launchBatchSize,
+          launchIntervalSeconds: launchIntervalMs / 1000,
+          presenceIntervalSeconds: presenceIntervalMs / 1000,
+        },
       },
-    }, args)
+      args
+    )
     sessionId = result.session.id
     await cacheResearchSessionState({
       root,
@@ -5174,8 +5280,7 @@ export async function commandResearchRun(args: Args) {
     campaignId: campaign.id,
     deadlineAt,
     experimentTarget,
-    acceptedExperimentCount:
-      sessionState?.session.acceptedExperimentCount ?? 0,
+    acceptedExperimentCount: sessionState?.session.acceptedExperimentCount ?? 0,
     remainingExperimentCount:
       experimentTarget === null
         ? null
@@ -5247,6 +5352,7 @@ export async function commandResearchRun(args: Args) {
   let waitingLogged = false
   let lastLaunchBatchAt = 0
   let providerBackoffUntil = 0
+  let serverLeasePausedUntil = 0
   let providerBackoffReason: string | null = null
   let providerBackoffAttempt = 0
   let providerBackoffLogged = false
@@ -5373,8 +5479,8 @@ export async function commandResearchRun(args: Args) {
         continue
       }
 
-      const latest = await getLocalSessionState(root, sessionId).catch(() =>
-        getResearchSessionState(sessionId, args)
+      const latest = await getResearchSessionState(sessionId, args).catch(() =>
+        getLocalSessionState(root, sessionId)
       )
       if (latest.session.status !== "running") break
       const activeWorkers = activeSessionWorkers({
@@ -5382,17 +5488,15 @@ export async function commandResearchRun(args: Args) {
         sessionId,
       }).length
       const occupiedWorkerSlots = Math.max(activeWorkers, activeRuns.size)
-      const openSlots = Math.max(
-        0,
-        workerTarget - occupiedWorkerSlots
-      )
+      const openSlots = Math.max(0, workerTarget - occupiedWorkerSlots)
       const concurrencySlots = Math.max(0, maxConcurrency - activeRuns.size)
       const providerBackoffActive = Date.now() < providerBackoffUntil
+      const serverLeasePaused = Date.now() < serverLeasePausedUntil
       const rampWaiting =
         lastLaunchBatchAt > 0 &&
         Date.now() - lastLaunchBatchAt < launchIntervalMs
       const launchSlots =
-        providerBackoffActive || rampWaiting
+        providerBackoffActive || serverLeasePaused || rampWaiting
           ? 0
           : Math.min(openSlots, concurrencySlots, launchBatchSize)
       let launchedThisTick = 0
@@ -5410,8 +5514,8 @@ export async function commandResearchRun(args: Args) {
           .check()
           .catch(() => null)
         if (launchStopCheck?.shouldStop) break
-        const refreshed = await getLocalSessionState(root, sessionId).catch(
-          () => getResearchSessionState(sessionId, args)
+        const refreshed = await getResearchSessionState(sessionId, args).catch(
+          () => getLocalSessionState(root, sessionId)
         )
         const activeCount = Math.max(
           activeSessionWorkers({
@@ -5464,6 +5568,11 @@ export async function commandResearchRun(args: Args) {
           args,
         })
           .then(async (result) => {
+            if (result.leaseUnavailable) {
+              serverLeasePausedUntil =
+                Date.now() + Math.max(1000, Math.min(5000, launchIntervalMs))
+              return result
+            }
             if (result.workerId) {
               await recordLocalWorkerHeartbeat({
                 root,

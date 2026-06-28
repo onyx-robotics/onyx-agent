@@ -8,8 +8,13 @@ import {
 } from "../lib/api"
 import { readSetupFile } from "../lib/contract"
 import { emitEvent } from "../lib/events"
-import { currentCommit, normalizeRepositoryUrl, repoRoot, repositoryUrl } from "../lib/git"
-import { readState, writeState } from "../lib/outbox"
+import {
+  currentCommit,
+  normalizeRepositoryUrl,
+  repoRoot,
+  repositoryUrl,
+} from "../lib/git"
+import { readState, writeState } from "../lib/runtime-state"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { assertSetupCommitted } from "../lib/setup-git"
 
@@ -36,18 +41,21 @@ export async function commandCampaignCreate(args: Args) {
     )
   }
 
-  const result = await upsertCampaign({
-    repositoryUrl: normalizeRepositoryUrl(
-      await repositoryUrl(root, args.options["repository-url"])
-    ),
-    name,
-    projectPath,
-    ...(description ? { description } : {}),
-    baseCommitSha,
-    setup,
-    ...(humanFeedback ? { humanFeedback } : {}),
-    promotionRefName,
-  }, args)
+  const result = await upsertCampaign(
+    {
+      repositoryUrl: normalizeRepositoryUrl(
+        await repositoryUrl(root, args.options["repository-url"])
+      ),
+      name,
+      projectPath,
+      ...(description ? { description } : {}),
+      baseCommitSha,
+      setup,
+      ...(humanFeedback ? { humanFeedback } : {}),
+      promotionRefName,
+    },
+    args
+  )
 
   const state = await readState(root)
   const key = campaignStateKey(projectPath, name)
@@ -156,8 +164,12 @@ export async function commandCampaignStatus(args: Args) {
   }
   console.log(`campaign: ${name}`)
   console.log(`id: ${campaign?.id ?? stateCampaign?.campaignId ?? "(unknown)"}`)
-  console.log(`metric: ${campaign?.metricName ?? stateCampaign?.metricName ?? "(unknown)"}`)
-  console.log(`base: ${campaign?.baseCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`)
+  console.log(
+    `metric: ${campaign?.metricName ?? stateCampaign?.metricName ?? "(unknown)"}`
+  )
+  console.log(
+    `base: ${campaign?.baseCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`
+  )
   const promotionRefName =
     campaign?.promotionRefName ?? stateCampaign?.promotionRefName ?? null
   if (promotionRefName) {
@@ -182,7 +194,9 @@ export async function commandCampaignDelete(args: Args) {
     cachedCampaignId ??
     (await resolveProject(root, args)
       .then((project) => listProjectCampaigns(project.id, args))
-      .then((campaigns) => campaigns.find((campaign) => campaign.name === name)?.id))
+      .then(
+        (campaigns) => campaigns.find((campaign) => campaign.name === name)?.id
+      ))
   if (!campaignId) throw new Error(`Campaign ${name} was not found.`)
   const result = await deleteCampaign(campaignId, args)
 

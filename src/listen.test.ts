@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test"
 
 import { commandListen } from "./commands/listen"
 import { repoRoot } from "./lib/git"
-import { writeState } from "./lib/outbox"
+import { writeState } from "./lib/runtime-state"
 import { campaignStateKey } from "./lib/project"
 import { runProcess } from "./lib/process"
 import { writeWorkerLatestState } from "./lib/worker-activity"

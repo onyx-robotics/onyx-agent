@@ -15,27 +15,14 @@ export {
   scopedRoot,
 } from "./lib/project"
 export {
-  appendOutbox,
-  clearLastRun,
-  clientRunRef,
-  lastRunPath,
-  lastRunsDir,
   onyxStateDir,
-  outboxPath,
-  outboxSpoolDir,
-  readLastRun,
-  readLastRuns,
-  readOutbox,
-  scopedLastRunPath,
   readState,
   updateState,
-  rewriteOutbox,
   statePath,
-  writeLastRun,
   writeState,
+  withOnyxLock,
   type CliState,
-  type LastRunRecord,
-} from "./lib/outbox"
+} from "./lib/runtime-state"
 export {
   appendHistory,
   apiExperimentToHistory,
@@ -64,7 +51,6 @@ export {
   type ExperimentRow,
   type ListenModel,
 } from "./lib/tui"
-export { flushOutbox, type FlushResult } from "./lib/sync"
 export {
   currentBranch,
   currentCommit,
@@ -130,13 +116,9 @@ export {
   commandCampaignStatus,
   commandCampaignUse,
 } from "./commands/campaign"
-export {
-  commandExpList,
-  commandExpLog,
-  commandExpRun,
-} from "./commands/exp"
+export { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 export { commandListen } from "./commands/listen"
-export { commandPush, commandStatus, commandSync } from "./commands/sync"
+export { commandStatus } from "./commands/status"
 export { commandToolsRun } from "./commands/tools"
 export {
   commandResearchBrief,

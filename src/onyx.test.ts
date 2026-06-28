@@ -4,10 +4,13 @@ import { tmpdir } from "node:os"
 
 import { afterEach, describe, expect, test } from "bun:test"
 
-import { commandResearchFinish, commandResearchShouldStop } from "./commands/research"
-import { commandPush, commandSync } from "./commands/sync"
+import {
+  commandResearchFinish,
+  commandResearchShouldStop,
+} from "./commands/research"
 import { git } from "./lib/git"
-import { researchDbPath } from "./lib/research-db"
+import { researchRuntimeStatePath } from "./lib/research-runtime"
+import { main } from "./main"
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -40,9 +43,7 @@ function installMockApi(
           : input.url
     )
     const bodyText =
-      typeof init?.body === "string" && init.body.length > 0
-        ? init.body
-        : null
+      typeof init?.body === "string" && init.body.length > 0 ? init.body : null
     const response = handler({
       method: init?.method ?? "GET",
       path: url.pathname,
@@ -68,7 +69,7 @@ describe("remote-first agent architecture", () => {
   test("runtime state no longer points at .git/onyx/research.db", async () => {
     const root = await tempRepo()
     try {
-      const path = await researchDbPath(root)
+      const path = await researchRuntimeStatePath(root)
       expect(path).toEndWith(".git/onyx/runtime/runtime-state.json")
       expect(path).not.toContain("research.db")
     } finally {
@@ -77,12 +78,23 @@ describe("remote-first agent architecture", () => {
   })
 
   test("public sync and push commands are removed", async () => {
-    await expect(commandPush({ positional: ["push"], options: {} })).rejects.toThrow(
-      "removed"
-    )
-    await expect(commandSync({ positional: ["sync"], options: {} })).rejects.toThrow(
-      "removed"
-    )
+    const originalError = console.error
+    const originalExit = process.exit
+    const errors: string[] = []
+    console.error = (message?: unknown) => {
+      errors.push(String(message))
+    }
+    process.exit = ((code?: number) => {
+      throw new Error(`exit ${code ?? 0}`)
+    }) as typeof process.exit
+    try {
+      await expect(main(["push"])).rejects.toThrow("exit 1")
+      await expect(main(["sync"])).rejects.toThrow("exit 1")
+      expect(errors.join("\n")).toContain("removed")
+    } finally {
+      console.error = originalError
+      process.exit = originalExit
+    }
   })
 
   test("should-stop polls the remote control-state endpoint", async () => {

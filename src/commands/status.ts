@@ -7,22 +7,11 @@ import {
   readConfig,
 } from "../lib/config"
 import { repoRoot } from "../lib/git"
-import { readState } from "../lib/outbox"
+import { readState } from "../lib/runtime-state"
 import { resolveProjectPath } from "../lib/project"
-import { removedSyncCommandMessage } from "../lib/sync"
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
-}
-
-export async function commandPush(_args: Args) {
-  void _args
-  throw new Error(removedSyncCommandMessage("push"))
-}
-
-export async function commandSync(_args: Args) {
-  void _args
-  throw new Error(removedSyncCommandMessage("sync"))
 }
 
 export async function commandStatus(args: Args) {
@@ -94,6 +83,8 @@ export async function commandStatus(args: Args) {
   if (project) {
     console.log(`project: ${project.name} (${project.id})`)
   } else {
-    console.log(`project: unavailable${projectError ? ` (${projectError})` : ""}`)
+    console.log(
+      `project: unavailable${projectError ? ` (${projectError})` : ""}`
+    )
   }
 }

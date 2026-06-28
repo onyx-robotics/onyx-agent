@@ -16,7 +16,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { commandResearchRun } from "./commands/research"
 import { setupHash, type ResearchSetupFile } from "./lib/contract"
 import { currentCommit, git } from "./lib/git"
-import { writeState } from "./lib/outbox"
+import { writeState } from "./lib/runtime-state"
 import { campaignStateKey } from "./lib/project"
 
 const PROJECT_ID = "10000000-0000-4000-8000-000000000001"
@@ -110,7 +110,9 @@ function setupFile(): ResearchSetupFile {
 async function createSmokeRepo() {
   const root = await mkdtemp(join(tmpdir(), "onyx-supervisor-smoke-"))
   const origin = await mkdtemp(join(tmpdir(), "onyx-supervisor-origin-"))
-  const workerScriptDir = await mkdtemp(join(tmpdir(), "onyx-supervisor-worker-"))
+  const workerScriptDir = await mkdtemp(
+    join(tmpdir(), "onyx-supervisor-worker-")
+  )
   await git(["init", "--bare"], origin)
   await git(["init"], root)
   await git(["config", "user.email", "test@example.com"], root)
@@ -121,7 +123,11 @@ async function createSmokeRepo() {
   await mkdir(join(root, "onyx", "tools", "evaluation"), { recursive: true })
   await mkdir(join(root, "src"), { recursive: true })
   await writeFile(join(root, "src", "smoke.txt"), "base\n", "utf8")
-  await writeFile(join(root, "onyx", "setup.json"), `${JSON.stringify(setup, null, 2)}\n`, "utf8")
+  await writeFile(
+    join(root, "onyx", "setup.json"),
+    `${JSON.stringify(setup, null, 2)}\n`,
+    "utf8"
+  )
   await writeFile(
     join(root, "onyx", "onyx.md"),
     [
@@ -185,10 +191,10 @@ async function createSmokeRepo() {
     [
       "#!/bin/sh",
       "set -eu",
-      "echo \"fake worker ${ONYX_WORKER_ID}\"",
-      "printf \"result ${ONYX_WORKER_ID}\\n\" > src/result.txt",
+      'echo "fake worker ${ONYX_WORKER_ID}"',
+      'printf "result ${ONYX_WORKER_ID}\\n" > src/result.txt',
       "git add src/result.txt",
-      "git commit -m \"fake worker result ${ONYX_WORKER_ID}\"",
+      'git commit -m "fake worker result ${ONYX_WORKER_ID}"',
     ].join("\n"),
     "utf8"
   )
@@ -237,8 +243,7 @@ function session({
     acceptedExperimentCount,
     remainingExperimentCount: Math.max(0, 1 - acceptedExperimentCount),
     deadlineAt: null,
-    terminalReason:
-      status === "completed" ? "experiment_target_reached" : null,
+    terminalReason: status === "completed" ? "experiment_target_reached" : null,
     schedulerSiteId: SITE_ID,
     finalizationStatus: status === "completed" ? "complete" : "running",
     metadata: {},
@@ -275,7 +280,10 @@ function hypothesis(baseCommitSha: string) {
   }
 }
 
-function worker(workerId: string, status: "registered" | "running" | "completed") {
+function worker(
+  workerId: string,
+  status: "registered" | "running" | "completed"
+) {
   return {
     id: workerId,
     campaignId: CAMPAIGN_ID,
@@ -291,7 +299,10 @@ function worker(workerId: string, status: "registered" | "running" | "completed"
     gitLabel: null,
     siteId: SITE_ID,
     supervisorRunId: "supervisor-smoke",
-    leaseExpiresAt: status === "completed" ? null : new Date(Date.now() + 60_000).toISOString(),
+    leaseExpiresAt:
+      status === "completed"
+        ? null
+        : new Date(Date.now() + 60_000).toISOString(),
     leaseReleasedAt: status === "completed" ? nowIso() : null,
     lastSeenAt: nowIso(),
     startedAt: nowIso(),
@@ -305,10 +316,14 @@ function installSupervisorApi({
   baseCommitSha,
   workerTarget,
   reportOutcome = "accepted",
+  leaseMode = "normal",
+  reportFailure = false,
 }: {
   baseCommitSha: string
   workerTarget: number
   reportOutcome?: "accepted" | "rejected"
+  leaseMode?: "normal" | "no_slots"
+  reportFailure?: boolean
 }) {
   previousApiUrl = process.env.ONYX_API_URL
   previousApiKey = process.env.ONYX_API_KEY
@@ -334,9 +349,7 @@ function installSupervisorApi({
     )
     const method = init?.method ?? "GET"
     const bodyText =
-      typeof init?.body === "string" && init.body.length > 0
-        ? init.body
-        : null
+      typeof init?.body === "string" && init.body.length > 0 ? init.body : null
     const body = bodyText ? JSON.parse(bodyText) : null
     calls.push({ method, path: url.pathname, body })
 
@@ -394,6 +407,23 @@ function installSupervisorApi({
       method === "POST" &&
       url.pathname === `/api/v1/research/sessions/${SESSION_ID}/worker-leases`
     ) {
+      if (leaseMode === "no_slots") {
+        terminal = true
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "conflict",
+              message: "Research session has no open worker slots",
+              details: {
+                code: "no_worker_slots",
+                workerTarget,
+                occupied: workerTarget,
+              },
+            },
+          }),
+          { status: 409, headers: { "content-type": "application/json" } }
+        )
+      }
       workerSequence += 1
       const workerId = `60000000-0000-4000-8000-${String(workerSequence).padStart(12, "0")}`
       leasedWorkers.push(workerId)
@@ -418,6 +448,13 @@ function installSupervisorApi({
       /^\/api\/v1\/research\/workers\/[^/]+\/heartbeat$/.test(url.pathname)
     ) {
       const workerId = url.pathname.split("/").at(-2)!
+      if (
+        body?.status === "completed" ||
+        body?.status === "failed" ||
+        body?.status === "stopped"
+      ) {
+        terminal = true
+      }
       data = {
         worker: worker(
           workerId,
@@ -445,6 +482,17 @@ function installSupervisorApi({
       method === "POST" &&
       url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
     ) {
+      if (reportFailure) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "internal_error",
+              message: "simulated report failure",
+            },
+          }),
+          { status: 500, headers: { "content-type": "application/json" } }
+        )
+      }
       terminal = true
       acceptedExperimentCount = 1
       const rejected = reportOutcome === "rejected"
@@ -607,82 +655,78 @@ afterEach(() => {
 
 describe("remote-first research supervisor smoke", () => {
   for (const workerTarget of [1, 10, 100]) {
-    test(
-      `acquires server leases and reports directly at worker target ${workerTarget}`,
-      async () => {
-        const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
-          await createSmokeRepo()
-        const calls = installSupervisorApi({ baseCommitSha, workerTarget })
-        try {
-          await withMutedConsole(() =>
-            commandResearchRun({
-              positional: ["research", "run"],
-              options: {
-                cwd: root,
-                campaign: "smoke",
-                workers: String(workerTarget),
-                "max-concurrency": "1",
-                experiments: "1",
-                foreground: "true",
-                quiet: "true",
-                "worker-command": shellQuote(workerScript),
-                "presence-interval": "0.1",
-                "launch-interval-seconds": "0.01",
-                "startup-timeout": "5",
-                "heartbeat-sample-interval": "0",
-                "first-attempt-warning-seconds": "0",
-                "final-ref-push-timeout": "5",
-              },
-            })
-          )
+    test(`acquires server leases and reports directly at worker target ${workerTarget}`, async () => {
+      const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
+        await createSmokeRepo()
+      const calls = installSupervisorApi({ baseCommitSha, workerTarget })
+      try {
+        await withMutedConsole(() =>
+          commandResearchRun({
+            positional: ["research", "run"],
+            options: {
+              cwd: root,
+              campaign: "smoke",
+              workers: String(workerTarget),
+              "max-concurrency": "1",
+              experiments: "1",
+              foreground: "true",
+              quiet: "true",
+              "worker-command": shellQuote(workerScript),
+              "presence-interval": "0.1",
+              "launch-interval-seconds": "0.01",
+              "startup-timeout": "5",
+              "heartbeat-sample-interval": "0",
+              "first-attempt-warning-seconds": "0",
+              "final-ref-push-timeout": "5",
+            },
+          })
+        )
 
-          const leaseCalls = calls.filter((call) =>
-            call.path.endsWith(`/sessions/${SESSION_ID}/worker-leases`)
-          )
-          expect(leaseCalls).toHaveLength(1)
-          expect(leaseCalls[0]!.body).toMatchObject({
-            workerName: "smoke-hypothesis-custom",
-            agentKind: "custom",
-            runtime: "local",
-          })
-          const sessionCreate = calls.find((call) =>
-            call.path.endsWith(`/campaigns/${CAMPAIGN_ID}/sessions`)
-          )
-          expect(sessionCreate?.body).toMatchObject({
-            workerTarget,
-            experimentTarget: 1,
-          })
-          const presenceCalls = calls.filter(
-            (call) => call.path === "/api/v1/research/presence"
-          )
-          expect(presenceCalls.length).toBeGreaterThan(0)
-          for (const call of presenceCalls) {
-            expect(call.body).not.toHaveProperty("syncLagMs")
-            expect(call.body).not.toHaveProperty("pendingSyncCount")
-            expect(call.body).not.toHaveProperty("pushQueueDepth")
-          }
-          expect(
-            calls.some(
-              (call) =>
-                call.method === "POST" &&
-                call.path ===
-                  `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
-            )
-          ).toBe(true)
-          expect(await pathExists(join(root, ".git", "onyx", "research.db"))).toBe(
-            false
-          )
-          expect(
-            await pathExists(join(root, ".git", "onyx", "outbox.d", "pending"))
-          ).toBe(false)
-        } finally {
-          await rm(root, { recursive: true, force: true })
-          await rm(origin, { recursive: true, force: true })
-          await rm(workerScriptDir, { recursive: true, force: true })
+        const leaseCalls = calls.filter((call) =>
+          call.path.endsWith(`/sessions/${SESSION_ID}/worker-leases`)
+        )
+        expect(leaseCalls).toHaveLength(1)
+        expect(leaseCalls[0]!.body).toMatchObject({
+          workerName: "smoke-hypothesis-custom",
+          agentKind: "custom",
+          runtime: "local",
+        })
+        const sessionCreate = calls.find((call) =>
+          call.path.endsWith(`/campaigns/${CAMPAIGN_ID}/sessions`)
+        )
+        expect(sessionCreate?.body).toMatchObject({
+          workerTarget,
+          experimentTarget: 1,
+        })
+        const presenceCalls = calls.filter(
+          (call) => call.path === "/api/v1/research/presence"
+        )
+        expect(presenceCalls.length).toBeGreaterThan(0)
+        for (const call of presenceCalls) {
+          expect(call.body).not.toHaveProperty("syncLagMs")
+          expect(call.body).not.toHaveProperty("pendingSyncCount")
+          expect(call.body).not.toHaveProperty("pushQueueDepth")
         }
-      },
-      60_000
-    )
+        expect(
+          calls.some(
+            (call) =>
+              call.method === "POST" &&
+              call.path ===
+                `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+          )
+        ).toBe(true)
+        expect(
+          await pathExists(join(root, ".git", "onyx", "research.db"))
+        ).toBe(false)
+        expect(
+          await pathExists(join(root, ".git", "onyx", "outbox.d", "pending"))
+        ).toBe(false)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+        await rm(origin, { recursive: true, force: true })
+        await rm(workerScriptDir, { recursive: true, force: true })
+      }
+    }, 60_000)
   }
 
   test("records late rejected experiment reports as clean finalization outcomes", async () => {
@@ -722,17 +766,24 @@ describe("remote-first research supervisor smoke", () => {
           call.path === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
       )
       expect(manifestFiles).toHaveLength(1)
-      const workerLogRoot = join(root, ".git", "onyx", "worker-logs", SESSION_ID)
+      const workerLogRoot = join(
+        root,
+        ".git",
+        "onyx",
+        "worker-logs",
+        SESSION_ID
+      )
       const manifests = await Promise.all(
         (await readdir(workerLogRoot))
           .filter((file) => file.endsWith(".manifest.json"))
-          .map(async (file) =>
-            JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
-              finalization?: {
-                finalizationStatus?: string
-                error?: string | null
+          .map(
+            async (file) =>
+              JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
+                finalization?: {
+                  finalizationStatus?: string
+                  error?: string | null
+                }
               }
-            }
           )
       )
       expect(
@@ -742,6 +793,207 @@ describe("remote-first research supervisor smoke", () => {
               "discarded_after_completion" &&
             manifest.finalization.error ===
               "experiment report rejected by server acceptance state"
+        )
+      ).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(origin, { recursive: true, force: true })
+      await rm(workerScriptDir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  test("pauses launches when the server reports no worker slots", async () => {
+    const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
+      await createSmokeRepo()
+    const calls = installSupervisorApi({
+      baseCommitSha,
+      workerTarget: 1,
+      leaseMode: "no_slots",
+    })
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            "max-concurrency": "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "worker-command": shellQuote(workerScript),
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "5",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+          },
+        })
+      )
+
+      const leaseCalls = calls.filter((call) =>
+        call.path.endsWith(`/sessions/${SESSION_ID}/worker-leases`)
+      )
+      expect(leaseCalls).toHaveLength(1)
+      expect(
+        calls.some(
+          (call) =>
+            call.path ===
+            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+        )
+      ).toBe(false)
+      expect(await pathExists(join(root, ".git", "onyx", "research.db"))).toBe(
+        false
+      )
+      expect(
+        await pathExists(join(root, ".git", "onyx", "outbox.d", "pending"))
+      ).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(origin, { recursive: true, force: true })
+      await rm(workerScriptDir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  test("records failed immutable ref pushes in the worker manifest", async () => {
+    const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
+      await createSmokeRepo()
+    await rm(origin, { recursive: true, force: true })
+    const calls = installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            "max-concurrency": "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "worker-command": shellQuote(workerScript),
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "5",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+            "final-ref-push-timeout": "5",
+          },
+        })
+      )
+
+      expect(
+        calls.some(
+          (call) =>
+            call.path ===
+            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+        )
+      ).toBe(false)
+      const workerLogRoot = join(
+        root,
+        ".git",
+        "onyx",
+        "worker-logs",
+        SESSION_ID
+      )
+      const manifests = await Promise.all(
+        (await readdir(workerLogRoot))
+          .filter((file) => file.endsWith(".manifest.json"))
+          .map(
+            async (file) =>
+              JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
+                finalization?: {
+                  finalizationStatus?: string
+                  error?: string | null
+                }
+              }
+          )
+      )
+      expect(
+        manifests.some(
+          (manifest) =>
+            manifest.finalization?.finalizationStatus === "failed" &&
+            manifest.finalization.error?.includes(
+              "Failed to push experiment ref"
+            )
+        )
+      ).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(workerScriptDir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  test("keeps pushed refs recoverable when API report fails after push", async () => {
+    const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
+      await createSmokeRepo()
+    const calls = installSupervisorApi({
+      baseCommitSha,
+      workerTarget: 1,
+      reportFailure: true,
+    })
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            "max-concurrency": "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "worker-command": shellQuote(workerScript),
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "5",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+            "final-ref-push-timeout": "5",
+          },
+        })
+      )
+
+      expect(
+        calls.some(
+          (call) =>
+            call.path ===
+            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+        )
+      ).toBe(true)
+      const refs = await git(
+        ["ls-remote", origin, `refs/onyx/experiments/${CAMPAIGN_ID}/*`],
+        root
+      )
+      expect(refs.trim()).not.toBe("")
+      const workerLogRoot = join(
+        root,
+        ".git",
+        "onyx",
+        "worker-logs",
+        SESSION_ID
+      )
+      const manifests = await Promise.all(
+        (await readdir(workerLogRoot))
+          .filter((file) => file.endsWith(".manifest.json"))
+          .map(
+            async (file) =>
+              JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
+                finalization?: {
+                  finalizationStatus?: string
+                  error?: string | null
+                }
+              }
+          )
+      )
+      expect(
+        manifests.some(
+          (manifest) =>
+            manifest.finalization?.finalizationStatus === "failed" &&
+            manifest.finalization.error?.includes("experiment log failed")
         )
       ).toBe(true)
     } finally {

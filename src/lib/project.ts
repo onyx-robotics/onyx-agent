@@ -1,7 +1,7 @@
 import { join } from "node:path"
 
 import type { Args } from "./args"
-import { readState } from "./outbox"
+import { readState } from "./runtime-state"
 
 export const ONYX_DIR = "onyx"
 
@@ -16,7 +16,9 @@ export function normalizeProjectPath(value?: string | null) {
     path.includes("\0") ||
     path.split("/").some((segment) => segment === "." || segment === "..")
   ) {
-    throw new Error("--project-path must be a relative path without '.' or '..'")
+    throw new Error(
+      "--project-path must be a relative path without '.' or '..'"
+    )
   }
   return path
 }
