@@ -5,7 +5,6 @@ import {
   commandKnowledgeAdd,
   commandResearchBrief,
   commandResearchSessionStateBrief,
-  commandResearchShouldStop,
   commandSummaryUpsert,
 } from "./commands/research"
 import { commandToolsRun } from "./commands/tools"
@@ -65,8 +64,6 @@ export async function workerMain(argv = process.argv.slice(2)) {
       return commandResearchBrief(args)
     if (command === "research" && sub === "session-state-brief")
       return commandResearchSessionStateBrief(args)
-    if (command === "research" && sub === "should-stop")
-      return commandResearchShouldStop(args)
     if (command === "tools" && sub === "run") return commandToolsRun(args)
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "workflow" && sub === "status")

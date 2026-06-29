@@ -33,6 +33,7 @@ export const localResearchRemoteMetadataSchema = z.object({
   workerId: z.uuid().optional(),
   hypothesisId: z.uuid().optional(),
   sessionId: z.uuid().optional(),
+  acceptedIndex: z.number().int().positive().nullable().optional(),
   reportedAt: z.iso.datetime().optional(),
 })
 
@@ -122,6 +123,7 @@ export const localResearchHistoryRecordSchema = z.object({
   startedAt: z.iso.datetime().nullable().optional(),
   completedAt: z.iso.datetime().nullable().optional(),
   createdAt: z.iso.datetime(),
+  acceptedIndex: z.number().int().positive().nullable().optional(),
   experimentId: z.uuid().optional(),
   campaignId: z.uuid().optional(),
   sessionId: z.uuid().optional(),

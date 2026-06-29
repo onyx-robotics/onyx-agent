@@ -45,7 +45,7 @@ describe("hypothesis worker prompt", () => {
       "- Final shutdown deadline: 2026-06-20T14:10:00.000Z"
     )
     expect(prompt).toContain(
-      "- Session target: keep producing measured attempts until local stop checks ask you to stop"
+      "- Session target: keep producing measured attempts until the session-state brief stop guidance asks you to stop"
     )
     expect(prompt).toContain(
       "- Worktree root: /repo/.git/onyx/worktrees/session-hypothesis"
@@ -73,6 +73,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "Routine session-state brief command: `onyx-worker research session-state-brief --json`"
     )
+    expect(prompt).not.toContain("Stop check command")
     expect(prompt).toContain(
       'Campaign brief command for deeper context: `onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"`'
     )
@@ -91,8 +92,16 @@ describe("hypothesis worker prompt", () => {
     )
     expect(prompt).toContain("onyx-worker knowledge add")
     expect(prompt).toContain("onyx-worker research session-state-brief --json")
-    expect(prompt).not.toContain('"shouldStop": true')
-    expect(prompt).toContain("not stop authority")
+    expect(prompt).not.toContain("onyx-worker research should-stop --json")
+    expect(prompt).not.toContain("should-stop")
+    expect(prompt).toContain("stop.shouldStopStartingNewWork")
+    expect(prompt).toContain("stop.recommendedAction")
+    expect(prompt).toContain('recommendedAction` is `"exit"`')
+    expect(prompt).toContain('`"finish_current_attempt_then_exit"`')
+    expect(prompt).toContain("Do not start another workflow")
+    expect(prompt).toContain("Start every loop by running")
+    expect(prompt).toContain("After logging, return to step 1")
+    expect(prompt).not.toContain("Immediately after logging")
     expect(prompt).toContain(
       "If `onyx-worker exp log` says the attempt was discarded, treat the session as complete"
     )
@@ -113,6 +122,9 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("onyx-worker exp run --resume --auto")
     expect(prompt).toContain(
       "The required order is strict: `exp run --auto`, make exactly one commit, `exp run --resume --auto`, then `exp log`"
+    )
+    expect(prompt).toContain(
+      "Never stack a new experiment commit on top of an unlogged one"
     )
     expect(prompt).toContain(
       "the server records reports first and settles accepted/discarded disposition separately"

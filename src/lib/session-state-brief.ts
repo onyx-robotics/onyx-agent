@@ -49,6 +49,21 @@ export type WorkerSessionStateBrief = {
   summaries: ApiSessionStateBrief["summaries"]
   knowledge: ApiSessionStateBrief["knowledge"]
   updatedAt: string | null
+  stop: WorkerSessionStopGuidance
+}
+
+export type WorkerSessionStopGuidance = {
+  shouldStopStartingNewWork: boolean
+  reasonCodes: Array<
+    | "stop_requested"
+    | "session_terminal"
+    | "deadline_reached"
+    | "experiment_target_reached"
+  >
+  reasons: string[]
+  recommendedAction: "continue" | "finish_current_attempt_then_exit" | "exit"
+  activeWorkflowCount: number
+  unloggedAttemptCount: number
 }
 
 function safeSegment(value: string) {
@@ -130,10 +145,12 @@ export function placeholderSessionStateBrief({
 export function workerSessionStateBriefFromSnapshot({
   context,
   snapshot,
+  stop,
   warnings = [],
 }: {
   context: WorkerRuntimeContext
   snapshot: SessionStateBriefSnapshot | null
+  stop?: WorkerSessionStopGuidance
   warnings?: string[]
 }): WorkerSessionStateBrief {
   const fallbackGeneratedAt = new Date().toISOString()
@@ -181,5 +198,15 @@ export function workerSessionStateBriefFromSnapshot({
     summaries: brief?.summaries ?? [],
     knowledge: brief?.knowledge ?? [],
     updatedAt: brief?.updatedAt ?? null,
+    stop:
+      stop ??
+      ({
+        shouldStopStartingNewWork: false,
+        reasonCodes: [],
+        reasons: [],
+        recommendedAction: "continue",
+        activeWorkflowCount: 0,
+        unloggedAttemptCount: 0,
+      } satisfies WorkerSessionStopGuidance),
   }
 }

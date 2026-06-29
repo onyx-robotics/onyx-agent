@@ -19,7 +19,6 @@ import {
   commandResearchHypotheses,
   commandResearchSessionStateBrief,
   commandResearchRun,
-  commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
   commandResearchStop,
@@ -72,7 +71,6 @@ Usage:
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude|opencode]
   onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--quiet]
-  onyx research should-stop [--session <id>] [--worker <id>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>] [--require-online]
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
@@ -175,8 +173,6 @@ export async function main(argv = process.argv.slice(2)) {
       args.positional[2] === "add"
     )
       return commandResearchHypothesisAdd(args)
-    if (command === "research" && sub === "should-stop")
-      return commandResearchShouldStop(args)
     if (command === "research" && sub === "session-state-brief")
       return commandResearchSessionStateBrief(args)
     if (command === "research" && sub === "stop")

@@ -201,9 +201,11 @@ diagnostics.
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
 and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
 worker prompts and logs live under `.git/onyx/`. Workers run
-`onyx-worker research session-state-brief --json` for routine context, use
-`onyx-worker research brief` only for fuller prose memory, run the setup workflow
-through `onyx-worker exp run --campaign <name> --auto` and
+`onyx-worker research session-state-brief --json` for routine context and
+worker-specific stop guidance. They inspect `stop.shouldStopStartingNewWork`
+and `stop.recommendedAction` at the start of each loop, use
+`onyx-worker research brief` only for fuller prose memory, run the setup
+workflow through `onyx-worker exp run --campaign <name> --auto` and
 `onyx-worker exp run --resume --auto`, push
 `refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment with
 setup/session/hypothesis/worker context. `onyx research hypothesis add`

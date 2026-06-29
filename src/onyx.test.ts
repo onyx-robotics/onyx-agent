@@ -8,7 +8,6 @@ import {
   commandResearchFinish,
   commandResearchStatus,
   commandResearchSessionStateBrief,
-  commandResearchShouldStop,
 } from "./commands/research"
 import { commandExpList } from "./commands/exp"
 import type { ApiSessionStateBrief } from "./lib/api"
@@ -16,6 +15,7 @@ import { git } from "./lib/git"
 import {
   cacheResearchSessionState,
   researchRuntimeStatePath,
+  upsertWorkflowRun,
 } from "./lib/research-runtime"
 import { updateState } from "./lib/runtime-state"
 import {
@@ -220,91 +220,6 @@ describe("remote-first agent architecture", () => {
     }
   })
 
-  test("should-stop polls the remote control-state endpoint", async () => {
-    const root = await tempRepo()
-    const logs: string[] = []
-    const originalLog = console.log
-    console.log = (message?: unknown) => {
-      logs.push(String(message))
-    }
-    installMockApi(({ method, path }) => {
-      expect(method).toBe("GET")
-      expect(path).toBe(`/api/v1/research/sessions/${SESSION_ID}/control-state`)
-      return {
-        sessionId: SESSION_ID,
-        status: "running",
-        finalizationStatus: "running",
-        progress: {
-          experimentTarget: 3,
-          acceptedExperimentCount: 1,
-          remainingExperimentCount: 2,
-          deadlineAt: null,
-          terminalReason: null,
-        },
-        launch: {
-          activeWorkerCount: 1,
-          workerTarget: 10,
-          openWorkerSlotCount: 9,
-          activeHypothesisCount: 1,
-          acceptingExperiments: true,
-        },
-        finalization: {
-          status: "running",
-          reasons: [],
-          terminalReason: null,
-          unmeasuredSalvageCount: 0,
-        },
-        updatedAt: new Date().toISOString(),
-      }
-    })
-    try {
-      await commandResearchShouldStop({
-        positional: ["research", "should-stop"],
-        options: { cwd: root, session: SESSION_ID, json: "true" },
-      })
-      const payload = JSON.parse(logs.join("\n"))
-      expect(payload.shouldStop).toBe(false)
-      expect(payload.sessionId).toBe(SESSION_ID)
-    } finally {
-      console.log = originalLog
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("worker should-stop is a local deprecated no-op", async () => {
-    const root = await tempRepo()
-    const logs: string[] = []
-    const calls: string[] = []
-    const originalLog = console.log
-    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
-    console.log = (message?: unknown) => {
-      logs.push(String(message))
-    }
-    const paths = await writeTestWorkerContext({ root })
-    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
-    installMockApi(({ method, path }) => {
-      calls.push(`${method} ${path}`)
-      throw new Error(`unexpected API call: ${method} ${path}`)
-    })
-    try {
-      await commandResearchShouldStop({
-        positional: ["research", "should-stop"],
-        options: { cwd: root, json: "true" },
-      })
-      const payload = JSON.parse(logs.join("\n"))
-      expect(payload.shouldStop).toBe(false)
-      expect(payload.deprecated).toBe(true)
-      expect(payload.reasonCodes).toEqual([])
-      expect(calls).toEqual([])
-    } finally {
-      console.log = originalLog
-      if (previousWorkerContext === undefined)
-        delete process.env.ONYX_WORKER_CONTEXT
-      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
   test("worker session-state-brief reads the local supervisor file only", async () => {
     const root = await tempRepo()
     const logs: string[] = []
@@ -343,6 +258,167 @@ describe("remote-first agent architecture", () => {
       expect(payload.refreshStatus).toBe("ok")
       expect(payload.progress.acceptedExperimentCount).toBe(7)
       expect(payload.worker.sessionId).toBe(SESSION_ID)
+      expect(payload.stop).toEqual({
+        shouldStopStartingNewWork: false,
+        reasonCodes: [],
+        reasons: [],
+        recommendedAction: "continue",
+        activeWorkflowCount: 0,
+        unloggedAttemptCount: 0,
+      })
+      expect(calls).toEqual([])
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker session-state-brief exits after target completion with no active work", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const calls: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    console.log = (message?: unknown) => {
+      logs.push(String(message))
+    }
+    const paths = await writeTestWorkerContext({ root })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    const brief = makeSessionStateBrief()
+    brief.session.status = "completed"
+    brief.session.acceptedExperimentCount = 100
+    brief.session.remainingExperimentCount = 0
+    brief.session.terminalReason = "experiment_target_reached"
+    brief.progress.acceptedExperimentCount = 100
+    brief.progress.remainingExperimentCount = 0
+    brief.progress.terminalReason = "experiment_target_reached"
+    await writeSessionStateBriefSnapshot({
+      root,
+      sessionId: SESSION_ID,
+      snapshot: {
+        schemaVersion: 1,
+        sequence: 4,
+        refreshStatus: "ok",
+        generatedAt: "2026-06-29T12:00:00.000Z",
+        fetchedAt: "2026-06-29T12:00:01.000Z",
+        lastRefreshAttemptAt: "2026-06-29T12:00:01.000Z",
+        brief,
+      },
+    })
+    installMockApi(({ method, path }) => {
+      calls.push(`${method} ${path}`)
+      throw new Error(`unexpected API call: ${method} ${path}`)
+    })
+    try {
+      await commandResearchSessionStateBrief({
+        positional: ["research", "session-state-brief"],
+        options: { cwd: root, json: "true" },
+      })
+      const payload = JSON.parse(logs.join("\n"))
+      expect(payload.stop.shouldStopStartingNewWork).toBe(true)
+      expect(payload.stop.reasonCodes).toContain("experiment_target_reached")
+      expect(payload.stop.reasonCodes).toContain("session_terminal")
+      expect(payload.stop.recommendedAction).toBe("exit")
+      expect(payload.stop.activeWorkflowCount).toBe(0)
+      expect(payload.stop.unloggedAttemptCount).toBe(0)
+      expect(calls).toEqual([])
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker session-state-brief finishes active work before exiting after target completion", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const calls: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    const workerId = "22222222-2222-4222-8222-222222222222"
+    const campaignId = "33333333-3333-4333-8333-333333333333"
+    const campaignName = "scale-test"
+    const hypothesisId = "44444444-4444-4444-8444-444444444444"
+    console.log = (message?: unknown) => {
+      logs.push(String(message))
+    }
+    const paths = await writeTestWorkerContext({
+      root,
+      workerId,
+      campaignId,
+      campaignName,
+      hypothesisId,
+    })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    const now = "2026-06-29T12:00:00.000Z"
+    await upsertWorkflowRun({
+      root,
+      run: {
+        id: "workflow-1",
+        campaignId,
+        campaignName,
+        projectPath: "",
+        runRef: "run-ref-1",
+        baseCommitSha: "abc123",
+        resultCommitSha: null,
+        resultRef: `refs/onyx/experiments/${campaignId}/run-ref-1`,
+        setupHash: "setup-hash",
+        status: "running",
+        currentStepIndex: 0,
+        metrics: {},
+        blockReason: null,
+        createdAt: now,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        sessionId: SESSION_ID,
+        workerId,
+        hypothesisId,
+      },
+    })
+    const brief = makeSessionStateBrief()
+    brief.session.status = "completed"
+    brief.session.acceptedExperimentCount = 100
+    brief.session.remainingExperimentCount = 0
+    brief.session.terminalReason = "experiment_target_reached"
+    brief.progress.acceptedExperimentCount = 100
+    brief.progress.remainingExperimentCount = 0
+    brief.progress.terminalReason = "experiment_target_reached"
+    await writeSessionStateBriefSnapshot({
+      root,
+      sessionId: SESSION_ID,
+      snapshot: {
+        schemaVersion: 1,
+        sequence: 5,
+        refreshStatus: "ok",
+        generatedAt: "2026-06-29T12:00:00.000Z",
+        fetchedAt: "2026-06-29T12:00:01.000Z",
+        lastRefreshAttemptAt: "2026-06-29T12:00:01.000Z",
+        brief,
+      },
+    })
+    installMockApi(({ method, path }) => {
+      calls.push(`${method} ${path}`)
+      throw new Error(`unexpected API call: ${method} ${path}`)
+    })
+    try {
+      await commandResearchSessionStateBrief({
+        positional: ["research", "session-state-brief"],
+        options: { cwd: root, json: "true" },
+      })
+      const payload = JSON.parse(logs.join("\n"))
+      expect(payload.stop.shouldStopStartingNewWork).toBe(true)
+      expect(payload.stop.reasonCodes).toContain("experiment_target_reached")
+      expect(payload.stop.recommendedAction).toBe(
+        "finish_current_attempt_then_exit"
+      )
+      expect(payload.stop.activeWorkflowCount).toBe(1)
+      expect(payload.stop.unloggedAttemptCount).toBe(0)
       expect(calls).toEqual([])
     } finally {
       console.log = originalLog
@@ -373,6 +449,8 @@ describe("remote-first agent architecture", () => {
       expect(payload.brief).toBeUndefined()
       expect(payload.progress).toBeNull()
       expect(payload.warnings.length).toBeGreaterThan(0)
+      expect(payload.stop.shouldStopStartingNewWork).toBe(false)
+      expect(payload.stop.recommendedAction).toBe("continue")
     } finally {
       console.log = originalLog
       if (previousWorkerContext === undefined)
@@ -408,6 +486,8 @@ describe("remote-first agent architecture", () => {
       expect(payload.refreshStatus).toBe("initializing")
       expect(payload.progress).toBeNull()
       expect(payload.latestExperiments).toEqual([])
+      expect(payload.stop.shouldStopStartingNewWork).toBe(false)
+      expect(payload.stop.recommendedAction).toBe("continue")
       expect(payload.warnings.join("\n")).toContain(
         "supervisor has not fetched remote state yet"
       )

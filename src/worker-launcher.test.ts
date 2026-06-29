@@ -80,7 +80,7 @@ async function writeFakeOnyx(path: string) {
       "  exit 99",
       "fi",
       'if [[ "${1:-}" == "--help" ]]; then',
-      '  echo "onyx research should-stop"',
+      '  echo "onyx research session-state-brief"',
       '  echo "onyx knowledge add"',
       '  echo "onyx knowledge list"',
       '  echo "onyx summary upsert"',

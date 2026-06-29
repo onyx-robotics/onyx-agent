@@ -59,6 +59,15 @@ function firstString(...values: unknown[]) {
   return values.find((value): value is string => typeof value === "string")
 }
 
+function nestedErrorMessage(value: unknown): string | null {
+  const record = recordObject(value)
+  if (!record) return typeof value === "string" ? value : null
+  const direct = firstString(record.message, record.name, record.code)
+  const cause = nestedErrorMessage(record.cause)
+  const error = nestedErrorMessage(record.error)
+  return [direct, cause, error].filter(Boolean).join(": ") || null
+}
+
 function openCodeToolLine(record: Record<string, unknown>) {
   const part = recordObject(record.part)
   const input = recordObject(record.input) ?? recordObject(part?.input)
@@ -88,12 +97,10 @@ function activityLinesFromOpenCodeEvent(record: Record<string, unknown>) {
   if (type === "step_start") return ["step: start"]
   if (type === "step_finish") return ["step: finish"]
   if (type === "error") {
-    return [
-      `error: ${
-        typeof record.message === "string" ? compact(record.message) : "opencode"
-      }`,
-    ]
+    return [`error: ${compact(nestedErrorMessage(record) ?? "opencode")}`]
   }
+  const errorMessage = nestedErrorMessage(record.error)
+  if (errorMessage) return [`error: ${compact(errorMessage)}`]
   return []
 }
 

@@ -26,6 +26,7 @@ import { emitEvent } from "../lib/events"
 import { currentCommit, git, repoRoot } from "../lib/git"
 import { apiExperimentToHistory } from "../lib/history"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
+import { collectLocalResearchStopReasons } from "../lib/research-stop"
 import {
   clientRunRef,
   type CachedAttemptRecord,
@@ -417,6 +418,21 @@ async function assertWorkerCanStartFreshWorkflow({
   context: WorkerWorkflowContext
 }) {
   if (!context.workerId) return
+  if (context.sessionId) {
+    const stopCheck = await collectLocalResearchStopReasons({
+      root,
+      sessionId: context.sessionId,
+    })
+    if (stopCheck.shouldStop) {
+      throw new Error(
+        [
+          `Session stop condition reached; worker ${context.workerId} will not start a new workflow.`,
+          `Reasons: ${stopCheck.reasons.join(", ") || stopCheck.reasonCodes.join(", ")}`,
+          "Exit cleanly after logging any terminal attempt already in progress.",
+        ].join("\n")
+      )
+    }
+  }
   const active = await listWorkflowRuns(root, {
     campaignName,
     projectPath,
@@ -1259,6 +1275,12 @@ export async function commandExpRun(args: Args) {
       campaignName,
     })
     const context = resolveWorkerWorkflowContext(args)
+    await assertWorkerCanStartFreshWorkflow({
+      root,
+      campaignName,
+      projectPath,
+      context,
+    })
     const baseCommitSha = await resolveFreshBaseCommitSha({
       root,
       args,

@@ -127,7 +127,6 @@ export {
   commandResearchHypotheses,
   commandResearchSessionStateBrief,
   commandResearchRun,
-  commandResearchShouldStop,
   commandResearchStart,
   commandResearchStatus,
   commandResearchStop,

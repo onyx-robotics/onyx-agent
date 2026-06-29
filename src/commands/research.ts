@@ -83,6 +83,7 @@ import {
   workerSessionStateBriefFromSnapshot,
   writeSessionStateBriefSnapshot,
   type SessionStateBriefSnapshot,
+  type WorkerSessionStopGuidance,
 } from "../lib/session-state-brief"
 import { readWorkerRuntimeContext } from "../lib/worker-context"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
@@ -93,6 +94,7 @@ import {
   type StreamingProcessResult,
 } from "../lib/process"
 import { resolveOpenCodeModelId } from "../lib/opencode-models"
+import { collectLocalResearchStopReasons } from "../lib/research-stop"
 import {
   abandonBlockedWorkflowRunsForSession,
   assertLocalSessionSchedulerSite,
@@ -103,6 +105,7 @@ import {
   getLocalSessionState,
   listLocalAttempts,
   listLocalExperimentHistory,
+  listWorkflowRuns,
   recordLocalWorkerHeartbeat,
   registerLocalWorker,
   getResearchSiteId,
@@ -250,6 +253,8 @@ async function appendWorkerActivityEvent(
 
 const PIPED_ONYX_MUTATION_COMMAND =
   /\bonyx\s+(?:exp\s+run|exp\s+log|sync|push)\b[^\n|]*\|/i
+const PROVIDER_STREAM_ERROR =
+  /AI_APICallError|APICallError|Cannot connect to API|socket connection was closed|message="stream error"|stream error/i
 
 async function recordWorkerHarnessWarnings(
   manifest: WorkerLaunchManifest | null | undefined
@@ -262,6 +267,11 @@ async function recordWorkerHarnessWarnings(
     if (PIPED_ONYX_MUTATION_COMMAND.test(line)) {
       warnings.push(
         `piped Onyx mutation command detected: ${line.trim().slice(0, 240)}`
+      )
+    }
+    if (PROVIDER_STREAM_ERROR.test(line)) {
+      warnings.push(
+        `provider stream/API error detected: ${line.trim().slice(0, 240)}`
       )
     }
     if (warnings.length >= 20) break
@@ -1558,7 +1568,8 @@ async function computeSessionFinalizationStatus({
       const cleanFinalizationStatus =
         finalization.finalizationStatus === "measured_and_logged" ||
         finalization.finalizationStatus === "already_logged" ||
-        finalization.finalizationStatus === "none"
+        finalization.finalizationStatus === "none" ||
+        finalization.finalizationStatus === "discarded_after_completion"
       const hasUnresolvedSalvage =
         finalization.finalizationStatus.startsWith("salvaged_unmeasured") ||
         (!cleanFinalizationStatus && finalization.unloggedCommitCount > 0)
@@ -2127,9 +2138,37 @@ export async function finalizeHypothesisAttempt({
         manifest.salvaged = false
         manifest.unloggedCommitCount = 0
       } else if (analysis.kind === "salvage_only") {
-        manifest.finalizationStatus = "salvaged_unmeasured"
-        manifest.salvaged = true
-        manifest.error = analysis.reason
+        const stopCheck = await collectResearchStopReasons({
+          root,
+          sessionId,
+        }).catch(() => null)
+        if (stopCheck?.shouldStop) {
+          manifest.finalizationStatus = "discarded_after_completion"
+          manifest.salvaged = false
+          manifest.error = [
+            "Session stop condition reached before final measurement; discarded unlogged work without creating an experiment.",
+            analysis.reason,
+          ]
+            .filter(Boolean)
+            .join(" ")
+          if (activityManifest) {
+            await appendWorkerActivityEvent(activityManifest, {
+              type: "finalization",
+              phase: "discarded",
+              summary: "Session completed before final measurement",
+              metadata: {
+                finalizationStatus: manifest.finalizationStatus,
+                unloggedCommitCount: analysis.unloggedCommits.length,
+                stopReasons: stopCheck.reasons,
+                salvageReason: analysis.reason,
+              },
+            })
+          }
+        } else {
+          manifest.finalizationStatus = "salvaged_unmeasured"
+          manifest.salvaged = true
+          manifest.error = analysis.reason
+        }
       } else {
         const measurementBaseCommitSha = analysis.measurementBaseCommitSha
         const stopCheck = await collectResearchStopReasons({
@@ -2256,10 +2295,6 @@ export async function finalizeHypothesisAttempt({
         hypothesisId: hypothesis.id,
         reason: `Worker finalization ${manifest.finalizationStatus}; workflow no longer represents a loggable attempt.`,
       }).catch(() => [])
-    }
-
-    if (manifest.finalizationStatus === "discarded_after_completion") {
-      return manifest
     }
 
     const workerBranchPush = await pushWorkerBranch({
@@ -2487,55 +2522,22 @@ export async function collectResearchStopReasons({
   sessionId: string
   nowMs?: number
 }): Promise<ResearchStopCheck> {
-  const reasons: string[] = []
-  const reasonCodes = new Set<ResearchStopReasonCode>()
-  const addStopReason = (code: ResearchStopReasonCode, reason: string) =>
-    addResearchStopReason(reasonCodes, reasons, code, reason)
-
-  const state = await readState(root).catch(() => null)
-  const localSession = state?.sessions?.[sessionId]
-  if (localSession?.stopRequested) {
-    addStopReason("stop_requested", "stop requested")
-  }
-  const localSessionState = await getLocalSessionState(root, sessionId).catch(
-    () => null
+  const localCheck = await collectLocalResearchStopReasons({
+    root,
+    sessionId,
+    nowMs,
+  })
+  const reasons = [...localCheck.reasons]
+  const reasonCodes = new Set<ResearchStopReasonCode>(
+    localCheck.reasonCodes as ResearchStopReasonCode[]
   )
-  if (localSessionState && localSessionState.session.status !== "running") {
-    if (
-      localSessionState.session.terminalReason === "experiment_target_reached"
-    ) {
-      addStopReason("experiment_target_reached", "experiment target reached")
-    } else if (
-      localSessionState.session.terminalReason === "deadline_reached"
-    ) {
-      addStopReason("deadline_reached", "deadline reached")
-    }
-    addStopReason(
-      "session_terminal",
-      `local session ${localSessionState.session.status}`
-    )
-  }
-  const localDeadline = localSessionState?.session.deadlineAt
-    ? Date.parse(localSessionState.session.deadlineAt)
-    : Number.NaN
-  if (Number.isFinite(localDeadline) && nowMs >= localDeadline) {
-    addStopReason("deadline_reached", "deadline reached")
-  }
-  const workerResearchDeadline = process.env.ONYX_RESEARCH_DEADLINE_AT
-    ? Date.parse(process.env.ONYX_RESEARCH_DEADLINE_AT)
-    : Number.NaN
-  if (
-    Number.isFinite(workerResearchDeadline) &&
-    nowMs >= workerResearchDeadline
-  ) {
-    addStopReason("deadline_reached", "worker shutdown cushion reached")
-  }
 
   return {
     shouldStop: reasons.length > 0,
     sessionId,
     reasonCodes: [...reasonCodes],
     reasons,
+    ...(localCheck.controlState ? { controlState: localCheck.controlState } : {}),
   }
 }
 
@@ -4203,13 +4205,32 @@ export async function commandResearchStatus(args: Args) {
         logPath: manifest?.logPath ?? null,
       }
     })
+  const localDiscardedAfterCompletion = manifests
+    .filter(
+      (manifest) =>
+        manifest.finalization?.finalizationStatus ===
+        "discarded_after_completion"
+    )
+    .slice(0, 25)
+    .map((manifest) => ({
+      workerId: manifest.workerId,
+      workerName: manifest.workerName,
+      status: manifest.status,
+      unloggedCommitCount: manifest.finalization?.unloggedCommitCount ?? null,
+      workerBranchPushStatus:
+        manifest.finalization?.workerBranchPushStatus ?? null,
+      logPath: manifest.logPath,
+      manifestPath: manifest.manifestPath,
+    }))
   const localUnloggedAttempts = manifests
     .filter(
       (manifest) =>
         manifest.finalization?.finalizationStatus.startsWith(
           "salvaged_unmeasured"
         ) ||
-        (manifest.finalization?.unloggedCommitCount ?? 0) > 0 ||
+        ((manifest.finalization?.unloggedCommitCount ?? 0) > 0 &&
+          manifest.finalization?.finalizationStatus !==
+            "discarded_after_completion") ||
         (!manifest.finalization &&
           ["completed", "failed", "stopped"].includes(manifest.status))
     )
@@ -4308,6 +4329,10 @@ export async function commandResearchStatus(args: Args) {
             count: localUnloggedAttempts.length,
             workers: localUnloggedAttempts,
           },
+          localDiscardedAfterCompletion: {
+            count: localDiscardedAfterCompletion.length,
+            workers: localDiscardedAfterCompletion,
+          },
           workerWarnings,
           launchSuggestions,
         },
@@ -4336,6 +4361,11 @@ export async function commandResearchStatus(args: Args) {
   }
   if (localUnloggedAttempts.length > 0) {
     console.log(`local unlogged attempts: ${localUnloggedAttempts.length}`)
+  }
+  if (localDiscardedAfterCompletion.length > 0) {
+    console.log(
+      `local discarded late work: ${localDiscardedAfterCompletion.length}`
+    )
   }
   if (workerWarnings.length > 0) {
     console.log(
@@ -4635,100 +4665,65 @@ async function reconcileCampaignIntoLocalState({
   return response
 }
 
-export async function commandResearchShouldStop(args: Args) {
-  const workerContext = await readWorkerRuntimeContext().catch(() => null)
-  if (workerContext) {
-    if (args.options.json === "true") {
-      console.log(
-        JSON.stringify(
-          {
-            shouldStop: false,
-            sessionId: workerContext.sessionId,
-            reasonCodes: [],
-            reasons: [],
-            deprecated: true,
-            message:
-              "Supervised workers do not make stop decisions; the supervisor and harness own worker shutdown.",
-          },
-          null,
-          2
-        )
-      )
-    } else {
-      console.log(
-        `continue: session ${workerContext.sessionId} (supervisor-owned stop control)`
-      )
+async function workerSessionStopGuidance({
+  root,
+  context,
+  snapshot,
+}: {
+  root: string
+  context: Awaited<ReturnType<typeof readWorkerRuntimeContext>>
+  snapshot: SessionStateBriefSnapshot | null
+}): Promise<WorkerSessionStopGuidance> {
+  if (!context) {
+    return {
+      shouldStopStartingNewWork: false,
+      reasonCodes: [],
+      reasons: [],
+      recommendedAction: "continue",
+      activeWorkflowCount: 0,
+      unloggedAttemptCount: 0,
     }
-    return
   }
-  const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
-  if (workerId && !args.options.session) {
-    throw new Error(
-      "Remote worker should-stop polling was removed. Pass --session <id>, or use the supervisor-owned worker harness."
-    )
+  const stopCheck = await collectLocalResearchStopReasons({
+    root,
+    sessionId: context.sessionId,
+    snapshot,
+  })
+  let activeWorkflowCount = 0
+  let unloggedAttemptCount = 0
+  if (stopCheck.shouldStop) {
+    const [activeWorkflows, unloggedAttempts] = await Promise.all([
+      listWorkflowRuns(root, {
+        campaignName: context.campaignName,
+        projectPath: context.projectPath,
+        sessionId: context.sessionId,
+        workerId: context.workerId,
+        hypothesisId: context.hypothesisId,
+        statuses: ["running", "paused"],
+      }),
+      listLocalAttempts(root, {
+        campaignName: context.campaignName,
+        projectPath: context.projectPath,
+        sessionId: context.sessionId,
+        workerId: context.workerId,
+        hypothesisId: context.hypothesisId,
+      }),
+    ])
+    activeWorkflowCount = activeWorkflows.length
+    unloggedAttemptCount = unloggedAttempts.length
   }
-  const root = await repoRoot(args.options.cwd)
-  const projectPath = await resolveProjectPath(root, args)
-  const state = await readState(root)
-  const sessionId =
-    args.options.session ??
-    process.env.ONYX_SESSION_ID ??
-    activeSessionIdFromState({
-      state,
-      projectPath,
-      campaignName: args.options.campaign,
-    })
-  if (!sessionId) {
-    console.log("continue: no active session")
-    return
-  }
-
-  const control = await getResearchSessionControlState(sessionId, args)
-  const reasons: string[] = []
-  const reasonCodes: ResearchStopReasonCode[] = []
-  if (control.status !== "running") {
-    if (control.progress.terminalReason === "experiment_target_reached") {
-      reasonCodes.push("experiment_target_reached")
-    } else if (control.progress.terminalReason === "deadline_reached") {
-      reasonCodes.push("deadline_reached")
-    } else if (control.progress.terminalReason === "stop_requested") {
-      reasonCodes.push("stop_requested")
-    }
-    reasonCodes.push("session_terminal")
-    reasons.push(`session ${control.status}`)
-  }
-  if (
-    control.progress.deadlineAt &&
-    Date.now() >= Date.parse(control.progress.deadlineAt)
-  ) {
-    reasonCodes.push("deadline_reached")
-    reasons.push("deadline reached")
-  }
-  if (control.progress.remainingExperimentCount === 0) {
-    reasonCodes.push("experiment_target_reached")
-    reasons.push("experiment target reached")
-  }
-  const shouldStop = reasons.length > 0
-  if (args.options.json === "true") {
-    console.log(
-      JSON.stringify(
-        {
-          shouldStop,
-          sessionId,
-          reasonCodes,
-          reasons,
-          controlState: control,
-        },
-        null,
-        2
-      )
-    )
-  } else {
-    console.log(
-      shouldStop
-        ? `stop: ${reasons.join(", ")}`
-        : `continue: session ${sessionId}`
-    )
+  const hasWorkToFinish = activeWorkflowCount > 0 || unloggedAttemptCount > 0
+  return {
+    shouldStopStartingNewWork: stopCheck.shouldStop,
+    reasonCodes: stopCheck.reasonCodes,
+    reasons: stopCheck.reasons,
+    recommendedAction: stopCheck.shouldStop
+      ? hasWorkToFinish
+        ? "finish_current_attempt_then_exit"
+        : "exit"
+      : "continue",
+    activeWorkflowCount,
+    unloggedAttemptCount,
   }
 }
 
@@ -4749,9 +4744,15 @@ export async function commandResearchSessionStateBrief(args: Args) {
   } catch (error) {
     warnings.push(errorMessage(error))
   }
+  const stop = await workerSessionStopGuidance({
+    root: context.worktreeRoot,
+    context,
+    snapshot,
+  })
   const stateBrief = workerSessionStateBriefFromSnapshot({
     context,
     snapshot,
+    stop,
     warnings,
   })
   if (args.options.json === "true") {
@@ -4773,6 +4774,11 @@ export async function commandResearchSessionStateBrief(args: Args) {
         !stateBrief.progress || stateBrief.progress.experimentTarget === null
           ? ""
           : `/${stateBrief.progress.experimentTarget}`
+      }`,
+      `Stop: ${stateBrief.stop.recommendedAction}${
+        stateBrief.stop.reasonCodes.length > 0
+          ? ` (${stateBrief.stop.reasonCodes.join(", ")})`
+          : ""
       }`,
       `Hypothesis: ${stateBrief.worker.hypothesisName}`,
       `Generated: ${stateBrief.generatedAt}`,
@@ -4992,6 +4998,11 @@ export async function commandResearchFinish(args: Args) {
           "salvaged_unmeasured"
         )
     ).length
+  const finishDiscardedAfterCompletion = finishManifests.filter(
+    (manifest) =>
+      manifest.finalization?.finalizationStatus ===
+      "discarded_after_completion"
+  ).length
   const finishAccepted =
     finishLive?.session.acceptedExperimentCount ??
     finishLocal?.session.acceptedExperimentCount ??
@@ -5003,10 +5014,19 @@ export async function commandResearchFinish(args: Args) {
     null
 
   const body = [
-    `Finalized campaign ${campaign.name}.`,
+    finishFinalization?.status === "failed"
+      ? `Finalized campaign ${campaign.name} with failed worker finalization.`
+      : finishFinalization?.status === "incomplete"
+        ? `Finalized campaign ${campaign.name} with incomplete worker finalization.`
+        : finishDiscardedAfterCompletion > 0
+          ? `Finalized campaign ${campaign.name} with late discarded worker work.`
+          : `Finalized campaign ${campaign.name}.`,
     `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
     `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
-    `Experiment counts: accepted=${finishAccepted}${finishTarget === null ? "" : `/${finishTarget}`} unmeasuredSalvage=${finishUnmeasuredSalvage}`,
+    `Experiment counts: accepted=${finishAccepted}${finishTarget === null ? "" : `/${finishTarget}`} unmeasuredSalvage=${finishUnmeasuredSalvage} discardedAfterCompletion=${finishDiscardedAfterCompletion}`,
+    finishFinalization?.reasons.length
+      ? `Finalization notes: ${finishFinalization.reasons.slice(0, 5).join("; ")}`
+      : "",
     "Hypothesis refs are not promoted from mutable hypothesis heads; use verified experiment best projections for curated outputs.",
     "",
     "Local branches:",
@@ -6556,6 +6576,11 @@ export async function commandResearchRun(args: Args) {
           "salvaged_unmeasured"
         )
     ).length
+  const discardedAfterCompletionCount = completionManifests.filter(
+    (manifest) =>
+      manifest.finalization?.finalizationStatus ===
+      "discarded_after_completion"
+  ).length
   const acceptedExperiments =
     completionLive?.session.acceptedExperimentCount ??
     completionLocal?.session.acceptedExperimentCount ??
@@ -6579,7 +6604,7 @@ export async function commandResearchRun(args: Args) {
     `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
   )
   console.log(
-    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount}.`
+    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount} discardedAfterCompletion=${discardedAfterCompletionCount}.`
   )
   const apiTimingSummary = renderApiTimingSummary(args)
   if (apiTimingSummary) console.error(apiTimingSummary)
