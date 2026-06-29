@@ -1696,7 +1696,9 @@ export type ResearchSessionStatus = z.infer<typeof researchSessionStatusSchema>
 export type ResearchSessionTerminalReason = z.infer<
   typeof researchSessionTerminalReasonSchema
 >
-export type ResearchStopReasonCode = z.infer<typeof researchStopReasonCodeSchema>
+export type ResearchStopReasonCode = z.infer<
+  typeof researchStopReasonCodeSchema
+>
 export type CreateResearchSessionRequest = z.infer<
   typeof createResearchSessionRequestSchema
 >
