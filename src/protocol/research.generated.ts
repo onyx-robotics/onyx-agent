@@ -982,6 +982,16 @@ export const researchCampaignOverviewResponseSchema = z.object({
   }),
 })
 
+export const completeResearchCampaignRequestSchema = z.object({
+  sessionId: z.uuid().optional(),
+})
+
+export const completeResearchCampaignResponseSchema = z.object({
+  data: z.object({
+    campaign: researchCampaignSchema,
+  }),
+})
+
 export const researchCampaignTimelinePointSchema = z.object({
   experimentId: z.uuid(),
   displayIndex: z.number().int().positive(),
@@ -1657,6 +1667,12 @@ export type BatchResearchCampaignExperimentResponse = z.infer<
 >
 export type ResearchCampaignOverviewResponse = z.infer<
   typeof researchCampaignOverviewResponseSchema
+>
+export type CompleteResearchCampaignRequest = z.infer<
+  typeof completeResearchCampaignRequestSchema
+>
+export type CompleteResearchCampaignResponse = z.infer<
+  typeof completeResearchCampaignResponseSchema
 >
 export type ResearchCampaignTimelinePoint = z.infer<
   typeof researchCampaignTimelinePointSchema

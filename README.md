@@ -241,7 +241,8 @@ onyx research finish --campaign fast-eval
 ```
 
 `finish` reads remote state, writes the final campaign summary through
-`/api/v1`, and prints local extraction branches such as `onyx/fast-eval/best`.
+`/api/v1`, marks the remote campaign completed, and prints local extraction
+branches such as `onyx/fast-eval/best`.
 
 To delete a research direction entirely — the campaign record with all its
 experiments and matching local cache rows:

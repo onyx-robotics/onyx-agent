@@ -493,6 +493,15 @@ export type ApiReconcileCampaignResponse = {
 export type ApiVerifyResearchGitResponse =
   ApiReconcileCampaignResponse["gitVerification"]
 
+type ApiTimingBucket = {
+  count: number
+  maxMs: number
+  samples: number[]
+}
+
+const API_TIMING_SAMPLE_LIMIT = 200
+const apiTimingBuckets = new Map<string, ApiTimingBucket>()
+
 function apiTimingsEnabled(args?: Args) {
   return (
     args?.options["api-timings"] === "true" ||
@@ -515,7 +524,67 @@ function apiTimingCategory(method: string, path: string) {
   if (method === "GET" && pathname.includes("/control-state")) {
     return "control_state"
   }
+  if (method === "POST" && pathname.includes("/settle")) {
+    return "settlement"
+  }
+  if (method === "GET" && pathname.includes("/live")) {
+    return "live_status"
+  }
+  if (method === "GET" && pathname.includes("/overview")) {
+    return "campaign_overview"
+  }
+  if (method === "POST" && pathname.includes("/worker-leases/batch")) {
+    return "worker_lease_batch"
+  }
+  if (method === "POST" && pathname.includes("/reconcile")) {
+    return "reconcile"
+  }
+  if (method === "POST" && pathname.includes("/verify-git")) {
+    return "verify_git"
+  }
   return null
+}
+
+function recordApiTiming(category: string, durationMs: number) {
+  const bucket =
+    apiTimingBuckets.get(category) ??
+    ({ count: 0, maxMs: 0, samples: [] } satisfies ApiTimingBucket)
+  bucket.count += 1
+  bucket.maxMs = Math.max(bucket.maxMs, durationMs)
+  if (bucket.samples.length < API_TIMING_SAMPLE_LIMIT) {
+    bucket.samples.push(durationMs)
+  } else {
+    bucket.samples[bucket.count % API_TIMING_SAMPLE_LIMIT] = durationMs
+  }
+  apiTimingBuckets.set(category, bucket)
+}
+
+function percentile(samples: number[], p: number) {
+  if (samples.length === 0) return 0
+  const sorted = [...samples].sort((left, right) => left - right)
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)
+  )
+  return sorted[index] ?? 0
+}
+
+export function resetApiTimingSummary() {
+  apiTimingBuckets.clear()
+}
+
+export function renderApiTimingSummary(args?: Args) {
+  if (!apiTimingsEnabled(args) || apiTimingBuckets.size === 0) return null
+  const lines = ["API timings:"]
+  for (const [category, bucket] of [...apiTimingBuckets.entries()].sort()) {
+    lines.push(
+      `- ${category}: count=${bucket.count} max=${bucket.maxMs}ms p95=${percentile(
+        bucket.samples,
+        95
+      )}ms`
+    )
+  }
+  return lines.join("\n")
 }
 
 function emitApiTiming(
@@ -533,6 +602,7 @@ function emitApiTiming(
 ) {
   const category = apiTimingCategory(event.method, event.path)
   if (!category || !apiTimingsEnabled(args)) return
+  recordApiTiming(category, event.durationMs)
   const metadata = [
     `category=${category}`,
     `method=${event.method}`,
@@ -924,6 +994,23 @@ export async function stopCampaignSession(
     await callApi(
       "POST",
       `/api/v1/research/sessions/${sessionId}/stop`,
+      body,
+      args
+    )
+  )
+}
+
+export async function completeCampaign(
+  campaignId: string,
+  body: {
+    sessionId?: string
+  },
+  args?: Args
+): Promise<{ campaign: ApiCampaign }> {
+  return apiData<{ campaign: ApiCampaign }>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/complete`,
       body,
       args
     )

@@ -13,6 +13,7 @@ import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
   ApiError,
+  completeCampaign,
   getCampaignOverview,
   acquireResearchWorkerLease,
   acquireResearchWorkerLeasesBatch,
@@ -30,6 +31,8 @@ import {
   listCampaignKnowledge,
   listProjectCampaigns,
   reconcileCampaign,
+  renderApiTimingSummary,
+  resetApiTimingSummary,
   settleResearchSession,
   stopCampaignSession,
   upsertCampaignSummary,
@@ -112,6 +115,7 @@ import { formatAge } from "../lib/tui"
 import {
   activitySummaryForManifest,
   readWorkerLatestState,
+  type WorkerLatestState,
   writeWorkerLatestState,
 } from "../lib/worker-activity"
 import {
@@ -1129,7 +1133,49 @@ function createPresenceSupervisor({
   let stopped = false
   let timer: ReturnType<typeof setInterval> | null = null
 
-  const snapshot = async (forceFull = false) => {
+  type PresenceSnapshotOptions = {
+    forceFull?: boolean
+    terminal?: boolean
+  }
+
+  const normalizeSnapshotOptions = (
+    options: boolean | PresenceSnapshotOptions = {}
+  ): PresenceSnapshotOptions =>
+    typeof options === "boolean" ? { forceFull: options } : options
+
+  const snapshotStatus = ({
+    worker,
+    manifest,
+    latest,
+  }: {
+    worker: ApiWorker
+    manifest?: WorkerLaunchManifest | null
+    latest?: WorkerLatestState | null
+  }): ApiWorker["status"] => {
+    const manifestStatus = manifest ? workerStatusFromManifest(manifest) : null
+    if (manifestStatus && !workerIsActive({ status: manifestStatus })) {
+      return manifestStatus
+    }
+    if (latest?.status && !workerIsActive({ status: latest.status })) {
+      return latest.status
+    }
+    if (
+      latest?.status === "registered" &&
+      latest.phase &&
+      latest.phase !== "registered" &&
+      latest.phase !== "starting"
+    ) {
+      return "running"
+    }
+    return latest?.status ?? manifestStatus ?? worker.status
+  }
+
+  const snapshot = async (
+    rawOptions: boolean | PresenceSnapshotOptions = {}
+  ) => {
+    const options = normalizeSnapshotOptions(rawOptions)
+    const forceFull = options.forceFull ?? false
+    const terminal = options.terminal ?? false
     if (args.options.offline === "true") return
     const state = await getLocalSessionState(root, sessionId)
     const cliState = await readState(root).catch(() => null)
@@ -1177,13 +1223,15 @@ function createPresenceSupervisor({
       )
     }
     const workersForPresence = [...workerById.values()]
-    const activeWorkerCount = workersForPresence.filter((worker) => {
-      const manifest = manifestByWorker.get(worker.id)
-      const latest = manifest ? latestByWorker.get(worker.id) : null
-      const status =
-        latest?.status ?? (manifest ? workerStatusFromManifest(manifest) : null)
-      return workerIsActive({ status: status ?? worker.status })
-    }).length
+    const activeWorkerCount = terminal
+      ? 0
+      : workersForPresence.filter((worker) => {
+          const manifest = manifestByWorker.get(worker.id)
+          const latest = manifest ? latestByWorker.get(worker.id) : null
+          return workerIsActive({
+            status: snapshotStatus({ worker, manifest, latest }),
+          })
+        }).length
     const unmeasuredSalvageCount = manifests.filter(
       (manifest) =>
         manifest.finalization?.salvaged &&
@@ -1209,11 +1257,10 @@ function createPresenceSupervisor({
               manifest.finalization?.finalizationStatus ?? null,
           }
         : {}
+      const status = snapshotStatus({ worker, manifest, latest })
       const snapshot = {
         id: worker.id,
-        status:
-          latest?.status ??
-          (manifest ? workerStatusFromManifest(manifest) : worker.status),
+        status,
         phase: latest?.phase ?? manifest?.status ?? worker.phase,
         progressMessage: latest?.progressMessage ?? worker.progressMessage,
         gitLabel: worker.gitLabel ?? manifest?.finalization?.commitSha ?? null,
@@ -1266,13 +1313,14 @@ function createPresenceSupervisor({
             unchangedWorkerCount,
             droppedOrDeferredWorkerCount,
             unmeasuredSalvageCount,
-            providerBackoff,
+            providerBackoff: terminal ? null : providerBackoff,
             ignoredPresence:
               cliState?.sessions?.[sessionId]?.ignoredPresence ?? {},
             lastUploadAt: observedAt,
             metadata: {
               splitIndex: index + 1,
               splitCount,
+              terminal,
             },
           },
           workers: chunk.map((worker) => worker.snapshot),
@@ -1391,9 +1439,9 @@ function createPresenceSupervisor({
     }
   }
 
-  const run = (forceFull = false) => {
+  const run = (options: boolean | PresenceSnapshotOptions = {}) => {
     if (running) return running
-    running = snapshot(forceFull)
+    running = snapshot(options)
       .catch((error) => {
         if (!stopped) {
           console.warn(
@@ -1417,8 +1465,8 @@ function createPresenceSupervisor({
     request() {
       if (!stopped) void run()
     },
-    async flush() {
-      await run(true).catch(() => {})
+    async flush(options: PresenceSnapshotOptions = {}) {
+      await run({ ...options, forceFull: true }).catch(() => {})
     },
     async stop() {
       stopped = true
@@ -3935,12 +3983,13 @@ export async function commandResearchBrief(args: Args) {
 }
 
 export async function commandResearchStatus(args: Args) {
-  const root = await repoRoot()
+  const root = await repoRoot(args.options.cwd)
   const shouldReconcile = args.options.reconcile === "true"
   const campaignInfo = await campaignForName(root, args, {
     persistState: shouldReconcile,
   })
   const { campaign } = campaignInfo
+  let freshOverview = campaignInfo.overview
   const projectPath = await resolveProjectPath(root, args)
   if (shouldReconcile) {
     await reconcileCampaignIntoLocalState({
@@ -3949,6 +3998,9 @@ export async function commandResearchStatus(args: Args) {
       projectPath,
       args,
     }).catch(() => {})
+    freshOverview = await getCampaignOverview(campaign.id, args).catch(
+      () => freshOverview
+    )
   }
   const state = await readState(root)
   const activeSessionId =
@@ -3976,13 +4028,13 @@ export async function commandResearchStatus(args: Args) {
   }
   const overview = localSessionState
     ? {
-        campaign: localSessionState.campaign,
+        campaign: freshOverview.campaign,
         hypotheses: localSessionState.hypotheses,
         workers: localSessionState.workers,
         summaries: localSessionState.summaries,
         knowledge: localSessionState.knowledge,
       }
-    : campaignInfo.overview
+    : freshOverview
   const hypotheses = overview.hypotheses
   const workers =
     activeSessionId && !scopeAll
@@ -4010,6 +4062,7 @@ export async function commandResearchStatus(args: Args) {
   if (live?.session.status) {
     sessionStatus = live.session.status
   }
+  const statusCampaign = live?.campaign ?? freshOverview.campaign
   const liveWorkerById = new Map(
     (live?.workers ?? []).map((worker) => [worker.id, worker])
   )
@@ -4216,7 +4269,7 @@ export async function commandResearchStatus(args: Args) {
     console.log(
       JSON.stringify(
         {
-          campaign: overview.campaign,
+          campaign: statusCampaign,
           session: activeSessionId
             ? {
                 id: activeSessionId,
@@ -4884,6 +4937,20 @@ export async function commandResearchFinish(args: Args) {
       requireOnline: args.options["require-online"] === "true",
     })
   }
+
+  await completeCampaign(
+    campaign.id,
+    sessionId ? { sessionId } : {},
+    args
+  ).catch((error) => {
+    if (args.options["require-online"] === "true") throw error
+    console.warn(
+      `Campaign completion skipped: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+    return null
+  })
 
   const overview = await reconcileCampaignIntoLocalState({
     root,
@@ -5799,6 +5866,7 @@ export async function commandResearchRun(args: Args) {
   const supervisorRunId =
     process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
   const leaseTokensByWorkerId = new Map<string, string>()
+  resetApiTimingSummary()
   try {
     await waitForStartupSessionReady({
       args,
@@ -5856,6 +5924,7 @@ export async function commandResearchRun(args: Args) {
   let providerTerminalFailure: ProviderLaunchFailure | null = null
   let lastStopCheck: ResearchStopCheck | null = null
   let lastGitVerificationAt = 0
+  const gitVerificationIntervalMs = workerTarget >= 10 ? 60_000 : 30_000
   let gitVerificationInFlight: Promise<unknown> | null = null
   const supervisorPid = process.pid
   const supervisorLogPath = args.options["supervisor-log-path"] ?? null
@@ -5961,7 +6030,7 @@ export async function commandResearchRun(args: Args) {
       }
       if (
         !gitVerificationInFlight &&
-        loopNow - lastGitVerificationAt >= 30_000
+        loopNow - lastGitVerificationAt >= gitVerificationIntervalMs
       ) {
         lastGitVerificationAt = loopNow
         gitVerificationInFlight = verifyResearchCampaignGit(campaign.id, args, {
@@ -6012,6 +6081,14 @@ export async function commandResearchRun(args: Args) {
       const openSlots =
         controlState?.launch.openWorkerSlotCount ??
         Math.max(0, workerTarget - occupiedWorkerSlots)
+      const remainingExperimentSlots =
+        typeof controlState?.progress.remainingExperimentCount === "number"
+          ? Math.max(
+              0,
+              controlState.progress.remainingExperimentCount -
+                occupiedWorkerSlots
+            )
+          : Number.POSITIVE_INFINITY
       const concurrencySlots = Math.max(0, maxConcurrency - activeRuns.size)
       const providerBackoffActive = Date.now() < providerBackoffUntil
       const serverLeasePaused = Date.now() < serverLeasePausedUntil
@@ -6028,7 +6105,12 @@ export async function commandResearchRun(args: Args) {
         rampWaiting ||
         !launchStateAllowsWork
           ? 0
-          : Math.min(openSlots, concurrencySlots, launchBatchSize)
+          : Math.min(
+              openSlots,
+              concurrencySlots,
+              launchBatchSize,
+              remainingExperimentSlots
+            )
       let launchedThisTick = 0
 
       if (providerBackoffActive && !providerBackoffLogged) {
@@ -6488,7 +6570,10 @@ export async function commandResearchRun(args: Args) {
     providerBackoff: null,
     activeProcessCount: 0,
   })
-  await presenceSupervisor.flush()
+  await Promise.race([
+    presenceSupervisor.flush({ terminal: true }),
+    sleep(5000),
+  ]).catch(() => {})
 
   console.log(
     `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
@@ -6496,6 +6581,8 @@ export async function commandResearchRun(args: Args) {
   console.log(
     `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount}.`
   )
+  const apiTimingSummary = renderApiTimingSummary(args)
+  if (apiTimingSummary) console.error(apiTimingSummary)
 }
 
 export async function commandWorkerRun(args: Args) {
