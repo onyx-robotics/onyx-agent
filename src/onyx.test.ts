@@ -6,10 +6,22 @@ import { afterEach, describe, expect, test } from "bun:test"
 
 import {
   commandResearchFinish,
+  commandResearchSessionStateBrief,
   commandResearchShouldStop,
 } from "./commands/research"
+import { commandExpList } from "./commands/exp"
+import type { ApiSessionStateBrief } from "./lib/api"
 import { git } from "./lib/git"
 import { researchRuntimeStatePath } from "./lib/research-runtime"
+import {
+  placeholderSessionStateBrief,
+  writeSessionStateBriefSnapshot,
+} from "./lib/session-state-brief"
+import {
+  workerRuntimePaths,
+  writeWorkerRuntimeContext,
+  type WorkerRuntimePaths,
+} from "./lib/worker-launcher"
 import { main } from "./main"
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -24,6 +36,112 @@ async function tempRepo(prefix = "onyx-remote-first-") {
   await git(["config", "user.email", "test@example.com"], root)
   await git(["config", "user.name", "Onyx Test"], root)
   return root
+}
+
+async function writeTestWorkerContext({
+  root,
+  workerId = "22222222-2222-4222-8222-222222222222",
+  campaignId = "33333333-3333-4333-8333-333333333333",
+  campaignName = "scale-test",
+  hypothesisId = "44444444-4444-4444-8444-444444444444",
+  hypothesisName = "Hypothesis",
+}: {
+  root: string
+  workerId?: string
+  campaignId?: string
+  campaignName?: string
+  hypothesisId?: string
+  hypothesisName?: string
+}): Promise<WorkerRuntimePaths> {
+  const paths = await workerRuntimePaths({ root, sessionId: SESSION_ID, workerId })
+  await writeWorkerRuntimeContext({
+    paths,
+    context: {
+      schemaVersion: 1,
+      campaignId,
+      campaignName,
+      sessionId: SESSION_ID,
+      hypothesisId,
+      hypothesisName,
+      workerId,
+      workerLeaseToken: "lease-token",
+      workerBranch: "onyx/worker",
+      worktreeRoot: root,
+      projectPath: "",
+      projectRoot: root,
+      setupFile: join(root, "onyx/setup.json"),
+      validationFile: join(root, "onyx/validation.json"),
+      researchSpecFile: join(root, "onyx/onyx.md"),
+    },
+  })
+  return paths
+}
+
+function makeSessionStateBrief(): ApiSessionStateBrief {
+  const now = new Date("2026-06-29T12:00:00.000Z").toISOString()
+  return {
+    generatedAt: now,
+    session: {
+      id: SESSION_ID,
+      campaignId: "33333333-3333-4333-8333-333333333333",
+      name: "scale-run",
+      status: "running",
+      workerTarget: 100,
+      experimentTarget: 100,
+      acceptedExperimentCount: 7,
+      remainingExperimentCount: 93,
+      deadlineAt: null,
+      terminalReason: null,
+      schedulerSiteId: "site-1",
+      finalizationStatus: "running",
+      metadata: {},
+      startedAt: now,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    },
+    campaign: {
+      id: "33333333-3333-4333-8333-333333333333",
+      projectId: "55555555-5555-4555-8555-555555555555",
+      parentCampaignId: null,
+      name: "scale-test",
+      description: "Scale test",
+      baseCommitSha: "abc123",
+      status: "active",
+      metricName: "error",
+      metricUnit: null,
+      metricDirection: "minimize",
+      bestExperimentId: null,
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 7,
+      lastExperimentAt: now,
+      promotionRefName: null,
+      createdAt: now,
+      updatedAt: now,
+    },
+    project: {
+      id: "55555555-5555-4555-8555-555555555555",
+      name: "research-test",
+      repositoryUrl: "https://github.com/example/research-test.git",
+      repositoryFullName: "example/research-test",
+      defaultBranch: "main",
+      projectPath: "",
+    },
+    progress: {
+      experimentTarget: 100,
+      acceptedExperimentCount: 7,
+      remainingExperimentCount: 93,
+      deadlineAt: null,
+      terminalReason: null,
+    },
+    latestExperiments: [],
+    bestExperiment: null,
+    activeHypotheses: [],
+    summaries: [],
+    knowledge: [],
+    updatedAt: now,
+  }
 }
 
 function installMockApi(
@@ -118,6 +236,13 @@ describe("remote-first agent architecture", () => {
           deadlineAt: null,
           terminalReason: null,
         },
+        launch: {
+          activeWorkerCount: 1,
+          workerTarget: 10,
+          openWorkerSlotCount: 9,
+          activeHypothesisCount: 1,
+          acceptingExperiments: true,
+        },
         finalization: {
           status: "running",
           reasons: [],
@@ -137,6 +262,201 @@ describe("remote-first agent architecture", () => {
       expect(payload.sessionId).toBe(SESSION_ID)
     } finally {
       console.log = originalLog
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker should-stop is a local deprecated no-op", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const calls: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    console.log = (message?: unknown) => {
+      logs.push(String(message))
+    }
+    const paths = await writeTestWorkerContext({ root })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    installMockApi(({ method, path }) => {
+      calls.push(`${method} ${path}`)
+      throw new Error(`unexpected API call: ${method} ${path}`)
+    })
+    try {
+      await commandResearchShouldStop({
+        positional: ["research", "should-stop"],
+        options: { cwd: root, json: "true" },
+      })
+      const payload = JSON.parse(logs.join("\n"))
+      expect(payload.shouldStop).toBe(false)
+      expect(payload.deprecated).toBe(true)
+      expect(payload.reasonCodes).toEqual([])
+      expect(calls).toEqual([])
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker session-state-brief reads the local supervisor file only", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const calls: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    console.log = (message?: unknown) => {
+      logs.push(String(message))
+    }
+    const paths = await writeTestWorkerContext({ root })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    await writeSessionStateBriefSnapshot({
+      root,
+      sessionId: SESSION_ID,
+      snapshot: {
+        schemaVersion: 1,
+        sequence: 3,
+        refreshStatus: "ok",
+        generatedAt: "2026-06-29T12:00:00.000Z",
+        fetchedAt: "2026-06-29T12:00:01.000Z",
+        lastRefreshAttemptAt: "2026-06-29T12:00:01.000Z",
+        brief: makeSessionStateBrief(),
+      },
+    })
+    installMockApi(({ method, path }) => {
+      calls.push(`${method} ${path}`)
+      throw new Error(`unexpected API call: ${method} ${path}`)
+    })
+    try {
+      await commandResearchSessionStateBrief({
+        positional: ["research", "session-state-brief"],
+        options: { cwd: root, json: "true" },
+      })
+      const payload = JSON.parse(logs.join("\n"))
+      expect(payload.sequence).toBe(3)
+      expect(payload.refreshStatus).toBe("ok")
+      expect(payload.progress.acceptedExperimentCount).toBe(7)
+      expect(payload.worker.sessionId).toBe(SESSION_ID)
+      expect(calls).toEqual([])
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker session-state-brief tolerates a missing local brief", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    console.log = (message?: unknown) => {
+      logs.push(String(message))
+    }
+    const paths = await writeTestWorkerContext({ root })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    try {
+      await commandResearchSessionStateBrief({
+        positional: ["research", "session-state-brief"],
+        options: { cwd: root, json: "true" },
+      })
+      const payload = JSON.parse(logs.join("\n"))
+      expect(payload.refreshStatus).toBe("initializing")
+      expect(payload.brief).toBeUndefined()
+      expect(payload.progress).toBeNull()
+      expect(payload.warnings.length).toBeGreaterThan(0)
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker session-state-brief treats an initializing placeholder as context-only", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    console.log = (message?: unknown) => {
+      logs.push(String(message))
+    }
+    const paths = await writeTestWorkerContext({ root })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    await writeSessionStateBriefSnapshot({
+      root,
+      sessionId: SESSION_ID,
+      snapshot: placeholderSessionStateBrief({
+        now: "2026-06-29T12:00:00.000Z",
+      }),
+    })
+    try {
+      await commandResearchSessionStateBrief({
+        positional: ["research", "session-state-brief"],
+        options: { cwd: root, json: "true" },
+      })
+      const payload = JSON.parse(logs.join("\n"))
+      expect(payload.refreshStatus).toBe("initializing")
+      expect(payload.progress).toBeNull()
+      expect(payload.latestExperiments).toEqual([])
+      expect(payload.warnings.join("\n")).toContain(
+        "supervisor has not fetched remote state yet"
+      )
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker exp list uses worker context campaign id without overview fanout", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const calls: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    const campaignId = "33333333-3333-4333-8333-333333333333"
+    console.log = (message?: unknown) => {
+      logs.push(String(message))
+    }
+    const paths = await writeTestWorkerContext({ root, campaignId })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    installMockApi(({ method, path }) => {
+      calls.push(`${method} ${path}`)
+      if (
+        path.includes("/overview") ||
+        path.includes("/projects") ||
+        path.includes("/loop-state")
+      ) {
+        throw new Error(`unexpected fanout read: ${path}`)
+      }
+      if (path === `/api/v1/research/campaigns/${campaignId}/experiments`) {
+        return { items: [], page: { nextCursor: null } }
+      }
+      throw new Error(`unexpected API call: ${method} ${path}`)
+    })
+    try {
+      await commandExpList({
+        positional: ["exp", "list"],
+        options: { cwd: root, campaign: "scale-test", limit: "5" },
+      })
+      expect(logs.join("\n")).toContain(
+        "No experiments recorded in the Onyx API yet."
+      )
+      expect(calls).toEqual([
+        `GET /api/v1/research/campaigns/${campaignId}/experiments`,
+      ])
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
       await rm(root, { recursive: true, force: true })
     }
   })

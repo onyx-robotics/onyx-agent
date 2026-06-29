@@ -140,8 +140,6 @@ export function glyphFor(status: string): StatusGlyph {
   if (status === "failed") return { char: "✗", label: "failed", colorize: red }
   if (status === "checks_failed")
     return { char: "!", label: "checks", colorize: yellow }
-  if (status === "rejected")
-    return { char: "!", label: "rejected", colorize: yellow }
   return { char: "•", label: "ok", colorize: green }
 }
 

@@ -421,6 +421,7 @@ export function buildWorkerInvocation({
     const modelArgs = workerModel ? ["--model", workerModel] : []
     const args = [
       "run",
+      "--pure",
       "--dir",
       worktree,
       "--format",
@@ -600,8 +601,8 @@ export async function preflightWorkerInvocation(
       args: ["research", "brief", "--help"],
     },
     {
-      name: "onyx-worker research should-stop help",
-      args: ["research", "should-stop", "--help"],
+      name: "onyx-worker research session-state-brief help",
+      args: ["research", "session-state-brief", "--help"],
     },
     {
       name: "onyx-worker knowledge add help",
@@ -637,15 +638,6 @@ export async function preflightWorkerInvocation(
     "-q",
     "--refresh",
   ])
-
-  if (options.sessionId) {
-    await runCheck(
-      "onyx-worker should-stop",
-      "onyx-worker",
-      ["research", "should-stop", "--session", options.sessionId, "--json"],
-      { allowExitCodes: [0] }
-    )
-  }
 
   return { version, onyxVersion, checks }
 }

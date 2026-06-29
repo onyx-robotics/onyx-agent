@@ -827,6 +827,7 @@ export async function registerLocalWorker({
   campaignId,
   sessionId,
   hypothesisId,
+  workerId,
   workerName,
   agentKind,
   runtime = "local",
@@ -836,6 +837,7 @@ export async function registerLocalWorker({
   campaignId: string
   sessionId?: string | null
   hypothesisId: string
+  workerId?: string
   workerName: string
   agentKind: string
   runtime?: "local" | "hosted"
@@ -843,7 +845,7 @@ export async function registerLocalWorker({
 }) {
   const at = nowIso()
   const worker: ApiWorker = {
-    id: randomUUID(),
+    id: workerId ?? randomUUID(),
     campaignId,
     sessionId: sessionId ?? null,
     hypothesisId,
@@ -864,7 +866,10 @@ export async function registerLocalWorker({
   if (sessionId) {
     const record = await readSessionRecord(root, sessionId).catch(() => null)
     if (record) {
-      record.workers.push(worker)
+      record.workers = [
+        ...record.workers.filter((item) => item.id !== worker.id),
+        worker,
+      ]
       await writeSessionRecord(root, record)
     }
   }
@@ -993,6 +998,9 @@ export async function acceptOrDiscardLocalExperiment({
     gitStatus: "pending",
     gitVerifiedAt: null,
     gitStatusReason: null,
+    disposition: "accepted",
+    dispositionReason: "local",
+    settledAt: at,
     primaryMetricName: record.primaryMetricName,
     primaryMetricValue: record.primaryMetricValue,
     secondaryMetrics: record.metrics,

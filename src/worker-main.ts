@@ -4,6 +4,7 @@ import { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 import {
   commandKnowledgeAdd,
   commandResearchBrief,
+  commandResearchSessionStateBrief,
   commandResearchShouldStop,
   commandSummaryUpsert,
 } from "./commands/research"
@@ -17,11 +18,11 @@ export const WORKER_USAGE = `onyx-worker - worker-safe Onyx research CLI
 Usage:
   onyx-worker --version
   onyx-worker research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
-  onyx-worker research should-stop [--session <id>] [--json]
+  onyx-worker research session-state-brief [--json]
   onyx-worker tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
   onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx-worker workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
-  onyx-worker exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
+  onyx-worker exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx-worker exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx-worker knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--require-online]
   onyx-worker summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text> [--require-online]
@@ -62,6 +63,8 @@ export async function workerMain(argv = process.argv.slice(2)) {
 
     if (command === "research" && sub === "brief")
       return commandResearchBrief(args)
+    if (command === "research" && sub === "session-state-brief")
+      return commandResearchSessionStateBrief(args)
     if (command === "research" && sub === "should-stop")
       return commandResearchShouldStop(args)
     if (command === "tools" && sub === "run") return commandToolsRun(args)

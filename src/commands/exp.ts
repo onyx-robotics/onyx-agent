@@ -33,6 +33,7 @@ import {
 } from "../lib/local-attempt-cache"
 import { onyxStateDir, readState, writeState } from "../lib/runtime-state"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
+import { readWorkerRuntimeContext } from "../lib/worker-context"
 import {
   clearLocalAttempt,
   abandonBlockedWorkflowRunsForSession,
@@ -82,15 +83,13 @@ function validateStatus(value: string): ExperimentStatus {
     value === "succeeded" ||
     value === "failed" ||
     value === "checks_failed" ||
-    value === "setup_violation" ||
-    value === "accepted" ||
-    value === "rejected"
+    value === "setup_violation"
   ) {
     return value
   }
 
   throw new Error(
-    "--status must be queued, running, succeeded, failed, checks_failed, setup_violation, accepted, or rejected"
+    "--status must be queued, running, succeeded, failed, checks_failed, or setup_violation"
   )
 }
 
@@ -1383,10 +1382,7 @@ export async function commandExpLog(args: Args) {
       "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for failed unmeasured attempts. Rerun the workflow or leave unlogged salvage to the worker harness."
     )
   }
-  if (
-    (status === "succeeded" || status === "accepted") &&
-    metricValue === null
-  ) {
+  if (status === "succeeded" && metricValue === null) {
     throw new Error(
       `Cannot record ${status} without a metric for "${metricName}".`
     )
@@ -1395,7 +1391,7 @@ export async function commandExpLog(args: Args) {
   if (
     checks &&
     checks.status !== "passed" &&
-    (status === "succeeded" || status === "accepted")
+    status === "succeeded"
   ) {
     throw new Error(
       `Cannot record ${status}: checks ${checks.status}. Use --status checks_failed.`
@@ -1543,29 +1539,52 @@ export async function commandExpList(args: Args) {
   }
   const state = await readState(root)
   const campaignName = args.options.campaign ?? state.activeCampaign
-  const campaigns = campaignName
+  const workerContext = await readWorkerRuntimeContext().catch(() => null)
+  const resolvedCampaigns = workerContext
     ? [
         {
-          campaign: (
-            await getCampaignOverview(
-              (
-                await ensureCampaignMetadata({
-                  root,
-                  args,
-                  projectPath,
-                  campaignName,
-                })
-              ).campaignId,
-              args
-            )
-          ).campaign,
+          campaign: {
+            id: workerContext.campaignId,
+            name: workerContext.campaignName,
+          },
         },
       ]
-    : await resolveProject(root, args)
-        .then((project) => listProjectCampaigns(project.id, args))
-        .then((items) => items.map((campaign) => ({ campaign })))
+    : campaignName
+      ? [
+          {
+            campaign: (
+              await getCampaignOverview(
+                (
+                  await ensureCampaignMetadata({
+                    root,
+                    args,
+                    projectPath,
+                    campaignName,
+                  })
+                ).campaignId,
+                args
+              )
+            ).campaign,
+          },
+        ]
+      : await resolveProject(root, args)
+          .then((project) => listProjectCampaigns(project.id, args))
+          .then((items) => items.map((campaign) => ({ campaign })))
+  if (
+    workerContext &&
+    args.options.campaign &&
+    !resolvedCampaigns.some(
+      ({ campaign }) =>
+        campaign.id === args.options.campaign ||
+        campaign.name === args.options.campaign
+    )
+  ) {
+    throw new Error(
+      `Worker ${workerContext.workerId} is not assigned to campaign ${args.options.campaign}.`
+    )
+  }
   const rows: LocalResearchHistoryRecord[] = []
-  for (const { campaign } of campaigns) {
+  for (const { campaign } of resolvedCampaigns) {
     let cursor: string | null = null
     do {
       const page = await listCampaignExperiments(campaign.id, args, {

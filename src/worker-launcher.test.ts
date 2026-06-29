@@ -173,6 +173,7 @@ describe("worker launchers", () => {
     expect(opencode.command).toBe("opencode")
     expect(opencode.args).toEqual([
       "run",
+      "--pure",
       "--dir",
       "/tmp/worktree",
       "--format",
@@ -264,6 +265,7 @@ describe("worker launchers", () => {
           `printf '%s\\n' '{"type":"step_start"}'`,
           `printf '%s\\n' '{"type":"text","text":"hello from opencode"}'`,
           `printf '%s\\n' '{"type":"tool_use","name":"bash"}'`,
+          `printf '%s\\n' '{"type":"tool_use","part":{"type":"tool","tool":"bash","input":{"command":"bun test"}}}'`,
           `printf '%s\\n' '{"type":"step_finish"}'`,
           `printf '%s\\n' '{"type":"error","message":"provider failed"}'`,
         ].join("; "),
@@ -282,6 +284,7 @@ describe("worker launchers", () => {
     expect(activity).toContain("[stdout] step: start")
     expect(activity).toContain("[stdout] hello from opencode")
     expect(activity).toContain("[stdout] tool: bash")
+    expect(activity).toContain("[stdout] tool: bash bun test")
     expect(activity).toContain("[stdout] step: finish")
     expect(activity).toContain("[stdout] error: provider failed")
   })
@@ -548,7 +551,7 @@ describe("worker launchers", () => {
         "#!/usr/bin/env bun",
         'if (process.env.ONYX_LAUNCHER_BYPASS !== "1") process.exit(42)',
         'if (process.argv.includes("--help")) {',
-        '  console.log("onyx-worker research should-stop")',
+        '  console.log("onyx-worker research session-state-brief")',
         '  console.log("onyx-worker knowledge add")',
         '  console.log("onyx-worker summary upsert")',
         '  console.log("onyx-worker exp run [--campaign")',
@@ -592,7 +595,8 @@ describe("worker launchers", () => {
         timeoutMs: 5000,
       })
       expect(help.code).toBe(0)
-      expect(help.stdout).toContain("onyx-worker research should-stop")
+      expect(help.stdout).toContain("onyx-worker research session-state-brief")
+      expect(help.stdout).not.toContain("onyx-worker research should-stop")
       expect(help.stdout).toContain("onyx-worker summary upsert")
     } finally {
       if (previousConfigHome === undefined) {

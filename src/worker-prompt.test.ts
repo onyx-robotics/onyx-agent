@@ -71,10 +71,10 @@ describe("hypothesis worker prompt", () => {
       "Treat `/repo/.git/onyx/worktrees/session-hypothesis` as the only project root"
     )
     expect(prompt).toContain(
-      'Campaign brief command: `onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"`'
+      "Routine session-state brief command: `onyx-worker research session-state-brief --json`"
     )
     expect(prompt).toContain(
-      'Run `onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"` for current campaign memory'
+      'Campaign brief command for deeper context: `onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"`'
     )
     expect(prompt).toContain("single routine context source")
     expect(prompt).toContain("onyx-worker exp list --grep")
@@ -90,10 +90,9 @@ describe("hypothesis worker prompt", () => {
       'onyx-worker summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
     )
     expect(prompt).toContain("onyx-worker knowledge add")
-    expect(prompt).toContain(
-      'onyx-worker research should-stop --session "$ONYX_SESSION_ID" --json'
-    )
-    expect(prompt).toContain('"shouldStop": true')
+    expect(prompt).toContain("onyx-worker research session-state-brief --json")
+    expect(prompt).not.toContain('"shouldStop": true')
+    expect(prompt).toContain("not stop authority")
     expect(prompt).toContain(
       "If `onyx-worker exp log` says the attempt was discarded, treat the session as complete"
     )
@@ -104,14 +103,30 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "The supervisor launched this worker with `onyx-worker`, `ONYX_WORKER_CONTEXT`, and an isolated `ONYX_HOME`"
     )
-    expect(prompt).toContain("the full `onyx` CLI is the user/orchestrator surface")
+    expect(prompt).toContain(
+      "the full `onyx` CLI is the user/orchestrator surface"
+    )
     expect(prompt).not.toContain("Do not run `onyx profile use`")
     expect(prompt).toContain(
       'onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto'
     )
     expect(prompt).toContain("onyx-worker exp run --resume --auto")
+    expect(prompt).toContain(
+      "The required order is strict: `exp run --auto`, make exactly one commit, `exp run --resume --auto`, then `exp log`"
+    )
+    expect(prompt).toContain(
+      "the server records reports first and settles accepted/discarded disposition separately"
+    )
+    expect(prompt).not.toContain(
+      "Do not mark autonomous attempts `accepted` or `rejected`"
+    )
+    expect(prompt).toContain(
+      "If `exp log` says there are zero unlogged attempts, do not amend, reset, or rewrite history"
+    )
     expect(prompt).toContain("onyx-worker workflow status --blocked")
-    expect(prompt).toContain('onyx-worker exp log --campaign "$ONYX_CAMPAIGN_NAME"')
+    expect(prompt).toContain(
+      'onyx-worker exp log --campaign "$ONYX_CAMPAIGN_NAME"'
+    )
     expect(prompt).not.toContain("onyx workflow status --active")
     expect(prompt).not.toContain("<pre-edit-sha>")
     expect(prompt).not.toContain("<workflowRunId>")
@@ -126,7 +141,9 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("Reserve the final 90 second(s) for shutdown")
     expect(prompt).toContain("Product state is remote-first")
     expect(prompt).toContain("call the Onyx API directly")
-    expect(prompt).toContain("pushes the immutable experiment ref before it reports")
+    expect(prompt).toContain(
+      "pushes the immutable experiment ref before it reports"
+    )
     expect(prompt).not.toContain("onyx-worker sync status")
     expect(prompt).not.toContain(".git/onyx/research.db")
     expect(prompt).not.toContain("Supervisor/harness sync owns durable pushes")
@@ -140,6 +157,6 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).not.toContain("ONYX_BRIEF_FILE")
     expect(prompt).not.toContain(".git/onyx/briefs")
     expect(prompt).not.toContain("ONYX_SESSION_STATE_FILE")
-    expect(prompt).not.toContain("session-state")
+    expect(prompt).not.toContain("loop-state")
   })
 })

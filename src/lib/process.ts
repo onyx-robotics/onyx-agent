@@ -49,19 +49,41 @@ function textFromClaudeMessage(record: Record<string, unknown>) {
   return lines
 }
 
+function recordObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function firstString(...values: unknown[]) {
+  return values.find((value): value is string => typeof value === "string")
+}
+
+function openCodeToolLine(record: Record<string, unknown>) {
+  const part = recordObject(record.part)
+  const input = recordObject(record.input) ?? recordObject(part?.input)
+  const name =
+    firstString(record.name, record.tool, part?.name, part?.tool) ?? "tool"
+  const command = firstString(
+    record.command,
+    input?.command,
+    input?.cmd,
+    input?.args
+  )
+  if (command && command !== name) return `tool: ${name} ${compact(command, 180)}`
+  return `tool: ${name}`
+}
+
 function activityLinesFromOpenCodeEvent(record: Record<string, unknown>) {
   const type = record.type
   if (type === "text" && typeof record.text === "string") {
     return [compact(record.text)]
   }
-  if (type === "tool_use") {
-    const name =
-      typeof record.name === "string"
-        ? record.name
-        : typeof record.tool === "string"
-          ? record.tool
-          : "tool"
-    return [`tool: ${name}`]
+  if (type === "tool_use" || type === "tool") {
+    return [openCodeToolLine(record)]
+  }
+  if (recordObject(record.part)?.type === "tool") {
+    return [openCodeToolLine(record)]
   }
   if (type === "step_start") return ["step: start"]
   if (type === "step_finish") return ["step: finish"]

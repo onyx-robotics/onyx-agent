@@ -315,13 +315,13 @@ function worker(
 function installSupervisorApi({
   baseCommitSha,
   workerTarget,
-  reportOutcome = "accepted",
+  reportDisposition = "received",
   leaseMode = "normal",
   reportFailure = false,
 }: {
   baseCommitSha: string
   workerTarget: number
-  reportOutcome?: "accepted" | "rejected"
+  reportDisposition?: "received" | "accepted" | "discarded"
   leaseMode?: "normal" | "no_slots"
   reportFailure?: boolean
 }) {
@@ -333,6 +333,7 @@ function installSupervisorApi({
 
   const calls: ApiCall[] = []
   let acceptedExperimentCount = 0
+  let receivedExperimentCount = 0
   let terminal = false
   let workerSequence = 0
   const leasedWorkers: string[] = []
@@ -395,6 +396,14 @@ function installSupervisorApi({
           deadlineAt: null,
           terminalReason: runningSession.terminalReason,
         },
+        launch: {
+          activeWorkerCount: leasedWorkers.length,
+          workerTarget,
+          openWorkerSlotCount: Math.max(0, workerTarget - leasedWorkers.length),
+          activeHypothesisCount: 1,
+          acceptingExperiments:
+            runningSession.status === "running" && acceptedExperimentCount < 1,
+        },
         finalization: {
           status: runningSession.finalizationStatus,
           reasons: [],
@@ -402,6 +411,109 @@ function installSupervisorApi({
           unmeasuredSalvageCount: 0,
         },
         updatedAt: nowIso(),
+      }
+    } else if (
+      method === "POST" &&
+      url.pathname === `/api/v1/research/sessions/${SESSION_ID}/settle`
+    ) {
+      if (receivedExperimentCount > 0) {
+        acceptedExperimentCount = 1
+        terminal = true
+      }
+      data = {
+        sessionId: SESSION_ID,
+        status: terminal ? "completed" : "running",
+        finalizationStatus: runningSession.finalizationStatus,
+        progress: {
+          experimentTarget: 1,
+          acceptedExperimentCount,
+          remainingExperimentCount: Math.max(0, 1 - acceptedExperimentCount),
+          deadlineAt: null,
+          terminalReason: terminal ? "experiment_target_reached" : null,
+        },
+        launch: {
+          activeWorkerCount: leasedWorkers.length,
+          workerTarget,
+          openWorkerSlotCount: Math.max(0, workerTarget - leasedWorkers.length),
+          activeHypothesisCount: 1,
+          acceptingExperiments: !terminal && acceptedExperimentCount < 1,
+        },
+        finalization: {
+          status: runningSession.finalizationStatus,
+          reasons: [],
+          terminalReason: terminal ? "experiment_target_reached" : null,
+          unmeasuredSalvageCount: 0,
+        },
+        updatedAt: nowIso(),
+      }
+    } else if (
+      method === "POST" &&
+      url.pathname ===
+        `/api/v1/research/sessions/${SESSION_ID}/worker-leases/batch`
+    ) {
+      if (leaseMode === "no_slots") {
+        terminal = true
+        data = {
+          grants: [],
+          unavailable: (body?.workers ?? []).map(
+            (requested: { workerRef: string; workerName: string }) => ({
+              workerRef: requested.workerRef,
+              workerName: requested.workerName,
+              code: "no_worker_slots",
+              message: "Research session has no open worker slots",
+            })
+          ),
+          capacity: {
+            workerTarget,
+            occupied: workerTarget,
+            requested: body?.workers?.length ?? 0,
+            granted: 0,
+            existing: 0,
+            openSlots: 0,
+          },
+        }
+      } else {
+        const grants = (body?.workers ?? []).map(
+          (requested: { workerRef: string; workerName: string }) => {
+            workerSequence += 1
+            const workerId = `60000000-0000-4000-8000-${String(workerSequence).padStart(12, "0")}`
+            leasedWorkers.push(workerId)
+            return {
+              workerRef: requested.workerRef,
+              worker: {
+                ...worker(workerId, "registered"),
+                workerName: requested.workerName,
+                workerRef: requested.workerRef,
+              },
+              leaseToken: `lease-token-${workerSequence}`.padEnd(16, "x"),
+              leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+              hypothesis: currentHypothesis,
+              session: runningSession,
+              campaign: currentCampaign,
+              project: {
+                id: PROJECT_ID,
+                name: "Smoke project",
+                repositoryUrl: "https://github.com/onyx/smoke",
+                repositoryFullName: "onyx/smoke",
+                defaultBranch: "main",
+                projectPath: "",
+              },
+              existing: false,
+            }
+          }
+        )
+        data = {
+          grants,
+          unavailable: [],
+          capacity: {
+            workerTarget,
+            occupied: 0,
+            requested: body?.workers?.length ?? 0,
+            granted: grants.length,
+            existing: 0,
+            openSlots: workerTarget,
+          },
+        }
       }
     } else if (
       method === "POST" &&
@@ -480,6 +592,42 @@ function installSupervisorApi({
       }
     } else if (
       method === "POST" &&
+      url.pathname === "/api/v1/research/worker-heartbeats/batch"
+    ) {
+      data = {
+        results: (body?.heartbeats ?? []).map(
+          (heartbeat: {
+            workerId: string
+            status?: string
+            event?: string
+          }) => ({
+            workerId: heartbeat.workerId,
+            ok: true,
+            worker: worker(
+              heartbeat.workerId,
+              heartbeat.status === "completed" ? "completed" : "running"
+            ),
+            heartbeat: {
+              id: `70000000-0000-4000-8000-${String(calls.length).padStart(12, "0")}`,
+              campaignId: CAMPAIGN_ID,
+              sessionId: SESSION_ID,
+              hypothesisId: HYPOTHESIS_ID,
+              workerId: heartbeat.workerId,
+              experimentId: null,
+              status: heartbeat.status ?? "running",
+              event: heartbeat.event ?? null,
+              phase: "running",
+              progressMessage: null,
+              gitLabel: null,
+              resourceStats: {},
+              metadata: {},
+              createdAt: nowIso(),
+            },
+          })
+        ),
+      }
+    } else if (
+      method === "POST" &&
       url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
     ) {
       if (reportFailure) {
@@ -493,25 +641,31 @@ function installSupervisorApi({
           { status: 500, headers: { "content-type": "application/json" } }
         )
       }
-      terminal = true
-      acceptedExperimentCount = 1
-      const rejected = reportOutcome === "rejected"
+      receivedExperimentCount += 1
       data = {
-        outcome: reportOutcome,
+        outcome: "recorded",
         experiment: {
           id: "80000000-0000-4000-8000-000000000001",
           campaignId: CAMPAIGN_ID,
           sessionId: SESSION_ID,
           hypothesisId: HYPOTHESIS_ID,
           workerId: body?.workerId ?? leasedWorkers[0] ?? null,
-          acceptedIndex: rejected ? null : 1,
+          acceptedIndex: reportDisposition === "accepted" ? 1 : null,
           runRef: body?.runRef ?? "run",
           name: body?.name ?? "experiment",
           description: body?.description ?? null,
           baseCommitSha: body?.baseCommitSha,
           resultCommitSha: body?.resultCommitSha,
           resultRef: body?.resultRef,
-          status: rejected ? "rejected" : "succeeded",
+          status: "succeeded",
+          disposition: reportDisposition,
+          dispositionReason:
+            reportDisposition === "discarded"
+              ? "experiment_target_reached"
+              : reportDisposition === "accepted"
+                ? "accepted"
+                : null,
+          settledAt: reportDisposition === "received" ? null : nowIso(),
           setupCompliance: body?.setupCompliance ?? null,
           gitStatus: "pending",
           gitVerifiedAt: null,
@@ -534,6 +688,17 @@ function installSupervisorApi({
           status: "completed",
           acceptedExperimentCount,
         }),
+      }
+    } else if (
+      method === "POST" &&
+      url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}/verify-git`
+    ) {
+      data = {
+        checkedCount: 0,
+        updatedCount: 0,
+        remainingCount: 0,
+        limit: Number(url.searchParams.get("gitVerifyLimit") ?? 50),
+        hasMore: false,
       }
     } else if (
       method === "POST" &&
@@ -683,14 +848,33 @@ describe("remote-first research supervisor smoke", () => {
         )
 
         const leaseCalls = calls.filter((call) =>
-          call.path.endsWith(`/sessions/${SESSION_ID}/worker-leases`)
+          call.path.endsWith(`/sessions/${SESSION_ID}/worker-leases/batch`)
         )
         expect(leaseCalls).toHaveLength(1)
         expect(leaseCalls[0]!.body).toMatchObject({
-          workerName: "smoke-hypothesis-custom",
-          agentKind: "custom",
-          runtime: "local",
+          workers: [
+            {
+              workerRef: expect.any(String),
+              workerName: "custom-1",
+              agentKind: "custom",
+              runtime: "local",
+            },
+          ],
         })
+        expect(
+          calls.some(
+            (call) =>
+              call.method === "POST" &&
+              call.path === "/api/v1/research/worker-heartbeats/batch"
+          )
+        ).toBe(true)
+        expect(
+          calls.some(
+            (call) =>
+              call.method === "GET" &&
+              call.path === `/api/v1/research/sessions/${SESSION_ID}/state`
+          )
+        ).toBe(false)
         const sessionCreate = calls.find((call) =>
           call.path.endsWith(`/campaigns/${CAMPAIGN_ID}/sessions`)
         )
@@ -702,6 +886,23 @@ describe("remote-first research supervisor smoke", () => {
           (call) => call.path === "/api/v1/research/presence"
         )
         expect(presenceCalls.length).toBeGreaterThan(0)
+        expect(
+          new Set([
+            (leaseCalls[0]!.body as { supervisorRunId?: string })
+              .supervisorRunId,
+            ...presenceCalls.map(
+              (call) =>
+                (call.body as { supervisorRunId?: string }).supervisorRunId
+            ),
+          ]).size
+        ).toBe(1)
+        expect(
+          presenceCalls.some(
+            (call) =>
+              ((call.body as { site?: { launchedWorkerCount?: number } }).site
+                ?.launchedWorkerCount ?? 0) >= 1
+          )
+        ).toBe(true)
         for (const call of presenceCalls) {
           expect(call.body).not.toHaveProperty("syncLagMs")
           expect(call.body).not.toHaveProperty("pendingSyncCount")
@@ -729,13 +930,13 @@ describe("remote-first research supervisor smoke", () => {
     }, 60_000)
   }
 
-  test("records late rejected experiment reports as clean finalization outcomes", async () => {
+  test("treats settled discarded experiment reports as clean logged outcomes", async () => {
     const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
       await createSmokeRepo()
     const calls = installSupervisorApi({
       baseCommitSha,
       workerTarget: 1,
-      reportOutcome: "rejected",
+      reportDisposition: "discarded",
     })
     try {
       await withMutedConsole(() =>
@@ -789,10 +990,7 @@ describe("remote-first research supervisor smoke", () => {
       expect(
         manifests.some(
           (manifest) =>
-            manifest.finalization?.finalizationStatus ===
-              "discarded_after_completion" &&
-            manifest.finalization.error ===
-              "experiment report rejected by server acceptance state"
+            manifest.finalization?.finalizationStatus === "measured_and_logged"
         )
       ).toBe(true)
     } finally {
@@ -833,14 +1031,15 @@ describe("remote-first research supervisor smoke", () => {
       )
 
       const leaseCalls = calls.filter((call) =>
-        call.path.endsWith(`/sessions/${SESSION_ID}/worker-leases`)
+        call.path.endsWith(`/sessions/${SESSION_ID}/worker-leases/batch`)
       )
       expect(leaseCalls).toHaveLength(1)
       expect(
         calls.some(
           (call) =>
+            call.method === "POST" &&
             call.path ===
-            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+              `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
         )
       ).toBe(false)
       expect(await pathExists(join(root, ".git", "onyx", "research.db"))).toBe(
@@ -887,8 +1086,9 @@ describe("remote-first research supervisor smoke", () => {
       expect(
         calls.some(
           (call) =>
+            call.method === "POST" &&
             call.path ===
-            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+              `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
         )
       ).toBe(false)
       const workerLogRoot = join(
@@ -960,8 +1160,9 @@ describe("remote-first research supervisor smoke", () => {
       expect(
         calls.some(
           (call) =>
+            call.method === "POST" &&
             call.path ===
-            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+              `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
         )
       ).toBe(true)
       const refs = await git(

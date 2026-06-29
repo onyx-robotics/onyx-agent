@@ -123,8 +123,7 @@ async function buildModel(root: string): Promise<ListenModel> {
   const metricDirection = meta?.metricDirection ?? "maximize"
   const measured = rows.filter(
     (row) =>
-      (row.status === "succeeded" || row.status === "accepted") &&
-      row.primaryMetricValue !== null
+      row.status === "succeeded" && row.primaryMetricValue !== null
   )
   const bestValue = measured.length
     ? measured.reduce(

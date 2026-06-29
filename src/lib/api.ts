@@ -59,6 +59,9 @@ export type ApiCampaignExperiment = {
   gitStatus: string
   gitVerifiedAt: string | null
   gitStatusReason: string | null
+  disposition: "received" | "accepted" | "discarded"
+  dispositionReason: string | null
+  settledAt: string | null
   primaryMetricName: string
   primaryMetricValue: number | null
   secondaryMetrics: Record<string, unknown>
@@ -125,6 +128,7 @@ export type ApiWorker = {
   gitLabel: string | null
   siteId?: string | null
   supervisorRunId?: string | null
+  workerRef?: string | null
   leaseExpiresAt?: string | null
   leaseReleasedAt?: string | null
   lastSeenAt: string
@@ -318,6 +322,13 @@ export type ApiSessionControlState = {
     deadlineAt: string | null
     terminalReason: ApiSession["terminalReason"]
   }
+  launch: {
+    activeWorkerCount: number
+    workerTarget: number
+    openWorkerSlotCount: number
+    activeHypothesisCount: number
+    acceptingExperiments: boolean
+  }
   finalization: {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
@@ -340,13 +351,27 @@ export type ApiSessionBrief = {
   updatedAt: string
 }
 
+export type ApiSessionStateBrief = {
+  generatedAt: string
+  session: ApiSession
+  campaign: ApiCampaign
+  project: ApiProject
+  progress: ApiSessionControlState["progress"]
+  latestExperiments: ApiCampaignExperiment[]
+  bestExperiment: ApiCampaignExperiment | null
+  activeHypotheses: ApiHypothesis[]
+  summaries: ApiSummary[]
+  knowledge: ApiKnowledge[]
+  updatedAt: string
+}
+
 export type ApiCampaignUpsertResult = {
   project: ApiProject
   campaign: ApiCampaign
 }
 
 export type ApiExperimentReportResult = {
-  outcome: "accepted" | "duplicate" | "rejected"
+  outcome: "recorded" | "duplicate"
   experiment: ApiCampaignExperiment
   session: ApiSession | null
 }
@@ -359,6 +384,29 @@ export type ApiWorkerLease = {
   session: ApiSession
   campaign: ApiCampaign
   project: ApiProject
+}
+
+export type ApiWorkerLeaseBatch = {
+  grants: Array<
+    ApiWorkerLease & {
+      workerRef: string
+      existing: boolean
+    }
+  >
+  unavailable: Array<{
+    workerRef: string
+    workerName: string
+    code: "no_worker_slots" | "worker_ref_terminal"
+    message: string
+  }>
+  capacity: {
+    workerTarget: number
+    occupied: number
+    requested: number
+    granted: number
+    existing: number
+    openSlots: number
+  }
 }
 
 export type ApiWorkerHeartbeatResponse = {
@@ -379,6 +427,22 @@ export type ApiWorkerHeartbeatResponse = {
     metadata: Record<string, unknown>
     createdAt: string
   }
+}
+
+export type ApiWorkerHeartbeatBatchResponse = {
+  results: Array<
+    | {
+        workerId: string
+        ok: true
+        worker: ApiWorker
+        heartbeat: ApiWorkerHeartbeatResponse["heartbeat"]
+      }
+    | {
+        workerId: string
+        ok: false
+        error: { code: string; message: string }
+      }
+  >
 }
 
 export type ApiResearchPresenceResponse = {
@@ -426,6 +490,65 @@ export type ApiReconcileCampaignResponse = {
   }
 }
 
+export type ApiVerifyResearchGitResponse =
+  ApiReconcileCampaignResponse["gitVerification"]
+
+function apiTimingsEnabled(args?: Args) {
+  return (
+    args?.options["api-timings"] === "true" ||
+    process.env.ONYX_API_TIMINGS === "1" ||
+    process.env.ONYX_API_TIMINGS === "true"
+  )
+}
+
+function apiTimingCategory(method: string, path: string) {
+  const pathname = path.split("?")[0] ?? path
+  if (method === "POST" && pathname.endsWith("/experiments")) {
+    return "experiment_report"
+  }
+  if (method === "POST" && pathname === "/api/v1/research/presence") {
+    return "presence_upload"
+  }
+  if (method === "POST" && pathname.includes("/heartbeat")) {
+    return "worker_heartbeat"
+  }
+  if (method === "GET" && pathname.includes("/control-state")) {
+    return "control_state"
+  }
+  return null
+}
+
+function emitApiTiming(
+  args: Args | undefined,
+  event: {
+    method: string
+    path: string
+    status: number | null
+    durationMs: number
+    ok: boolean
+    serverTiming?: string | null
+    onyxTiming?: string | null
+    error?: string | null
+  }
+) {
+  const category = apiTimingCategory(event.method, event.path)
+  if (!category || !apiTimingsEnabled(args)) return
+  const metadata = [
+    `category=${category}`,
+    `method=${event.method}`,
+    `path=${event.path.split("?")[0]}`,
+    `status=${event.status ?? "error"}`,
+    `ok=${event.ok}`,
+    `durationMs=${event.durationMs}`,
+    event.serverTiming
+      ? `serverTiming=${JSON.stringify(event.serverTiming)}`
+      : null,
+    event.onyxTiming ? `onyxTiming=${JSON.stringify(event.onyxTiming)}` : null,
+    event.error ? `error=${JSON.stringify(event.error)}` : null,
+  ].filter(Boolean)
+  console.error(`[onyx-api] ${metadata.join(" ")}`)
+}
+
 export async function callApi(
   method: string,
   path: string,
@@ -437,29 +560,54 @@ export async function callApi(
     Number.isFinite(timeoutMs) && timeoutMs > 0
       ? AbortSignal.timeout(timeoutMs)
       : undefined
-  const response = await fetch(`${await apiBaseUrl(args)}${path}`, {
-    method,
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${await apiKey(args)}`,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal,
-  })
-
-  const text = await response.text()
-  let payload: unknown = null
+  const startedAt = Date.now()
   try {
-    payload = text ? JSON.parse(text) : null
-  } catch {
-    payload = text
-  }
+    const response = await fetch(`${await apiBaseUrl(args)}${path}`, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${await apiKey(args)}`,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal,
+    })
 
-  if (!response.ok) {
-    throw new ApiError(method, path, response.status, payload)
-  }
+    const text = await response.text()
+    let payload: unknown = null
+    try {
+      payload = text ? JSON.parse(text) : null
+    } catch {
+      payload = text
+    }
 
-  return payload
+    emitApiTiming(args, {
+      method,
+      path,
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+      ok: response.ok,
+      serverTiming: response.headers.get("server-timing"),
+      onyxTiming: response.headers.get("x-onyx-timing"),
+    })
+
+    if (!response.ok) {
+      throw new ApiError(method, path, response.status, payload)
+    }
+
+    return payload
+  } catch (error) {
+    if (!(error instanceof ApiError)) {
+      emitApiTiming(args, {
+        method,
+        path,
+        status: null,
+        durationMs: Date.now() - startedAt,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    throw error
+  }
 }
 
 export class ApiError extends Error {
@@ -605,7 +753,16 @@ export async function getCampaignOverview(
 export async function listCampaignExperiments(
   campaignId: string,
   args?: Args,
-  options: { limit?: number; cursor?: string } = {}
+  options: {
+    limit?: number
+    cursor?: string
+    sessionId?: string
+    hypothesisId?: string
+    workerId?: string
+    resultCommitSha?: string
+    runRef?: string
+    status?: string
+  } = {}
 ): Promise<{
   items: ApiCampaignExperiment[]
   page: { nextCursor: string | null }
@@ -613,7 +770,10 @@ export async function listCampaignExperiments(
   const params = new URLSearchParams({
     limit: String(options.limit ?? 100),
   })
-  if (options.cursor) params.set("cursor", options.cursor)
+  for (const [key, value] of Object.entries(options)) {
+    if (key === "limit") continue
+    if (value !== undefined && value !== null) params.set(key, String(value))
+  }
   return apiData<{
     items: ApiCampaignExperiment[]
     page: { nextCursor: string | null }
@@ -649,7 +809,7 @@ export async function reportCampaignExperimentsBatch(
 ): Promise<{
   results: Array<{
     runRef: string
-    status: "accepted" | "duplicate" | "rejected" | "deleted" | "invalid"
+    status: "recorded" | "duplicate" | "deleted" | "invalid"
     experiment: ApiCampaignExperiment | null
     error: { code: string; message: string } | null
   }>
@@ -657,7 +817,7 @@ export async function reportCampaignExperimentsBatch(
   return apiData<{
     results: Array<{
       runRef: string
-      status: "accepted" | "duplicate" | "rejected" | "deleted" | "invalid"
+      status: "recorded" | "duplicate" | "deleted" | "invalid"
       experiment: ApiCampaignExperiment | null
       error: { code: string; message: string } | null
     }>
@@ -812,6 +972,24 @@ export async function getResearchSessionControlState(
   )
 }
 
+export async function settleResearchSession(
+  sessionId: string,
+  args?: Args,
+  options: { mode?: "try" | "blocking" } = {}
+): Promise<ApiSessionControlState> {
+  const params = new URLSearchParams()
+  if (options.mode) params.set("mode", options.mode)
+  const suffix = params.size > 0 ? `?${params.toString()}` : ""
+  return apiData<ApiSessionControlState>(
+    await callApi(
+      "POST",
+      `/api/v1/research/sessions/${sessionId}/settle${suffix}`,
+      {},
+      args
+    )
+  )
+}
+
 export async function getResearchSessionBrief(
   sessionId: string,
   args?: Args,
@@ -830,6 +1008,20 @@ export async function getResearchSessionBrief(
   )
 }
 
+export async function getResearchSessionStateBrief(
+  sessionId: string,
+  args?: Args
+): Promise<ApiSessionStateBrief> {
+  return apiData<ApiSessionStateBrief>(
+    await callApi(
+      "GET",
+      `/api/v1/research/sessions/${sessionId}/state-brief`,
+      undefined,
+      args
+    )
+  )
+}
+
 export async function reconcileCampaign(
   campaignId: string,
   args?: Args
@@ -838,6 +1030,26 @@ export async function reconcileCampaign(
     await callApi(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/reconcile`,
+      {},
+      args
+    )
+  )
+}
+
+export async function verifyResearchCampaignGit(
+  campaignId: string,
+  args?: Args,
+  options: { gitVerifyLimit?: number } = {}
+): Promise<ApiVerifyResearchGitResponse> {
+  const params = new URLSearchParams()
+  if (options.gitVerifyLimit !== undefined) {
+    params.set("gitVerifyLimit", String(options.gitVerifyLimit))
+  }
+  const suffix = params.size > 0 ? `?${params.toString()}` : ""
+  return apiData<ApiVerifyResearchGitResponse>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/verify-git${suffix}`,
       {},
       args
     )
@@ -889,6 +1101,32 @@ export async function acquireResearchWorkerLease(
   )
 }
 
+export async function acquireResearchWorkerLeasesBatch(
+  sessionId: string,
+  body: {
+    siteId: string
+    supervisorRunId: string
+    workers: Array<{
+      workerRef: string
+      workerName: string
+      agentKind?: string
+      runtime?: "local" | "hosted"
+      leaseSeconds?: number
+      metadata?: Record<string, unknown>
+    }>
+  },
+  args?: Args
+): Promise<ApiWorkerLeaseBatch> {
+  return apiData<ApiWorkerLeaseBatch>(
+    await callApi(
+      "POST",
+      `/api/v1/research/sessions/${sessionId}/worker-leases/batch`,
+      body,
+      args
+    )
+  )
+}
+
 export async function heartbeatWorker(
   workerId: string,
   body: {
@@ -910,6 +1148,35 @@ export async function heartbeatWorker(
     await callApi(
       "POST",
       `/api/v1/research/workers/${workerId}/heartbeat`,
+      body,
+      args
+    )
+  )
+}
+
+export async function heartbeatWorkersBatch(
+  body: {
+    heartbeats: Array<{
+      workerId: string
+      leaseToken?: string
+      status?: "registered" | "running" | "completed" | "failed" | "stopped"
+      sessionId?: string
+      hypothesisId?: string
+      experimentId?: string | null
+      phase?: string | null
+      event?: string | null
+      progressMessage?: string | null
+      gitLabel?: string | null
+      resourceStats?: Record<string, unknown>
+      metadata?: Record<string, unknown>
+    }>
+  },
+  args?: Args
+): Promise<ApiWorkerHeartbeatBatchResponse> {
+  return apiData<ApiWorkerHeartbeatBatchResponse>(
+    await callApi(
+      "POST",
+      `/api/v1/research/worker-heartbeats/batch`,
       body,
       args
     )

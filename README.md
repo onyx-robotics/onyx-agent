@@ -89,9 +89,10 @@ onyx listen
 
 The CLI writes research product state directly to `/api/v1`. Supabase/API owns
 campaigns, sessions, hypotheses, worker leases, experiments, summaries,
-knowledge, stop state, and accepted experiment ordering. Local `.git/onyx/`
-files are runtime artifacts: logs, manifests, workflow runs, attempts,
-resource locks, and a small `state.json` convenience cache.
+knowledge, stop state, report settlement, and accepted experiment ordering.
+Local `.git/onyx/` files are runtime artifacts: logs, manifests, workflow
+runs, attempts, session-state briefs, resource locks, and a small `state.json`
+convenience cache.
 Transient diagnostics use `onyx tools run <tool-id>`, which executes declared
 setup tools without creating workflow or measured-attempt state.
 
@@ -109,14 +110,17 @@ the orchestrator deliberately configures it. Slow eval cost is paid during
 `onyx setup validate`, not before every worker loop. The generated `onyx/onyx.md`
 is a research spec for durable project guidance: goal, metric interpretation,
 editable scope, evaluation caveats, declared tools, and project-specific
-constraints. Workers use CLI commands for live structured state instead of
-generated per-worker state files.
+constraints. The supervisor writes a shared local session-state brief for
+routine worker context; workers use targeted CLI commands only when they need
+deeper prose memory or history.
 
-Research commands require API access. Workers use server-assigned leases and
-lease-token heartbeats, push immutable experiment refs before reporting, and
-receive server outcomes (`accepted`, `duplicate`, or `rejected`). `onyx exp
-list`, `onyx research status`, `onyx listen`, `knowledge list`, and `summary
-list` read remote API state instead of offline local projections.
+Research commands require API access. The supervisor uses server-assigned
+leases, renews worker liveness in batches, and owns stop scheduling. Workers
+push immutable experiment refs before reporting; experiment report calls return
+`recorded` or `duplicate`, and later settlement assigns accepted/discarded
+disposition plus accepted indexes. `onyx exp list`, `onyx research status`,
+`onyx listen`, `knowledge list`, and `summary list` read remote API state
+instead of offline local projections.
 
 `onyx campaign setup` and `onyx research run` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
@@ -161,9 +165,9 @@ For large local runs, the supervisor ramps launches in batches
 (`--launch-batch-size`, default up to 10) separated by
 `--launch-interval-seconds` (default 5), backs off with capped exponential
 jitter when provider startup, rate-limit, overload, auth, or degraded-service
-failures happen, and asks the server for a worker lease before each launch.
-The server enforces the worker target, assigns hypotheses, assigns accepted
-indexes, and rejects late attempts idempotently after completion.
+failures happen, and asks the server for worker leases in idempotent batches.
+The server enforces the worker target, assigns hypotheses, records reports, and
+settles accepted/discarded disposition idempotently after completion.
 
 Presence is bounded for large sessions: the supervisor sends site telemetry
 every interval while uploading changed worker snapshots by default, a full
@@ -179,8 +183,8 @@ isolated `ONYX_HOME` plus `ONYX_WORKER_CONTEXT` under
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-server lease acquisition, adaptive coalesced presence updates, remote
-heartbeats, stop handling, and local child cleanup. `onyx research status --json` reports fresh
+server lease acquisition, session-state brief refreshes, adaptive coalesced
+presence updates, batch heartbeats, stop handling, and local child cleanup. `onyx research status --json` reports fresh
 supervisor telemetry when available, including active process count, launch
 rate, provider backoff, recent launch failures, PID, and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
 as a low-level debugging and recovery primitive.
@@ -196,16 +200,18 @@ diagnostics.
 
 Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
 and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
-worker prompts and logs live under `.git/onyx/`. Workers run `onyx-worker research brief`
-for current campaign memory, poll `onyx-worker research should-stop`, run the setup workflow through `onyx-worker exp run
---campaign <name> --base <sha> --auto` and `onyx-worker exp run --resume <id> --auto`,
-push `refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment
-with setup/session/hypothesis/worker context. `onyx research hypothesis add`
+worker prompts and logs live under `.git/onyx/`. Workers run
+`onyx-worker research session-state-brief --json` for routine context, use
+`onyx-worker research brief` only for fuller prose memory, run the setup workflow
+through `onyx-worker exp run --campaign <name> --auto` and
+`onyx-worker exp run --resume --auto`, push
+`refs/onyx/experiments/<campaignId>/<runRef>`, and report the experiment with
+setup/session/hypothesis/worker context. `onyx research hypothesis add`
 can create another campaign hypothesis at any time from a JSON plan file or inline
 focus/hypothesis flags; a running supervisor picks up new active hypotheses as
-soon as worker slots open. Workers
-publish shared learning with `onyx-worker knowledge add` and read it back through
-`onyx-worker research brief`, but successor hypothesis selection remains an
+soon as worker slots open. Workers publish shared learning with
+`onyx-worker knowledge add` and read it back through the session-state brief or
+fuller research brief, but successor hypothesis selection remains an
 orchestrator/human decision.
 After the agent exits, the worker harness performs one final best-effort
 commit, checks whether HEAD is already represented by a reported experiment,

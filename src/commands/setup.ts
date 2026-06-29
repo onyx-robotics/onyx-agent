@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises"
 import type { Args } from "../lib/args"
 import {
   readSetupFile,
+  readValidationFile,
   setupHash,
   setupPath,
   validationPath,
@@ -65,6 +66,26 @@ function validationStatus(
   if (checks.some((item) => item.status === "failed")) return "failed"
   if (checks.some((item) => item.status === "warning")) return "warning"
   return "passed"
+}
+
+function stripGeneratedValidationFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripGeneratedValidationFields)
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== "generatedAt" && key !== "checkedAt")
+      .map(([key, nested]) => [key, stripGeneratedValidationFields(nested)])
+  )
+}
+
+function validationsMatchIgnoringGeneratedFields(
+  left: ResearchSetupValidationFile,
+  right: ResearchSetupValidationFile
+) {
+  return (
+    JSON.stringify(stripGeneratedValidationFields(left)) ===
+    JSON.stringify(stripGeneratedValidationFields(right))
+  )
 }
 
 function defaultSetupFile(projectPath: string, args: Args): ResearchSetupFile {
@@ -575,8 +596,15 @@ async function validateAndWrite({
     setup,
     executeMetricTool,
   })
+  const existing = await readValidationFile(root, projectPath)
+  if (
+    existing &&
+    validationsMatchIgnoringGeneratedFields(existing, validation)
+  ) {
+    return { validation: existing, written: false }
+  }
   await writeValidationFile(root, projectPath, validation)
-  return validation
+  return { validation, written: true }
 }
 
 export async function commandSetupInit(args: Args) {
@@ -601,11 +629,12 @@ export async function commandSetupInit(args: Args) {
     defaultEvalScript(setupFile, args),
     0o755
   )
-  const validation = await validateAndWrite({
+  const validationResult = await validateAndWrite({
     root,
     projectPath,
     executeMetricTool: false,
   })
+  const validation = validationResult.validation
 
   console.log(`setup: ${dir}`)
   console.log(wroteSetup ? "created onyx/setup.json" : "kept onyx/setup.json")
@@ -615,7 +644,9 @@ export async function commandSetupInit(args: Args) {
       ? "created onyx/tools/evaluation/run.sh"
       : "kept onyx/tools/evaluation/run.sh"
   )
-  console.log(`wrote ${validationPath(root, projectPath)}`)
+  console.log(
+    `${validationResult.written ? "wrote" : "unchanged"} ${validationPath(root, projectPath)}`
+  )
   console.log(`setup validation: ${validation.status}`)
   if (isSelfReferentialEvalCommand(args.options["eval-command"], projectPath)) {
     console.warn(
@@ -635,11 +666,12 @@ export async function commandSetupValidate(args: Args) {
   }
   const root = await repoRoot()
   const projectPath = await resolveProjectPath(root, args)
-  const validation = await validateAndWrite({
+  const validationResult = await validateAndWrite({
     root,
     projectPath,
     executeMetricTool: true,
   })
+  const validation = validationResult.validation
 
   console.log(`setup validation: ${validation.status}`)
   const groups = [
@@ -654,7 +686,9 @@ export async function commandSetupValidate(args: Args) {
       console.log(`- ${item.id}: ${item.status} - ${item.message}`)
     }
   }
-  console.log(`wrote ${validationPath(root, projectPath)}`)
+  console.log(
+    `${validationResult.written ? "wrote" : "unchanged"} ${validationPath(root, projectPath)}`
+  )
   console.log(
     "metric readiness: `onyx setup validate` executed the canonical metric tool and recorded readiness evidence in validation.json."
   )

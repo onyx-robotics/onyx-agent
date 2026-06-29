@@ -111,7 +111,7 @@ export function experimentRecordToHistory(
 }
 
 export function apiExperimentToHistory(
-  campaign: ApiCampaign,
+  campaign: Pick<ApiCampaign, "id" | "name">,
   experiment: ApiCampaignExperiment
 ): LocalResearchHistoryRecord | null {
   const metrics: Record<string, number> = {}

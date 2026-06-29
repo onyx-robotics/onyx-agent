@@ -17,6 +17,7 @@ import {
   commandResearchBrief,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
+  commandResearchSessionStateBrief,
   commandResearchRun,
   commandResearchShouldStop,
   commandResearchStart,
@@ -71,7 +72,7 @@ Usage:
   onyx research hypotheses --example
   onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude|opencode]
   onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--quiet]
-  onyx research should-stop [--session <id>] [--json]
+  onyx research should-stop [--session <id>] [--worker <id>] [--json]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research finish [--campaign <name>] [--session <id>] [--require-online]
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
@@ -82,23 +83,23 @@ Usage:
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
-  onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|accepted|rejected|running|queued] [--allow-unmeasured] [--project-path <path>]
+  onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
   onyx status [--json]
 
 Worker primitives are exposed through the separate worker-safe entrypoint:
   onyx-worker research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
-  onyx-worker research should-stop [--session <id>] [--json]
+  onyx-worker research session-state-brief [--json]
   onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next]
   onyx-worker exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>]
   onyx-worker tools run <name> [args...]
 
 Research control-plane state is remote-first through /api/v1. Local files under
 .git/onyx/ hold runtime logs, workflow runs, attempt manifests, resource locks,
-and convenience state only. Workers push immutable experiment refs before
-reporting results; \`onyx exp list\`, \`onyx research status\`, summaries, and
-knowledge read from the remote API.
+session-state briefs, and convenience state only. Workers push immutable
+experiment refs before reporting results; \`onyx exp list\`, \`onyx research status\`,
+summaries, and knowledge read from the remote API.
 
 Env:
   ONYX_API_KEY   overrides the selected profile API key
@@ -176,6 +177,8 @@ export async function main(argv = process.argv.slice(2)) {
       return commandResearchHypothesisAdd(args)
     if (command === "research" && sub === "should-stop")
       return commandResearchShouldStop(args)
+    if (command === "research" && sub === "session-state-brief")
+      return commandResearchSessionStateBrief(args)
     if (command === "research" && sub === "stop")
       return commandResearchStop(args)
     if (command === "research" && sub === "finish")

@@ -91,6 +91,7 @@ export type CliState = {
       } | null
       supervisor?: {
         pid?: number | null
+        supervisorRunId?: string | null
         logPath?: string | null
         activeProcessCount?: number
         launchRate?: {
