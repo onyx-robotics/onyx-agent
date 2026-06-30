@@ -1049,6 +1049,96 @@ export const listResearchCampaignExperimentsResponseSchema = z.object({
   }),
 })
 
+// Slim row for the team experiments table: only the displayed fields, so the
+// query/response avoids reading and shipping the heavy experiment jsonb columns.
+export const researchExperimentRowSchema = z.object({
+  id: z.uuid(),
+  campaignId: z.uuid(),
+  projectId: z.uuid(),
+  projectName: z.string().min(1),
+  campaignName: z.string().min(1),
+  hypothesisId: z.uuid().nullable(),
+  name: z.string().min(1),
+  status: researchExperimentStatusSchema,
+  disposition: researchExperimentDispositionSchema,
+  gitStatus: researchExperimentGitStatusSchema,
+  primaryMetricName: z.string().min(1),
+  primaryMetricValue: z.number().finite().nullable(),
+  durationMs: z.number().int().nonnegative().nullable(),
+  createdAt: z.iso.datetime(),
+})
+
+// Multi-value query params are passed as comma-separated strings (the route
+// query parser collapses repeated keys), so split + validate as an array.
+function csvEnumQueryParam<T extends z.ZodTypeAny>(item: T) {
+  return z
+    .preprocess((value) => {
+      if (typeof value !== "string") return value
+      const parts = value
+        .split(",")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+      return parts.length > 0 ? parts : undefined
+    }, z.array(item).optional())
+    .optional()
+}
+
+export const researchExperimentSortFieldSchema = z.enum([
+  "createdAt",
+  "name",
+  "status",
+  "disposition",
+  "primaryMetricValue",
+  "durationMs",
+  "projectName",
+  "campaignName",
+])
+
+export const listResearchExperimentsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(50),
+  search: z.string().trim().min(1).max(200).optional(),
+  projectId: z.uuid().optional(),
+  campaignId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
+  status: csvEnumQueryParam(researchExperimentStatusSchema),
+  disposition: csvEnumQueryParam(researchExperimentDispositionSchema),
+  sortBy: researchExperimentSortFieldSchema.default("createdAt"),
+  sortDir: z.enum(["asc", "desc"]).default("desc"),
+})
+
+export const listResearchExperimentsResponseSchema = z.object({
+  data: z.object({
+    items: z.array(researchExperimentRowSchema),
+    // Echo only — the total/pageCount come from the facets endpoint so paging
+    // and sorting don't re-run the count.
+    page: z.object({
+      page: z.number().int().positive(),
+      pageSize: z.number().int().positive(),
+    }),
+  }),
+})
+
+// Filters-only query (no page/pageSize/sort) so the count + facet breakdowns
+// are cached across pages and sort changes.
+export const listResearchExperimentsFacetsQuerySchema = z.object({
+  search: z.string().trim().min(1).max(200).optional(),
+  projectId: z.uuid().optional(),
+  campaignId: z.uuid().optional(),
+  hypothesisId: z.uuid().optional(),
+  status: csvEnumQueryParam(researchExperimentStatusSchema),
+  disposition: csvEnumQueryParam(researchExperimentDispositionSchema),
+})
+
+export const researchExperimentsFacetsResponseSchema = z.object({
+  data: z.object({
+    total: z.number().int().nonnegative(),
+    // Keyed by status/disposition value; only present values are included.
+    status: z.record(z.string(), z.number().int().nonnegative()),
+    disposition: z.record(z.string(), z.number().int().nonnegative()),
+  }),
+})
+
 export const createResearchKnowledgeResponseSchema = z.object({
   data: researchKnowledgeSchema,
 })
@@ -1688,6 +1778,22 @@ export type ListResearchCampaignExperimentsQuery = z.infer<
 >
 export type ListResearchCampaignExperimentsResponse = z.infer<
   typeof listResearchCampaignExperimentsResponseSchema
+>
+export type ResearchExperimentRow = z.infer<typeof researchExperimentRowSchema>
+export type ResearchExperimentSortField = z.infer<
+  typeof researchExperimentSortFieldSchema
+>
+export type ListResearchExperimentsQuery = z.infer<
+  typeof listResearchExperimentsQuerySchema
+>
+export type ListResearchExperimentsResponse = z.infer<
+  typeof listResearchExperimentsResponseSchema
+>
+export type ListResearchExperimentsFacetsQuery = z.infer<
+  typeof listResearchExperimentsFacetsQuerySchema
+>
+export type ResearchExperimentsFacetsResponse = z.infer<
+  typeof researchExperimentsFacetsResponseSchema
 >
 export type ResearchMetricSeriesQuery = z.infer<
   typeof researchMetricSeriesQuerySchema
