@@ -1058,9 +1058,9 @@ export const researchExperimentRowSchema = z.object({
   projectName: z.string().min(1),
   campaignName: z.string().min(1),
   hypothesisId: z.uuid().nullable(),
+  hypothesisName: z.string().min(1).nullable(),
   name: z.string().min(1),
   status: researchExperimentStatusSchema,
-  disposition: researchExperimentDispositionSchema,
   gitStatus: researchExperimentGitStatusSchema,
   primaryMetricName: z.string().min(1),
   primaryMetricValue: z.number().finite().nullable(),
@@ -1083,11 +1083,12 @@ function csvEnumQueryParam<T extends z.ZodTypeAny>(item: T) {
     .optional()
 }
 
+const csvUuidQueryParam = () => csvEnumQueryParam(z.uuid())
+
 export const researchExperimentSortFieldSchema = z.enum([
   "createdAt",
   "name",
   "status",
-  "disposition",
   "primaryMetricValue",
   "durationMs",
   "projectName",
@@ -1098,11 +1099,10 @@ export const listResearchExperimentsQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(50),
   search: z.string().trim().min(1).max(200).optional(),
-  projectId: z.uuid().optional(),
-  campaignId: z.uuid().optional(),
-  hypothesisId: z.uuid().optional(),
+  projectId: csvUuidQueryParam(),
+  campaignId: csvUuidQueryParam(),
+  hypothesisId: csvUuidQueryParam(),
   status: csvEnumQueryParam(researchExperimentStatusSchema),
-  disposition: csvEnumQueryParam(researchExperimentDispositionSchema),
   sortBy: researchExperimentSortFieldSchema.default("createdAt"),
   sortDir: z.enum(["asc", "desc"]).default("desc"),
 })
@@ -1123,19 +1123,20 @@ export const listResearchExperimentsResponseSchema = z.object({
 // are cached across pages and sort changes.
 export const listResearchExperimentsFacetsQuerySchema = z.object({
   search: z.string().trim().min(1).max(200).optional(),
-  projectId: z.uuid().optional(),
-  campaignId: z.uuid().optional(),
-  hypothesisId: z.uuid().optional(),
+  projectId: csvUuidQueryParam(),
+  campaignId: csvUuidQueryParam(),
+  hypothesisId: csvUuidQueryParam(),
   status: csvEnumQueryParam(researchExperimentStatusSchema),
-  disposition: csvEnumQueryParam(researchExperimentDispositionSchema),
 })
 
 export const researchExperimentsFacetsResponseSchema = z.object({
   data: z.object({
     total: z.number().int().nonnegative(),
-    // Keyed by status/disposition value; only present values are included.
+    // Keyed by facet value; only present values are included.
+    project: z.record(z.string(), z.number().int().nonnegative()),
+    campaign: z.record(z.string(), z.number().int().nonnegative()),
+    hypothesis: z.record(z.string(), z.number().int().nonnegative()),
     status: z.record(z.string(), z.number().int().nonnegative()),
-    disposition: z.record(z.string(), z.number().int().nonnegative()),
   }),
 })
 
