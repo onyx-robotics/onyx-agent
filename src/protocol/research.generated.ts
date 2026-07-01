@@ -1059,7 +1059,10 @@ export const researchExperimentRowSchema = z.object({
   campaignName: z.string().min(1),
   hypothesisId: z.uuid().nullable(),
   hypothesisName: z.string().min(1).nullable(),
+  hypothesisDescription: z.string().nullable(),
   name: z.string().min(1),
+  description: z.string().nullable(),
+  resultCommitSha: z.string().min(1),
   status: researchExperimentStatusSchema,
   gitStatus: researchExperimentGitStatusSchema,
   primaryMetricName: z.string().min(1),
@@ -1087,12 +1090,9 @@ const csvUuidQueryParam = () => csvEnumQueryParam(z.uuid())
 
 export const researchExperimentSortFieldSchema = z.enum([
   "createdAt",
-  "name",
-  "status",
   "primaryMetricValue",
   "durationMs",
-  "projectName",
-  "campaignName",
+  "hypothesisName",
 ])
 
 export const listResearchExperimentsQuerySchema = z.object({
