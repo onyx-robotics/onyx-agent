@@ -4,8 +4,8 @@ Open-source agent package for Onyx research workflows.
 
 It installs the `onyx` command and the bundled `onyx` agent skill. The command
 is terminal-only: agents make code changes in your existing git repository,
-commit measured attempts, push immutable experiment refs, and report experiment
-metadata plus setup, hypothesis, and worker state to the Onyx app.
+commit measured attempts, push immutable experiment refs best-effort, and report
+experiment metadata plus setup, hypothesis, and worker state to the Onyx app.
 
 ## Install
 
@@ -116,18 +116,20 @@ deeper prose memory or history.
 
 Research commands require API access. The supervisor uses server-assigned
 leases, renews worker liveness in batches, and owns stop scheduling. Workers
-push immutable experiment refs before reporting; experiment report calls return
-`recorded` or `duplicate`, and later settlement assigns accepted/discarded
-disposition plus accepted indexes. `onyx exp list`, `onyx research status`,
+attempt to push immutable experiment refs while reporting; failed pushes are
+recorded as local-reported evidence instead of blocking metrics. Experiment
+report calls return `recorded` or `duplicate`, and later settlement assigns
+accepted/discarded disposition plus accepted indexes. `onyx exp list`,
+`onyx research status`,
 `onyx listen`, `knowledge list`, and `summary list` read remote API state
 instead of offline local projections.
 
 `onyx campaign setup` and `onyx research run` require the `onyx/` setup
 surface to be committed. This keeps worker worktrees pinned to a base commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
-declared workflow tools. GitHub-backed campaigns also require that base commit
-to be present on the repository remote; the CLI warns when it is missing, while
-the bundled `/onyx` skill pushes the setup base before campaign setup.
+declared workflow tools. GitHub App access is optional for local research:
+without it, Onyx records local-reported commits and metrics, while web
+code/diff viewing stays unavailable until GitHub is connected.
 
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable

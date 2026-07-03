@@ -10,6 +10,7 @@ export type CliState = {
     id: string
     name: string
     repositoryUrl: string
+    repositoryAccessMode?: "local_reported" | "github_public" | "github_app"
     repositoryFullName: string | null
     defaultBranch: string
     projectPath: string

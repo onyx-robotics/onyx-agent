@@ -132,7 +132,7 @@ The supervisor launched this worker with \`onyx-worker\`, \`ONYX_WORKER_CONTEXT\
 - Restoring an earlier best with \`git checkout <best-sha> -- <scoped files>\` is allowed only inside a normal \`onyx-worker exp run\` attempt that produces exactly one measured forward commit.
 - Do not delete campaigns or experiments. Deletion/tombstones are human/orchestrator actions.
 - Do not edit \`.git/onyx/worker-logs\`, \`.git/onyx/worker-runtime\`, \`.git/onyx/workflow-runs\`, \`.git/onyx/attempts\`, worker manifests, or latest-state JSON directly. Those files are owned by the Onyx CLI and supervisor.
-- Product state is remote-first. \`onyx-worker exp log\`, \`onyx-worker knowledge add\`, \`onyx-worker summary upsert\`, and heartbeats call the Onyx API directly. \`onyx-worker exp log\` pushes the immutable experiment ref before it reports; if it fails, report the command, exit code, and error output instead of patching local files by hand.
+- Product state is remote-first. \`onyx-worker exp log\`, \`onyx-worker knowledge add\`, \`onyx-worker summary upsert\`, and heartbeats call the Onyx API directly. \`onyx-worker exp log\` attempts to push the immutable experiment ref before it reports; failed pushes are recorded as local-reported evidence, so do not patch local files by hand to compensate.
 
 On stop: leave the worktree clean, make sure every committed attempt is logged, and summarize best result, failed ideas, and next promising ideas. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, immutable-ref push, and API report.`
 }

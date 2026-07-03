@@ -135,6 +135,9 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "If `exp log` says there are zero unlogged attempts, do not amend, reset, or rewrite history"
     )
+    expect(prompt).toContain(
+      "failed pushes are recorded as local-reported evidence"
+    )
     expect(prompt).toContain("onyx-worker workflow status --blocked")
     expect(prompt).toContain(
       'onyx-worker exp log --campaign "$ONYX_CAMPAIGN_NAME"'
@@ -154,7 +157,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain("Product state is remote-first")
     expect(prompt).toContain("call the Onyx API directly")
     expect(prompt).toContain(
-      "pushes the immutable experiment ref before it reports"
+      "attempts to push the immutable experiment ref before it reports"
     )
     expect(prompt).not.toContain("onyx-worker sync status")
     expect(prompt).not.toContain(".git/onyx/research.db")

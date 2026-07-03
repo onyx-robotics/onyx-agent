@@ -15,6 +15,7 @@ export type ApiProject = {
   id: string
   name: string
   repositoryUrl: string
+  repositoryAccessMode: "local_reported" | "github_public" | "github_app"
   repositoryFullName: string | null
   defaultBranch: string
   projectPath: string
@@ -31,6 +32,15 @@ export type ApiCampaign = {
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
+  baseGitStatus?:
+    | "local_reported"
+    | "pending"
+    | "verified"
+    | "missing"
+    | "mismatch"
+    | "unreachable"
+  baseGitVerifiedAt?: string | null
+  baseGitStatusReason?: string | null
   bestExperimentId?: string | null
   bestMetricValue: number | null
   bestCommitSha: string | null
@@ -59,6 +69,9 @@ export type ApiCampaignExperiment = {
   gitStatus: string
   gitVerifiedAt: string | null
   gitStatusReason: string | null
+  resultRefPushStatus: "pushed" | "failed" | "skipped" | null
+  resultRefPushedAt: string | null
+  resultRefPushError: string | null
   disposition: "received" | "accepted" | "discarded"
   dispositionReason: string | null
   settledAt: string | null
@@ -711,6 +724,7 @@ export async function resolveProject(
       id: args.options.project,
       name: args.options.project,
       repositoryUrl: "",
+      repositoryAccessMode: "local_reported",
       repositoryFullName: null,
       defaultBranch: "main",
       projectPath,
@@ -730,6 +744,8 @@ export async function resolveProject(
       id: state.projectCache.id,
       name: state.projectCache.name,
       repositoryUrl: state.projectCache.repositoryUrl,
+      repositoryAccessMode:
+        state.projectCache.repositoryAccessMode ?? "local_reported",
       repositoryFullName: state.projectCache.repositoryFullName,
       defaultBranch: state.projectCache.defaultBranch,
       projectPath: state.projectCache.projectPath,
@@ -752,6 +768,7 @@ export async function resolveProject(
         id: project.id,
         name: project.name,
         repositoryUrl: url,
+        repositoryAccessMode: project.repositoryAccessMode,
         repositoryFullName: project.repositoryFullName,
         defaultBranch: project.defaultBranch,
         projectPath,

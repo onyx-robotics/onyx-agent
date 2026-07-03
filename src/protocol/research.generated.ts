@@ -50,6 +50,11 @@ export const researchExperimentDispositionSchema = z.enum([
   "discarded",
 ])
 export const researchProjectProviderSchema = z.literal("github")
+export const researchRepositoryAccessModeSchema = z.enum([
+  "local_reported",
+  "github_public",
+  "github_app",
+])
 export const researchRepositorySyncStatusSchema = z.enum([
   "not_synced",
   "syncing",
@@ -118,11 +123,17 @@ export const researchStopReasonCodeSchema = z.enum([
   "experiment_target_reached",
 ])
 export const researchExperimentGitStatusSchema = z.enum([
+  "local_reported",
   "pending",
   "verified",
   "missing",
   "mismatch",
   "unreachable",
+])
+export const researchResultRefPushStatusSchema = z.enum([
+  "pushed",
+  "failed",
+  "skipped",
 ])
 export const researchExperimentLinkTypeSchema = z.enum([
   "inspired_by",
@@ -338,9 +349,10 @@ export const researchProjectSchema = z.object({
   repositoryOwner: z.string().min(1),
   repositoryName: z.string().min(1),
   repositoryProvider: researchProjectProviderSchema,
-  githubInstallationId: z.string().min(1),
-  githubRepositoryId: z.string().min(1),
-  repositoryFullName: z.string().min(1),
+  repositoryAccessMode: researchRepositoryAccessModeSchema,
+  githubInstallationId: z.string().min(1).nullable(),
+  githubRepositoryId: z.string().min(1).nullable(),
+  repositoryFullName: z.string().min(1).nullable(),
   repositoryIsPrivate: z.boolean(),
   defaultBranch: z.string().min(1),
   projectPath: projectPathSchema,
@@ -397,6 +409,9 @@ export const researchCampaignSchema = z.object({
   name: z.string().min(1),
   description: z.string().nullable(),
   baseCommitSha: z.string().min(1),
+  baseGitStatus: researchExperimentGitStatusSchema,
+  baseGitVerifiedAt: z.iso.datetime().nullable(),
+  baseGitStatusReason: z.string().nullable(),
   status: researchCampaignStatusSchema,
   metricName: z.string().min(1),
   metricUnit: z.string().nullable(),
@@ -443,6 +458,9 @@ export const researchCampaignExperimentSchema = z.object({
   gitStatus: researchExperimentGitStatusSchema,
   gitVerifiedAt: z.iso.datetime().nullable(),
   gitStatusReason: z.string().nullable(),
+  resultRefPushStatus: researchResultRefPushStatusSchema.nullable(),
+  resultRefPushedAt: z.iso.datetime().nullable(),
+  resultRefPushError: z.string().nullable(),
   status: researchExperimentStatusSchema,
   disposition: researchExperimentDispositionSchema,
   dispositionReason: z.string().nullable(),
@@ -484,6 +502,9 @@ export const createResearchCampaignExperimentRequestSchema = z
     baseCommitSha: gitShaSchema,
     resultCommitSha: gitShaSchema,
     resultRef: gitRefSchema,
+    resultRefPushStatus: researchResultRefPushStatusSchema.optional(),
+    resultRefPushedAt: z.iso.datetime().optional(),
+    resultRefPushError: z.string().trim().max(2000).optional(),
     status: researchExperimentStatusSchema.default("succeeded"),
     setupCompliance: researchSetupComplianceSchema.default({
       status: "passed",
@@ -951,6 +972,9 @@ export const researchCampaignExperimentSummarySchema = z.object({
   gitStatus: researchExperimentGitStatusSchema,
   gitVerifiedAt: z.iso.datetime().nullable(),
   gitStatusReason: z.string().nullable(),
+  resultRefPushStatus: researchResultRefPushStatusSchema.nullable(),
+  resultRefPushedAt: z.iso.datetime().nullable(),
+  resultRefPushError: z.string().nullable(),
   status: researchExperimentStatusSchema,
   disposition: researchExperimentDispositionSchema,
   dispositionReason: z.string().nullable(),
@@ -1065,6 +1089,7 @@ export const researchExperimentRowSchema = z.object({
   resultCommitSha: z.string().min(1),
   status: researchExperimentStatusSchema,
   gitStatus: researchExperimentGitStatusSchema,
+  resultRefPushStatus: researchResultRefPushStatusSchema.nullable(),
   primaryMetricName: z.string().min(1),
   primaryMetricValue: z.number().finite().nullable(),
   durationMs: z.number().int().nonnegative().nullable(),
@@ -1539,10 +1564,25 @@ export const researchDiffFileSchema = z.object({
   ),
 })
 
+export const researchCodeAccessSchema = z.object({
+  status: z.enum(["available", "unavailable"]),
+  reason: z
+    .enum([
+      "github_connection_required",
+      "commit_not_visible",
+      "base_commit_not_visible",
+      "code_read_failed",
+    ])
+    .nullable()
+    .default(null),
+  message: z.string().nullable().default(null),
+})
+
 export const researchCampaignFileTreeResponseSchema = z.object({
   data: z.object({
     experiment: researchCampaignExperimentSchema,
     commitSha: gitShaSchema,
+    codeAccess: researchCodeAccessSchema,
     files: z.array(researchFileTreeNodeSchema),
   }),
 })
@@ -1557,6 +1597,7 @@ export const researchCampaignFileBlobResponseSchema = z.object({
     language: z.string().nullable(),
     isProtected: z.boolean(),
     isTruncated: z.boolean(),
+    codeAccess: researchCodeAccessSchema,
   }),
 })
 
@@ -1565,6 +1606,7 @@ export const researchCampaignDiffResponseSchema = z.object({
     baseExperiment: researchCampaignExperimentSchema.nullable(),
     baseCommitSha: gitShaSchema,
     compareExperiment: researchCampaignExperimentSchema,
+    codeAccess: researchCodeAccessSchema,
     files: z.array(researchDiffFileSchema),
   }),
 })
@@ -1575,6 +1617,7 @@ export const researchCampaignExperimentCodeResponseSchema = z.object({
     baseExperiment: researchCampaignExperimentSchema.nullable(),
     baseCommitSha: gitShaSchema,
     commitSha: gitShaSchema,
+    codeAccess: researchCodeAccessSchema,
     files: z.array(researchFileTreeNodeSchema),
     diffFiles: z.array(researchDiffFileSchema),
   }),
@@ -1675,6 +1718,9 @@ export type ResearchExperimentDisposition = z.infer<
 export type ResearchProjectProvider = z.infer<
   typeof researchProjectProviderSchema
 >
+export type ResearchRepositoryAccessMode = z.infer<
+  typeof researchRepositoryAccessModeSchema
+>
 export type ResearchRepositorySyncStatus = z.infer<
   typeof researchRepositorySyncStatusSchema
 >
@@ -1702,6 +1748,9 @@ export type ResearchWorkerRuntime = z.infer<typeof researchWorkerRuntimeSchema>
 export type ResearchWorkerStatus = z.infer<typeof researchWorkerStatusSchema>
 export type ResearchExperimentGitStatus = z.infer<
   typeof researchExperimentGitStatusSchema
+>
+export type ResearchResultRefPushStatus = z.infer<
+  typeof researchResultRefPushStatusSchema
 >
 export type ResearchExperimentLinkType = z.infer<
   typeof researchExperimentLinkTypeSchema
@@ -1947,6 +1996,7 @@ export type ResearchSessionControlStateResponse = z.infer<
 export type SettleResearchSessionQuery = z.infer<
   typeof settleResearchSessionQuerySchema
 >
+export type ResearchCodeAccess = z.infer<typeof researchCodeAccessSchema>
 export type ResearchCampaignFileTreeResponse = z.infer<
   typeof researchCampaignFileTreeResponseSchema
 >

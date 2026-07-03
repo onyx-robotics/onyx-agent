@@ -1483,13 +1483,19 @@ export async function commandExpLog(args: Args) {
     workerId,
     hypothesisId,
   }
-  await git(["push", "origin", `${resultCommitSha}:${resultRef}`], root).catch(
-    (error) => {
-      throw new Error(
-        `Failed to push experiment ref ${resultRef}. The local commit is ${resultCommitSha}; push it with \`git push origin ${resultCommitSha}:${resultRef}\` before retrying. ${errorMessage(error)}`
-      )
-    }
-  )
+  let resultRefPushStatus: "pushed" | "failed" = "pushed"
+  let resultRefPushedAt: string | undefined
+  let resultRefPushError: string | undefined
+  try {
+    await git(["push", "origin", `${resultCommitSha}:${resultRef}`], root)
+    resultRefPushedAt = new Date().toISOString()
+  } catch (error) {
+    resultRefPushStatus = "failed"
+    resultRefPushError = errorMessage(error)
+    console.warn(
+      `Warning: failed to push experiment ref ${resultRef}. Onyx will record the result as local-reported; push later with \`git push origin ${resultCommitSha}:${resultRef}\` to make code and diffs visible after GitHub is connected. ${resultRefPushError}`
+    )
+  }
   const report = await reportCampaignExperiment(
     campaign.campaignId,
     {
@@ -1502,6 +1508,9 @@ export async function commandExpLog(args: Args) {
       baseCommitSha,
       resultCommitSha,
       resultRef,
+      resultRefPushStatus,
+      ...(resultRefPushedAt ? { resultRefPushedAt } : {}),
+      ...(resultRefPushError ? { resultRefPushError } : {}),
       status: loggedStatus,
       setupCompliance: loggedCompliance,
       primaryMetricName: metricName,
@@ -1527,7 +1536,7 @@ export async function commandExpLog(args: Args) {
     args
   ).catch((error) => {
     throw new Error(
-      `Experiment ref ${resultRef} was pushed, but API reporting failed. Retry \`onyx exp log --campaign ${campaignName} --run-ref ${runRef}\` after checking the Onyx API. ${errorMessage(error)}`
+      `API reporting failed after local measurement${resultRefPushStatus === "pushed" ? " and ref push" : ""}. Retry \`onyx exp log --campaign ${campaignName} --run-ref ${runRef}\` after checking the Onyx API. ${errorMessage(error)}`
     )
   })
   await clearLocalAttempt(root, { runRef }).catch(() => {})
@@ -1540,12 +1549,18 @@ export async function commandExpLog(args: Args) {
     resultRef,
     message: `${record.name} (${loggedStatus})`,
   })
+  const gitNote =
+    report.experiment.gitStatus === "local_reported"
+      ? " [local-reported]"
+      : ""
+  const pushNote =
+    resultRefPushStatus === "failed" ? " (experiment ref push failed)" : ""
   console.log(
     `${report.outcome}: ${record.name} (${report.experiment.status}) for campaign ${campaignName}${
       report.experiment.acceptedIndex
         ? ` as #${report.experiment.acceptedIndex}`
         : ""
-    }`
+    }${gitNote}${pushNote}`
   )
   return report.experiment
 }

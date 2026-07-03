@@ -982,6 +982,7 @@ describe("remote-first research supervisor smoke", () => {
               JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
                 finalization?: {
                   finalizationStatus?: string
+                  workerBranchPushStatus?: string
                   error?: string | null
                 }
               }
@@ -1083,14 +1084,16 @@ describe("remote-first research supervisor smoke", () => {
         })
       )
 
-      expect(
-        calls.some(
-          (call) =>
-            call.method === "POST" &&
-            call.path ===
-              `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
-        )
-      ).toBe(false)
+      const reportCall = calls.find(
+        (call) =>
+          call.method === "POST" &&
+          call.path ===
+            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+      )
+      expect(reportCall).toBeDefined()
+      expect(reportCall?.body).toMatchObject({
+        resultRefPushStatus: "failed",
+      })
       const workerLogRoot = join(
         root,
         ".git",
@@ -1107,6 +1110,7 @@ describe("remote-first research supervisor smoke", () => {
                 finalization?: {
                   finalizationStatus?: string
                   error?: string | null
+                  workerBranchPushStatus?: string | null
                 }
               }
           )
@@ -1114,10 +1118,9 @@ describe("remote-first research supervisor smoke", () => {
       expect(
         manifests.some(
           (manifest) =>
-            manifest.finalization?.finalizationStatus === "failed" &&
-            manifest.finalization.error?.includes(
-              "Failed to push experiment ref"
-            )
+            manifest.finalization?.finalizationStatus ===
+              "measured_and_logged" &&
+            manifest.finalization.workerBranchPushStatus === "failed"
         )
       ).toBe(true)
     } finally {

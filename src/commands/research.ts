@@ -1578,9 +1578,6 @@ async function computeSessionFinalizationStatus({
           `worker ${manifest.workerId} has unlogged or salvaged work`
         )
       }
-      if (finalization.workerBranchPushStatus === "failed") {
-        incompleteReasons.push(`worker ${manifest.workerId} branch push failed`)
-      }
       if (finalization.rootDriftStatus === "dirty") {
         incompleteReasons.push(
           `worker ${manifest.workerId} detected root drift`
