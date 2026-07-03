@@ -21,6 +21,14 @@ export type ApiProject = {
   projectPath: string
 }
 
+export type ApiGitStatus =
+  | "local_reported"
+  | "pending"
+  | "verified"
+  | "missing"
+  | "mismatch"
+  | "unreachable"
+
 export type ApiCampaign = {
   id: string
   projectId: string
@@ -32,13 +40,7 @@ export type ApiCampaign = {
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
-  baseGitStatus?:
-    | "local_reported"
-    | "pending"
-    | "verified"
-    | "missing"
-    | "mismatch"
-    | "unreachable"
+  baseGitStatus?: ApiGitStatus
   baseGitVerifiedAt?: string | null
   baseGitStatusReason?: string | null
   bestExperimentId?: string | null
@@ -49,6 +51,42 @@ export type ApiCampaign = {
   promotionRefName: string | null
   createdAt?: string
   updatedAt?: string
+}
+
+export type ApiCampaignGitVerificationSummary = {
+  repositoryAccessMode: ApiProject["repositoryAccessMode"]
+  baseGitStatus: ApiGitStatus
+  baseGitVerifiedAt: string | null
+  baseGitStatusReason: string | null
+  acceptedExperimentGitStatusCounts: Record<ApiGitStatus, number>
+  needsVerificationCount: number
+  hardFailureCount: number
+  lastVerifiedAt: string | null
+  recommendedAction:
+    | "connect_github"
+    | "resolve_ref_mismatch"
+    | "push_refs"
+    | "verify_git"
+    | "retry_later"
+    | "none"
+  message: string
+}
+
+export type ApiCampaignGitVerificationResult = {
+  checkedCount: number
+  updatedCount: number
+  remainingCount: number
+  limit: number
+  hasMore: boolean
+  base: {
+    checked: boolean
+    updated: boolean
+    previousStatus: ApiGitStatus | null
+    status: ApiGitStatus
+    verifiedAt: string | null
+    statusReason: string | null
+  }
+  summary: ApiCampaignGitVerificationSummary
 }
 
 export type ApiCampaignExperiment = {
@@ -211,6 +249,7 @@ export type ApiKnowledge = {
 
 export type ApiCampaignTimeline = {
   campaign: ApiCampaign
+  gitVerification?: ApiCampaignGitVerificationSummary
   workers: ApiWorker[]
   hypotheses: ApiHypothesis[]
   summaries: ApiSummary[]
@@ -494,13 +533,7 @@ export type ApiReconcileCampaignResponse = {
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
   experiments: ApiCampaignExperiment[]
-  gitVerification: {
-    checkedCount: number
-    updatedCount: number
-    remainingCount: number
-    limit: number
-    hasMore: boolean
-  }
+  gitVerification: ApiCampaignGitVerificationResult
 }
 
 export type ApiVerifyResearchGitResponse =

@@ -4028,6 +4028,7 @@ export async function commandResearchStatus(args: Args) {
   const overview = localSessionState
     ? {
         campaign: freshOverview.campaign,
+        gitVerification: freshOverview.gitVerification,
         hypotheses: localSessionState.hypotheses,
         workers: localSessionState.workers,
         summaries: localSessionState.summaries,
@@ -4316,6 +4317,7 @@ export async function commandResearchStatus(args: Args) {
           activeWorkers,
           terminalWorkers,
           ignoredPresence,
+          gitVerification: freshOverview.gitVerification ?? null,
           bestExperiment,
           providerBackoff,
           recentFailedLaunches,
@@ -4342,6 +4344,14 @@ export async function commandResearchStatus(args: Args) {
 
   console.log(`campaign: ${campaign.name}`)
   console.log(`setup: local onyx/setup.json`)
+  if (shouldReconcile && freshOverview.gitVerification) {
+    const summary = freshOverview.gitVerification
+    const suffix =
+      summary.recommendedAction === "none"
+        ? ""
+        : ` needsVerification=${summary.needsVerificationCount} hardFailures=${summary.hardFailureCount}`
+    console.log(`git verification: ${summary.message}${suffix}`)
+  }
   if (activeSessionId) {
     console.log(`session: ${activeSessionId} ${sessionStatus ?? ""}`.trim())
   }

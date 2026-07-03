@@ -699,6 +699,33 @@ function installSupervisorApi({
         remainingCount: 0,
         limit: Number(url.searchParams.get("gitVerifyLimit") ?? 50),
         hasMore: false,
+        base: {
+          checked: true,
+          updated: false,
+          previousStatus: "verified",
+          status: "verified",
+          verifiedAt: null,
+          statusReason: null,
+        },
+        summary: {
+          repositoryAccessMode: "github_app",
+          baseGitStatus: "verified",
+          baseGitVerifiedAt: null,
+          baseGitStatusReason: null,
+          acceptedExperimentGitStatusCounts: {
+            local_reported: 0,
+            pending: 0,
+            verified: 0,
+            missing: 0,
+            mismatch: 0,
+            unreachable: 0,
+          },
+          needsVerificationCount: 0,
+          hardFailureCount: 0,
+          lastVerifiedAt: null,
+          recommendedAction: "none",
+          message: "No accepted experiment refs need Git verification yet.",
+        },
       }
     } else if (
       method === "POST" &&

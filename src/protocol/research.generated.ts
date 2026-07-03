@@ -988,9 +988,58 @@ export const researchCampaignExperimentSummarySchema = z.object({
   updatedAt: z.iso.datetime(),
 })
 
+const gitStatusCountSchema = z.number().int().nonnegative()
+
+export const researchCampaignGitVerificationSummarySchema = z.object({
+  repositoryAccessMode: researchRepositoryAccessModeSchema,
+  baseGitStatus: researchExperimentGitStatusSchema,
+  baseGitVerifiedAt: z.iso.datetime().nullable(),
+  baseGitStatusReason: z.string().nullable(),
+  acceptedExperimentGitStatusCounts: z.object({
+    local_reported: gitStatusCountSchema,
+    pending: gitStatusCountSchema,
+    verified: gitStatusCountSchema,
+    missing: gitStatusCountSchema,
+    mismatch: gitStatusCountSchema,
+    unreachable: gitStatusCountSchema,
+  }),
+  needsVerificationCount: z.number().int().nonnegative(),
+  hardFailureCount: z.number().int().nonnegative(),
+  lastVerifiedAt: z.iso.datetime().nullable(),
+  recommendedAction: z.enum([
+    "connect_github",
+    "resolve_ref_mismatch",
+    "push_refs",
+    "verify_git",
+    "retry_later",
+    "none",
+  ]),
+  message: z.string().min(1),
+})
+
+const researchCampaignBaseGitVerificationResultSchema = z.object({
+  checked: z.boolean(),
+  updated: z.boolean(),
+  previousStatus: researchExperimentGitStatusSchema.nullable(),
+  status: researchExperimentGitStatusSchema,
+  verifiedAt: z.iso.datetime().nullable(),
+  statusReason: z.string().nullable(),
+})
+
+const researchCampaignGitVerificationCountsSchema = z.object({
+  checkedCount: z.number().int().nonnegative(),
+  updatedCount: z.number().int().nonnegative(),
+  remainingCount: z.number().int().nonnegative(),
+  limit: z.number().int().positive(),
+  hasMore: z.boolean(),
+  base: researchCampaignBaseGitVerificationResultSchema,
+  summary: researchCampaignGitVerificationSummarySchema,
+})
+
 export const researchCampaignOverviewResponseSchema = z.object({
   data: z.object({
     campaign: researchCampaignSchema,
+    gitVerification: researchCampaignGitVerificationSummarySchema,
     bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
     latestExperiments: z.array(researchCampaignExperimentSummarySchema),
     sessions: z.array(researchSessionSchema),
@@ -1035,6 +1084,7 @@ export const researchCampaignTimelineBestStepSchema = z.object({
 export const researchCampaignTimelineResponseSchema = z.object({
   data: z.object({
     campaign: researchCampaignSchema,
+    gitVerification: researchCampaignGitVerificationSummarySchema,
     experiments: z.array(researchCampaignExperimentSummarySchema),
     points: z.array(researchCampaignTimelinePointSchema),
     bestSteps: z.array(researchCampaignTimelineBestStepSchema),
@@ -1665,24 +1715,12 @@ export const reconcileResearchCampaignResponseSchema = z.object({
     hypotheses: z.array(researchHypothesisSchema),
     workers: z.array(researchWorkerSchema),
     experiments: z.array(researchCampaignExperimentSchema),
-    gitVerification: z.object({
-      checkedCount: z.number().int().nonnegative(),
-      updatedCount: z.number().int().nonnegative(),
-      remainingCount: z.number().int().nonnegative(),
-      limit: z.number().int().positive(),
-      hasMore: z.boolean(),
-    }),
+    gitVerification: researchCampaignGitVerificationCountsSchema,
   }),
 })
 
 export const verifyResearchCampaignGitResponseSchema = z.object({
-  data: z.object({
-    checkedCount: z.number().int().nonnegative(),
-    updatedCount: z.number().int().nonnegative(),
-    remainingCount: z.number().int().nonnegative(),
-    limit: z.number().int().positive(),
-    hasMore: z.boolean(),
-  }),
+  data: researchCampaignGitVerificationCountsSchema,
 })
 
 export const deleteResearchCampaignResponseSchema = z.object({
@@ -1789,6 +1827,9 @@ export type ResearchSetupCompliance = z.infer<
 >
 export type ResearchCampaignExperimentSummary = z.infer<
   typeof researchCampaignExperimentSummarySchema
+>
+export type ResearchCampaignGitVerificationSummary = z.infer<
+  typeof researchCampaignGitVerificationSummarySchema
 >
 export type ResearchExperimentLink = z.infer<
   typeof researchExperimentLinkSchema
