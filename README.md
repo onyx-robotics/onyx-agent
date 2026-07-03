@@ -128,8 +128,10 @@ instead of offline local projections.
 surface to be committed. This keeps worker worktrees pinned to a base commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
 declared workflow tools. GitHub App access is optional for local research:
-without it, Onyx records local-reported commits and metrics, while web
-code/diff viewing stays unavailable until GitHub is connected.
+public repositories can show web code/diffs once commits and refs are pushed to
+GitHub, while private repositories record local-reported commits and metrics
+until the GitHub App is connected for private code/diff viewing and
+verification.
 
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable

@@ -29,7 +29,7 @@ The setup phase is a one-time critical process for a research campaign where you
 3. Encode reset, readiness, safety, reliability, and hardware/service work as declared `setup.tools` entries and linear `workflow` command steps. Keep exactly one leading agent step and exactly one required `metric: true` command step.
 4. Run `onyx setup validate`. Setup validation executes the required metric tool once, requires exactly one primary `METRIC <name>=<number>` line, and records readiness evidence in `onyx/validation.json`. Review the `metric_tool_readiness` check before committing. Failed or stale validation blocks campaign setup and research run; warning checks do not.
 5. Commit the setup surface with `git add <setup-dir> && git commit -m "Add Onyx setup"` where `<setup-dir>` is `onyx` at repo root or `<projectPath>/onyx` in a monorepo; `onyx campaign setup` and `onyx research run` require the committed campaign base to contain the setup files.
-6. Run `onyx campaign setup --name <slug> --description <goal>`. GitHub App access is not required for local research; without it, Onyx records local-reported commits and metrics, while web code/diff viewing stays unavailable until GitHub is connected.
+6. Run `onyx campaign setup --name <slug> --description <goal>`. GitHub App access is not required for local research; public repositories can show web code/diffs once commits and refs are pushed to GitHub, while private repositories record local-reported commits and metrics until the GitHub App is connected for private code/diff viewing and verification.
 7. Move on to the Research phase after the setup surface has been built out and approved by the human user.
 
 ### Setup Surface

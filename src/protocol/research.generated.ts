@@ -379,7 +379,7 @@ const repositoryFullNameSchema = z
 
 const researchRepositoryIdentitySchema = z
   .object({
-    repositoryUrl: z.url().optional(),
+    repositoryUrl: z.string().trim().min(1).max(500).optional(),
     repositoryFullName: repositoryFullNameSchema.optional(),
     githubRepositoryId: z.string().trim().min(1).optional(),
     projectPath: projectPathSchema.default(""),
