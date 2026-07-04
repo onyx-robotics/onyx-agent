@@ -24,6 +24,7 @@ import {
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, repoRoot } from "../lib/git"
+import { acquireFileResourceLease } from "../lib/resource-locks"
 import { apiExperimentToHistory } from "../lib/history"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
@@ -1486,6 +1487,20 @@ export async function commandExpLog(args: Args) {
   let resultRefPushStatus: "pushed" | "failed" = "pushed"
   let resultRefPushedAt: string | undefined
   let resultRefPushError: string | undefined
+  // Cap concurrent result-ref pushes across every worker of this clone via
+  // the shared file-lease mechanism (locks live under the common git dir).
+  // 100 workers finishing evals together otherwise fan out 100 simultaneous
+  // pushes to origin. On lease timeout the push proceeds uncapped: pushing
+  // is more important than the cap.
+  const releasePushSlot = await acquireFileResourceLease({
+    root,
+    resourceName: "onyx-result-ref-push",
+    slots: 4,
+    timeoutMs: 120_000,
+    leaseMs: 180_000,
+    ownerId: `${process.pid}:${runRef}`,
+    metadata: { pid: process.pid, runRef },
+  }).catch(() => null)
   try {
     await git(["push", "origin", `${resultCommitSha}:${resultRef}`], root)
     resultRefPushedAt = new Date().toISOString()
@@ -1495,6 +1510,8 @@ export async function commandExpLog(args: Args) {
     console.warn(
       `Warning: failed to push experiment ref ${resultRef}. Onyx will record the result as local-reported; push later with \`git push origin ${resultCommitSha}:${resultRef}\` to make code and diffs visible after GitHub is connected. ${resultRefPushError}`
     )
+  } finally {
+    await releasePushSlot?.()
   }
   const report = await reportCampaignExperiment(
     campaign.campaignId,

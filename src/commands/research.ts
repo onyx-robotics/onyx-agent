@@ -1844,6 +1844,35 @@ async function ensureWorktree({
   return { dir, branch }
 }
 
+/**
+ * Removes a finished worker's worktree so a 100-worker session does not
+ * leave 100 working trees on disk. The worker branch and any pushed refs
+ * survive removal, so salvage/recovery evidence is unaffected. Set
+ * ONYX_KEEP_WORKTREES=1 to keep worktrees for debugging.
+ */
+async function removeWorkerWorktree({
+  root,
+  sessionId,
+  workerId,
+}: {
+  root: string
+  sessionId: string
+  workerId: string
+}) {
+  if (process.env.ONYX_KEEP_WORKTREES === "1") return
+  const dir = join(await onyxStateDir(root), "worktrees", sessionId, workerId)
+  if (!(await pathExists(dir))) return
+  await withOnyxLock(root, "git-worktree", async () => {
+    try {
+      await git(["worktree", "remove", "--force", dir], root)
+    } catch {
+      // Leave the directory for the next prune rather than failing the
+      // worker lifecycle over cleanup.
+      await git(["worktree", "prune"], root).catch(() => {})
+    }
+  })
+}
+
 function workerBranchName({
   sessionId,
   workerId,
@@ -3464,11 +3493,17 @@ async function runHypothesisOnce({
       })
     }
     if (finalization.rootDriftStatus === "dirty") {
+      // Keep the worktree for inspection when the main checkout drifted.
       throw new Error(
         finalization.error ??
           "Main checkout changed during worker run; see worker manifest."
       )
     }
+    await removeWorkerWorktree({
+      root,
+      sessionId,
+      workerId: worker.id,
+    }).catch(() => {})
 
     if (stoppedByHarness) {
       if (launchManifest) {
@@ -5963,6 +5998,8 @@ export async function commandResearchRun(args: Args) {
   const supervisorLogPath = args.options["supervisor-log-path"] ?? null
   let lastTelemetryAt = 0
   let stopLogged = false
+  // Clear stale worktree bookkeeping left by crashed runs before launching.
+  await git(["worktree", "prune"], root).catch(() => {})
   const sessionStopChecker = createResearchSessionStopChecker({
     root,
     sessionId,
