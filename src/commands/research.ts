@@ -150,6 +150,9 @@ const CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS = 30_000
 const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
 const MAX_LOCAL_SUPERVISOR_WORKERS = 250
 const DEFAULT_REF_PUSH_QUEUE_CONCURRENCY = 4
+// Server-side verification is push-webhook-first; the supervisor sweep is a
+// backstop for lost webhooks, not the primary heal path.
+const GIT_VERIFICATION_BACKSTOP_INTERVAL_MS = 10 * 60_000
 const MAX_REF_PUSH_QUEUE_DEPTH = 500
 const SUPERVISOR_TELEMETRY_STALE_MS = 45_000
 const SUPERVISOR_LOG_DIR = "supervisor-logs"
@@ -5951,7 +5954,10 @@ export async function commandResearchRun(args: Args) {
   let providerTerminalFailure: ProviderLaunchFailure | null = null
   let lastStopCheck: ResearchStopCheck | null = null
   let lastGitVerificationAt = 0
-  const gitVerificationIntervalMs = workerTarget >= 10 ? 60_000 : 30_000
+  // Verification is push-webhook-first server-side; this loop is only the
+  // slow backstop for lost webhooks, plus the final verify at completion.
+  const gitVerificationIntervalMs = GIT_VERIFICATION_BACKSTOP_INTERVAL_MS
+  let gitVerificationPausedUntil = 0
   let gitVerificationInFlight: Promise<unknown> | null = null
   const supervisorPid = process.pid
   const supervisorLogPath = args.options["supervisor-log-path"] ?? null
@@ -6057,12 +6063,25 @@ export async function commandResearchRun(args: Args) {
       }
       if (
         !gitVerificationInFlight &&
+        loopNow >= gitVerificationPausedUntil &&
         loopNow - lastGitVerificationAt >= gitVerificationIntervalMs
       ) {
         lastGitVerificationAt = loopNow
         gitVerificationInFlight = verifyResearchCampaignGit(campaign.id, args, {
           gitVerifyLimit: 50,
         })
+          .then((verification) => {
+            // The server surfaces GitHub budget state; honor it instead of
+            // sweeping into an exhausted budget.
+            const retryAfterSeconds = verification?.rateLimit?.limited
+              ? verification.rateLimit.retryAfterSeconds
+              : null
+            if (retryAfterSeconds && retryAfterSeconds > 0) {
+              gitVerificationPausedUntil =
+                Date.now() + retryAfterSeconds * 1000
+            }
+            return null
+          })
           .catch(() => null)
           .finally(() => {
             gitVerificationInFlight = null

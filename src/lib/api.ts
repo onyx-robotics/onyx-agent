@@ -78,6 +78,13 @@ export type ApiCampaignGitVerificationResult = {
   remainingCount: number
   limit: number
   hasMore: boolean
+  rateLimit: {
+    limited: boolean
+    retryAfterSeconds: number | null
+    remaining: number | null
+    limit: number | null
+    resetAt: string | null
+  } | null
   base: {
     checked: boolean
     updated: boolean
