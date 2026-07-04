@@ -1026,12 +1026,21 @@ const researchCampaignBaseGitVerificationResultSchema = z.object({
   statusReason: z.string().nullable(),
 })
 
+export const researchGitVerificationRateLimitSchema = z.object({
+  limited: z.boolean(),
+  retryAfterSeconds: z.number().int().nonnegative().nullable(),
+  remaining: z.number().int().nonnegative().nullable(),
+  limit: z.number().int().nonnegative().nullable(),
+  resetAt: z.iso.datetime().nullable(),
+})
+
 const researchCampaignGitVerificationCountsSchema = z.object({
   checkedCount: z.number().int().nonnegative(),
   updatedCount: z.number().int().nonnegative(),
   remainingCount: z.number().int().nonnegative(),
   limit: z.number().int().positive(),
   hasMore: z.boolean(),
+  rateLimit: researchGitVerificationRateLimitSchema.nullable(),
   base: researchCampaignBaseGitVerificationResultSchema,
   summary: researchCampaignGitVerificationSummarySchema,
 })
