@@ -68,6 +68,30 @@ describe("activity lines", () => {
     ])
   })
 
+  test("reads opencode part-nested text and drops whitespace-only parts", () => {
+    // Real `opencode run --format json` shape: content nested in the part.
+    expect(
+      lines([
+        {
+          type: "text",
+          timestamp: 1783204837022,
+          part: {
+            id: "prt_1",
+            type: "text",
+            text: "That scored 13.96 — something went wrong. Let me debug.",
+          },
+        },
+        // Paragraph-separator parts must vanish instead of rendering as a
+        // bare "text" event name.
+        { type: "text", timestamp: 1783204837023, part: { type: "text", text: "\n\n" } },
+        { type: "reasoning", part: { type: "reasoning", text: "IO-bound." } },
+      ])
+    ).toEqual([
+      "[stdout] thought: That scored 13.96 — something went wrong. Let me debug.",
+      "[stdout] thought: IO-bound.",
+    ])
+  })
+
   test("passes plain non-JSON output through untouched", () => {
     expect(activityLinesForOutput("stderr", "warning: slow eval\n")).toEqual([
       "[stderr] warning: slow eval",

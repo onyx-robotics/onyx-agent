@@ -56,15 +56,20 @@ function textFromClaudeMessage(record: Record<string, unknown>) {
 
 // codex exec --json emits JSONL items; agent messages and reasoning carry
 // the model's actual words. Without this the whole stream reduces to bare
-// event names like "item.completed".
-function activityLinesFromCodexEvent(record: Record<string, unknown>) {
+// event names like "item.completed". Returns null when the event is not a
+// codex shape (fall through to other parsers) and [] to swallow recognized
+// events with no readable content.
+function activityLinesFromCodexEvent(
+  record: Record<string, unknown>
+): string[] | null {
   const item = recordObject(record.item)
-  if (item) {
+  if (item && record.type === "item.completed") {
     if (
       (item.type === "agent_message" || item.type === "reasoning") &&
       typeof item.text === "string"
     ) {
-      return [`thought: ${compact(item.text)}`]
+      const text = compact(item.text)
+      return text ? [`thought: ${text}`] : []
     }
     if (item.type === "command_execution" && typeof item.command === "string") {
       return [`tool: ${compact(item.command)}`]
@@ -76,13 +81,15 @@ function activityLinesFromCodexEvent(record: Record<string, unknown>) {
   const msg = recordObject(record.msg)
   if (msg) {
     if (msg.type === "agent_message" && typeof msg.message === "string") {
-      return [`thought: ${compact(msg.message)}`]
+      const text = compact(msg.message)
+      return text ? [`thought: ${text}`] : []
     }
     if (msg.type === "agent_reasoning" && typeof msg.text === "string") {
-      return [`thought: ${compact(msg.text)}`]
+      const text = compact(msg.text)
+      return text ? [`thought: ${text}`] : []
     }
   }
-  return []
+  return null
 }
 
 function recordObject(value: unknown): Record<string, unknown> | null {
@@ -119,18 +126,35 @@ function openCodeToolLine(record: Record<string, unknown>) {
   return `tool: ${name}`
 }
 
-function activityLinesFromOpenCodeEvent(record: Record<string, unknown>) {
+// Returns null when the event is not an opencode shape (fall through) and
+// [] to swallow recognized events with no readable content.
+function activityLinesFromOpenCodeEvent(
+  record: Record<string, unknown>
+): string[] | null {
   const type = record.type
-  if (type === "text" && typeof record.text === "string") {
-    return [`thought: ${compact(record.text)}`]
+  if (
+    (type === "text" || type === "reasoning") &&
+    typeof record.text === "string"
+  ) {
+    const text = compact(record.text)
+    return text ? [`thought: ${text}`] : []
   }
-  if (type === "reasoning" && typeof record.text === "string") {
-    return [`thought: ${compact(record.text)}`]
+  // opencode run --format json nests the content in the part:
+  // {"type":"text","part":{"type":"text","text":"..."}}. Whitespace-only
+  // parts (paragraph separators) are dropped.
+  const part = recordObject(record.part)
+  if (
+    part &&
+    (part.type === "text" || part.type === "reasoning") &&
+    typeof part.text === "string"
+  ) {
+    const text = compact(part.text)
+    return text ? [`thought: ${text}`] : []
   }
   if (type === "tool_use" || type === "tool") {
     return [openCodeToolLine(record)]
   }
-  if (recordObject(record.part)?.type === "tool") {
+  if (part?.type === "tool") {
     return [openCodeToolLine(record)]
   }
   if (type === "step_start") return ["step: start"]
@@ -140,7 +164,7 @@ function activityLinesFromOpenCodeEvent(record: Record<string, unknown>) {
   }
   const errorMessage = nestedErrorMessage(record.error)
   if (errorMessage) return [`error: ${compact(errorMessage)}`]
-  return []
+  return null
 }
 
 export function activityLinesForOutput(
@@ -172,12 +196,12 @@ export function activityLinesForOutput(
         continue
       }
       const codexLines = activityLinesFromCodexEvent(parsed)
-      if (codexLines.length > 0) {
+      if (codexLines !== null) {
         lines.push(...codexLines)
         continue
       }
       const openCodeLines = activityLinesFromOpenCodeEvent(parsed)
-      if (openCodeLines.length > 0) {
+      if (openCodeLines !== null) {
         lines.push(...openCodeLines)
         continue
       }
