@@ -1,14 +1,18 @@
 import { watch, type FSWatcher } from "node:fs"
 import { basename } from "node:path"
 
+import type { LocalResearchHistoryRecord } from "../protocol"
+
+import { listCampaignExperiments } from "../lib/api"
+import type { Args } from "../lib/args"
 import { gitResult, repoRoot } from "../lib/git"
+import { apiExperimentToHistory } from "../lib/history"
 import { onyxStateDir, readState } from "../lib/runtime-state"
 import { campaignStateKey } from "../lib/project"
 import {
   getActiveLocalCampaignName,
   getLocalSessionState,
   listLocalAttempts,
-  listLocalExperimentHistory,
 } from "../lib/research-runtime"
 import {
   formatAge,
@@ -29,6 +33,52 @@ const ACTIVE_WINDOW_MS = 2 * 60_000
 // While idle, rebuild the model every Nth interval tick (2s instead of 500ms)
 // to keep git spawns and file reads minimal on constrained hardware.
 const IDLE_REBUILD_EVERY = 4
+// Remote experiment poll cadence: logged experiments live in the Onyx API
+// (local files only hold unlogged attempt manifests), so the table refreshes
+// from remote projections — eagerly while live, gently while idle.
+const REMOTE_POLL_ACTIVE_MS = 5_000
+const REMOTE_POLL_IDLE_MS = 30_000
+// Experiments shown are the table tail; cap the pages fetched per refresh.
+const REMOTE_FETCH_LIMIT = 200
+
+type RemoteExperimentCache = {
+  campaignId: string | null
+  rows: LocalResearchHistoryRecord[]
+  fetchedAt: number
+}
+
+/**
+ * Fetches the campaign's logged experiments from the Onyx API. Returns null
+ * on any failure (offline, expired key, missing campaign) so the caller
+ * keeps rendering the previous rows — listen degrades, it never crashes.
+ */
+async function fetchRemoteExperiments(
+  campaignId: string,
+  campaignName: string,
+  args: Args
+): Promise<LocalResearchHistoryRecord[] | null> {
+  try {
+    const rows: LocalResearchHistoryRecord[] = []
+    let cursor: string | null = null
+    do {
+      const page = await listCampaignExperiments(campaignId, args, {
+        limit: 100,
+        cursor: cursor ?? undefined,
+      })
+      for (const experiment of page.items) {
+        const row = apiExperimentToHistory(
+          { id: campaignId, name: campaignName },
+          experiment
+        )
+        if (row) rows.push(row)
+      }
+      cursor = page.page.nextCursor
+    } while (cursor && rows.length < REMOTE_FETCH_LIMIT)
+    return rows
+  } catch {
+    return null
+  }
+}
 
 /** Latest commit on HEAD as a live-activity candidate. */
 async function headCommitInfo(root: string) {
@@ -42,7 +92,10 @@ async function headCommitInfo(root: string) {
   return { sha, committedAt: committedAt ?? "", subject: subject ?? "" }
 }
 
-async function buildModel(root: string): Promise<ListenModel> {
+async function buildModel(
+  root: string,
+  remoteRows: LocalResearchHistoryRecord[]
+): Promise<ListenModel> {
   const state = await readState(root)
   const campaignName =
     state.activeCampaign ?? (await getActiveLocalCampaignName(root)) ?? null
@@ -65,13 +118,13 @@ async function buildModel(root: string): Promise<ListenModel> {
     )
   )
 
-  const records = await listLocalExperimentHistory(root)
-  // Ascending — the most recent experiment renders at the bottom of the
-  // table. Copy before sorting/pushing so the cached array stays untouched.
+  // Logged experiments come from the Onyx API projection; ascending so the
+  // most recent experiment renders at the bottom of the table. Copy before
+  // sorting/pushing so the cached array stays untouched.
   const rows = (
     campaignName
-      ? records.filter((record) => record.campaignName === campaignName)
-      : [...records]
+      ? remoteRows.filter((record) => record.campaignName === campaignName)
+      : [...remoteRows]
   ).sort((a, b) =>
     a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0
   )
@@ -86,15 +139,13 @@ async function buildModel(root: string): Promise<ListenModel> {
     }
     rows.push({
       schemaVersion: 1,
-      type: "campaign_experiment_logged",
+      source: "local",
       campaignName: lastRun.campaignName,
       runRef: lastRun.runRef,
-      projectPath: lastRun.projectPath,
       baseCommitSha: lastRun.baseCommitSha,
       resultCommitSha: lastRun.resultCommitSha,
       resultRef: lastRun.resultRef,
       status: lastRun.status,
-      setupCompliance: lastRun.setupCompliance,
       name: `(unlogged) ${lastRun.resultCommitSha.slice(0, 7)}`,
       description: null,
       primaryMetricName: lastRun.primaryMetricName,
@@ -110,9 +161,9 @@ async function buildModel(root: string): Promise<ListenModel> {
         : null,
       durationMs: lastRun.durationMs ?? null,
       outputSummary: lastRun.outputSummary ?? null,
-      sessionId: lastRun.sessionId,
-      workerId: lastRun.workerId,
-      hypothesisId: lastRun.hypothesisId,
+      sessionId: lastRun.sessionId ?? undefined,
+      workerId: lastRun.workerId ?? undefined,
+      hypothesisId: lastRun.hypothesisId ?? undefined,
       startedAt: lastRun.startedAt ?? null,
       completedAt: lastRun.completedAt ?? null,
       createdAt: lastRun.createdAt,
@@ -173,15 +224,25 @@ async function buildModel(root: string): Promise<ListenModel> {
           ? hypothesesById.get(worker.hypothesisId)?.name
           : null) ??
         null
+      // A worker killed by the harness never writes a terminal latest-state
+      // snapshot — it freezes at "running". The manifest records the real
+      // exit, so a terminal manifest wins over stale snapshot status/phase.
+      const manifestTerminal = Boolean(
+        manifest &&
+          (manifest.completedAt !== null ||
+            ["completed", "failed", "stopped"].includes(manifest.status))
+      )
       return {
         workerId,
         workerName: worker?.workerName ?? manifest?.workerName ?? null,
         hypothesisName,
-        status:
-          latest?.status ?? worker?.status ?? manifest?.status ?? "running",
-        phase: latest?.phase ?? worker?.phase ?? null,
-        progressMessage:
-          latest?.progressMessage ?? worker?.progressMessage ?? null,
+        status: manifestTerminal
+          ? manifest!.status
+          : (latest?.status ?? worker?.status ?? manifest?.status ?? "running"),
+        phase: manifestTerminal ? null : (latest?.phase ?? worker?.phase ?? null),
+        progressMessage: manifestTerminal
+          ? null
+          : (latest?.progressMessage ?? worker?.progressMessage ?? null),
         latestAt: latest?.at ?? null,
         lastSeenAt: worker?.lastSeenAt ?? null,
         lastOutputAt: manifest?.lastOutputAt ?? null,
@@ -251,9 +312,62 @@ function frameText(lines: string[], live: boolean) {
  * Live, read-only view of the current repo's research session. With no TTY it
  * prints a single snapshot and exits.
  */
-export async function commandListen() {
-  const root = await repoRoot()
+export async function commandListen(
+  args: Args = { positional: [], options: {} }
+) {
+  const root = await repoRoot(args.options.cwd)
   await onyxStateDir(root) // ensure .git/onyx exists so fs.watch can attach
+
+  const remote: RemoteExperimentCache = {
+    campaignId: null,
+    rows: [],
+    fetchedAt: 0,
+  }
+  let remoteFetching = false
+
+  // Refreshes the remote experiment cache when it is stale for the current
+  // cadence; resolves once the fetch settles so callers can redraw.
+  const refreshRemote = async (activeCadence: boolean) => {
+    if (remoteFetching) return false
+    const pollMs = activeCadence ? REMOTE_POLL_ACTIVE_MS : REMOTE_POLL_IDLE_MS
+    const state = await readState(root)
+    const campaignName =
+      state.activeCampaign ?? (await getActiveLocalCampaignName(root)) ?? null
+    const meta = campaignName
+      ? state.campaigns?.[
+          campaignStateKey(state.projectPath ?? "", campaignName)
+        ]
+      : undefined
+    const campaignId = meta?.campaignId ?? null
+
+    if (!campaignId || !campaignName) {
+      const hadRows = remote.rows.length > 0
+      remote.campaignId = null
+      remote.rows = []
+      return hadRows
+    }
+
+    if (
+      campaignId === remote.campaignId &&
+      Date.now() - remote.fetchedAt < pollMs
+    ) {
+      return false
+    }
+
+    remoteFetching = true
+    try {
+      const rows = await fetchRemoteExperiments(campaignId, campaignName, args)
+      remote.fetchedAt = Date.now()
+      if (rows) {
+        remote.campaignId = campaignId
+        remote.rows = rows
+        return true
+      }
+      return false
+    } finally {
+      remoteFetching = false
+    }
+  }
 
   const size = () => ({
     columns: process.stdout.columns ?? 100,
@@ -262,7 +376,8 @@ export async function commandListen() {
   })
 
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    const model = await buildModel(root)
+    await refreshRemote(true)
+    const model = await buildModel(root, remote.rows)
     process.stdout.write(
       frameText(renderFrame(model, { ...size(), color: false }), false)
     )
@@ -293,12 +408,19 @@ export async function commandListen() {
     if (closed || rebuilding) return
     rebuilding = true
     try {
-      const model = await buildModel(root)
+      const model = await buildModel(root, remote.rows)
       cachedModel = model
     } finally {
       rebuilding = false
     }
     draw()
+    // Refresh remote experiments on their own cadence; a completed fetch
+    // redraws with the new rows.
+    void refreshRemote(cachedModel?.active ?? true)
+      .then((changed) => {
+        if (changed) requestRender()
+      })
+      .catch(() => {})
   }
 
   const requestRender = () => {

@@ -111,7 +111,6 @@ import {
   completeLocalCampaign,
   getLocalSessionState,
   listLocalAttempts,
-  listLocalExperimentHistory,
   listWorkflowRuns,
   recordLocalWorkerHeartbeat,
   registerLocalWorker,
@@ -1920,12 +1919,9 @@ async function localExperimentCommitSetFor({
   campaignName: string
   hypothesisId: string
 }) {
-  const [experiments, attempts] = await Promise.all([
-    listLocalExperimentHistory(root).catch(() => []),
-    listLocalAttempts(root).catch(() => []),
-  ])
+  const attempts = await listLocalAttempts(root).catch(() => [])
   const commits = new Set<string>()
-  for (const record of [...experiments, ...attempts]) {
+  for (const record of attempts) {
     if (
       record.campaignName === campaignName &&
       record.hypothesisId === hypothesisId &&
@@ -1944,13 +1940,8 @@ async function hasWorkerLoggedAttempt({
   root: string
   workerId: string
 }) {
-  const [experiments, attempts] = await Promise.all([
-    listLocalExperimentHistory(root).catch(() => []),
-    listLocalAttempts(root).catch(() => []),
-  ])
-  return [...experiments, ...attempts].some(
-    (record) => record.workerId === workerId
-  )
+  const attempts = await listLocalAttempts(root).catch(() => [])
+  return attempts.some((record) => record.workerId === workerId)
 }
 
 async function findRemoteWorkerExperimentForCommit({

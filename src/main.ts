@@ -196,7 +196,7 @@ export async function main(argv = process.argv.slice(2)) {
     if (command === "exp" && sub === "list") return commandExpList(args)
     if (command === "workflow" && sub === "status")
       return commandWorkflowStatus(args)
-    if (command === "listen") return commandListen()
+    if (command === "listen") return commandListen(args)
     if (command === "status") return commandStatus(args)
     if (command === "push")
       throw new Error(removedResearchSyncCommandMessage("push"))

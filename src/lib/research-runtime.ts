@@ -1045,15 +1045,6 @@ export async function logLocalExperiment(input: {
   return result.experiment
 }
 
-export async function listLocalExperimentHistory(
-  _root: string,
-  _options: { campaignName?: string; limit?: number } = {}
-): Promise<LocalResearchCampaignExperimentLoggedRecord[]> {
-  void _root
-  void _options
-  return []
-}
-
 export async function markExperimentRefsVerified(_input: {
   root: string
   refs: Array<{ runRef: string; commitSha: string; ref: string }>
