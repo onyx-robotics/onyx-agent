@@ -672,6 +672,17 @@ function emitApiTiming(
   console.error(`[onyx-api] ${metadata.join(" ")}`)
 }
 
+// Transient failures worth one bounded retry: connection resets and
+// gateway/overload statuses. Every Onyx write is idempotent by design
+// (runRef/workerRef keys, presence sequence guards), so retrying POSTs is
+// safe. Timeouts (AbortError) are not retried — the overall budget is spent.
+const RETRYABLE_API_STATUSES = new Set([429, 502, 503, 504])
+const API_RETRY_ATTEMPTS = 3
+
+function apiRetryDelayMs(attempt: number) {
+  return 250 * attempt + Math.floor(Math.random() * 100)
+}
+
 export async function callApi(
   method: string,
   path: string,
@@ -684,8 +695,8 @@ export async function callApi(
       ? AbortSignal.timeout(timeoutMs)
       : undefined
   const startedAt = Date.now()
-  try {
-    const response = await fetch(`${await apiBaseUrl(args)}${path}`, {
+  const requestOnce = async () =>
+    fetch(`${await apiBaseUrl(args)}${path}`, {
       method,
       headers: {
         "content-type": "application/json",
@@ -694,6 +705,37 @@ export async function callApi(
       body: body ? JSON.stringify(body) : undefined,
       signal,
     })
+  try {
+    let response: Response | null = null
+    for (let attempt = 1; attempt <= API_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        response = await requestOnce()
+      } catch (error) {
+        // Timeouts have spent the whole budget; connection-level failures
+        // get the remaining attempts.
+        const aborted =
+          signal?.aborted ||
+          (error instanceof Error && error.name === "AbortError")
+        if (aborted || attempt === API_RETRY_ATTEMPTS) throw error
+        await new Promise((resolve) =>
+          setTimeout(resolve, apiRetryDelayMs(attempt))
+        )
+        continue
+      }
+      if (
+        attempt === API_RETRY_ATTEMPTS ||
+        !RETRYABLE_API_STATUSES.has(response.status)
+      ) {
+        break
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, apiRetryDelayMs(attempt))
+      )
+      if (signal?.aborted) break
+    }
+    if (!response) {
+      throw new Error(`No response received for ${method} ${path}`)
+    }
 
     const text = await response.text()
     let payload: unknown = null

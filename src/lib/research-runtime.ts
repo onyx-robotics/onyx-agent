@@ -454,16 +454,26 @@ export async function researchRuntimeStatePath(root: string) {
   return join(await runtimeDir(root), "runtime-state.json")
 }
 
+// Site ids are immutable once written; memoize per root so supervisor-rate
+// callers do not re-read the file on every API call.
+const siteIdCache = new Map<string, string>()
+
 export async function getResearchSiteId(root: string) {
+  const cached = siteIdCache.get(root)
+  if (cached) return cached
   const path = await siteIdPath(root)
   try {
     const existing = (await readFile(path, "utf8")).trim()
-    if (existing) return existing
+    if (existing) {
+      siteIdCache.set(root, existing)
+      return existing
+    }
   } catch {
     // The site id is created lazily on first use.
   }
   const id = randomUUID()
   await writeFile(path, `${id}\n`, "utf8")
+  siteIdCache.set(root, id)
   return id
 }
 

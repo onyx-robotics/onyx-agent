@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -194,17 +194,39 @@ async function readExistingDeveloperConfig() {
   }
 }
 
+// The supervisor calls the API continuously and every call resolves the
+// active profile; cache the parsed config keyed by file mtime so steady-state
+// reads cost one stat instead of a read+parse. External edits (profile
+// switches from another shell) still land via the mtime check.
+let configCache: { mtimeMs: number; config: Config } | null = null
+
+/** Test hook: module-level cache shared across calls. */
+export function clearConfigCache() {
+  configCache = null
+}
+
 export async function readConfig(): Promise<Config> {
+  let mtimeMs: number | null = null
+  try {
+    mtimeMs = (await stat(configPath())).mtimeMs
+  } catch {
+    return emptyConfig()
+  }
+  if (configCache && configCache.mtimeMs === mtimeMs) {
+    return configCache.config
+  }
   try {
     const parsed = JSON.parse(
       await readFile(configPath(), "utf8")
     ) as Partial<Config>
 
-    return {
+    const config = {
       profiles: normalizeProfiles(parsed.profiles),
       currentProfile: parsed.currentProfile ?? "",
       developer: normalizeDeveloperConfig(parsed.developer),
     }
+    configCache = { mtimeMs, config }
+    return config
   } catch {
     return emptyConfig()
   }
@@ -231,6 +253,7 @@ export async function writeConfig(config: ConfigInput) {
       mode: 0o600,
     }
   )
+  configCache = null
 }
 
 export function normalizeProfileName(value: string) {
