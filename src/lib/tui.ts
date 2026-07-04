@@ -321,6 +321,8 @@ function sessionIsTerminal(status: string | null | undefined) {
 }
 
 const MAX_SLOT_ROWS = 8
+// Experiment rows shown in the listen box; the tail is what matters live.
+const MAX_TABLE_ROWS = 12
 
 export type ListenSlotRow = {
   slotIndex: number | null
@@ -591,9 +593,24 @@ export function renderFrame(
     nowMs: size.nowMs,
     selectedSlot: size.selectedSlot ?? null,
   })
-  // Newest at the bottom: keep the tail when the table outgrows the screen.
-  const tableRows = Math.max(1, size.rows - 8 - workerLines.length)
-  const table = renderExperimentTable(model.rows.slice(-tableRows), {
+  // Height budget: every frame line outside the experiment rows — the fixed
+  // chrome (blank, top border, blank box line, bottom border, activity,
+  // blank, footer), the table header, the worker panel, its separator, and a
+  // reserved line for the earlier-experiments indicator. The frame must
+  // never exceed the terminal height or each redraw scrolls the top border
+  // off screen.
+  const separatorLines = workerLines.length > 0 ? 1 : 0
+  const chrome = 7 + 1 + workerLines.length + separatorLines + 1
+  // Newest at the bottom: keep the tail when the table outgrows the budget,
+  // and never more than MAX_TABLE_ROWS so the box stays compact on tall
+  // terminals. `onyx exp list` is the full history view.
+  const tableRows = Math.min(
+    MAX_TABLE_ROWS,
+    Math.max(1, size.rows - chrome)
+  )
+  const shown = model.rows.slice(-tableRows)
+  const hiddenCount = model.rows.length - shown.length
+  const table = renderExperimentTable(shown, {
     columns: inner,
     color,
     nowMs: size.nowMs,
@@ -601,7 +618,18 @@ export function renderFrame(
   const tableBody =
     model.rows.length === 0
       ? [table[0]!, dim("no experiments yet", color)]
-      : table
+      : hiddenCount > 0
+        ? [
+            table[0]!,
+            dim(
+              `… ${hiddenCount} earlier experiment${
+                hiddenCount === 1 ? "" : "s"
+              } (onyx exp list)`,
+              color
+            ),
+            ...table.slice(1),
+          ]
+        : table
   const body =
     workerLines.length > 0
       ? [...workerLines, dim("─".repeat(Math.min(inner, 24)), color), ...tableBody]

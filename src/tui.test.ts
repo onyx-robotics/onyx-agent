@@ -102,6 +102,47 @@ describe("slot rows", () => {
   })
 })
 
+describe("frame height", () => {
+  test("never exceeds the terminal height and caps the table", () => {
+    const experiments = Array.from({ length: 50 }, (_, i) => ({
+      campaignName: "smoke",
+      name: `exp-${i + 1}`,
+      status: "succeeded" as const,
+      resultCommitSha: "b".repeat(40),
+      primaryMetricName: "score",
+      primaryMetricValue: i / 100,
+      createdAt: new Date(1751630000000 + i * 60_000).toISOString(),
+    }))
+    for (const rows of [20, 24, 30, 50]) {
+      const lines = renderFrame(
+        model({
+          workerTarget: 4,
+          workers: [
+            workerRow({ workerId: "a", workerName: "w-a", slotIndex: 1 }),
+            workerRow({ workerId: "b", workerName: "w-b", slotIndex: 2 }),
+          ],
+          rows: experiments,
+        }),
+        { ...size, rows, color: false }
+      ).map(stripAnsi)
+
+      // The whole frame fits — the top border must stay on screen.
+      expect(lines.length).toBeLessThanOrEqual(rows)
+      expect(lines[1]).toContain("╭─ ONYX")
+      // Hidden tail is surfaced, newest experiment always visible.
+      expect(lines.join("\n")).toContain("earlier experiment")
+      expect(lines.join("\n")).toContain("exp-50")
+    }
+
+    // Tall terminals still cap the table at MAX_TABLE_ROWS.
+    const tall = renderFrame(
+      model({ rows: experiments }),
+      { ...size, rows: 60, color: false }
+    ).map(stripAnsi)
+    expect(tall.filter((line) => line.includes("exp-")).length).toBe(12)
+  })
+})
+
 describe("focus frame", () => {
   test("renders worker identity and the activity tail", () => {
     const lines = renderFocusFrame(
