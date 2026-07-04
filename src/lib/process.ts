@@ -41,12 +41,48 @@ function textFromClaudeMessage(record: Record<string, unknown>) {
     if (!item || typeof item !== "object") continue
     const block = item as Record<string, unknown>
     if (block.type === "text" && typeof block.text === "string") {
-      lines.push(compact(block.text))
+      lines.push(`thought: ${compact(block.text)}`)
+    } else if (
+      block.type === "thinking" &&
+      typeof block.thinking === "string"
+    ) {
+      lines.push(`thought: ${compact(block.thinking)}`)
     } else if (block.type === "tool_use" && typeof block.name === "string") {
       lines.push(`tool: ${block.name}`)
     }
   }
   return lines
+}
+
+// codex exec --json emits JSONL items; agent messages and reasoning carry
+// the model's actual words. Without this the whole stream reduces to bare
+// event names like "item.completed".
+function activityLinesFromCodexEvent(record: Record<string, unknown>) {
+  const item = recordObject(record.item)
+  if (item) {
+    if (
+      (item.type === "agent_message" || item.type === "reasoning") &&
+      typeof item.text === "string"
+    ) {
+      return [`thought: ${compact(item.text)}`]
+    }
+    if (item.type === "command_execution" && typeof item.command === "string") {
+      return [`tool: ${compact(item.command)}`]
+    }
+    if (item.type === "file_change") return ["tool: apply_patch"]
+    return []
+  }
+  // Older codex stream shape: {"msg":{"type":"agent_message","message":..}}.
+  const msg = recordObject(record.msg)
+  if (msg) {
+    if (msg.type === "agent_message" && typeof msg.message === "string") {
+      return [`thought: ${compact(msg.message)}`]
+    }
+    if (msg.type === "agent_reasoning" && typeof msg.text === "string") {
+      return [`thought: ${compact(msg.text)}`]
+    }
+  }
+  return []
 }
 
 function recordObject(value: unknown): Record<string, unknown> | null {
@@ -86,7 +122,10 @@ function openCodeToolLine(record: Record<string, unknown>) {
 function activityLinesFromOpenCodeEvent(record: Record<string, unknown>) {
   const type = record.type
   if (type === "text" && typeof record.text === "string") {
-    return [compact(record.text)]
+    return [`thought: ${compact(record.text)}`]
+  }
+  if (type === "reasoning" && typeof record.text === "string") {
+    return [`thought: ${compact(record.text)}`]
   }
   if (type === "tool_use" || type === "tool") {
     return [openCodeToolLine(record)]
@@ -104,7 +143,7 @@ function activityLinesFromOpenCodeEvent(record: Record<string, unknown>) {
   return []
 }
 
-function activityLinesForOutput(
+export function activityLinesForOutput(
   stream: "stdout" | "stderr",
   text: string
 ): string[] {
@@ -122,12 +161,19 @@ function activityLinesForOutput(
         typeof (parsed.delta as Record<string, unknown>).text === "string"
       ) {
         lines.push(
-          compact((parsed.delta as Record<string, unknown>).text as string)
+          `thought: ${compact(
+            (parsed.delta as Record<string, unknown>).text as string
+          )}`
         )
         continue
       }
       if (parsed.type === "assistant") {
         lines.push(...textFromClaudeMessage(parsed))
+        continue
+      }
+      const codexLines = activityLinesFromCodexEvent(parsed)
+      if (codexLines.length > 0) {
+        lines.push(...codexLines)
         continue
       }
       const openCodeLines = activityLinesFromOpenCodeEvent(parsed)

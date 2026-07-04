@@ -128,17 +128,41 @@ async function readFileTail(
   }
 }
 
-/** Last non-empty line of a worker's activity log — the live trace feed. */
+// Activity-log lines look like `[iso] [stdout] text` (or `[harness iso] text`).
+const ACTIVITY_LINE_PREFIX = /^\[[^\]]*\]\s*(?:\[(?:stdout|stderr)\]\s*)?/
+
+/** Event-stream bookkeeping that is not what the model is thinking. */
+function isTraceNoise(text: string) {
+  return (
+    text.startsWith("step: ") ||
+    text.startsWith("system: ") ||
+    text.startsWith("#") ||
+    /^[a-z_.]+$/.test(text) // bare event names, e.g. "item.completed"
+  )
+}
+
+/**
+ * Latest reasoning line of a worker's activity log. Prefers `thought:` lines
+ * (the model's own words) over tool/step bookkeeping, which only shows when
+ * no thought exists in the tail yet.
+ */
 async function readTraceLine(path: string | null): Promise<string | null> {
   if (!path) return null
   const tail = await readFileTail(path, TRACE_TAIL_BYTES)
   if (!tail) return null
   const lines = tail.split("\n")
+  let fallback: string | null = null
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const line = lines[i]!.trim()
-    if (line) return line
+    if (!line) continue
+    const text = line.replace(ACTIVITY_LINE_PREFIX, "").trim()
+    if (!text) continue
+    if (text.startsWith("thought: ")) {
+      return text.slice("thought: ".length)
+    }
+    if (!fallback && !isTraceNoise(text)) fallback = text
   }
-  return null
+  return fallback
 }
 
 /** Trailing lines of a worker's activity log for the focus pane. */

@@ -282,7 +282,7 @@ describe("worker launchers", () => {
     expect(result.code).toBe(0)
     const activity = await readFile(activityLogPath, "utf8")
     expect(activity).toContain("[stdout] step: start")
-    expect(activity).toContain("[stdout] hello from opencode")
+    expect(activity).toContain("[stdout] thought: hello from opencode")
     expect(activity).toContain("[stdout] tool: bash")
     expect(activity).toContain("[stdout] tool: bash bun test")
     expect(activity).toContain("[stdout] step: finish")

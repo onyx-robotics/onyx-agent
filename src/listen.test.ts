@@ -121,10 +121,16 @@ describe("onyx listen", () => {
       phase: "measuring",
       progressMessage: "Evaluating widget cache",
     })
-    // The live reasoning feed comes from the activity log's last line.
+    // The live reasoning feed prefers the model's own words over trailing
+    // tool/step bookkeeping, and strips the timestamp prefix.
     await writeFile(
       paths.activityLogPath,
-      "[12:00:01] orienting: reading onyx.md\n[12:00:02] eval tool run 3\n",
+      [
+        "[12:00:01] [stdout] thought: Trying a larger cache size",
+        "[12:00:02] [stdout] tool: bash",
+        "[12:00:03] [stdout] step: finish",
+        "",
+      ].join("\n"),
       "utf8"
     )
     // A finished worker whose latest-state snapshot froze at "running" — the
@@ -210,7 +216,8 @@ describe("onyx listen", () => {
     const text = await captureSnapshot(root)
     // Slot rows: name · hypothesis · status phase · age · trace.
     expect(text).toContain("1 worker-cache · Cache tune · running measuring")
-    expect(text).toContain("[12:00:02] eval tool run 3")
+    expect(text).toContain("Trying a larger cache size")
+    expect(text).not.toContain("step: finish")
     expect(text).toContain("backoff rate_limit")
     // The terminal manifest wins over the stale "running" snapshot, and
     // terminal workers show no trace line.
