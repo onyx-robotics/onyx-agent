@@ -193,7 +193,9 @@ export async function commandLogin(args: Args) {
   const loginPromise = waitForCliLogin({
     port,
     state,
-    timeoutMs: Number(args.options.timeout ?? 120_000),
+    // New-account signup (email verification, team naming) can easily take
+    // more than a couple of minutes before the browser reaches the callback.
+    timeoutMs: Number(args.options.timeout ?? 600_000),
   })
 
   if (optionalFlag(args, "print-url")) {

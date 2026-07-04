@@ -170,17 +170,19 @@ export async function waitForCliLogin({
   port,
   state,
   timeoutMs,
+  lingerMs = 2_000,
 }: {
   port: number
   state: string
   timeoutMs: number
+  lingerMs?: number
 }): Promise<CliLoginResult> {
   let server: Server | null = null
   let timeout: ReturnType<typeof setTimeout> | null = null
+  let completed = false
   const login = new Promise<CliLoginResult>((resolveLogin, reject) => {
     server = createServer((request, response) => {
       response.setHeader("connection", "close")
-      response.on("finish", () => request.socket.destroy())
 
       const url = new URL(request.url ?? "/", `http://127.0.0.1:${port}`)
       if (url.pathname !== "/callback") {
@@ -190,7 +192,19 @@ export async function waitForCliLogin({
 
       if (url.searchParams.get("state") !== state) {
         response.writeHead(400).end("Invalid state")
-        reject(new Error("Login callback returned an invalid state."))
+        if (!completed) {
+          reject(new Error("Login callback returned an invalid state."))
+        }
+        return
+      }
+
+      // Browsers can replay the redirect (connection retry, duplicate form
+      // submit, refresh); answer repeats with the same success page instead
+      // of letting them land on a closed port.
+      if (completed) {
+        response
+          .writeHead(200, { "content-type": "text/html; charset=utf-8" })
+          .end(cliLoginCompleteHtml())
         return
       }
 
@@ -211,6 +225,7 @@ export async function waitForCliLogin({
         return
       }
 
+      completed = true
       response
         .writeHead(200, { "content-type": "text/html; charset=utf-8" })
         .end(cliLoginCompleteHtml())
@@ -224,11 +239,21 @@ export async function waitForCliLogin({
         alreadyConfigured,
       })
     })
+    server.on("error", (error) => {
+      const code = (error as NodeJS.ErrnoException).code
+      reject(
+        code === "EADDRINUSE"
+          ? new Error(
+              `Port ${port} is already in use. Another onyx login may still be waiting; close it or pass --port <number>.`
+            )
+          : error
+      )
+    })
     server.listen(port, "127.0.0.1")
   })
 
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       login,
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
@@ -238,6 +263,15 @@ export async function waitForCliLogin({
         timeout.unref()
       }),
     ])
+    if (lingerMs > 0) {
+      // Keep serving the success page briefly so browser-side replays of the
+      // callback hit a live server rather than a refused connection.
+      await new Promise((resolveLinger) => {
+        const linger = setTimeout(resolveLinger, lingerMs)
+        linger.unref()
+      })
+    }
+    return result
   } finally {
     if (timeout) clearTimeout(timeout)
     if (server) await closeServer(server)
