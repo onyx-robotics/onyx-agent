@@ -2158,6 +2158,18 @@ export const researchWorkerUpsertedEventSchema = z.object({
   }),
 })
 
+// Coalesced form for batch paths (supervisor heartbeat batches): one message
+// per campaign per batch instead of one per worker, so a 100-worker session
+// fans out ~2 events/min to each browser instead of ~400.
+export const researchWorkersUpsertedEventSchema = z.object({
+  type: z.literal("research.workers.upserted"),
+  data: z.object({
+    projectId: z.uuid(),
+    campaignId: z.uuid(),
+    workers: z.array(researchWorkerSchema).min(1),
+  }),
+})
+
 export const researchSessionUpsertedEventSchema = z.object({
   type: z.literal("research.session.upserted"),
   data: z.object({
@@ -2191,6 +2203,7 @@ export const researchEventSchema = z.discriminatedUnion("type", [
   researchSummaryUpsertedEventSchema,
   researchKnowledgeUpsertedEventSchema,
   researchWorkerUpsertedEventSchema,
+  researchWorkersUpsertedEventSchema,
   researchSessionUpsertedEventSchema,
   researchSessionLiveChangedEventSchema,
 ])
@@ -2221,6 +2234,9 @@ export type ResearchKnowledgeUpsertedEvent = z.infer<
 >
 export type ResearchWorkerUpsertedEvent = z.infer<
   typeof researchWorkerUpsertedEventSchema
+>
+export type ResearchWorkersUpsertedEvent = z.infer<
+  typeof researchWorkersUpsertedEventSchema
 >
 export type ResearchSessionUpsertedEvent = z.infer<
   typeof researchSessionUpsertedEventSchema
