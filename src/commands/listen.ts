@@ -3,7 +3,7 @@ import { basename } from "node:path"
 
 import type { LocalResearchHistoryRecord } from "../protocol"
 
-import { listCampaignExperiments } from "../lib/api"
+import { getCampaignOverview, listCampaignExperiments } from "../lib/api"
 import type { Args } from "../lib/args"
 import { gitResult, repoRoot } from "../lib/git"
 import { apiExperimentToHistory } from "../lib/history"
@@ -40,25 +40,40 @@ const REMOTE_POLL_ACTIVE_MS = 5_000
 const REMOTE_POLL_IDLE_MS = 30_000
 // Experiments shown are the table tail; cap the pages fetched per refresh.
 const REMOTE_FETCH_LIMIT = 200
+// A hung fetch must not stall the refresh loop for the default 120s API
+// timeout; listen reads are best-effort and retried on the next cadence.
+const REMOTE_FETCH_TIMEOUT_MS = 10_000
 
 type RemoteExperimentCache = {
   campaignId: string | null
   rows: LocalResearchHistoryRecord[]
+  /** Campaign best projection from the overview — the fetched page window
+   * can miss the best experiment on large campaigns. */
+  bestValue: number | null
   fetchedAt: number
+  stale: boolean
 }
 
 /**
- * Fetches the campaign's logged experiments from the Onyx API. Returns null
- * on any failure (offline, expired key, missing campaign) so the caller
- * keeps rendering the previous rows — listen degrades, it never crashes.
+ * Fetches the campaign's logged experiments and best projection from the
+ * Onyx API. Returns null on any failure (offline, expired key, missing
+ * campaign) so the caller keeps rendering the previous rows — listen
+ * degrades, it never crashes.
  */
 async function fetchRemoteExperiments(
   campaignId: string,
   campaignName: string,
   args: Args
-): Promise<LocalResearchHistoryRecord[] | null> {
+): Promise<{
+  rows: LocalResearchHistoryRecord[]
+  bestValue: number | null
+} | null> {
   try {
     const rows: LocalResearchHistoryRecord[] = []
+    const overviewPromise = getCampaignOverview(campaignId, args)
+    // The rejection is consumed by the awaited copy below; without this
+    // marker an experiments-fetch failure leaves it unhandled.
+    overviewPromise.catch(() => {})
     let cursor: string | null = null
     do {
       const page = await listCampaignExperiments(campaignId, args, {
@@ -74,7 +89,11 @@ async function fetchRemoteExperiments(
       }
       cursor = page.page.nextCursor
     } while (cursor && rows.length < REMOTE_FETCH_LIMIT)
-    return rows
+    const overview = await overviewPromise
+    return {
+      rows,
+      bestValue: overview.bestExperiment?.primaryMetricValue ?? null,
+    }
   } catch {
     return null
   }
@@ -94,8 +113,9 @@ async function headCommitInfo(root: string) {
 
 async function buildModel(
   root: string,
-  remoteRows: LocalResearchHistoryRecord[]
+  remote: Pick<RemoteExperimentCache, "rows" | "bestValue" | "stale">
 ): Promise<ListenModel> {
+  const remoteRows = remote.rows
   const state = await readState(root)
   const campaignName =
     state.activeCampaign ?? (await getActiveLocalCampaignName(root)) ?? null
@@ -176,7 +196,7 @@ async function buildModel(
     (row) =>
       row.status === "succeeded" && row.primaryMetricValue !== null
   )
-  const bestValue = measured.length
+  const computedBest = measured.length
     ? measured.reduce(
         (best, row) =>
           metricDirection === "minimize"
@@ -184,6 +204,17 @@ async function buildModel(
             : Math.max(best, row.primaryMetricValue as number),
         metricDirection === "minimize" ? Infinity : -Infinity
       )
+    : null
+  // Combine the campaign's best projection (covers experiments beyond the
+  // fetched page window) with the locally computed best (covers unlogged
+  // attempts the projection cannot know about).
+  const bestCandidates = [computedBest, remote.bestValue].filter(
+    (value): value is number => value !== null
+  )
+  const bestValue = bestCandidates.length
+    ? metricDirection === "minimize"
+      ? Math.min(...bestCandidates)
+      : Math.max(...bestCandidates)
     : null
 
   // Activity: latest commit on HEAD; research activity comes from remote rows.
@@ -288,6 +319,7 @@ async function buildModel(
     metricUnit: meta?.metricUnit ?? null,
     metricDirection,
     bestValue,
+    apiStale: remote.stale,
     activity,
     active:
       active ||
@@ -318,10 +350,20 @@ export async function commandListen(
   const root = await repoRoot(args.options.cwd)
   await onyxStateDir(root) // ensure .git/onyx exists so fs.watch can attach
 
+  // A user-passed --api-timeout still wins; listen just tightens the default.
+  const apiArgs: Args = {
+    ...args,
+    options: {
+      "api-timeout": String(REMOTE_FETCH_TIMEOUT_MS),
+      ...args.options,
+    },
+  }
   const remote: RemoteExperimentCache = {
     campaignId: null,
     rows: [],
+    bestValue: null,
     fetchedAt: 0,
+    stale: false,
   }
   let remoteFetching = false
 
@@ -344,6 +386,8 @@ export async function commandListen(
       const hadRows = remote.rows.length > 0
       remote.campaignId = null
       remote.rows = []
+      remote.bestValue = null
+      remote.stale = false
       return hadRows
     }
 
@@ -356,14 +400,22 @@ export async function commandListen(
 
     remoteFetching = true
     try {
-      const rows = await fetchRemoteExperiments(campaignId, campaignName, args)
+      const fetched = await fetchRemoteExperiments(
+        campaignId,
+        campaignName,
+        apiArgs
+      )
       remote.fetchedAt = Date.now()
-      if (rows) {
+      if (fetched) {
         remote.campaignId = campaignId
-        remote.rows = rows
+        remote.rows = fetched.rows
+        remote.bestValue = fetched.bestValue
+        remote.stale = false
         return true
       }
-      return false
+      const wasStale = remote.stale
+      remote.stale = true
+      return !wasStale
     } finally {
       remoteFetching = false
     }
@@ -377,7 +429,7 @@ export async function commandListen(
 
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
     await refreshRemote(true)
-    const model = await buildModel(root, remote.rows)
+    const model = await buildModel(root, remote)
     process.stdout.write(
       frameText(renderFrame(model, { ...size(), color: false }), false)
     )
@@ -408,7 +460,7 @@ export async function commandListen(
     if (closed || rebuilding) return
     rebuilding = true
     try {
-      const model = await buildModel(root, remote.rows)
+      const model = await buildModel(root, remote)
       cachedModel = model
     } finally {
       rebuilding = false

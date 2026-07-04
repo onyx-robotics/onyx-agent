@@ -140,6 +140,8 @@ export function glyphFor(status: string): StatusGlyph {
   if (status === "failed") return { char: "✗", label: "failed", colorize: red }
   if (status === "checks_failed")
     return { char: "!", label: "checks", colorize: yellow }
+  if (status === "setup_violation")
+    return { char: "!", label: "setup", colorize: yellow }
   return { char: "•", label: "ok", colorize: green }
 }
 
@@ -275,6 +277,8 @@ export type ListenModel = {
   activity: string | null
   /** True while an agent session is live — animates the activity spinner. */
   active: boolean
+  /** True when the last Onyx API fetch failed — the table may be stale. */
+  apiStale?: boolean
   /** Ascending by recency — the most recent experiment renders at the bottom. */
   rows: ExperimentRow[]
   providerBackoff?: {
@@ -440,7 +444,9 @@ export function renderFrame(
   )}`
   const footer = dim(
     truncate(
-      " q quit",
+      model.apiStale
+        ? " q quit · api unreachable — showing cached experiments"
+        : " q quit",
       columns
     ),
     color

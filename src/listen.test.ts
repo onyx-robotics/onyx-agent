@@ -237,6 +237,15 @@ describe("onyx listen", () => {
       workerId: null,
       hypothesisId: null,
     }
+    const violation = {
+      ...experiment,
+      id: "33333333-3333-4333-8333-333333333333",
+      runRef: "run-2",
+      resultCommitSha: "c".repeat(40),
+      name: "edited-protected-path",
+      status: "setup_violation",
+      primaryMetricValue: null,
+    }
     const requests: string[] = []
     const server = Bun.serve({
       port: 0,
@@ -248,7 +257,29 @@ describe("onyx listen", () => {
           `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
         ) {
           return Response.json({
-            data: { items: [experiment], page: { nextCursor: null } },
+            data: {
+              items: [experiment, violation],
+              page: { nextCursor: null },
+            },
+          })
+        }
+        if (
+          url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}/overview`
+        ) {
+          // The campaign best projection covers experiments beyond the
+          // fetched page window.
+          return Response.json({
+            data: {
+              campaign: { id: CAMPAIGN_ID, name: "smoke" },
+              bestExperiment: { ...experiment, primaryMetricValue: 0.97 },
+              latestExperiments: [],
+              sessions: [],
+              workers: [],
+              hypotheses: [],
+              summaries: [],
+              knowledge: [],
+              counts: { experiments: 2, hypothesisCount: 0, activeWorkers: 0 },
+            },
           })
         }
         return Response.json(
@@ -283,7 +314,12 @@ describe("onyx listen", () => {
       )
       expect(text).toContain("tune-cache-sizes")
       expect(text).toContain("0.42")
-      expect(text).toContain("best 0.42")
+      // The overview projection wins when it beats the fetched window.
+      expect(text).toContain("best 0.97")
+      // Setup violations render as warnings, not as successes.
+      expect(text).toContain("edited-protected-path")
+      expect(text).toContain("setup")
+      expect(text).not.toContain("api unreachable")
     } finally {
       server.stop(true)
     }
@@ -307,5 +343,7 @@ describe("onyx listen", () => {
 
     const text = await captureSnapshot(root)
     expect(text).toContain("no experiments yet")
+    // A failed fetch is surfaced instead of silently rendering stale data.
+    expect(text).toContain("api unreachable")
   })
 })
