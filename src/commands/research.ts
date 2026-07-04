@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto"
 import { closeSync, openSync } from "node:fs"
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  rm,
+  rmdir,
+  writeFile,
+} from "node:fs/promises"
 import { spawn } from "node:child_process"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -1860,7 +1867,8 @@ async function removeWorkerWorktree({
   workerId: string
 }) {
   if (process.env.ONYX_KEEP_WORKTREES === "1") return
-  const dir = join(await onyxStateDir(root), "worktrees", sessionId, workerId)
+  const sessionDir = join(await onyxStateDir(root), "worktrees", sessionId)
+  const dir = join(sessionDir, workerId)
   if (!(await pathExists(dir))) return
   await withOnyxLock(root, "git-worktree", async () => {
     try {
@@ -1870,6 +1878,9 @@ async function removeWorkerWorktree({
       // worker lifecycle over cleanup.
       await git(["worktree", "prune"], root).catch(() => {})
     }
+    // Last worker out removes the session directory; rmdir refuses to
+    // delete a non-empty directory, so earlier workers no-op here.
+    await rmdir(sessionDir).catch(() => {})
   })
 }
 
