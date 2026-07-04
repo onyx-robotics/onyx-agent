@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises"
+import { mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -97,6 +97,7 @@ describe("onyx listen", () => {
       hypothesisName: "Cache tune",
       workerId: "worker_123",
       workerName: "worker-cache",
+      slotIndex: 1,
       version: null,
       startedAt: now,
       lastOutputAt: now,
@@ -120,6 +121,12 @@ describe("onyx listen", () => {
       phase: "measuring",
       progressMessage: "Evaluating widget cache",
     })
+    // The live reasoning feed comes from the activity log's last line.
+    await writeFile(
+      paths.activityLogPath,
+      "[12:00:01] orienting: reading onyx.md\n[12:00:02] eval tool run 3\n",
+      "utf8"
+    )
     // A finished worker whose latest-state snapshot froze at "running" — the
     // harness killed the process before it could write a terminal snapshot.
     const donePaths = await workerLaunchPaths({
@@ -150,6 +157,7 @@ describe("onyx listen", () => {
       hypothesisName: "Batch tune",
       workerId: "worker_456",
       workerName: "worker-done",
+      slotIndex: 2,
       version: null,
       startedAt: now,
       lastOutputAt: now,
@@ -200,14 +208,91 @@ describe("onyx listen", () => {
     })
 
     const text = await captureSnapshot(root)
-    expect(text).toContain("worker-cache")
-    expect(text).toContain("phase=measuring")
-    expect(text).toContain("Evaluating widget cache")
+    // Slot rows: name · hypothesis · status phase · age · trace.
+    expect(text).toContain("1 worker-cache · Cache tune · running measuring")
+    expect(text).toContain("[12:00:02] eval tool run 3")
     expect(text).toContain("backoff rate_limit")
-    // The terminal manifest wins over the stale "running" snapshot.
-    expect(text).toContain("worker-done: stopped")
+    // The terminal manifest wins over the stale "running" snapshot, and
+    // terminal workers show no trace line.
+    expect(text).toContain("2 worker-done · Batch tune · stopped")
     expect(text).not.toContain("still going (stale)")
     expect(text).toContain("workers 1/2")
+  })
+
+  test("collapses the worker panel when the session is terminal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-listen-"))
+    await runProcess("git", ["init"], { cwd: root })
+    await repoRoot(root)
+    const sessionId = "session_done"
+    const now = new Date().toISOString()
+    const paths = await workerLaunchPaths({
+      root,
+      sessionId,
+      hypothesisId: "hyp_123",
+      hypothesisName: "Cache tune",
+      workerId: "worker_123",
+    })
+    await writeWorkerLaunchManifest({
+      schemaVersion: 1,
+      agentKind: "codex",
+      workerModel: null,
+      command: "codex",
+      args: [],
+      onyxWorkerPath: null,
+      workerContextPath: null,
+      addedWritableRoots: [],
+      cwd: root,
+      promptPath: join(paths.dir, "prompt.md"),
+      logPath: paths.logPath,
+      activityLogPath: paths.activityLogPath,
+      activityJsonlPath: paths.activityJsonlPath,
+      latestStatePath: paths.latestStatePath,
+      manifestPath: paths.manifestPath,
+      sessionId,
+      hypothesisId: "hyp_123",
+      hypothesisName: "Cache tune",
+      workerId: "worker_123",
+      workerName: "worker-cache",
+      slotIndex: 1,
+      version: null,
+      startedAt: now,
+      lastOutputAt: now,
+      completedAt: now,
+      status: "stopped",
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+      preflight: null,
+      finalization: {
+        finalizationStatus: "already_logged",
+      } as never,
+    })
+    await writeState(root, {
+      projectPath: "",
+      activeCampaign: "smoke",
+      campaigns: {
+        [campaignStateKey("", "smoke")]: {
+          campaignId: CAMPAIGN_ID,
+          sessionId,
+          metricName: "score",
+          metricDirection: "maximize",
+        },
+      },
+      sessions: {
+        [sessionId]: {
+          campaignName: "smoke",
+          campaignId: CAMPAIGN_ID,
+          status: "completed",
+        },
+      },
+    })
+
+    const text = await captureSnapshot(root)
+    // One summary line, no per-slot rows.
+    expect(text).toContain("session completed · 1 workers · 1 already_logged")
+    expect(text).not.toContain("worker-cache ·")
   })
 
   test("renders logged experiments from the Onyx API", async () => {

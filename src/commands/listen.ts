@@ -1,4 +1,5 @@
 import { watch, type FSWatcher } from "node:fs"
+import { open } from "node:fs/promises"
 import { basename } from "node:path"
 
 import type { LocalResearchHistoryRecord } from "../protocol"
@@ -15,7 +16,9 @@ import {
   listLocalAttempts,
 } from "../lib/research-runtime"
 import {
+  buildSlotRows,
   formatAge,
+  renderFocusFrame,
   renderFrame,
   type ListenModel,
   type ListenWorkerRow,
@@ -97,6 +100,55 @@ async function fetchRemoteExperiments(
   } catch {
     return null
   }
+}
+
+// Tail sizes for activity-log reads: one line for slot rows, a screenful for
+// the focus pane.
+const TRACE_TAIL_BYTES = 4 * 1024
+const FOCUS_TAIL_BYTES = 32 * 1024
+
+/** Reads the trailing bytes of a file without loading the whole log. */
+async function readFileTail(
+  path: string,
+  maxBytes: number
+): Promise<string | null> {
+  let handle: Awaited<ReturnType<typeof open>> | null = null
+  try {
+    handle = await open(path, "r")
+    const { size } = await handle.stat()
+    const length = Math.min(size, maxBytes)
+    if (length === 0) return ""
+    const buffer = Buffer.alloc(length)
+    await handle.read(buffer, 0, length, size - length)
+    return buffer.toString("utf8")
+  } catch {
+    return null
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
+/** Last non-empty line of a worker's activity log — the live trace feed. */
+async function readTraceLine(path: string | null): Promise<string | null> {
+  if (!path) return null
+  const tail = await readFileTail(path, TRACE_TAIL_BYTES)
+  if (!tail) return null
+  const lines = tail.split("\n")
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i]!.trim()
+    if (line) return line
+  }
+  return null
+}
+
+/** Trailing lines of a worker's activity log for the focus pane. */
+async function readFocusLines(path: string | null): Promise<string[]> {
+  if (!path) return []
+  const tail = await readFileTail(path, FOCUS_TAIL_BYTES)
+  if (!tail) return []
+  const lines = tail.split("\n").filter((line) => line.trim().length > 0)
+  // Drop the first line when the tail window may have cut it mid-line.
+  return tail.length >= FOCUS_TAIL_BYTES ? lines.slice(1) : lines
 }
 
 /** Latest commit on HEAD as a live-activity candidate. */
@@ -244,8 +296,14 @@ async function buildModel(
     ])
   )
   const workerIds = new Set([...workersById.keys(), ...manifestByWorker.keys()])
-  const workers: ListenWorkerRow[] = [...workerIds]
-    .map((workerId) => {
+  const sessionStatus =
+    localSession?.session.status ??
+    (activeSessionId ? (state.sessions?.[activeSessionId]?.status ?? null) : null)
+  const sessionTerminal =
+    sessionStatus !== null &&
+    ["completed", "failed", "stopped"].includes(sessionStatus)
+  const workers: ListenWorkerRow[] = await Promise.all(
+    [...workerIds].map(async (workerId) => {
       const worker = workersById.get(workerId)
       const manifest = manifestByWorker.get(workerId)
       const latest = manifest ? latestByWorker.get(workerId) : null
@@ -263,6 +321,12 @@ async function buildModel(
           (manifest.completedAt !== null ||
             ["completed", "failed", "stopped"].includes(manifest.status))
       )
+      const activityLogPath = manifest?.activityLogPath ?? null
+      const logPath = manifest?.logPath ?? null
+      const trace =
+        manifestTerminal || sessionTerminal
+          ? null
+          : await readTraceLine(activityLogPath ?? logPath)
       return {
         workerId,
         workerName: worker?.workerName ?? manifest?.workerName ?? null,
@@ -274,47 +338,25 @@ async function buildModel(
         progressMessage: manifestTerminal
           ? null
           : (latest?.progressMessage ?? worker?.progressMessage ?? null),
+        trace,
+        slotIndex: manifest?.slotIndex ?? null,
         latestAt: latest?.at ?? null,
         lastSeenAt: worker?.lastSeenAt ?? null,
         lastOutputAt: manifest?.lastOutputAt ?? null,
         startedAt: manifest?.startedAt ?? null,
         completedAt: manifest?.completedAt ?? null,
         finalizationStatus: manifest?.finalization?.finalizationStatus ?? null,
-        activityLogPath: manifest?.activityLogPath ?? null,
-        logPath: manifest?.logPath ?? null,
+        activityLogPath,
+        logPath,
       }
     })
-    .sort((a, b) => {
-      const activeA = ["registered", "running", "starting"].includes(a.status)
-      const activeB = ["registered", "running", "starting"].includes(b.status)
-      if (activeA !== activeB) return activeA ? -1 : 1
-      const aAt = Date.parse(
-        a.latestAt ??
-          a.lastOutputAt ??
-          a.lastSeenAt ??
-          a.completedAt ??
-          a.startedAt ??
-          ""
-      )
-      const bAt = Date.parse(
-        b.latestAt ??
-          b.lastOutputAt ??
-          b.lastSeenAt ??
-          b.completedAt ??
-          b.startedAt ??
-          ""
-      )
-      return (Number.isFinite(bAt) ? bAt : 0) - (Number.isFinite(aAt) ? aAt : 0)
-    })
+  )
 
   return {
     projectName: basename(root),
     campaignName,
     sessionId: activeSessionId,
-    sessionStatus:
-      localSession?.session.status ??
-      (activeSessionId ? state.sessions?.[activeSessionId]?.status : null) ??
-      null,
+    sessionStatus,
     metricName,
     metricUnit: meta?.metricUnit ?? null,
     metricDirection,
@@ -331,6 +373,7 @@ async function buildModel(
       ? (state.sessions?.[activeSessionId]?.providerBackoff ?? null)
       : null,
     workers,
+    workerTarget: localSession?.session.workerTarget ?? null,
   }
 }
 
@@ -446,10 +489,43 @@ export async function commandListen(
   let cachedModel: ListenModel | null = null
   let rebuilding = false
   let lastFrame = ""
+  // Slot selection + focus-mode UI state (table is the default view).
+  let selectedSlot: number | null = null
+  let focusMode = false
+  let focusLines: string[] = []
+
+  const slotCount = () => {
+    if (!cachedModel) return 0
+    return buildSlotRows(cachedModel).reduce(
+      (max, row) => Math.max(max, row.slotIndex ?? 0),
+      0
+    )
+  }
+
+  const focusedWorker = () => {
+    if (!cachedModel || selectedSlot === null) return null
+    return (
+      buildSlotRows(cachedModel).find((row) => row.slotIndex === selectedSlot)
+        ?.worker ?? null
+    )
+  }
 
   const draw = () => {
     if (closed || !cachedModel) return
-    const frame = frameText(renderFrame(cachedModel, size()), true)
+    const frame = frameText(
+      focusMode && selectedSlot !== null
+        ? renderFocusFrame(
+            cachedModel,
+            {
+              slotIndex: selectedSlot,
+              worker: focusedWorker(),
+              logLines: focusLines,
+            },
+            size()
+          )
+        : renderFrame(cachedModel, { ...size(), selectedSlot }),
+      true
+    )
     // Identical frames (idle, no age changes) skip the terminal write.
     if (frame === lastFrame) return
     lastFrame = frame
@@ -462,6 +538,12 @@ export async function commandListen(
     try {
       const model = await buildModel(root, remote)
       cachedModel = model
+      if (focusMode && selectedSlot !== null) {
+        const worker = focusedWorker()
+        focusLines = await readFocusLines(
+          worker ? (worker.activityLogPath ?? worker.logPath) : null
+        )
+      }
     } finally {
       rebuilding = false
     }
@@ -485,8 +567,43 @@ export async function commandListen(
     }, wait)
   }
 
+  const moveSelection = (delta: number) => {
+    const count = slotCount()
+    if (count === 0) return
+    const current = selectedSlot ?? (delta > 0 ? 0 : count + 1)
+    selectedSlot = Math.min(count, Math.max(1, current + delta))
+    draw()
+  }
+
+  const enterFocus = () => {
+    if (selectedSlot === null || focusMode) return
+    focusMode = true
+    focusLines = []
+    requestRender()
+  }
+
+  const exitFocus = () => {
+    if (!focusMode) return
+    focusMode = false
+    focusLines = []
+    draw()
+  }
+
   const onKey = (key: string) => {
-    if (key === "q" || key === "Q" || key === "\x03") quit()
+    if (key === "q" || key === "Q" || key === "\x03") return quit()
+    if (key >= "1" && key <= "8") {
+      const slot = Number(key)
+      if (slot <= slotCount()) {
+        selectedSlot = slot
+        if (focusMode) requestRender()
+        else draw()
+      }
+      return
+    }
+    if (key === "\x1b[A") return moveSelection(-1) // up
+    if (key === "\x1b[B") return moveSelection(1) // down
+    if (key === "\x1b[C" || key === "\r") return enterFocus() // right / enter
+    if (key === "\x1b[D" || key === "\x1b") return exitFocus() // left / esc
   }
 
   const cleanup = () => {

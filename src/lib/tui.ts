@@ -288,6 +288,8 @@ export type ListenModel = {
     delayMs?: number
   } | null
   workers?: ListenWorkerRow[]
+  /** Desired worker capacity — slot rows render 1..workerTarget. */
+  workerTarget?: number | null
 }
 
 export type ListenWorkerRow = {
@@ -297,6 +299,9 @@ export type ListenWorkerRow = {
   status: string
   phase: string | null
   progressMessage: string | null
+  /** Last line of the worker's activity log — the live reasoning feed. */
+  trace: string | null
+  slotIndex: number | null
   latestAt: string | null
   lastSeenAt: string | null
   lastOutputAt: string | null
@@ -311,66 +316,227 @@ function workerIsTerminal(status: string) {
   return status === "completed" || status === "failed" || status === "stopped"
 }
 
+function sessionIsTerminal(status: string | null | undefined) {
+  return status === "completed" || status === "failed" || status === "stopped"
+}
+
+const MAX_SLOT_ROWS = 8
+
+export type ListenSlotRow = {
+  slotIndex: number | null
+  worker: ListenWorkerRow | null
+}
+
+/**
+ * Stable slot rows: one per capacity slot (1..workerTarget), each showing its
+ * current occupant — a replacement lands in the same row instead of
+ * reshuffling the panel. Pre-slot manifests (no slotIndex) append after.
+ */
+export function buildSlotRows(model: ListenModel): ListenSlotRow[] {
+  const workers = model.workers ?? []
+  const bySlot = new Map<number, ListenWorkerRow[]>()
+  const unslotted: ListenWorkerRow[] = []
+  for (const worker of workers) {
+    if (worker.slotIndex === null) {
+      unslotted.push(worker)
+      continue
+    }
+    const group = bySlot.get(worker.slotIndex)
+    if (group) group.push(worker)
+    else bySlot.set(worker.slotIndex, [worker])
+  }
+
+  const maxSlotSeen = Math.max(0, ...bySlot.keys())
+  const slotCount = Math.max(model.workerTarget ?? 0, maxSlotSeen)
+  const rows: ListenSlotRow[] = []
+  for (let slot = 1; slot <= slotCount; slot += 1) {
+    const group = bySlot.get(slot) ?? []
+    const occupant =
+      group.find((worker) => !workerIsTerminal(worker.status)) ??
+      group.sort((a, b) =>
+        (b.startedAt ?? "").localeCompare(a.startedAt ?? "")
+      )[0] ??
+      null
+    rows.push({ slotIndex: slot, worker: occupant })
+  }
+  for (const worker of unslotted) {
+    rows.push({ slotIndex: null, worker })
+  }
+  return rows
+}
+
+function workerActivityAt(worker: ListenWorkerRow) {
+  return (
+    worker.latestAt ??
+    worker.lastOutputAt ??
+    worker.lastSeenAt ??
+    worker.completedAt ??
+    worker.startedAt
+  )
+}
+
+function slotRowText(
+  row: ListenSlotRow,
+  options: { columns: number; nowMs: number }
+) {
+  const slotLabel = row.slotIndex === null ? "·" : String(row.slotIndex)
+  const worker = row.worker
+  if (!worker) return `${slotLabel} idle`
+
+  const name = worker.workerName ?? worker.workerId.slice(0, 8)
+  const parts = [
+    name,
+    worker.hypothesisName,
+    `${worker.status}${worker.phase ? ` ${worker.phase}` : ""}`,
+    formatAge(workerActivityAt(worker), options.nowMs),
+    worker.trace,
+  ].filter(Boolean)
+  return `${slotLabel} ${parts.join(" · ")}`
+}
+
 function renderWorkerPanel(
   model: ListenModel,
-  options: { columns: number; color: boolean; nowMs: number }
+  options: {
+    columns: number
+    color: boolean
+    nowMs: number
+    selectedSlot?: number | null
+  }
 ) {
   const workers = model.workers ?? []
   if (!model.sessionId && workers.length === 0 && !model.providerBackoff) {
     return []
   }
 
-  const active = workers.filter((worker) => !workerIsTerminal(worker.status))
-  const terminal = workers.length - active.length
   const backoff = model.providerBackoff
     ? ` · backoff ${model.providerBackoff.reason} ${formatAge(
         model.providerBackoff.until,
         options.nowMs
       )}`
     : ""
+
+  // Terminal sessions collapse to one summary line — the per-worker rows are
+  // history, and the experiment table gets the vertical space back.
+  if (sessionIsTerminal(model.sessionStatus)) {
+    const finalizationCounts = new Map<string, number>()
+    for (const worker of workers) {
+      const key =
+        worker.finalizationStatus && worker.finalizationStatus !== "none"
+          ? worker.finalizationStatus
+          : worker.status
+      finalizationCounts.set(key, (finalizationCounts.get(key) ?? 0) + 1)
+    }
+    const summary = [
+      `session ${model.sessionStatus}`,
+      `${workers.length} workers`,
+      ...[...finalizationCounts.entries()].map(
+        ([status, count]) => `${count} ${status}`
+      ),
+    ].join(" · ")
+    return [bold(truncate(summary + backoff, options.columns), options.color)]
+  }
+
+  const active = workers.filter((worker) => !workerIsTerminal(worker.status))
   const summary = truncate(
     [
       `session ${model.sessionStatus ?? model.sessionId ?? "local"}`,
-      `workers ${active.length}/${workers.length}`,
-      terminal ? `terminal ${terminal}` : null,
-    ]
-      .filter(Boolean)
-      .join(" · ") + backoff,
+      `workers ${active.length}/${model.workerTarget ?? workers.length}`,
+    ].join(" · ") + backoff,
     options.columns
   )
   const lines = [bold(summary, options.color)]
 
-  for (const worker of workers.slice(0, 8)) {
-    const activityAt =
-      worker.latestAt ??
-      worker.lastOutputAt ??
-      worker.lastSeenAt ??
-      worker.completedAt ??
-      worker.startedAt
-    const name = worker.workerName ?? worker.workerId.slice(0, 8)
-    const phase = worker.phase ? ` phase=${worker.phase}` : ""
-    const finalization = worker.finalizationStatus
-      ? ` final=${worker.finalizationStatus}`
-      : ""
-    const age = formatAge(activityAt, options.nowMs)
-    const logPath = worker.activityLogPath ?? worker.logPath
-    const detail = [
-      worker.progressMessage ?? worker.hypothesisName,
-      logPath ? `activity=${logPath}` : null,
-    ]
-      .filter(Boolean)
-      .join(" · ")
+  const slotRows = buildSlotRows(model)
+  for (const row of slotRows.slice(0, MAX_SLOT_ROWS)) {
+    const selected =
+      options.selectedSlot !== null &&
+      options.selectedSlot !== undefined &&
+      row.slotIndex === options.selectedSlot
+    const marker = selected ? "▸ " : "  "
+    const text = truncate(
+      slotRowText(row, options),
+      Math.max(1, options.columns - marker.length)
+    )
+    const body = row.worker
+      ? selected
+        ? bold(text, options.color)
+        : text
+      : dim(text, options.color)
+    lines.push(`${marker}${body}`)
+  }
+  if (slotRows.length > MAX_SLOT_ROWS) {
     lines.push(
-      truncate(
-        `  ${name}: ${worker.status}${phase}${finalization} seen=${age}${
-          detail ? ` · ${detail}` : ""
-        }`,
-        options.columns
-      )
+      dim(`  +${slotRows.length - MAX_SLOT_ROWS} more slots`, options.color)
     )
   }
 
   return lines
+}
+
+/**
+ * Full-screen focus frame for one worker slot: identity header plus the live
+ * tail of its activity log. Pure — the caller reads the log lines.
+ */
+export function renderFocusFrame(
+  model: ListenModel,
+  focus: {
+    slotIndex: number
+    worker: ListenWorkerRow | null
+    logLines: string[]
+  },
+  size: { columns: number; rows: number; nowMs: number; color?: boolean }
+): string[] {
+  const columns = Math.max(40, size.columns)
+  const color = size.color ?? true
+  const worker = focus.worker
+  const name = worker
+    ? (worker.workerName ?? worker.workerId.slice(0, 8))
+    : "idle"
+  const title = truncate(
+    `ONYX | slot ${focus.slotIndex} | ${name}`,
+    Math.max(8, columns - 8)
+  )
+  const fill = Math.max(1, columns - 5 - title.length)
+  const top = `${dim("╭─ ", color)}${bold(title, color)}${dim(
+    ` ${"─".repeat(fill)}╮`,
+    color
+  )}`
+  const inner = columns - 4
+  const boxLine = (line: string) => {
+    const cut = truncateAnsi(line, inner)
+    const padding = " ".repeat(Math.max(0, inner - stripAnsi(cut).length))
+    return `${dim("│ ", color)}${cut}${padding}${dim(" │", color)}`
+  }
+
+  const header = worker
+    ? [
+        worker.hypothesisName,
+        `${worker.status}${worker.phase ? ` ${worker.phase}` : ""}`,
+        `seen ${formatAge(workerActivityAt(worker), size.nowMs)}`,
+        worker.finalizationStatus && worker.finalizationStatus !== "none"
+          ? `final ${worker.finalizationStatus}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "no worker in this slot"
+  const logPath = worker ? (worker.activityLogPath ?? worker.logPath) : null
+
+  // Newest at the bottom; clip to the space between header and border.
+  const bodyRows = Math.max(1, size.rows - 7)
+  const tail = focus.logLines.slice(-bodyRows)
+  const body = tail.length > 0 ? tail : [dim("no activity yet", color)]
+
+  return [
+    "",
+    top,
+    boxLine(dim(header, color)),
+    ...(logPath ? [boxLine(dim(truncate(logPath, inner), color))] : []),
+    boxLine(""),
+    ...body.map((line) => boxLine(line)),
+    dim(`╰${"─".repeat(columns - 2)}╯`, color),
+    dim(" ← back · q quit", color),
+  ]
 }
 
 /**
@@ -382,7 +548,13 @@ function renderWorkerPanel(
  */
 export function renderFrame(
   model: ListenModel,
-  size: { columns: number; rows: number; nowMs: number; color?: boolean }
+  size: {
+    columns: number
+    rows: number
+    nowMs: number
+    color?: boolean
+    selectedSlot?: number | null
+  }
 ): string[] {
   const columns = Math.max(40, size.columns)
   const color = size.color ?? true
@@ -417,6 +589,7 @@ export function renderFrame(
     columns: inner,
     color,
     nowMs: size.nowMs,
+    selectedSlot: size.selectedSlot ?? null,
   })
   // Newest at the bottom: keep the tail when the table outgrows the screen.
   const tableRows = Math.max(1, size.rows - 8 - workerLines.length)
@@ -442,15 +615,17 @@ export function renderFrame(
     `Research Agent: ${model.activity ?? "waiting for activity…"}`,
     columns - 4
   )}`
-  const footer = dim(
-    truncate(
-      model.apiStale
-        ? " q quit · api unreachable — showing cached experiments"
-        : " q quit",
-      columns
-    ),
-    color
-  )
+  const hasSlots = (model.workers ?? []).length > 0 || (model.workerTarget ?? 0) > 0
+  const hints = [
+    "q quit",
+    hasSlots && !sessionIsTerminal(model.sessionStatus)
+      ? "↑↓/1-8 select · → focus"
+      : null,
+    model.apiStale ? "api unreachable — showing cached experiments" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+  const footer = dim(truncate(` ${hints}`, columns), color)
 
   // Blank line above the box; blank box line below the title border; blank
   // line above the footer.

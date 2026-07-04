@@ -129,6 +129,7 @@ import {
 } from "../lib/worker-activity"
 import {
   buildWorkerInvocation,
+  lowestFreeSlot,
   preflightWorkerInvocation,
   readWorkerLaunchManifests,
   workerRuntimeEnvironment,
@@ -2986,6 +2987,7 @@ async function runHypothesisOnce({
   quiet,
   refPushQueue,
   preacquiredLease,
+  slotIndex = null,
   onRegistered,
   args,
 }: {
@@ -3007,6 +3009,8 @@ async function runHypothesisOnce({
   quiet: boolean
   refPushQueue: ReturnType<typeof createRefPushQueue>
   preacquiredLease?: ApiWorkerLease | null
+  /** Supervisor capacity slot this worker occupies (stable across relaunches). */
+  slotIndex?: number | null
   onRegistered?: (worker: {
     workerId: string
     hypothesisId: string
@@ -3257,6 +3261,7 @@ async function runHypothesisOnce({
       hypothesisName: hypothesis.name,
       workerId: worker.id,
       workerName: worker.workerName,
+      slotIndex,
       version: preflight.version,
       startedAt: new Date().toISOString(),
       lastOutputAt: null,
@@ -5974,6 +5979,9 @@ export async function commandResearchRun(args: Args) {
   presenceSupervisor.request()
 
   const activeRuns = new Map<string, Promise<HypothesisRunResult>>()
+  // Capacity slot per active run: workers launched into freed slots reuse the
+  // lowest index, keeping `onyx listen` rows positionally stable.
+  const activeSlotsByRunKey = new Map<string, number>()
   let launched = 0
   let nextWorkerRefOrdinal = 1
   let completed = 0
@@ -6306,6 +6314,8 @@ export async function commandResearchRun(args: Args) {
           launched += 1
           launchedThisTick += 1
           const runKey = `${Date.now()}:${launched}:${grant.worker.id}`
+          const slotIndex = lowestFreeSlot(activeSlotsByRunKey.values())
+          activeSlotsByRunKey.set(runKey, slotIndex)
           const run = runHypothesisOnce({
             root,
             projectPath: effectiveProjectPath,
@@ -6327,6 +6337,7 @@ export async function commandResearchRun(args: Args) {
             quiet: args.options.quiet === "true",
             refPushQueue,
             preacquiredLease: grant,
+            slotIndex,
             onRegistered: ({ workerId, leaseToken }) => {
               leaseTokensByWorkerId.set(workerId, leaseToken)
             },
@@ -6464,6 +6475,7 @@ export async function commandResearchRun(args: Args) {
             .finally(() => {
               leaseTokensByWorkerId.delete(grant.worker.id)
               activeRuns.delete(runKey)
+              activeSlotsByRunKey.delete(runKey)
               void persistRuntimeTelemetry({
                 force: true,
                 activeProcessCount: activeRuns.size,
@@ -6794,6 +6806,7 @@ export async function commandWorkerRun(args: Args) {
     workerCommand: args.options["worker-command"],
     agentKind: workerSettings.agentKind,
     workerModel: workerSettings.workerModel,
+    slotIndex: 1,
     endTimeMs:
       maxMinutes !== null || Number.isFinite(deadlineMs)
         ? Date.now() + sessionBudgetMs

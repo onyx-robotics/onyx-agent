@@ -101,6 +101,9 @@ export type WorkerLaunchManifest = {
   hypothesisName: string
   workerId: string
   workerName: string
+  /** Stable 1-based supervisor capacity slot; null on manifests written
+   * before slots existed or outside a supervised run. */
+  slotIndex?: number | null
   version: string | null
   startedAt: string
   lastOutputAt: string | null
@@ -114,6 +117,27 @@ export type WorkerLaunchManifest = {
   warnings?: string[]
   preflight: WorkerPreflightResult | null
   finalization: WorkerFinalizationManifest | null
+}
+
+/** Smallest 1-based slot index not currently in use. */
+export function lowestFreeSlot(used: Iterable<number>) {
+  const taken = new Set(used)
+  let slot = 1
+  while (taken.has(slot)) slot += 1
+  return slot
+}
+
+/** True once the launched worker process has terminally exited. */
+export function manifestIsTerminal(manifest: {
+  status: WorkerLaunchManifest["status"]
+  completedAt: string | null
+}) {
+  return (
+    manifest.completedAt !== null ||
+    manifest.status === "completed" ||
+    manifest.status === "failed" ||
+    manifest.status === "stopped"
+  )
 }
 
 function safeSegment(value: string) {
