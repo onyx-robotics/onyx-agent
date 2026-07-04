@@ -1706,11 +1706,22 @@ export const researchCampaignGraphEdgeSchema = z.object({
   metadata: metadataSchema,
 })
 
+export const researchCampaignGraphQuerySchema = z.object({
+  // Bounded window over the campaign's most recent accepted experiments; the
+  // graph is a review surface, not a full-history browser.
+  maxNodes: z.coerce.number().int().min(10).max(2000).default(500),
+})
+
 export const researchCampaignGraphResponseSchema = z.object({
   data: z.object({
     campaign: researchCampaignSchema,
     nodes: z.array(researchCampaignGraphNodeSchema),
     edges: z.array(researchCampaignGraphEdgeSchema),
+    window: z.object({
+      maxNodes: z.number().int().positive(),
+      totalExperiments: z.number().int().nonnegative(),
+      truncated: z.boolean(),
+    }),
   }),
 })
 
@@ -1723,6 +1734,9 @@ export const reconcileResearchCampaignResponseSchema = z.object({
     campaign: researchCampaignSchema,
     hypotheses: z.array(researchHypothesisSchema),
     workers: z.array(researchWorkerSchema),
+    // Deltas: only the experiments this reconcile pass touched (git-status
+    // repairs), not a full campaign reload. Full lists come from the
+    // paginated experiments endpoint.
     experiments: z.array(researchCampaignExperimentSchema),
     gitVerification: researchCampaignGitVerificationCountsSchema,
   }),
