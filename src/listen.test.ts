@@ -1,4 +1,5 @@
 import { mkdtemp, writeFile } from "node:fs/promises"
+import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -44,6 +45,23 @@ async function captureSnapshot(root: string) {
     })
   }
   return output.join("")
+}
+
+async function getFreePort() {
+  return await new Promise<number>((resolve, reject) => {
+    const server = createServer()
+    server.unref()
+    server.on("error", reject)
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address()
+      const port = typeof address === "object" && address ? address.port : null
+      server.close((error) => {
+        if (error) reject(error)
+        else if (port) resolve(port)
+        else reject(new Error("Could not allocate a free port."))
+      })
+    })
+  })
 }
 
 describe("onyx listen", () => {
@@ -339,8 +357,9 @@ describe("onyx listen", () => {
       primaryMetricValue: null,
     }
     const requests: string[] = []
+    const port = await getFreePort()
     const server = Bun.serve({
-      port: 0,
+      port,
       fetch(request) {
         const url = new URL(request.url)
         requests.push(url.pathname)

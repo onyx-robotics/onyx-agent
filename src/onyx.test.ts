@@ -30,6 +30,7 @@ import {
 import { main } from "./main"
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111"
+const MOCK_API_ORIGIN = "https://api.onyx.test"
 
 let previousApiUrl: string | undefined
 let previousApiKey: string | undefined
@@ -159,7 +160,7 @@ function installMockApi(
   previousApiUrl = process.env.ONYX_API_URL
   previousApiKey = process.env.ONYX_API_KEY
   previousFetch = globalThis.fetch
-  process.env.ONYX_API_URL = "https://api.onyx.test"
+  process.env.ONYX_API_URL = MOCK_API_ORIGIN
   process.env.ONYX_API_KEY = "test-key"
   globalThis.fetch = (async (input, init) => {
     const url = new URL(
@@ -169,6 +170,10 @@ function installMockApi(
           ? input.href
           : input.url
     )
+    if (url.origin !== MOCK_API_ORIGIN) {
+      if (!previousFetch) throw new Error("original fetch is unavailable")
+      return previousFetch(input, init)
+    }
     const bodyText =
       typeof init?.body === "string" && init.body.length > 0 ? init.body : null
     const response = handler({
