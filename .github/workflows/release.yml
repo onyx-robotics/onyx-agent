@@ -35,6 +35,10 @@ jobs:
             dist/onyx-darwin-x64
             dist/onyx-linux-arm64
             dist/onyx-linux-x64-baseline
+            dist/onyx-worker-darwin-arm64
+            dist/onyx-worker-darwin-x64
+            dist/onyx-worker-linux-arm64
+            dist/onyx-worker-linux-x64-baseline
             dist/checksums.txt
             scripts/install.sh
       - name: Publish npm package
