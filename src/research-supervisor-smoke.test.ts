@@ -47,6 +47,22 @@ async function pathExists(path: string) {
     .catch(() => false)
 }
 
+function requireExperimentReport(calls: ApiCall[]) {
+  const report = calls.find(
+    (call) =>
+      call.method === "POST" &&
+      call.path === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+  )
+  if (report) return report
+  const diagnostics = calls.filter(
+    (call) =>
+      call.path.includes("/heartbeat") || call.path.endsWith("/summaries")
+  )
+  throw new Error(
+    `Expected an experiment report. Worker diagnostics: ${JSON.stringify(diagnostics)}`
+  )
+}
+
 async function withMutedConsole<T>(fn: () => Promise<T>) {
   if (process.env.CI) return fn()
   const originalLog = console.log
@@ -919,14 +935,7 @@ describe("remote-first research supervisor smoke", () => {
           expect(call.body).not.toHaveProperty("pendingSyncCount")
           expect(call.body).not.toHaveProperty("pushQueueDepth")
         }
-        expect(
-          calls.some(
-            (call) =>
-              call.method === "POST" &&
-              call.path ===
-                `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
-          )
-        ).toBe(true)
+        requireExperimentReport(calls)
         expect(
           await pathExists(join(root, ".git", "onyx", "research.db"))
         ).toBe(false)
