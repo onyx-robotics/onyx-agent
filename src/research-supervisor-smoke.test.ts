@@ -39,6 +39,11 @@ function shellQuote(value: string) {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
+function shellScriptCommand(path: string) {
+  // CI runners may mount the system temp directory with noexec.
+  return `sh ${shellQuote(path)}`
+}
+
 async function pathExists(path: string) {
   return stat(path)
     .then(() => true)
@@ -198,8 +203,6 @@ async function createSmokeRepo() {
     ].join("\n"),
     "utf8"
   )
-  await chmod(workerScript, 0o755)
-
   return { root, origin, workerScriptDir, baseCommitSha, workerScript }
 }
 
@@ -863,7 +866,7 @@ describe("remote-first research supervisor smoke", () => {
               experiments: "1",
               foreground: "true",
               quiet: "true",
-              "worker-command": shellQuote(workerScript),
+              "worker-command": shellScriptCommand(workerScript),
               "presence-interval": "0.1",
               "launch-interval-seconds": "0.01",
               "startup-timeout": "5",
@@ -977,7 +980,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellQuote(workerScript),
+            "worker-command": shellScriptCommand(workerScript),
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
@@ -1048,7 +1051,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellQuote(workerScript),
+            "worker-command": shellScriptCommand(workerScript),
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
@@ -1100,7 +1103,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellQuote(workerScript),
+            "worker-command": shellScriptCommand(workerScript),
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
@@ -1176,7 +1179,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellQuote(workerScript),
+            "worker-command": shellScriptCommand(workerScript),
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
