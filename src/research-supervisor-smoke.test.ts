@@ -48,6 +48,7 @@ async function pathExists(path: string) {
 }
 
 async function withMutedConsole<T>(fn: () => Promise<T>) {
+  if (process.env.CI) return fn()
   const originalLog = console.log
   const originalWarn = console.warn
   const originalError = console.error
