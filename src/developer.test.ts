@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 
 import {
   ONYX_LAUNCHER_BYPASS,
@@ -26,6 +26,10 @@ import {
   writeConfig,
   type DeveloperCheckout,
 } from "./lib/config"
+
+let configHome: string | null = null
+let previousConfigHome: string | undefined
+let previousLauncherBypass: string | undefined
 
 async function captureLogs<T>(fn: () => Promise<T>) {
   const previous = console.log
@@ -70,10 +74,25 @@ async function writeProductCheckout(root: string) {
 
 describe("developer mode", () => {
   beforeEach(async () => {
-    process.env.XDG_CONFIG_HOME = await mkdtemp(
+    previousConfigHome = process.env.XDG_CONFIG_HOME
+    previousLauncherBypass = process.env[ONYX_LAUNCHER_BYPASS]
+    configHome = await mkdtemp(
       join(tmpdir(), "onyx-developer-config-test-")
     )
+    process.env.XDG_CONFIG_HOME = configHome
     delete process.env[ONYX_LAUNCHER_BYPASS]
+  })
+
+  afterEach(async () => {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = previousConfigHome
+    if (previousLauncherBypass === undefined) {
+      delete process.env[ONYX_LAUNCHER_BYPASS]
+    } else {
+      process.env[ONYX_LAUNCHER_BYPASS] = previousLauncherBypass
+    }
+    if (configHome) await rm(configHome, { recursive: true, force: true })
+    configHome = null
   })
 
   test("detects standalone and product checkouts", async () => {
