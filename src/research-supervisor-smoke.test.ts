@@ -31,17 +31,14 @@ let previousFetch: typeof fetch | null = null
 
 type ApiCall = { method: string; path: string; body: unknown }
 
+const FAKE_WORKER_COMMAND = [
+  "printf 'result\\n' > src/result.txt",
+  "git add src/result.txt",
+  "git commit -m 'fake worker result'",
+].join(" && ")
+
 function nowIso() {
   return new Date().toISOString()
-}
-
-function shellQuote(value: string) {
-  return `'${value.replaceAll("'", `'"'"'`)}'`
-}
-
-function shellScriptCommand(path: string) {
-  // CI runners may mount the system temp directory with noexec.
-  return `sh ${shellQuote(path)}`
 }
 
 async function pathExists(path: string) {
@@ -115,9 +112,6 @@ function setupFile(): ResearchSetupFile {
 async function createSmokeRepo() {
   const root = await mkdtemp(join(tmpdir(), "onyx-supervisor-smoke-"))
   const origin = await mkdtemp(join(tmpdir(), "onyx-supervisor-origin-"))
-  const workerScriptDir = await mkdtemp(
-    join(tmpdir(), "onyx-supervisor-worker-")
-  )
   await git(["init", "--bare"], origin)
   await git(["init"], root)
   await git(["config", "user.email", "test@example.com"], root)
@@ -190,20 +184,7 @@ async function createSmokeRepo() {
     },
   })
 
-  const workerScript = join(workerScriptDir, "fake-worker.sh")
-  await writeFile(
-    workerScript,
-    [
-      "#!/bin/sh",
-      "set -eu",
-      'echo "fake worker ${ONYX_WORKER_ID}"',
-      'printf "result ${ONYX_WORKER_ID}\\n" > src/result.txt',
-      "git add src/result.txt",
-      'git commit -m "fake worker result ${ONYX_WORKER_ID}"',
-    ].join("\n"),
-    "utf8"
-  )
-  return { root, origin, workerScriptDir, baseCommitSha, workerScript }
+  return { root, origin, baseCommitSha }
 }
 
 function campaign(baseCommitSha: string) {
@@ -851,8 +832,7 @@ afterEach(() => {
 describe("remote-first research supervisor smoke", () => {
   for (const workerTarget of [1, 10, 100]) {
     test(`acquires server leases and reports directly at worker target ${workerTarget}`, async () => {
-      const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
-        await createSmokeRepo()
+      const { root, origin, baseCommitSha } = await createSmokeRepo()
       const calls = installSupervisorApi({ baseCommitSha, workerTarget })
       try {
         await withMutedConsole(() =>
@@ -866,7 +846,7 @@ describe("remote-first research supervisor smoke", () => {
               experiments: "1",
               foreground: "true",
               quiet: "true",
-              "worker-command": shellScriptCommand(workerScript),
+              "worker-command": FAKE_WORKER_COMMAND,
               "presence-interval": "0.1",
               "launch-interval-seconds": "0.01",
               "startup-timeout": "5",
@@ -955,14 +935,12 @@ describe("remote-first research supervisor smoke", () => {
       } finally {
         await rm(root, { recursive: true, force: true })
         await rm(origin, { recursive: true, force: true })
-        await rm(workerScriptDir, { recursive: true, force: true })
       }
     }, 60_000)
   }
 
   test("treats settled discarded experiment reports as clean logged outcomes", async () => {
-    const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
-      await createSmokeRepo()
+    const { root, origin, baseCommitSha } = await createSmokeRepo()
     const calls = installSupervisorApi({
       baseCommitSha,
       workerTarget: 1,
@@ -980,7 +958,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellScriptCommand(workerScript),
+            "worker-command": FAKE_WORKER_COMMAND,
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
@@ -1027,13 +1005,11 @@ describe("remote-first research supervisor smoke", () => {
     } finally {
       await rm(root, { recursive: true, force: true })
       await rm(origin, { recursive: true, force: true })
-      await rm(workerScriptDir, { recursive: true, force: true })
     }
   }, 60_000)
 
   test("pauses launches when the server reports no worker slots", async () => {
-    const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
-      await createSmokeRepo()
+    const { root, origin, baseCommitSha } = await createSmokeRepo()
     const calls = installSupervisorApi({
       baseCommitSha,
       workerTarget: 1,
@@ -1051,7 +1027,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellScriptCommand(workerScript),
+            "worker-command": FAKE_WORKER_COMMAND,
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
@@ -1082,13 +1058,11 @@ describe("remote-first research supervisor smoke", () => {
     } finally {
       await rm(root, { recursive: true, force: true })
       await rm(origin, { recursive: true, force: true })
-      await rm(workerScriptDir, { recursive: true, force: true })
     }
   }, 60_000)
 
   test("records failed immutable ref pushes in the worker manifest", async () => {
-    const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
-      await createSmokeRepo()
+    const { root, origin, baseCommitSha } = await createSmokeRepo()
     await rm(origin, { recursive: true, force: true })
     const calls = installSupervisorApi({ baseCommitSha, workerTarget: 1 })
     try {
@@ -1103,7 +1077,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellScriptCommand(workerScript),
+            "worker-command": FAKE_WORKER_COMMAND,
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
@@ -1155,13 +1129,11 @@ describe("remote-first research supervisor smoke", () => {
       ).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
-      await rm(workerScriptDir, { recursive: true, force: true })
     }
   }, 60_000)
 
   test("keeps pushed refs recoverable when API report fails after push", async () => {
-    const { root, origin, workerScriptDir, baseCommitSha, workerScript } =
-      await createSmokeRepo()
+    const { root, origin, baseCommitSha } = await createSmokeRepo()
     const calls = installSupervisorApi({
       baseCommitSha,
       workerTarget: 1,
@@ -1179,7 +1151,7 @@ describe("remote-first research supervisor smoke", () => {
             experiments: "1",
             foreground: "true",
             quiet: "true",
-            "worker-command": shellScriptCommand(workerScript),
+            "worker-command": FAKE_WORKER_COMMAND,
             "presence-interval": "0.1",
             "launch-interval-seconds": "0.01",
             "startup-timeout": "5",
@@ -1233,7 +1205,6 @@ describe("remote-first research supervisor smoke", () => {
     } finally {
       await rm(root, { recursive: true, force: true })
       await rm(origin, { recursive: true, force: true })
-      await rm(workerScriptDir, { recursive: true, force: true })
     }
   }, 60_000)
 })
