@@ -1,6 +1,8 @@
 import type { ApiSessionControlState } from "./api"
 import { getLocalSessionState } from "./research-runtime"
-import { readState } from "./runtime-state"
+import { onyxStateDir, readState } from "./runtime-state"
+import { pathExists } from "./process"
+import { join } from "node:path"
 import {
   readSessionStateBriefSnapshot,
   type SessionStateBriefSnapshot,
@@ -45,13 +47,11 @@ function addControlStateReasons({
     addReason(reasonCodes, reasons, code, reason)
 
   if (control.status !== "running") {
-    if (control.status === "stop_requested") {
-      add("stop_requested", "stop requested")
-    } else if (control.progress.terminalReason === "experiment_target_reached") {
+    if (control.progress.terminalReason === "experiment_target_reached") {
       add("experiment_target_reached", "experiment target reached")
     } else if (control.progress.terminalReason === "deadline_reached") {
       add("deadline_reached", "deadline reached")
-    } else if (control.progress.terminalReason === "stop_requested") {
+    } else if (control.progress.terminalReason === "user_stopped") {
       add("stop_requested", "stop requested")
     }
     add("session_terminal", `session ${control.status}`)
@@ -70,7 +70,7 @@ function addControlStateReasons({
       add("experiment_target_reached", "experiment target reached")
     } else if (control.progress.terminalReason === "deadline_reached") {
       add("deadline_reached", "deadline reached")
-    } else if (control.progress.terminalReason === "stop_requested") {
+    } else if (control.progress.terminalReason === "user_stopped") {
       add("stop_requested", "stop requested")
     } else {
       add("session_terminal", "session is not accepting experiments")
@@ -96,7 +96,14 @@ export async function collectLocalResearchStopReasons({
 
   const state = await readState(root).catch(() => null)
   const localSession = state?.sessions?.[sessionId]
-  if (localSession?.stopRequested) {
+  const stopMarkerExists = await onyxStateDir(root)
+    .then((stateDir) =>
+      pathExists(
+        join(stateDir, "worker-runtime", sessionId, "stop-marker.json")
+      )
+    )
+    .catch(() => false)
+  if (localSession?.stopRequested || stopMarkerExists) {
     add("stop_requested", "stop requested")
   }
 
@@ -105,23 +112,21 @@ export async function collectLocalResearchStopReasons({
   )
   if (localSessionState) {
     if (localSessionState.session.status !== "running") {
-      if (localSessionState.session.status === "stop_requested") {
-        add("stop_requested", "stop requested")
-      } else if (
-        localSessionState.session.terminalReason ===
-        "experiment_target_reached"
+      if (
+        localSessionState.session.terminalReason === "experiment_target_reached"
       ) {
         add("experiment_target_reached", "experiment target reached")
       } else if (
         localSessionState.session.terminalReason === "deadline_reached"
       ) {
         add("deadline_reached", "deadline reached")
-      } else if (
-        localSessionState.session.terminalReason === "stop_requested"
-      ) {
+      } else if (localSessionState.session.terminalReason === "user_stopped") {
         add("stop_requested", "stop requested")
       }
-      add("session_terminal", `local session ${localSessionState.session.status}`)
+      add(
+        "session_terminal",
+        `local session ${localSessionState.session.status}`
+      )
     }
     const localDeadline = localSessionState.session.deadlineAt
       ? Date.parse(localSessionState.session.deadlineAt)
@@ -147,7 +152,9 @@ export async function collectLocalResearchStopReasons({
     controlState = {
       sessionId,
       status: brief.session.status,
+      runtimeState: brief.session.status === "running" ? "active" : "ended",
       finalizationStatus: brief.session.finalizationStatus,
+      assignments: [],
       progress: brief.progress,
       launch: {
         activeWorkerCount: 0,
@@ -182,11 +189,12 @@ export async function collectLocalResearchStopReasons({
     add("deadline_reached", "worker shutdown cushion reached")
   }
 
-  return {
+  const result: LocalResearchStopCheck = {
     shouldStop: reasons.length > 0,
     sessionId,
     reasonCodes: [...reasonCodes],
     reasons,
-    ...(controlState ? { controlState } : {}),
   }
+  if (controlState) result.controlState = controlState
+  return result
 }

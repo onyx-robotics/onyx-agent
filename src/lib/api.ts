@@ -1,6 +1,8 @@
 import type {
   CreateResearchCampaignExperimentRequest,
   CreateResearchCampaignRequest,
+  ResearchEvaluationManifest,
+  ResearchSessionHypothesisAssignment,
   ResearchHypothesisPlan,
   ResearchSetupCompliance,
 } from "../protocol"
@@ -35,22 +37,42 @@ export type ApiCampaign = {
   parentCampaignId?: string | null
   name: string
   description: string | null
+  createdFromCommitSha: string | null
+  currentEvaluationRevisionId: string | null
+  currentEvaluationRevision: ApiEvaluationRevision | null
+  /** Derived locally for legacy display/runtime helpers; not part of the API contract. */
   baseCommitSha: string
-  status?: "active" | "completed" | "archived"
+  bestExperimentId: string | null
+  bestMetricValue: number | null
+  bestCommitSha: string | null
+  status: "active" | "archived" | "completed"
   metricName: string
   metricUnit: string | null
   metricDirection: "maximize" | "minimize"
-  baseGitStatus?: ApiGitStatus
-  baseGitVerifiedAt?: string | null
-  baseGitStatusReason?: string | null
-  bestExperimentId?: string | null
-  bestMetricValue: number | null
-  bestCommitSha: string | null
   experimentCount: number
   lastExperimentAt?: string | null
   promotionRefName: string | null
   createdAt?: string
   updatedAt?: string
+}
+
+export type ApiEvaluationRevision = {
+  id: string
+  campaignId: string
+  fingerprint: string
+  setupHash: string
+  manifest: ResearchEvaluationManifest
+  firstSeenCommitSha: string
+  gitStatus: ApiGitStatus
+  gitVerifiedAt: string | null
+  gitStatusReason: string | null
+  bestExperimentId: string | null
+  bestMetricValue: number | null
+  bestCommitSha: string | null
+  experimentCount: number
+  lastExperimentAt: string | null
+  createdAt: string
+  updatedAt: string
 }
 
 export type ApiCampaignGitVerificationSummary = {
@@ -99,8 +121,10 @@ export type ApiCampaignGitVerificationResult = {
 export type ApiCampaignExperiment = {
   id: string
   campaignId: string
-  sessionId: string | null
-  hypothesisId: string | null
+  sessionId: string
+  evaluationRevisionId: string
+  assignmentId: string
+  hypothesisId: string
   workerId: string | null
   acceptedIndex: number | null
   runRef: string
@@ -142,27 +166,35 @@ export type ApiSession = {
   id: string
   campaignId: string
   name: string
-  status: "running" | "stop_requested" | "completed" | "failed" | "stopped"
-  workerTarget: number | null
+  evaluationRevisionId: string
+  baseCommitSha: string
+  setupHash: string
+  baseGitStatus: ApiGitStatus
+  baseGitVerifiedAt: string | null
+  baseGitStatusReason: string | null
+  runtimeState: "starting" | "active" | "stale" | "abandoned" | "ended"
+  /** Derived locally from endedAt/endReason. */
+  status: "running" | "completed" | "failed" | "stopped"
+  finalizationStatus: "running" | "complete" | "incomplete" | "failed"
+  terminalReason: ApiSession["endReason"]
+  workerTarget: number
   experimentTarget: number | null
   acceptedExperimentCount: number
   remainingExperimentCount: number | null
   deadlineAt: string | null
-  terminalReason:
+  endedAt: string | null
+  endReason:
     | "experiment_target_reached"
     | "deadline_reached"
-    | "stop_requested"
+    | "user_stopped"
     | "provider_capacity_exhausted"
-    | "no_active_hypotheses"
+    | "all_hypotheses_closed"
+    | "supervisor_failed"
     | "failed"
+    | "abandoned"
     | null
   schedulerSiteId: string | null
-  finalizationStatus:
-    | "not_started"
-    | "running"
-    | "complete"
-    | "incomplete"
-    | "failed"
+  assignments: ResearchSessionHypothesisAssignment[]
   metadata: Record<string, unknown>
   startedAt?: string
   completedAt?: string | null
@@ -174,6 +206,7 @@ export type ApiWorker = {
   id: string
   campaignId: string
   sessionId: string | null
+  assignmentId?: string
   hypothesisId: string
   workerName: string
   agentKind: string
@@ -202,7 +235,8 @@ export type ApiHypothesis = {
   createdBySessionId: string | null
   name: string
   description: string | null
-  status: "active" | "paused" | "retired"
+  status: "active" | "closed"
+  /** Assignment bases and revision projections supersede these local fallbacks. */
   baseCommitSha: string
   bestExperimentId: string | null
   bestMetricValue: number | null
@@ -219,6 +253,9 @@ export type ApiSummary = {
   sessionId: string | null
   hypothesisId: string | null
   authoredByWorkerId: string | null
+  evaluationRevisionId: string | null
+  watermarkAcceptedCount: number | null
+  watermarkExperimentId: string | null
   summaryKind:
     | "campaign_brief"
     | "session_brief"
@@ -294,7 +331,8 @@ export type ApiSessionLive = {
     acceptedExperimentCount: number
     remainingExperimentCount: number | null
     deadlineAt: string | null
-    terminalReason: ApiSession["terminalReason"]
+    endedAt: string | null
+    endReason: ApiSession["endReason"]
     warning?: string | null
   }
   finalization?: {
@@ -372,6 +410,7 @@ export type ApiSessionLive = {
 
 export type ApiSessionControlState = {
   sessionId: string
+  runtimeState: ApiSession["runtimeState"]
   status: ApiSession["status"]
   finalizationStatus: ApiSession["finalizationStatus"]
   progress: {
@@ -379,6 +418,8 @@ export type ApiSessionControlState = {
     acceptedExperimentCount: number
     remainingExperimentCount: number | null
     deadlineAt: string | null
+    endedAt: string | null
+    endReason: ApiSession["endReason"]
     terminalReason: ApiSession["terminalReason"]
   }
   launch: {
@@ -388,6 +429,7 @@ export type ApiSessionControlState = {
     activeHypothesisCount: number
     acceptingExperiments: boolean
   }
+  assignments: ResearchSessionHypothesisAssignment[]
   finalization: {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
@@ -439,6 +481,7 @@ export type ApiWorkerLease = {
   worker: ApiWorker
   leaseToken: string
   leaseExpiresAt: string
+  assignment: ResearchSessionHypothesisAssignment
   hypothesis: ApiHypothesis
   session: ApiSession
   campaign: ApiCampaign
@@ -793,7 +836,68 @@ export function apiData<T>(payload: unknown): T {
   if (!payload || typeof payload !== "object" || !("data" in payload)) {
     throw new Error(`Unexpected API response: ${JSON.stringify(payload)}`)
   }
-  return (payload as { data: T }).data
+  return normalizeResearchResponse((payload as { data: T }).data) as T
+}
+
+function normalizeResearchResponse(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeResearchResponse)
+  if (!value || typeof value !== "object") return value
+  const normalized = Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      normalizeResearchResponse(item),
+    ])
+  ) as Record<string, unknown>
+
+  if (typeof normalized.runtimeState === "string") {
+    const ended = normalized.runtimeState === "ended"
+    const failed =
+      normalized.endReason === "failed" ||
+      normalized.endReason === "supervisor_failed"
+    normalized.status = ended ? (failed ? "failed" : "completed") : "running"
+    normalized.finalizationStatus = ended
+      ? failed
+        ? "failed"
+        : "complete"
+      : "running"
+    normalized.terminalReason = normalized.endReason ?? null
+    normalized.completedAt = normalized.endedAt ?? null
+    if (normalized.progress && typeof normalized.progress === "object") {
+      const progress = normalized.progress as Record<string, unknown>
+      progress.terminalReason = progress.endReason ?? null
+    }
+    normalized.finalization ??= {
+      status: normalized.finalizationStatus,
+      reasons: normalized.endReason ? [normalized.endReason] : [],
+      terminalReason: normalized.endReason ?? null,
+      unmeasuredSalvageCount: 0,
+    }
+  }
+  if (
+    typeof normalized.metricName === "string" &&
+    "currentEvaluationRevision" in normalized
+  ) {
+    const revision = normalized.currentEvaluationRevision as Record<
+      string,
+      unknown
+    > | null
+    normalized.baseCommitSha =
+      normalized.createdFromCommitSha ?? revision?.firstSeenCommitSha ?? ""
+    normalized.bestExperimentId = revision?.bestExperimentId ?? null
+    normalized.bestMetricValue = revision?.bestMetricValue ?? null
+    normalized.bestCommitSha = revision?.bestCommitSha ?? null
+  }
+  if (
+    normalized.plan &&
+    typeof normalized.plan === "object" &&
+    (normalized.status === "active" || normalized.status === "closed")
+  ) {
+    normalized.baseCommitSha = ""
+    normalized.bestExperimentId = null
+    normalized.bestMetricValue = null
+    normalized.lastWorkedAt = null
+  }
+  return normalized
 }
 
 export async function resolveProject(
@@ -1004,16 +1108,36 @@ export async function createCampaignSession(
   campaignId: string,
   body: {
     name: string
-    workerTarget?: number
-    hypotheses?: ResearchHypothesisPlan[]
+    baseCommitSha: string
+    setupHash: string
+    evaluationFingerprint: string
+    evaluationManifest: ResearchEvaluationManifest
+    workerTarget: number
+    assignments: Array<{
+      hypothesisId: string
+      startingCommitSha: string
+      sourceExperimentId?: string
+      setupHash: string
+      evaluationFingerprint: string
+    }>
     metadata?: Record<string, unknown>
     experimentTarget?: number
     deadlineAt?: string
     schedulerSiteId?: string
   },
   args?: Args
-): Promise<{ session: ApiSession; hypotheses: ApiHypothesis[] }> {
-  return apiData<{ session: ApiSession; hypotheses: ApiHypothesis[] }>(
+): Promise<{
+  session: ApiSession
+  hypotheses: ApiHypothesis[]
+  evaluationRevision: ApiEvaluationRevision
+  assignments: ResearchSessionHypothesisAssignment[]
+}> {
+  return apiData<{
+    session: ApiSession
+    hypotheses: ApiHypothesis[]
+    evaluationRevision: ApiEvaluationRevision
+    assignments: ResearchSessionHypothesisAssignment[]
+  }>(
     await callApi(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/sessions`,
@@ -1043,7 +1167,6 @@ export async function createCampaignHypothesis(
     plan: ResearchHypothesisPlan
     name?: string
     description?: string
-    baseCommitSha?: string
     metadata?: Record<string, unknown>
   },
   args?: Args
@@ -1078,12 +1201,49 @@ export async function updateCampaignHypothesis(
   )
 }
 
+export async function closeCampaignHypothesis(
+  hypothesisId: string,
+  body: { reason?: string } = {},
+  args?: Args
+): Promise<{
+  hypothesis: ApiHypothesis
+  canceledAssignmentIds: string[]
+  stoppedWorkerIds: string[]
+  endedSessionIds: string[]
+}> {
+  return apiData(
+    await callApi(
+      "POST",
+      `/api/v1/research/hypotheses/${hypothesisId}/close`,
+      body,
+      args
+    )
+  )
+}
+
+export async function reopenCampaignHypothesis(
+  hypothesisId: string,
+  args?: Args
+): Promise<{ hypothesis: ApiHypothesis }> {
+  return apiData(
+    await callApi(
+      "POST",
+      `/api/v1/research/hypotheses/${hypothesisId}/reopen`,
+      undefined,
+      args
+    )
+  )
+}
+
 export async function stopCampaignSession(
   sessionId: string,
   body: {
     campaignId: string
-    status?: "stop_requested" | "completed" | "failed" | "stopped"
-    finalizationStatus?: ApiSession["finalizationStatus"]
+    endReason?:
+      | "user_stopped"
+      | "provider_capacity_exhausted"
+      | "supervisor_failed"
+      | "failed"
     reason?: string
     metadata?: Record<string, unknown>
   },
@@ -1099,18 +1259,64 @@ export async function stopCampaignSession(
   )
 }
 
-export async function completeCampaign(
-  campaignId: string,
+export async function scaleCampaignSession(
+  sessionId: string,
   body: {
-    sessionId?: string
+    campaignId: string
+    workerTarget: number
+    siteId?: string
+    supervisorRunId?: string
+    metadata?: Record<string, unknown>
   },
+  args?: Args
+): Promise<{ session: ApiSession; event: Record<string, unknown> }> {
+  return apiData<{ session: ApiSession; event: Record<string, unknown> }>(
+    await callApi(
+      "POST",
+      `/api/v1/research/sessions/${sessionId}/scale`,
+      body,
+      args
+    )
+  )
+}
+
+export async function unarchiveCampaign(
+  campaignId: string,
   args?: Args
 ): Promise<{ campaign: ApiCampaign }> {
   return apiData<{ campaign: ApiCampaign }>(
     await callApi(
       "POST",
-      `/api/v1/research/campaigns/${campaignId}/complete`,
-      body,
+      `/api/v1/research/campaigns/${campaignId}/unarchive`,
+      undefined,
+      args
+    )
+  )
+}
+
+export async function listCampaignEvaluationRevisions(
+  campaignId: string,
+  args?: Args
+): Promise<ApiEvaluationRevision[]> {
+  return apiData<ApiEvaluationRevision[]>(
+    await callApi(
+      "GET",
+      `/api/v1/research/campaigns/${campaignId}/evaluation-revisions`,
+      undefined,
+      args
+    )
+  )
+}
+
+export async function archiveCampaign(
+  campaignId: string,
+  args?: Args
+): Promise<{ campaign: ApiCampaign }> {
+  return apiData<{ campaign: ApiCampaign }>(
+    await callApi(
+      "POST",
+      `/api/v1/research/campaigns/${campaignId}/archive`,
+      undefined,
       args
     )
   )

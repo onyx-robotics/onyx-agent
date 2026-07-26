@@ -13,15 +13,19 @@ import { commandListen } from "./commands/listen"
 import { commandLogin } from "./commands/login"
 import { commandProfile } from "./commands/profile"
 import {
-  commandResearchFinish,
   commandResearchBrief,
+  commandResearchClean,
   commandResearchHypothesisAdd,
+  commandResearchHypothesisClose,
+  commandResearchHypothesisList,
+  commandResearchHypothesisReopen,
   commandResearchHypotheses,
   commandResearchSessionStateBrief,
   commandResearchRun,
-  commandResearchStart,
+  commandResearchScale,
   commandResearchStatus,
   commandResearchStop,
+  commandResearchSummarize,
   commandKnowledgeAdd,
   commandKnowledgeList,
   commandSummaryList,
@@ -64,15 +68,18 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research start --campaign <name> [--workers <n>] [--agent codex|claude|opencode] [--model <model>] [--hypotheses <json-array>] (--experiments <n> | --max-minutes <n>)
-      (creates an async research session and prints low-level worker launch commands)
-  onyx research run --campaign <name> [--session <id>] [--workers <n>] [--max-concurrency <n>] [--launch-batch-size <n>] [--launch-interval-seconds <n>] [--provider-backoff-seconds <n>] [--heartbeat-sample-interval <seconds>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--hypotheses <json-array>] [--experiments <n>] [--max-minutes <n>] [--presence-interval <seconds>] [--foreground] [--json]
-      (starts the local supervisor detached by default; use --foreground to attach)
+  onyx research run --campaign <name> [--workers <n>] [--hypothesis <name-or-id>]... [--base <ref>] [--hypothesis-base <hypothesis>=<ref|experiment:id>]... [--new] [--experiments <n>] [--max-minutes <n>] [--agent codex|claude|opencode] [--model <model>] [--foreground] [--json]
+      (always creates a new bounded session; starts its local supervisor detached by default)
   onyx research hypotheses --example
-  onyx research hypothesis add (--campaign <name> | --session <id>) (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>] [--base <sha>] [--agent codex|claude|opencode]
+  onyx research hypothesis list --campaign <name> [--json]
+  onyx research hypothesis add --campaign <name> (--plan <json-file> | --focus <text> --hypothesis <text>) [--name <name>]
+  onyx research hypothesis close --campaign <name> --hypothesis <name-or-id> [--reason <text>]
+  onyx research hypothesis reopen --campaign <name> --hypothesis <name-or-id>
   onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--quiet]
   onyx research stop [--session <id>] [--reason <text>]
-  onyx research finish [--campaign <name>] [--session <id>] [--require-online]
+  onyx research scale --workers <n> [--session <id>]
+  onyx research clean [--dry-run]
+  onyx research summarize --campaign <name>
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
   onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text> [--require-online]
@@ -157,8 +164,6 @@ export async function main(argv = process.argv.slice(2)) {
       return commandCampaignStatus(args)
     if (command === "campaign" && sub === "delete")
       return commandCampaignDelete(args)
-    if (command === "research" && sub === "start")
-      return commandResearchStart(args)
     if (command === "research" && sub === "run") return commandResearchRun(args)
     if (command === "research" && sub === "hypotheses")
       return commandResearchHypotheses(args)
@@ -173,12 +178,34 @@ export async function main(argv = process.argv.slice(2)) {
       args.positional[2] === "add"
     )
       return commandResearchHypothesisAdd(args)
+    if (
+      command === "research" &&
+      sub === "hypothesis" &&
+      args.positional[2] === "list"
+    )
+      return commandResearchHypothesisList(args)
+    if (
+      command === "research" &&
+      sub === "hypothesis" &&
+      args.positional[2] === "close"
+    )
+      return commandResearchHypothesisClose(args)
+    if (
+      command === "research" &&
+      sub === "hypothesis" &&
+      args.positional[2] === "reopen"
+    )
+      return commandResearchHypothesisReopen(args)
     if (command === "research" && sub === "session-state-brief")
       return commandResearchSessionStateBrief(args)
     if (command === "research" && sub === "stop")
       return commandResearchStop(args)
-    if (command === "research" && sub === "finish")
-      return commandResearchFinish(args)
+    if (command === "research" && sub === "scale")
+      return commandResearchScale(args)
+    if (command === "research" && sub === "clean")
+      return commandResearchClean(args)
+    if (command === "research" && sub === "summarize")
+      return commandResearchSummarize(args)
     if (command === "research" && sub === "brief")
       return commandResearchBrief(args)
     if (command === "research" && sub === "status")

@@ -122,7 +122,8 @@ function openCodeToolLine(record: Record<string, unknown>) {
     input?.cmd,
     input?.args
   )
-  if (command && command !== name) return `tool: ${name} ${compact(command, 180)}`
+  if (command && command !== name)
+    return `tool: ${name} ${compact(command, 180)}`
   return `tool: ${name}`
 }
 
@@ -306,6 +307,7 @@ export async function runStreamingProcess(
       at: string
       text: string
     }) => void
+    onSpawn?: (pid: number) => void
     terminateOnOutput?: (event: {
       stream: "stdout" | "stderr"
       at: string
@@ -354,6 +356,7 @@ export async function runStreamingProcess(
       detached: useProcessGroup,
       stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     })
+    if (child.pid) options.onSpawn?.(child.pid)
     const outputTailBytes = options.outputTailBytes ?? 256 * 1024
     let stdout = Buffer.alloc(0)
     let stderr = Buffer.alloc(0)

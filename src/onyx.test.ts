@@ -5,7 +5,6 @@ import { tmpdir } from "node:os"
 import { afterEach, describe, expect, test } from "bun:test"
 
 import {
-  commandResearchFinish,
   commandResearchStatus,
   commandResearchSessionStateBrief,
 } from "./commands/research"
@@ -59,14 +58,20 @@ async function writeTestWorkerContext({
   hypothesisId?: string
   hypothesisName?: string
 }): Promise<WorkerRuntimePaths> {
-  const paths = await workerRuntimePaths({ root, sessionId: SESSION_ID, workerId })
+  const paths = await workerRuntimePaths({
+    root,
+    sessionId: SESSION_ID,
+    workerId,
+  })
   await writeWorkerRuntimeContext({
     paths,
     context: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       campaignId,
       campaignName,
       sessionId: SESSION_ID,
+      assignmentId: "66666666-6666-4666-8666-666666666666",
+      startingCommitSha: "abc123",
       hypothesisId,
       hypothesisName,
       workerId,
@@ -91,14 +96,24 @@ function makeSessionStateBrief(): ApiSessionStateBrief {
       id: SESSION_ID,
       campaignId: "33333333-3333-4333-8333-333333333333",
       name: "scale-run",
+      evaluationRevisionId: "77777777-7777-4777-8777-777777777777",
+      baseCommitSha: "abc123",
+      setupHash: "sha256:setup",
+      baseGitStatus: "verified",
+      baseGitVerifiedAt: now,
+      baseGitStatusReason: null,
+      runtimeState: "active",
       status: "running",
       workerTarget: 100,
       experimentTarget: 100,
       acceptedExperimentCount: 7,
       remainingExperimentCount: 93,
       deadlineAt: null,
+      endedAt: null,
+      endReason: null,
       terminalReason: null,
       schedulerSiteId: "site-1",
+      assignments: [],
       finalizationStatus: "running",
       metadata: {},
       startedAt: now,
@@ -112,10 +127,10 @@ function makeSessionStateBrief(): ApiSessionStateBrief {
       parentCampaignId: null,
       name: "scale-test",
       description: "Scale test",
+      createdFromCommitSha: "abc123",
+      currentEvaluationRevisionId: null,
+      currentEvaluationRevision: null,
       baseCommitSha: "abc123",
-      baseGitStatus: "verified",
-      baseGitVerifiedAt: now,
-      baseGitStatusReason: null,
       status: "active",
       metricName: "error",
       metricUnit: null,
@@ -143,6 +158,8 @@ function makeSessionStateBrief(): ApiSessionStateBrief {
       acceptedExperimentCount: 7,
       remainingExperimentCount: 93,
       deadlineAt: null,
+      endedAt: null,
+      endReason: null,
       terminalReason: null,
     },
     latestExperiments: [],
@@ -574,7 +591,12 @@ describe("remote-first agent architecture", () => {
       logs.push(String(message))
     }
     await git(
-      ["remote", "add", "origin", "https://github.com/example/research-test.git"],
+      [
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/research-test.git",
+      ],
       root
     )
     await cacheResearchSessionState({
@@ -662,218 +684,6 @@ describe("remote-first agent architecture", () => {
       )
     } finally {
       console.log = originalLog
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("research finish completes the campaign before writing final summary", async () => {
-    const root = await tempRepo()
-    const logs: string[] = []
-    const calls: string[] = []
-    const originalLog = console.log
-    const brief = makeSessionStateBrief()
-    const completedSession = {
-      ...brief.session,
-      status: "completed" as const,
-      acceptedExperimentCount: 50,
-      remainingExperimentCount: 0,
-      terminalReason: "experiment_target_reached" as const,
-      finalizationStatus: "complete" as const,
-    }
-    const completedCampaign = {
-      ...brief.campaign,
-      status: "completed" as const,
-      experimentCount: 50,
-    }
-    console.log = (message?: unknown) => {
-      logs.push(String(message))
-    }
-    await git(
-      ["remote", "add", "origin", "https://github.com/example/research-test.git"],
-      root
-    )
-    await cacheResearchSessionState({
-      root,
-      campaign: brief.campaign,
-      session: completedSession,
-    })
-    await updateState(root, (state) => {
-      state.projectPath = ""
-      state.activeCampaign = brief.campaign.name
-      state.campaigns = state.campaigns ?? {}
-      state.campaigns[brief.campaign.name] = {
-        ...(state.campaigns[brief.campaign.name] ?? {}),
-        campaignId: brief.campaign.id,
-        sessionId: SESSION_ID,
-        projectPath: "",
-      }
-    })
-    installMockApi(({ method, path, body }) => {
-      calls.push(`${method} ${path}`)
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/overview`) {
-        return {
-          campaign: completedCampaign,
-          bestExperiment: null,
-          latestExperiments: [],
-          sessions: [completedSession],
-          workers: [],
-          hypotheses: [],
-          summaries: [],
-          knowledge: [],
-          counts: {
-            experiments: 50,
-            hypothesisCount: 0,
-            activeWorkers: 0,
-          },
-        }
-      }
-      if (path === `/api/v1/research/sessions/${SESSION_ID}/stop`) {
-        expect(body).toMatchObject({
-          campaignId: brief.campaign.id,
-          status: "completed",
-          finalizationStatus: "complete",
-        })
-        return completedSession
-      }
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/complete`) {
-        expect(body).toEqual({ sessionId: SESSION_ID })
-        return { campaign: completedCampaign }
-      }
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/reconcile`) {
-        return {
-          campaign: completedCampaign,
-          hypotheses: [],
-          workers: [],
-          experiments: [],
-          gitVerification: {
-            checkedCount: 0,
-            updatedCount: 0,
-            remainingCount: 0,
-            limit: 100,
-            hasMore: false,
-            base: {
-              checked: true,
-              updated: false,
-              previousStatus: "verified",
-              status: "verified",
-              verifiedAt: null,
-              statusReason: null,
-            },
-            summary: {
-              repositoryAccessMode: "github_app",
-              baseGitStatus: "verified",
-              baseGitVerifiedAt: null,
-              baseGitStatusReason: null,
-              acceptedExperimentGitStatusCounts: {
-                local_reported: 0,
-                pending: 0,
-                verified: 0,
-                missing: 0,
-                mismatch: 0,
-                unreachable: 0,
-              },
-              needsVerificationCount: 0,
-              hardFailureCount: 0,
-              lastVerifiedAt: null,
-              recommendedAction: "none",
-              message: "No accepted experiment refs need Git verification yet.",
-            },
-          },
-        }
-      }
-      if (path === `/api/v1/research/sessions/${SESSION_ID}/live`) {
-        return {
-          session: completedSession,
-          campaign: completedCampaign,
-          progress: {
-            experimentTarget: 100,
-            acceptedExperimentCount: 50,
-            remainingExperimentCount: 0,
-            deadlineAt: null,
-            terminalReason: "experiment_target_reached",
-          },
-          finalization: {
-            status: "complete",
-            reasons: [],
-            terminalReason: "experiment_target_reached",
-            unmeasuredSalvageCount: 0,
-          },
-          livenessCounts: {
-            active: 0,
-            stale: 0,
-            lost: 0,
-            unknown: 0,
-            terminal: 0,
-          },
-          phaseCounts: {},
-          workers: [],
-          sites: [],
-          unmatchedPresenceCount: 0,
-          ignoredPresence: {},
-          providerBackoff: null,
-          recentExperiments: [],
-          recentTerminalWorkers: [],
-          liveWatermark: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        }
-      }
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/summaries`) {
-        return {
-          summary: {
-            id: "77777777-7777-4777-8777-777777777777",
-            campaignId: brief.campaign.id,
-            sessionId: SESSION_ID,
-            hypothesisId: null,
-            authoredByWorkerId: null,
-            experimentId: null,
-            summaryKind: "campaign_brief",
-            title: "final results",
-            body: "done",
-            isCurrent: true,
-            metadata: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          },
-        }
-      }
-      throw new Error(`unexpected API call: ${method} ${path}`)
-    })
-    try {
-      await commandResearchFinish({
-        positional: ["research", "finish"],
-        options: { cwd: root, campaign: brief.campaign.name },
-      })
-      expect(logs.join("\n")).toContain(
-        `Finalized campaign ${brief.campaign.name}.`
-      )
-      expect(calls.indexOf(`POST /api/v1/research/campaigns/${brief.campaign.id}/complete`)).toBeGreaterThan(
-        calls.indexOf(`POST /api/v1/research/sessions/${SESSION_ID}/stop`)
-      )
-      expect(calls.indexOf(`POST /api/v1/research/campaigns/${brief.campaign.id}/summaries`)).toBeGreaterThan(
-        calls.indexOf(`POST /api/v1/research/campaigns/${brief.campaign.id}/complete`)
-      )
-    } finally {
-      console.log = originalLog
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("finish rejects removed offline and sync flags", async () => {
-    const root = await tempRepo()
-    try {
-      await expect(
-        commandResearchFinish({
-          positional: ["research", "finish"],
-          options: { cwd: root, offline: "true", campaign: "smoke" },
-        })
-      ).rejects.toThrow("removed")
-      await expect(
-        commandResearchFinish({
-          positional: ["research", "finish"],
-          options: { cwd: root, "final-sync-timeout": "1", campaign: "smoke" },
-        })
-      ).rejects.toThrow("removed")
-    } finally {
       await rm(root, { recursive: true, force: true })
     }
   })

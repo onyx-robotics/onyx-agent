@@ -1,70 +1,53 @@
 ---
 name: onyx
-description: Coordinate the Onyx parallel auto research workflow. Use when asked to start, set up, monitor, stop, finish, or resume Onyx research; optimize a metric with a team of agents; or run /onyx anything.
+description: Coordinate endless additive Onyx research campaigns, bounded sessions, hypotheses, workers, checkpoints, and metric optimization.
 ---
 
 # Onyx Parallel Auto Research
 
-You are the main-thread Onyx orchestrator. The user talks to you. You keep the human workflow simple: collect or choose explicit setup inputs, create or update local files, validate the setup workflow, then start async research hypotheses. The overall research process consists of two phases:
-
-1. Setup
-2. Research
+You are the user-facing Onyx orchestrator. Keep the research direction durable while treating every execution session as a fresh, bounded batch.
 
 ## Setup
 
-The setup phase is a one-time critical process for a research campaign where you will build the tools and workflow to be used by the parallel research worker agents. You should invest time into making the setup excellent because it will directly impact the effectiveness of all downstream parallel research worker agents using the setup. You should work collaboratively with the human user to make sure the setup is correct, and spend time validating it. Note that the setup may involve creating tools to interact with real-world hardware, so reliability and safety are crucial.
+1. Establish the goal, immutable metric name/unit/direction, editable and protected scopes, evaluator, reset/readiness/safety tools, resource limits, hypotheses, worker capacity, and experiment/deadline bound.
+2. Run `onyx setup init`, then deliberately complete `onyx/setup.json`, `onyx/onyx.md`, and `onyx/tools/*`. The scaffolded evaluator fails until it emits exactly one primary `METRIC name=value` line.
+3. Keep exactly one leading agent workflow step and one required metric step. The metric tool must declare non-empty `fingerprintPaths`; the scaffold defaults to `["onyx/tools/evaluation"]`. Include every committed evaluator/config/data input that determines whether results are comparable.
+4. Run `onyx setup validate`, inspect `metric_tool_readiness`, and commit the complete setup surface. Research fingerprints committed git content, never dirty working-tree content.
+5. Run `onyx campaign setup --name <slug> --description <goal>`. Reusing the same campaign name is idempotent only when the metric contract matches. A metric change requires a new campaign.
 
-1. Ask or infer from the user:
-   - **Goal**
-   - **Metric**, **unit** (make sure this is a real unit like time `s`, `ms`, `us` that can be formatted with the metric), **direction** (`maximize` or `minimize`)
-   - **Evaluation** commands and tools
-   - **Editable scope** and **Protected scope**
-   - **Reliability**, **safety**, and other **constraint** tools and workflow steps to make sure research can be run for long periods of time with proper readiness checks/guardrails, ability to recover from issues, and thorough safety.
-   - **Reset** tools and workflow steps to ensure the environment is reset before each experiment
-   - **Resources** such as compute/cpu/gpu or real-world hardware
-   - **Agent worker count**
-   - **Budget**
-   - **Hypotheses** (if the user has any)
-2. Create the local setup surface with `onyx setup init`; pass `--editable-scope` or `--eval-command` only when you want those exact caller-provided values written into the scaffold. Then edit `onyx/setup.json`, `onyx/onyx.md`, and `onyx/tools/*` as needed. The default eval tool is `onyx/tools/evaluation/run.sh` and remains failing until deliberately configured. See the Setup Surface section below for more information before making edits.
-3. Encode reset, readiness, safety, reliability, and hardware/service work as declared `setup.tools` entries and linear `workflow` command steps. Keep exactly one leading agent step and exactly one required `metric: true` command step.
-4. Run `onyx setup validate`. Setup validation executes the required metric tool once, requires exactly one primary `METRIC <name>=<number>` line, and records readiness evidence in `onyx/validation.json`. Review the `metric_tool_readiness` check before committing. Failed or stale validation blocks campaign setup and research run; warning checks do not.
-5. Commit the setup surface with `git add <setup-dir> && git commit -m "Add Onyx setup"` where `<setup-dir>` is `onyx` at repo root or `<projectPath>/onyx` in a monorepo; `onyx campaign setup` and `onyx research run` require the committed campaign base to contain the setup files.
-6. Run `onyx campaign setup --name <slug> --description <goal>`. GitHub App access is not required for local research; public repositories can show web code/diffs once commits and refs are pushed to GitHub, while private repositories record local-reported commits and metrics until the GitHub App is connected for private code/diff viewing and verification. After pushing missing refs or connecting GitHub, use the web campaign page or `onyx research status --reconcile` to refresh Git verification state.
-7. Move on to the Research phase after the setup surface has been built out and approved by the human user.
+## Hypotheses
 
-### Setup Surface
+Hypotheses are durable conceptual options, not branches or mutable git bases.
 
-`onyx/setup.json` declares goal, metric, project path, editable scope, protected paths, resources, declared tools, and the linear experiment workflow. It is the only setup policy file.
+- List: `onyx research hypothesis list --campaign <slug>`
+- Add: `onyx research hypothesis add --campaign <slug> --name <name> --focus <focus> --hypothesis <statement>`
+- Close: `onyx research hypothesis close --campaign <slug> --hypothesis <name-or-id>`
+- Reopen: `onyx research hypothesis reopen --campaign <slug> --hypothesis <name-or-id>`
 
-`onyx/validation.json` is the latest local validation report. It stores a setup hash, setup checks, and metric-tool readiness evidence. It is evidence, not security. Research run blocks when validation is stale, any check failed, or `metric_tool_readiness` is missing.
+Adding or reopening affects future sessions only. Closing is abrupt: it cancels open assignments, stops matching workers, rejects late reports for that assignment, and can end a session when no active assignment remains.
 
-`onyx/onyx.md` is a markdown file intended to provide the worker agent with the research spec and specific notes on the project/setup. The worker agent will already have instructions on how to conduct its auto research, editable/protected scope, git/onyx rules, campaign related inputs/id/names, and how to use the CLI tools. The `onyx/onyx.md` should cover more specific insights on this specific project and setup that are more nuanced.
+## Sessions
 
-The setup surface must be committed before campaign creation and session start. This makes every worker worktree start from a campaign base that contains the same frozen setup, validation report, research spec, and workflow tools.
+Start with:
 
-Workflow v1 is strict and linear: one workflow run is one experiment attempt, one result commit, and one primary metric. Tool and step IDs are lowercase path-safe namespaced strings such as `evaluation.run`, `reset.clean`, and `reliability.check`.
+`onyx research run --campaign <slug> [--workers <n>] [--hypothesis <name-or-id>]... [--base <ref>] [--hypothesis-base <hypothesis>=<ref|experiment:id>]... (--experiments <n> | --max-minutes <n>)`
 
-Runtime rigor happens in `onyx exp run`, which pauses for the agent edit, requires exactly one clean result commit over the run base, verifies protected setup/tool paths, executes declared workflow tools, requires exactly one configured primary `METRIC <name>=<number>` line from the metric step, preserves any additional distinct `METRIC` lines as secondary metrics, and records setup compliance. Put physical limits, simulator validity checks, and anti-gaming rules in declared guardrail steps so metric wins that violate constraints become `checks_failed`.
+Every run creates a new remote session. Never resume or attach to an old session. Defaults are committed `HEAD`, every active hypothesis, and one worker. Assignment bases must contain the exact session setup hash and evaluation fingerprint; rebase/cherry-pick older experiment code onto the current setup before continuing it. Use `--new` only when intentionally running another local session for the campaign concurrently.
 
-Tool commands in `onyx/setup.json` are language-flexible: use Bash, Python, Node, hardware vendor CLIs, compiled binaries, or any executable command that fits the project.
+The command validates the committed setup and fingerprint inputs, snapshots hypothesis assignments, starts a detached supervisor, and prints its session ID, PID, log, status, and listen commands. Use `--json` for orchestration and `--foreground` only for debugging.
 
-Protected setup paths are frozen during Research: `onyx/setup.json`, `onyx/validation.json`, `onyx/onyx.md`, and `onyx/tools/*`.
+- Monitor: `onyx research status`, `onyx research status --json`, `onyx listen`, and the web campaign page.
+- Scale: `onyx research scale --workers <n> --session <id>`. Scale-down drains existing workers; use stop instead of zero.
+- Stop: `onyx research stop --session <id>`. A local stop marker suppresses crash salvage; uncertain process identity is never killed.
+- Checkpoint: `onyx research summarize --campaign <slug>`. Repeating without accepted research returns the existing immutable checkpoint.
+- Clean local runtime artifacts: inspect with `onyx research clean --dry-run`, then run `onyx research clean` if desired.
 
-## Research
+Evaluator changes remain in the campaign but create a separate evaluation revision. Never compare metrics across revisions as a single leaderboard.
 
-The research phase begins after you have completed the setup phase. During the research phase, you are serving as the main-thread orchestrator to keep the research phase running smoothly across the parallel research worker agents for long periods of time. The human user may interact with you, asking questions or asking you to take actions on the research process. Your objective is to keep the research phase reliably driving towards real, meaningful improvements on the campaign goal and metrics.
+## Worker contract
 
-1. Start the supervisor with inline JSON: `onyx research run --campaign <slug> --workers <n> --agent codex|claude|opencode [--model <model>] --hypotheses '<json-array>' --experiments <attempts> [--max-minutes <n>]`. By default this validates the setup, creates or resolves the remote session, starts a detached supervisor child, prints the `sessionId`, PID, log path, and monitoring commands, then returns control to you. Use `--json` when you need parseable startup output, and use `--foreground` only for deliberate attached debugging or smoke-test shells. Treat `--workers` as the active server lease target and `--experiments` as the exact accepted experiment target; use `--max-minutes` as an optional deadline, and include at least one completion condition. Use `--model <model>` to override the selected harness model for the session. Use `onyx research hypotheses --example` as a setup-aware template when drafting initial hypotheses, then pass the JSON array inline. The supervisor owns local worker process scheduling, batched server worker lease acquisition, session-state brief refreshes, coalesced presence/heartbeat updates, provider backoff, and child cleanup; use `--worker-command` only when a custom worker process is needed.
-2. Monitor with `onyx research status`, `onyx research status --json`, `onyx listen`, and the web campaign page after the detached start returns. Use `onyx research status --reconcile` only when you intentionally want lifecycle repair. Review experiments, worker summaries, and knowledge, then create fresh hypotheses with `onyx research hypothesis add --session <id> --focus <text> --hypothesis <text>` or `--plan <json-file>` whenever the campaign needs another option; the running supervisor will pick up active hypotheses when worker slots open.
-3. Stop with `onyx research stop --session <id>`.
-4. Finish with `onyx research finish --campaign <slug>`, then report local extraction branches and the best result.
+Workers use `ONYX_PROJECT_ROOT` as their source-editing root and `onyx-worker research session-state-brief --json` for routine session, assignment, stop, knowledge, summary, and progress context. They must not ask the user questions, launch agents, use the full control-plane CLI, or mutate protected setup paths/runtime files.
 
-### Hypothesis Worker Agents
+For each attempt, a worker runs `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, makes exactly one scoped clean commit, resumes with `onyx-worker exp run --resume --auto`, and reports with `onyx-worker exp log`. It publishes useful knowledge and hypothesis summaries as it works. Git holds immutable experiment commits/refs; Supabase owns session settlement, accepted indexes, projections, checkpoints, and provenance.
 
-`onyx research run` is the normal local path: it creates or attaches to a remote session, starts one detached supervisor by default, asks the server for worker leases in batches, sends telemetry-only presence and batched heartbeat updates, reports active process count, launch rate, provider backoff, and recent launch failures through status/listen, refreshes the local session-state brief, and lets server settlement assign accepted experiment indexes. For large local sessions, presence sends site telemetry every interval, changed worker snapshots by default, a full worker snapshot every 60 seconds or final upload, and splits worker snapshots above 250 per request; default presence cadence is 10 seconds for at least 50 workers and 15 seconds for at least 100 workers. Pass `--foreground` for attached debugging. `onyx worker run` remains a low-level debugging and recovery primitive in the full user/orchestrator CLI. Worker-safe primitives are exposed through `onyx-worker`, which users/orchestrators may run directly for debugging and supervised workers use during provider execution. `onyx research hypothesis add` creates campaign hypotheses during or between sessions; it accepts `--plan <json-file>` or inline `--focus`, `--hypothesis`, repeated `--starting-point`, `--avoid`, `--success`, and `--give-up` flags. Successor hypothesis design is orchestrator-controlled in this version: workers finish, fail, publish knowledge, and summarize, but they do not create new hypotheses.
-
-Built-in Codex, Claude, and OpenCode workers are equal first-class launchers: all run direct non-interactive CLI processes, receive the worker prompt through stdin, use the explicit `onyx-worker` command surface for worker-safe primitives, and write live logs/manifests under `.git/onyx/worker-logs/`, including a raw provider log, readable `.activity.log`, bounded structured `.activity.jsonl`, and a per-worker latest-state JSON snapshot for high-frequency progress. Supervised workers are launched with isolated `ONYX_HOME`, `ONYX_WORKER_CONTEXT`, `ONYX_WORKER_ID`, and `ONYX_WORKER_LEASE_TOKEN` under `.git/onyx/worker-runtime/<session>/<workerId>/` so profile/config state cannot leak across concurrent workers. Hypothesis workers do not ask the user questions, do not launch other agents, do not use the full `onyx` control-plane CLI, do not edit `.git/onyx/` runtime files directly, and do not edit protected setup paths.
-
-Workers treat `ONYX_PROJECT_ROOT` as the only source-editing root; the supervisor fixes their API target through `ONYX_API_URL`/`ONYX_API_KEY`, pins context through `ONYX_WORKER_CONTEXT`, and isolates config through `ONYX_HOME`. Use `onyx-worker research session-state-brief --json` as the routine context and stop-guidance command for progress, best/recent experiments, shared knowledge, summaries, and `stop.shouldStopStartingNewWork`/`stop.recommendedAction`; start each worker loop there, and do not start new work when the brief recommends exit or finishing current work before exit. Run `onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"` only when a fuller prose brief is useful, read `ONYX_RESEARCH_SPEC_FILE` for durable project guidance, and read `ONYX_SETUP_FILE` for exact setup policy. Avoid re-fetching the same state with separate `onyx research status`/`onyx knowledge list`/`onyx summary list` calls each loop, and only drill into history with a targeted `onyx-worker exp list --grep <pattern>` or `onyx-worker exp list --campaign "$ONYX_CAMPAIGN_NAME" --limit <n>` when the session-state brief is not enough; stop when the hypothesis is exhausted, when the supervisor/harness stops the worker, or when the session budget is nearly finished; make one small measured/logged attempt early before broad sweeps; treat restores as normal measured workflow attempts instead of unmeasured restore-forward commits; start each attempt with `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, edit scoped files at the agent pause, make exactly one clean commit, resume with `onyx-worker exp run --resume --auto`, inspect blocks with `onyx-worker workflow status --blocked`, and log every terminal attempt with `onyx-worker exp log --campaign "$ONYX_CAMPAIGN_NAME" --agent-notes ...`; `exp log` records the report or returns a duplicate and may not immediately include an accepted index because settlement happens separately. Publish learnings with `onyx-worker knowledge add`; update summaries with `onyx-worker summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"` (current summaries are already in the session-state brief); reserve the final shutdown cushion for logging and exiting; and leave the worktree clean on stop.
-
-Workers should not pipe mutation commands through `tail`, `head`, or other filters that can hide failed exits, and should never patch `.git/onyx/worker-logs`, `.git/onyx/worker-runtime`, `.git/onyx/workflow-runs`, `.git/onyx/attempts`, worker manifests, or latest-state JSON directly; if a CLI command fails to log or report, workers report the command, exit code, and error output instead of writing coordination files by hand. The worker harness monitors stop requests while provider processes run, gives them a default 30-second cooperative grace, then terminates the provider and still performs finalization: already-logged HEADs are marked `already_logged`, exactly one unlogged HEAD commit is measured, the immutable experiment ref is pushed best-effort, and the result is reported directly to the API when the session is still accepting experiments. Failed ref pushes are recorded as local-reported evidence instead of blocking metrics; late work after completion is recorded locally as `discarded_after_completion` without counting toward rankings, and multi-commit, restore-forward, or dirty salvage is preserved as `salvaged_unmeasured`.
+The harness monitors server cutoffs and assignment cancellation, gives cooperative stop grace, then terminates the provider. It salvages unexpected crashes only while both session and assignment still accept reports. Deliberate local stop, closed hypotheses, or ended sessions never become ranking inputs; late reports remain discarded diagnostics.

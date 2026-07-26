@@ -269,7 +269,7 @@ async function ensureCampaignMetadata({
     ...state.campaigns[key],
     campaignId: campaign.id,
     projectPath,
-    baseCommitSha: campaign.baseCommitSha,
+    baseCommitSha: campaign.createdFromCommitSha ?? (await currentCommit(root)),
     description: campaign.description,
     metricName: campaign.metricName,
     metricUnit: campaign.metricUnit,
@@ -282,7 +282,7 @@ async function ensureCampaignMetadata({
     campaignId: campaign.id,
     hypothesisId: state.campaigns[key]?.hypothesisId,
     metricName: campaign.metricName,
-    baseCommitSha: campaign.baseCommitSha,
+    baseCommitSha: campaign.createdFromCommitSha ?? (await currentCommit(root)),
   }
 }
 
@@ -1337,6 +1337,9 @@ export async function commandExpLog(args: Args) {
     campaignName,
   })
   const setup = await readSetupFile(root, projectPath)
+  const workerRuntimeContext = await readWorkerRuntimeContext().catch(
+    () => null
+  )
   if (setup.projectPath !== projectPath) {
     throw new Error(
       `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
@@ -1411,11 +1414,7 @@ export async function commandExpLog(args: Args) {
     )
   }
   const checks = usableAttempt?.checks ?? null
-  if (
-    checks &&
-    checks.status !== "passed" &&
-    status === "succeeded"
-  ) {
+  if (checks && checks.status !== "passed" && status === "succeeded") {
     throw new Error(
       `Cannot record ${status}: checks ${checks.status}. Use --status checks_failed.`
     )
@@ -1443,6 +1442,13 @@ export async function commandExpLog(args: Args) {
     process.env.ONYX_SESSION_ID
   const workerId =
     args.options.worker ?? usableAttempt?.workerId ?? process.env.ONYX_WORKER_ID
+  const assignmentId =
+    args.options.assignment ?? workerRuntimeContext?.assignmentId
+  if (!sessionId || !hypothesisId || !assignmentId) {
+    throw new Error(
+      "Experiment reports require a session, hypothesis, and session assignment. Run inside a supervised worker or pass --session, --hypothesis, and --assignment."
+    )
+  }
   const loggedCompliance =
     usableAttempt?.setupCompliance ??
     setupCompliance({
@@ -1517,6 +1523,7 @@ export async function commandExpLog(args: Args) {
     campaign.campaignId,
     {
       sessionId,
+      assignmentId,
       hypothesisId,
       workerId,
       name: record.name,
@@ -1567,9 +1574,7 @@ export async function commandExpLog(args: Args) {
     message: `${record.name} (${loggedStatus})`,
   })
   const gitNote =
-    report.experiment.gitStatus === "local_reported"
-      ? " [local-reported]"
-      : ""
+    report.experiment.gitStatus === "local_reported" ? " [local-reported]" : ""
   const pushNote =
     resultRefPushStatus === "failed" ? " (experiment ref push failed)" : ""
   console.log(

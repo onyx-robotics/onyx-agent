@@ -125,7 +125,7 @@ accepted/discarded disposition plus accepted indexes. `onyx exp list`,
 instead of offline local projections.
 
 `onyx campaign setup` and `onyx research run` require the `onyx/` setup
-surface to be committed. This keeps worker worktrees pinned to a base commit
+surface to be committed. This keeps each session assignment pinned to a commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
 declared workflow tools. GitHub App access is optional for local research:
 public repositories can show web code/diffs once commits and refs are pushed to
@@ -143,22 +143,23 @@ Hypothesis workers are driven by the TypeScript-rendered Markdown prompt in
 `src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the
 editor and standalone release binaries stay self-contained.
 
-To run multiple local research hypotheses directly from the CLI, use the
-repo-level supervisor with a built-in agent launcher:
+Add durable hypotheses, then start a fresh bounded session with the repo-level
+supervisor:
 
 ```bash
-plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
-onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --experiments 20
-onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
+onyx research hypothesis add --campaign fast-eval --name bounded-search --focus "Try a bounded search" --hypothesis "A focused local change can improve the configured metric."
+onyx research run --campaign fast-eval --workers 4 --agent codex --max-minutes 10 --experiments 20
+onyx research hypothesis add --campaign fast-eval --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 
-`onyx research run` validates the campaign and starts a detached supervisor by
+`onyx research run` validates committed setup and evaluator fingerprint inputs,
+always creates a new assignment-backed session, and starts a detached supervisor by
 default, then prints the session id, supervisor PID, log path, and monitoring
 commands before returning. Use `--json` for parseable startup output in
 orchestrator agents, and `--foreground` only when you intentionally want an
 attached debugging or smoke-test shell.
 
-`--workers` is the active slot target: when a short worker exits, the
+Omitting `--workers` selects one. It is the active slot target: when a short worker exits, the
 supervisor backfills that slot while the session is running. Bound sessions with
 `--experiments <n>` for an exact accepted experiment target, `--max-minutes <n>`
 for a deadline, or both:
@@ -174,6 +175,9 @@ jitter when provider startup, rate-limit, overload, auth, or degraded-service
 failures happen, and asks the server for worker leases in idempotent batches.
 The server enforces the worker target, assigns hypotheses, records reports, and
 settles accepted/discarded disposition idempotently after completion.
+Use `onyx research scale --workers <n> --session <id>` to change capacity;
+scale-down drains naturally. New hypotheses join future sessions only, while
+closing a hypothesis cancels its open assignments and workers immediately.
 
 Presence is bounded for large sessions: the supervisor sends site telemetry
 every interval while uploading changed worker snapshots by default, a full
@@ -241,16 +245,16 @@ the harness gives it the configured stop grace (30 seconds by default),
 terminates it if needed, then runs the same finalization path. Use
 `--worker-command` only for custom harnesses.
 
-Stop and finalize campaigns explicitly:
+Stop sessions and create campaign checkpoints explicitly:
 
 ```bash
 onyx research stop --session <id>
-onyx research finish --campaign fast-eval
+onyx research summarize --campaign fast-eval
 ```
 
-`finish` reads remote state, writes the final campaign summary through
-`/api/v1`, marks the remote campaign completed, and prints local extraction
-branches such as `onyx/fast-eval/best`.
+`summarize` reconciles reports and creates an immutable watermark checkpoint.
+Repeating it without new accepted experiments returns the existing checkpoint.
+Campaigns remain active until explicitly archived.
 
 To delete a research direction entirely — the campaign record with all its
 experiments and matching local cache rows:

@@ -8,8 +8,8 @@ import {
   rmdir,
   writeFile,
 } from "node:fs/promises"
-import { spawn } from "node:child_process"
-import { join } from "node:path"
+import { spawn, spawnSync } from "node:child_process"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import {
@@ -20,7 +20,7 @@ import { optionValues, type Args } from "../lib/args"
 import { commandExpLog, commandExpRun } from "./exp"
 import {
   ApiError,
-  completeCampaign,
+  closeCampaignHypothesis,
   getCampaignOverview,
   acquireResearchWorkerLease,
   acquireResearchWorkerLeasesBatch,
@@ -35,18 +35,23 @@ import {
   heartbeatWorkersBatch,
   heartbeatWorker,
   listCampaignExperiments,
+  listCampaignEvaluationRevisions,
+  listCampaignHypotheses,
   listCampaignKnowledge,
   listProjectCampaigns,
   reconcileCampaign,
+  reopenCampaignHypothesis,
   renderApiTimingSummary,
   resetApiTimingSummary,
   settleResearchSession,
+  scaleCampaignSession,
   stopCampaignSession,
   upsertCampaignSummary,
   upsertResearchPresence,
   verifyResearchCampaignGit,
   resolveProject,
   type ApiCampaign,
+  type ApiCampaignExperiment,
   type ApiHypothesis,
   type ApiResearchPresenceResponse,
   type ApiSession,
@@ -58,13 +63,16 @@ import {
   type ApiWorkerLease,
 } from "../lib/api"
 import {
+  normalizeSetupFile,
   readSetupFile,
   readValidationFile,
   setupPath,
+  setupHash,
   validationMatchesSetup,
   validationPath,
   type ResearchSetupFile,
 } from "../lib/contract"
+import { evaluationFingerprint } from "../lib/evaluation-fingerprint"
 import {
   apiBaseUrl,
   apiKey,
@@ -104,11 +112,9 @@ import { resolveOpenCodeModelId } from "../lib/opencode-models"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
 import {
   abandonBlockedWorkflowRunsForSession,
-  assertLocalSessionSchedulerSite,
   cacheLocalCampaign,
   cacheResearchSessionState,
   applyRemoteProjectionDeltas,
-  completeLocalCampaign,
   getLocalSessionState,
   listLocalAttempts,
   listWorkflowRuns,
@@ -130,6 +136,7 @@ import {
 import {
   buildWorkerInvocation,
   lowestFreeSlot,
+  manifestIsTerminal,
   preflightWorkerInvocation,
   readWorkerLaunchManifests,
   workerRuntimeEnvironment,
@@ -199,9 +206,11 @@ type SessionFinalizationStatus = ApiSession["finalizationStatus"]
 type SessionTerminalReason =
   | "experiment_target_reached"
   | "deadline_reached"
-  | "stop_requested"
+  | "user_stopped"
   | "provider_capacity_exhausted"
-  | "no_active_hypotheses"
+  | "all_hypotheses_closed"
+  | "supervisor_failed"
+  | "abandoned"
   | "failed"
 type ProviderLaunchFailure = {
   at: string
@@ -461,25 +470,6 @@ export function canLaunchWorkerBeforeDeadline({
   return usefulMs >= minimumUsefulLaunchMs(agentKind)
 }
 
-async function hypothesisPlansOption(args: Args) {
-  const json = args.options["hypotheses"]
-  if (!json) return undefined
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(json)
-  } catch (error) {
-    throw new Error(
-      `--hypotheses must be an inline JSON array, for example --hypotheses '[{"focus":"...","statement":"..."}]'. ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-  }
-  if (!Array.isArray(parsed)) {
-    throw new Error("--hypotheses must be an inline JSON array")
-  }
-  return parsed.map((plan) => researchHypothesisPlanSchema.parse(plan))
-}
-
 const INLINE_HYPOTHESIS_PLAN_OPTIONS = [
   "focus",
   "hypothesis",
@@ -688,10 +678,6 @@ async function resolveWorkerSettings({
     { cwd }
   )
   return { agentKind, workerModel }
-}
-
-function workerOptions({ agentKind, workerModel }: WorkerSettings) {
-  return ` --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}`
 }
 
 function workerModelMetadata(workerModel: string | null) {
@@ -1633,8 +1619,12 @@ async function writeRemoteSessionFinalization({
       sessionId,
       {
         campaignId,
-        status,
-        finalizationStatus: finalization.status,
+        endReason:
+          terminalReason === "provider_capacity_exhausted"
+            ? "provider_capacity_exhausted"
+            : status === "failed"
+              ? "failed"
+              : "user_stopped",
         reason:
           finalization.reasons.length > 0
             ? finalization.reasons.slice(0, 5).join("; ")
@@ -1770,7 +1760,7 @@ async function assertLocalSetupReady(root: string, projectPath: string) {
       [
         "Setup validation has blocking failure(s):",
         ...failing.map((check) => `- ${check.id}: ${check.message}`),
-        "Run `onyx setup validate`, fix the listed setup files/tools, and commit the setup surface before `onyx research start`.",
+        "Run `onyx setup validate`, fix the listed setup files/tools, and commit the setup surface before `onyx research run`.",
       ].join("\n")
     )
   }
@@ -1825,12 +1815,12 @@ async function recheckCheapSetupReadiness({
 
 async function ensureWorktree({
   root,
-  hypothesis,
+  startingCommitSha,
   sessionId,
   workerId,
 }: {
   root: string
-  hypothesis: ApiHypothesis
+  startingCommitSha: string
   sessionId: string
   workerId: string
 }) {
@@ -1842,10 +1832,7 @@ async function ensureWorktree({
       await mkdir(join(await onyxStateDir(root), "worktrees", sessionId), {
         recursive: true,
       })
-      await git(
-        ["worktree", "add", "-B", branch, dir, hypothesis.baseCommitSha],
-        root
-      )
+      await git(["worktree", "add", "-B", branch, dir, startingCommitSha], root)
     })
   }
   return { dir, branch }
@@ -2083,7 +2070,9 @@ export async function finalizeHypothesisAttempt({
   worktree,
   campaign,
   hypothesis,
+  startingCommitSha,
   sessionId,
+  assignmentId,
   workerId,
   workerBranch,
   activityManifest,
@@ -2095,7 +2084,9 @@ export async function finalizeHypothesisAttempt({
   worktree: string
   campaign: ApiCampaign
   hypothesis: ApiHypothesis
+  startingCommitSha: string
   sessionId: string
+  assignmentId: string
   workerId: string
   workerBranch: string
   activityManifest?: WorkerLaunchManifest | null
@@ -2121,8 +2112,7 @@ export async function finalizeHypothesisAttempt({
     const headBefore = await currentCommit(worktree)
     const dirty = (await git(["status", "--porcelain"], worktree)).trim()
     const hasResult =
-      (Boolean(dirty) && dirty.length > 0) ||
-      headBefore !== hypothesis.baseCommitSha
+      (Boolean(dirty) && dirty.length > 0) || headBefore !== startingCommitSha
     if (!hasResult) {
       const rootStatus = await mainWorktreeStatus(root)
       manifest.rootDriftStatus = rootStatus ? "dirty" : "clean"
@@ -2158,7 +2148,7 @@ export async function finalizeHypothesisAttempt({
       })
       const analysis = await analyzeFinalizationCommits({
         worktree,
-        baseCommitSha: hypothesis.baseCommitSha,
+        baseCommitSha: startingCommitSha,
         headCommitSha: commit.commitSha,
         loggedCommits,
       })
@@ -2238,6 +2228,7 @@ export async function finalizeHypothesisAttempt({
                 base: measurementBaseCommitSha,
                 hypothesis: hypothesis.id,
                 session: sessionId,
+                assignment: assignmentId,
                 worker: workerId,
                 timeout: "120",
                 "checks-timeout": "120",
@@ -2261,6 +2252,7 @@ export async function finalizeHypothesisAttempt({
                 base: measurementBaseCommitSha,
                 hypothesis: hypothesis.id,
                 session: sessionId,
+                assignment: assignmentId,
                 worker: workerId,
                 ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
                 ...(measurementError
@@ -2534,7 +2526,7 @@ function terminalReasonForStopCheck(
   stopCheck: ResearchStopCheck
 ): SessionTerminalReason | null {
   if (stopCheck.reasonCodes.includes("stop_requested")) {
-    return "stop_requested"
+    return "user_stopped"
   }
   if (stopCheck.reasonCodes.includes("experiment_target_reached")) {
     return "experiment_target_reached"
@@ -2569,19 +2561,23 @@ export async function collectResearchStopReasons({
     sessionId,
     reasonCodes: [...reasonCodes],
     reasons,
-    ...(localCheck.controlState ? { controlState: localCheck.controlState } : {}),
+    ...(localCheck.controlState
+      ? { controlState: localCheck.controlState }
+      : {}),
   }
 }
 
 export function createResearchSessionStopChecker({
   root,
   sessionId,
+  assignmentId,
   args,
   settleBeforeCheck = false,
   settlementNudgeIntervalMs = 5_000,
 }: {
   root: string
   sessionId: string
+  assignmentId?: string
   args: Args
   settleBeforeCheck?: boolean
   settlementNudgeIntervalMs?: number
@@ -2608,11 +2604,13 @@ export function createResearchSessionStopChecker({
           addResearchStopReason(reasonCodes, reasons, code, reason)
         if (control.status !== "running") {
           add(
-            control.progress.terminalReason === "experiment_target_reached" ||
-              control.progress.terminalReason === "deadline_reached" ||
-              control.progress.terminalReason === "stop_requested"
-              ? control.progress.terminalReason
-              : "session_terminal",
+            control.progress.terminalReason === "user_stopped"
+              ? "stop_requested"
+              : control.progress.terminalReason ===
+                    "experiment_target_reached" ||
+                  control.progress.terminalReason === "deadline_reached"
+                ? control.progress.terminalReason
+                : "session_terminal",
             `session ${control.status}`
           )
         }
@@ -2624,6 +2622,15 @@ export function createResearchSessionStopChecker({
         }
         if (control.progress.remainingExperimentCount === 0) {
           add("experiment_target_reached", "experiment target reached")
+        }
+        if (
+          assignmentId &&
+          control.assignments.some(
+            (assignment) =>
+              assignment.id === assignmentId && assignment.canceledAt !== null
+          )
+        ) {
+          add("stop_requested", "hypothesis assignment canceled")
         }
         return {
           shouldStop: reasons.length > 0,
@@ -3110,7 +3117,7 @@ async function runHypothesisOnce({
 
     const worktreeInfo = await ensureWorktree({
       root,
-      hypothesis,
+      startingCommitSha: lease.assignment.startingCommitSha,
       sessionId,
       workerId: worker.id,
     })
@@ -3147,10 +3154,12 @@ async function runHypothesisOnce({
     await writeWorkerRuntimeContext({
       paths: runtimePaths,
       context: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         campaignId: campaign.id,
         campaignName: campaign.name,
         sessionId,
+        assignmentId: lease.assignment.id,
+        startingCommitSha: lease.assignment.startingCommitSha,
         hypothesisId: hypothesis.id,
         hypothesisName: hypothesis.name,
         workerId: worker.id,
@@ -3261,6 +3270,10 @@ async function runHypothesisOnce({
       hypothesisName: hypothesis.name,
       workerId: worker.id,
       workerName: worker.workerName,
+      supervisorRunId,
+      pid: null,
+      processStartedAt: null,
+      commandIdentity: null,
       slotIndex,
       version: preflight.version,
       startedAt: new Date().toISOString(),
@@ -3343,6 +3356,7 @@ async function runHypothesisOnce({
     const stopChecker = createResearchSessionStopChecker({
       root,
       sessionId,
+      assignmentId: lease.assignment.id,
       args,
     })
     const workerResult = await withWorkerHeartbeat({
@@ -3386,6 +3400,18 @@ async function runHypothesisOnce({
           ].join("\n"),
           stdin: invocation.stdin,
           env: workerRunEnv,
+          onSpawn: (pid) => {
+            if (!launchManifest) return
+            const identity = inspectProcessIdentity(pid)
+            launchManifest = {
+              ...launchManifest,
+              pid,
+              supervisorRunId,
+              processStartedAt: identity?.startedAt ?? null,
+              commandIdentity: identity?.command ?? null,
+            }
+            void persistLaunchManifest(launchManifest).catch(() => {})
+          },
           cancel: {
             graceMs: stopGraceMs,
             pollMs: 5000,
@@ -3470,7 +3496,9 @@ async function runHypothesisOnce({
       worktree,
       campaign,
       hypothesis,
+      startingCommitSha: lease.assignment.startingCommitSha,
       sessionId,
+      assignmentId: lease.assignment.id,
       workerId: worker.id,
       workerBranch,
       activityManifest: launchManifest,
@@ -3726,139 +3754,18 @@ async function runHypothesisOnce({
   }
 }
 
-export async function commandResearchStart(args: Args) {
-  const root = await repoRoot()
-  const { campaign, projectPath } = await campaignForName(root, args)
-  await assertLocalSetupReady(root, projectPath)
-  await assertSetupCommitted({
-    root,
-    projectPath,
-    baseCommitSha: campaign.baseCommitSha,
-    requireBaseMatchesHead: true,
-  })
-
-  const workerTargetOption = args.options.workers ?? args.options.agents
-  if (args.options["max-experiments"] !== undefined) {
-    throw new Error("--max-experiments was removed. Use --experiments.")
-  }
-  if (args.options["max-worker-iterations"] !== undefined) {
-    throw new Error(
-      "--max-worker-iterations is no longer a research session option."
-    )
-  }
-  const experimentTarget = optionalPositiveIntegerOption(args, "experiments")
-  const maxMinutes =
-    args.options["max-minutes"] === undefined
-      ? null
-      : positiveNumberOption(args, "max-minutes", 120)
-  if (experimentTarget === null && maxMinutes === null) {
-    throw new Error("Pass --experiments <n> or --max-minutes <n>.")
-  }
-  const hypotheses = await hypothesisPlansOption(args)
-  const workerTarget =
-    workerTargetOption === undefined && hypotheses
-      ? hypotheses.length
-      : positiveIntegerOption(args, "workers", Number(workerTargetOption ?? 1))
-  const workerSettings = await resolveWorkerSettings({ args, cwd: root })
-  const deadlineAt =
-    maxMinutes === null
-      ? null
-      : new Date(Date.now() + maxMinutes * 60_000).toISOString()
-  const schedulerSiteId = await getResearchSiteId(root)
-  const result = await createCampaignSession(
-    campaign.id,
-    {
-      name: args.options.name ?? `research-${new Date().toISOString()}`,
-      workerTarget,
-      hypotheses,
-      ...(experimentTarget === null ? {} : { experimentTarget }),
-      ...(deadlineAt === null ? {} : { deadlineAt }),
-      ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
-      metadata: {
-        startedBy: "onyx-research",
-        experimentTarget,
-        maxMinutes,
-        agentKind: workerSettings.agentKind,
-        ...workerModelMetadata(workerSettings.workerModel),
-      },
-    },
-    args
-  )
-  await cacheResearchSessionState({
-    root,
-    campaign,
-    session: result.session,
-    hypotheses: result.hypotheses,
-  }).catch(() => {})
-  const state = await readState(root)
-  const key = campaignStateKey(projectPath, campaign.name)
-  state.campaigns = state.campaigns ?? {}
-  state.campaigns[key] = {
-    ...state.campaigns[key],
-    campaignId: campaign.id,
-    sessionId: result.session.id,
-  }
-  state.sessions = state.sessions ?? {}
-  state.sessions[result.session.id] = {
-    campaignName: campaign.name,
-    campaignId: campaign.id,
-    deadlineAt,
-    experimentTarget,
-    acceptedExperimentCount: 0,
-    remainingExperimentCount: experimentTarget,
-    schedulerSiteId,
-    status: "running",
-  }
-  await writeState(root, state)
-  await emitEvent(root, {
-    type: "research_started",
-    campaignName: campaign.name,
-    campaignId: campaign.id,
-    sessionId: result.session.id,
-    message: `${workerTarget} worker slot(s), ${result.hypotheses.length} hypothesis(s)`,
-  })
-  console.log(`Research session: ${result.session.id}`)
-  console.log(`Campaign: ${campaign.name}`)
-  console.log(`Workers: 0/${workerTarget}`)
-  console.log(`Hypotheses: ${result.hypotheses.length}`)
-  console.log(`Experiment target: ${experimentTarget ?? "deadline only"}`)
-  console.log(`Deadline: ${deadlineAt ?? "none"}`)
-  const agentOption = workerOptions(workerSettings)
-  const budgetOptions =
-    maxMinutes === null ? "" : workerBudgetOptions({ maxMinutes })
-  if (result.hypotheses.length === 0) {
-    console.log(
-      "No hypotheses were created. Add one with `onyx research hypothesis add --session " +
-        `${result.session.id} --focus <focus> --hypothesis <statement>` +
-        "` before launching workers."
-    )
-  } else {
-    for (let index = 0; index < workerTarget; index += 1) {
-      const hypothesis = result.hypotheses[index % result.hypotheses.length]
-      if (!hypothesis) continue
-      console.log(
-        `- worker ${index + 1}: ${hypothesis.name}: ${hypothesis.plan.focus}\n  onyx worker run --session ${result.session.id} --hypothesis ${hypothesis.id}${agentOption}${budgetOptions}`
-      )
-    }
-  }
-  console.log("Use `onyx listen` or `onyx research status` to supervise.")
-}
-
 export async function commandResearchHypothesisAdd(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const sessionId =
-    args.options.session ??
-    activeSessionIdFromState({
-      state,
-      projectPath,
-      campaignName: args.options.campaign,
-    })
-  if (!sessionId && !args.options.campaign) {
+  if (args.options.session) {
     throw new Error(
-      "Pass --session <id> or --campaign <name>, or start a research session first."
+      "--session is not valid when adding a hypothesis; session membership is immutable. Pass --campaign <name>."
     )
+  }
+  const sessionId: string | undefined = undefined
+  if (!args.options.campaign) {
+    throw new Error("Pass --campaign <name>.")
   }
 
   const setupForPlan = await readSetupFile(root, projectPath).catch(() => null)
@@ -3907,7 +3814,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
       plan,
       name: args.options.name,
       description: args.options.description ?? undefined,
-      baseCommitSha: args.options.base,
       metadata: {
         createdBy: "onyx-research",
         ...(sessionId ? { createdBySessionId: sessionId } : {}),
@@ -3989,8 +3895,132 @@ export async function commandResearchHypothesisAdd(args: Args) {
       `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}${budgetOptions}`
     )
   } else {
-    console.log("Start or choose a research session before launching a worker.")
+    console.log("This hypothesis is available to the next research session.")
   }
+}
+
+export async function commandResearchHypothesisList(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign } = await campaignForName(root, args)
+  const hypotheses = await listCampaignHypotheses(campaign.id, args)
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(hypotheses, null, 2))
+    return
+  }
+  if (hypotheses.length === 0) {
+    console.log(`No hypotheses in ${campaign.name}.`)
+    return
+  }
+  for (const hypothesis of hypotheses) {
+    console.log(
+      `${hypothesis.id}  ${hypothesis.status.padEnd(6)}  ${hypothesis.name}`
+    )
+  }
+}
+
+async function resolveCampaignHypothesis(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign } = await campaignForName(root, args)
+  const selector = args.options.hypothesis ?? args.options.name
+  if (!selector) throw new Error("Pass --hypothesis <name-or-id>.")
+  const hypotheses = await listCampaignHypotheses(campaign.id, args)
+  const hypothesis = hypotheses.find(
+    (candidate) => candidate.id === selector || candidate.name === selector
+  )
+  if (!hypothesis) {
+    throw new Error(`Hypothesis ${JSON.stringify(selector)} was not found.`)
+  }
+  return { campaign, hypothesis }
+}
+
+export async function commandResearchHypothesisClose(args: Args) {
+  const { campaign, hypothesis } = await resolveCampaignHypothesis(args)
+  const result = await closeCampaignHypothesis(
+    hypothesis.id,
+    { reason: args.options.reason },
+    args
+  )
+  console.log(
+    `Closed ${hypothesis.name} in ${campaign.name}; canceled ${result.canceledAssignmentIds.length} assignment(s) and stopped ${result.stoppedWorkerIds.length} worker(s).`
+  )
+}
+
+export async function commandResearchHypothesisReopen(args: Args) {
+  const { campaign, hypothesis } = await resolveCampaignHypothesis(args)
+  await reopenCampaignHypothesis(hypothesis.id, args)
+  console.log(
+    `Reopened ${hypothesis.name} in ${campaign.name}; it is eligible for future sessions.`
+  )
+}
+
+export async function commandResearchScale(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const sessionId =
+    args.options.session ??
+    selectLocalOpenSessionId({
+      state,
+      projectPath,
+      campaignName: args.options.campaign,
+      operation: "scale",
+    })
+  if (!sessionId) throw new Error("Pass --session <id>.")
+  const campaignId =
+    state.sessions?.[sessionId]?.campaignId ??
+    (await getResearchSessionState(sessionId, args)).campaign.id
+  const workerTarget = positiveIntegerOption(args, "workers", Number.NaN)
+  if (
+    !Number.isInteger(workerTarget) ||
+    workerTarget < 1 ||
+    workerTarget > 500
+  ) {
+    throw new Error("--workers must be an integer from 1 to 500.")
+  }
+  const { session } = await scaleCampaignSession(
+    sessionId,
+    {
+      campaignId,
+      workerTarget,
+      siteId: await getResearchSiteId(root),
+      supervisorRunId:
+        state.sessions?.[sessionId]?.supervisor?.supervisorRunId ?? undefined,
+      metadata: { source: "onyx-research-scale" },
+    },
+    args
+  )
+  console.log(
+    `Session ${session.id} worker target is now ${session.workerTarget}. Existing workers drain naturally when scaling down.`
+  )
+}
+
+export async function commandResearchClean(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const stateDir = await onyxStateDir(root)
+  const targets = [
+    join(stateDir, "worker-runtime"),
+    join(stateDir, "worker-logs"),
+    join(stateDir, "workflow-runs"),
+    join(stateDir, "attempts"),
+    join(stateDir, "worktrees"),
+    join(stateDir, SUPERVISOR_LOG_DIR),
+  ]
+  if (args.options["dry-run"] === "true") {
+    console.log(targets.join("\n"))
+    return
+  }
+  for (const target of targets) {
+    await rm(target, { recursive: true, force: true })
+  }
+  await updateState(root, (state) => {
+    state.sessions = {}
+    for (const campaign of Object.values(state.campaigns ?? {})) {
+      delete campaign.sessionId
+    }
+  })
+  console.log(
+    "Removed local Onyx research runtime, attempt, worktree, and log artifacts."
+  )
 }
 
 export async function commandResearchBrief(args: Args) {
@@ -4047,6 +4077,15 @@ export async function commandResearchStatus(args: Args) {
     )
   }
   const state = await readState(root)
+  const locallyOwnedOpenSessions = Object.entries(state.sessions ?? {})
+    .filter(
+      ([, session]) =>
+        session.campaignId === campaign.id &&
+        (session.status === "running" ||
+          session.status === "stop_requested" ||
+          session.stopPendingRemote === true)
+    )
+    .map(([id, session]) => ({ id, ...session }))
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   const scopeAll = args.options["all-sessions"] === "true"
@@ -4215,7 +4254,7 @@ export async function commandResearchStatus(args: Args) {
     supervisorTelemetry?.providerBackoff ??
     sessionRuntimeState?.providerBackoff ??
     null
-  const sessionMetadata = sessionState?.session.metadata ?? {}
+  const sessionMetadata: Record<string, unknown> = {}
   const launchRate = supervisorTelemetry?.launchRate ?? {
     batchSize:
       typeof sessionMetadata.launchBatchSize === "number"
@@ -4334,6 +4373,8 @@ export async function commandResearchStatus(args: Args) {
       JSON.stringify(
         {
           campaign: statusCampaign,
+          sessions: freshOverview.sessions,
+          locallyOwnedOpenSessions,
           session: activeSessionId
             ? {
                 id: activeSessionId,
@@ -4389,6 +4430,14 @@ export async function commandResearchStatus(args: Args) {
 
   console.log(`campaign: ${campaign.name}`)
   console.log(`setup: local onyx/setup.json`)
+  console.log(
+    `sessions: ${freshOverview.sessions.length} recent remote, ${locallyOwnedOpenSessions.length} locally owned open`
+  )
+  for (const session of freshOverview.sessions) {
+    console.log(
+      `  ${session.id}: ${session.runtimeState} workers=${session.workerTarget} accepted=${session.acceptedExperimentCount}${session.endedAt ? ` ended=${session.endReason ?? "ended"}` : ""}`
+    )
+  }
   if (shouldReconcile && freshOverview.gitVerification) {
     const summary = freshOverview.gitVerification
     const suffix =
@@ -4598,6 +4647,52 @@ function activeSessionIdFromState({
   return undefined
 }
 
+function selectLocalOpenSessionId({
+  state,
+  projectPath,
+  campaignName,
+  operation,
+}: {
+  state: Awaited<ReturnType<typeof readState>>
+  projectPath: string
+  campaignName?: string
+  operation: "stop" | "scale"
+}) {
+  const selectedCampaignName = campaignName ?? state.activeCampaign
+  const selectedCampaignId = selectedCampaignName
+    ? state.campaigns?.[campaignStateKey(projectPath, selectedCampaignName)]
+        ?.campaignId
+    : undefined
+  const openSessionIds = Object.entries(state.sessions ?? {})
+    .filter(([, session]) => {
+      if (selectedCampaignId && session.campaignId !== selectedCampaignId) {
+        return false
+      }
+      if (
+        !selectedCampaignId &&
+        selectedCampaignName &&
+        session.campaignName !== selectedCampaignName
+      ) {
+        return false
+      }
+      return (
+        session.stopPendingRemote === true ||
+        session.status === "running" ||
+        session.status === "stop_requested"
+      )
+    })
+    .map(([sessionId]) => sessionId)
+  if (openSessionIds.length > 1) {
+    throw new Error(
+      `Multiple local research sessions are open (${openSessionIds.join(", ")}). Pass --session <id> to ${operation} one.`
+    )
+  }
+  return (
+    openSessionIds[0] ??
+    activeSessionIdFromState({ state, projectPath, campaignName })
+  )
+}
+
 function renderSessionBrief(brief: ApiSessionBrief) {
   const lines: string[] = [
     `# ${brief.campaign.name}`,
@@ -4653,33 +4748,6 @@ function renderSessionBrief(brief: ApiSessionBrief) {
 
 function sessionStatusIsTerminal(status: string | null | undefined) {
   return status === "completed" || status === "failed" || status === "stopped"
-}
-
-async function readRunSessionState({
-  root,
-  sessionId,
-  args,
-}: {
-  root: string
-  sessionId: string
-  args: Args
-}) {
-  try {
-    const remote = await getResearchSessionState(sessionId, args)
-    await cacheResearchSessionState({
-      root,
-      campaign: remote.campaign,
-      session: remote.session,
-      hypotheses: remote.hypotheses,
-      workers: remote.workers,
-      experiments: remote.latestExperiments,
-      summaries: remote.summaries,
-      knowledge: remote.knowledge,
-    }).catch(() => {})
-    return remote
-  } catch {
-    return getLocalSessionState(root, sessionId)
-  }
 }
 
 async function reconcileCampaignIntoLocalState({
@@ -4849,10 +4917,11 @@ export async function commandResearchStop(args: Args) {
   const state = await readState(root)
   const sessionId =
     args.options.session ??
-    activeSessionIdFromState({
+    selectLocalOpenSessionId({
       state,
       projectPath,
       campaignName: args.options.campaign,
+      operation: "stop",
     })
   if (!sessionId) {
     throw new Error("Pass --session <id> or start a research session first.")
@@ -4875,18 +4944,82 @@ export async function commandResearchStop(args: Args) {
     stopRequested: true,
     status: "stop_requested",
   }
+  const stopMarkerDir = join(
+    await onyxStateDir(root),
+    "worker-runtime",
+    sessionId
+  )
+  await mkdir(stopMarkerDir, { recursive: true })
+  await writeFile(
+    join(stopMarkerDir, "stop-marker.json"),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        sessionId,
+        supervisorRunId:
+          state.sessions[sessionId]?.supervisor?.supervisorRunId ?? null,
+        requestedAt: new Date().toISOString(),
+        reason: args.options.reason ?? "user requested stop",
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  )
   await writeState(root, state)
 
+  const supervisor = state.sessions[sessionId]?.supervisor
+  if (supervisor?.pid) {
+    const currentIdentity = inspectProcessIdentity(supervisor.pid)
+    const processManifest = await readSupervisorProcessManifest(root, sessionId)
+    const identityMatches = supervisorProcessIdentityMatches({
+      runtime: supervisor,
+      manifest: processManifest,
+      identity: currentIdentity,
+    })
+    if (identityMatches) {
+      try {
+        process.kill(-supervisor.pid, "SIGTERM")
+      } catch {
+        process.kill(supervisor.pid, "SIGTERM")
+      }
+    } else {
+      console.warn(
+        `Supervisor ${supervisor.pid} identity could not be verified; no local signal was sent. The remote stop cutoff will still apply.`
+      )
+    }
+  }
+
   if (campaignId) {
-    await stopCampaignSession(
-      sessionId,
-      {
-        campaignId,
-        status: "stop_requested",
-        reason: args.options.reason ?? "stop requested",
-      },
-      args
-    )
+    try {
+      await stopCampaignSession(
+        sessionId,
+        {
+          campaignId,
+          endReason: "user_stopped",
+          reason: args.options.reason ?? "stop requested",
+        },
+        args
+      )
+      await updateState(root, (next) => {
+        if (next.sessions?.[sessionId]) {
+          next.sessions[sessionId]!.stopPendingRemote = false
+        }
+      })
+    } catch (error) {
+      await updateState(root, (next) => {
+        next.sessions = next.sessions ?? {}
+        next.sessions[sessionId] = {
+          ...(next.sessions[sessionId] ?? {}),
+          campaignId,
+          stopRequested: true,
+          stopPendingRemote: true,
+        }
+      })
+      throw new Error(
+        `Local stop was applied, but the remote cutoff is pending: ${errorMessage(error)}\nRetry exactly: onyx research stop --session ${sessionId}`
+      )
+    }
   } else {
     const control = await getResearchSessionControlState(sessionId, args)
     throw new Error(
@@ -4906,199 +5039,59 @@ function safeBranchSegment(value: string) {
   return value.replace(/[^A-Za-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
 }
 
-export async function commandResearchFinish(args: Args) {
+export async function commandResearchSummarize(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  if (
-    args.options.offline === "true" ||
-    args.options["sync-interval"] !== undefined ||
-    args.options["sync-concurrency"] !== undefined ||
-    args.options["sync-drain-batches"] !== undefined ||
-    args.options["sync-batch-size"] !== undefined ||
-    args.options["final-sync-timeout"] !== undefined
-  ) {
-    throw new Error(
-      "Offline and sync finalization flags were removed. Research finish reads and writes directly through the Onyx API."
-    )
-  }
-  const campaignInfo = await campaignForName(root, args)
-  const { campaign } = campaignInfo
-  const state = await readState(root)
-  const projectPath = await resolveProjectPath(root, args)
-  const sessionId =
-    args.options.session ??
-    activeSessionIdFromState({
-      state,
-      projectPath,
-      campaignName: campaign.name,
+  const { campaign } = await campaignForName(root, args)
+  await reconcileCampaign(campaign.id, args).catch(() => null)
+  const overview = await getCampaignOverview(campaign.id, args)
+  const revisionRows = await listCampaignEvaluationRevisions(campaign.id, args)
+  const experiments = [] as typeof overview.latestExperiments
+  let cursor: string | undefined
+  do {
+    const page = await listCampaignExperiments(campaign.id, args, {
+      limit: 100,
+      cursor,
     })
-  const finishFinalization = sessionId
-    ? await computeSessionFinalizationStatus({ root, sessionId })
-    : null
-
-  await completeLocalCampaign({
-    root,
-    campaignId: campaign.id,
-  }).catch(() => {})
-  if (sessionId) {
-    state.sessions = state.sessions ?? {}
-    state.sessions[sessionId] = {
-      ...(state.sessions[sessionId] ?? {}),
-      campaignId: campaign.id,
-      campaignName: campaign.name,
-      status: "completed",
-      stopRequested: false,
-      providerBackoff: null,
-    }
-    await writeState(root, state)
-    await abandonBlockedWorkflowRunsForSession({
-      root,
-      sessionId,
-      reason:
-        "Campaign finalized; blocked worker workflow is no longer active.",
-    }).catch(() => [])
-    await stopLocalSession({
-      root,
-      sessionId,
-      status: "completed",
-      reason: "finalized",
-    }).catch(() => {})
-    const sessionState = await getLocalSessionState(root, sessionId).catch(
-      () => null
-    )
-    for (const worker of sessionState?.workers ?? []) {
-      if (["registered", "running"].includes(worker.status)) {
-        await recordLocalWorkerHeartbeat({
-          root,
-          workerId: worker.id,
-          status: "stopped",
-          sessionId,
-          hypothesisId: worker.hypothesisId,
-          phase: "stopped",
-          event: "campaign_finalized",
-          progressMessage: "Campaign finalized",
-          gitLabel: worker.gitLabel ?? null,
-        }).catch(() => {})
-      }
-    }
-    await writeRemoteSessionFinalization({
-      sessionId,
-      campaignId: campaign.id,
-      status: finishFinalization?.status === "failed" ? "failed" : "completed",
-      finalization:
-        finishFinalization ??
-        ({
-          status: "complete",
-          reasons: [],
-          live: null,
-        } satisfies SessionFinalizationComputation),
-      args,
-      requireOnline: args.options["require-online"] === "true",
-    })
+    experiments.push(...page.items)
+    cursor = page.page.nextCursor ?? undefined
+  } while (cursor)
+  const revisions = new Map<string, typeof experiments>()
+  for (const experiment of experiments) {
+    const items = revisions.get(experiment.evaluationRevisionId) ?? []
+    items.push(experiment)
+    revisions.set(experiment.evaluationRevisionId, items)
   }
-
-  await completeCampaign(
-    campaign.id,
-    sessionId ? { sessionId } : {},
-    args
-  ).catch((error) => {
-    if (args.options["require-online"] === "true") throw error
-    console.warn(
-      `Campaign completion skipped: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-    return null
-  })
-
-  const overview = await reconcileCampaignIntoLocalState({
-    root,
-    campaignId: campaign.id,
-    projectPath: campaignInfo.projectPath,
-    args,
-  })
-    .then(() => getCampaignOverview(campaign.id, args))
-    .catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-      return campaignInfo.overview
-    })
-
-  const branches: string[] = []
-  const campaignSegment = safeBranchSegment(campaign.name)
-  if (overview.campaign.bestCommitSha) {
-    const bestBranch = `onyx/${campaignSegment}/best`
-    await git(
-      ["branch", "-f", bestBranch, overview.campaign.bestCommitSha],
-      root
-    )
-    branches.push(`${bestBranch} -> ${overview.campaign.bestCommitSha}`)
-  }
-  const finishLive = sessionId
-    ? await getResearchSessionLive(sessionId, args).catch(() => null)
-    : null
-  const finishLocal = sessionId
-    ? await getLocalSessionState(root, sessionId).catch(() => null)
-    : null
-  const finishManifests = sessionId
-    ? await readWorkerLaunchManifests(root, sessionId).catch(() => [])
-    : []
-  const finishUnmeasuredSalvage =
-    finishLive?.finalization?.unmeasuredSalvageCount ??
-    finishManifests.filter(
-      (manifest) =>
-        manifest.finalization?.salvaged &&
-        manifest.finalization.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        )
-    ).length
-  const finishDiscardedAfterCompletion = finishManifests.filter(
-    (manifest) =>
-      manifest.finalization?.finalizationStatus ===
-      "discarded_after_completion"
-  ).length
-  const finishAccepted =
-    finishLive?.session.acceptedExperimentCount ??
-    finishLocal?.session.acceptedExperimentCount ??
-    overview.campaign.experimentCount ??
-    0
-  const finishTarget =
-    finishLive?.session.experimentTarget ??
-    finishLocal?.session.experimentTarget ??
-    null
-
   const body = [
-    finishFinalization?.status === "failed"
-      ? `Finalized campaign ${campaign.name} with failed worker finalization.`
-      : finishFinalization?.status === "incomplete"
-        ? `Finalized campaign ${campaign.name} with incomplete worker finalization.`
-        : finishDiscardedAfterCompletion > 0
-          ? `Finalized campaign ${campaign.name} with late discarded worker work.`
-          : `Finalized campaign ${campaign.name}.`,
-    `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
-    `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
-    `Experiment counts: accepted=${finishAccepted}${finishTarget === null ? "" : `/${finishTarget}`} unmeasuredSalvage=${finishUnmeasuredSalvage} discardedAfterCompletion=${finishDiscardedAfterCompletion}`,
-    finishFinalization?.reasons.length
-      ? `Finalization notes: ${finishFinalization.reasons.slice(0, 5).join("; ")}`
-      : "",
-    "Hypothesis refs are not promoted from mutable hypothesis heads; use verified experiment best projections for curated outputs.",
-    "",
-    "Local branches:",
-    ...(branches.length > 0
-      ? branches.map((branch) => `- ${branch}`)
-      : ["- none"]),
+    `Campaign checkpoint for ${campaign.name}.`,
+    `Accepted experiments: ${overview.campaign.experimentCount}.`,
+    `Current evaluation revision: ${overview.campaign.currentEvaluationRevisionId ?? "none"}.`,
+    ...revisionRows.map((revision) => {
+      const experiments = revisions.get(revision.id) ?? []
+      const measured = experiments.filter(
+        (experiment) => experiment.primaryMetricValue !== null
+      )
+      const best = measured.sort((left, right) =>
+        campaign.metricDirection === "maximize"
+          ? (right.primaryMetricValue ?? -Infinity) -
+            (left.primaryMetricValue ?? -Infinity)
+          : (left.primaryMetricValue ?? Infinity) -
+            (right.primaryMetricValue ?? Infinity)
+      )[0]
+      return `Revision ${revision.id}${revision.id === campaign.currentEvaluationRevisionId ? " (current)" : ""}: ${experiments.length} experiment(s); best=${best?.primaryMetricValue ?? "n/a"} (${best?.resultCommitSha ?? "n/a"}).`
+    }),
   ].join("\n")
-  await upsertCampaignSummary(
+  const summary = await upsertCampaignSummary(
     campaign.id,
     {
-      sessionId,
       summaryKind: "campaign_brief",
-      title: `${campaign.name} final results`,
+      title: `${campaign.name} checkpoint`,
       body,
       isCurrent: true,
-      metadata: { authoredBy: "onyx-research-finish" },
+      metadata: { authoredBy: "onyx-research-summarize" },
     },
     args
   )
-  console.log(body)
+  console.log(summary.body)
 }
 
 export async function commandSummaryUpsert(args: Args) {
@@ -5302,37 +5295,6 @@ export async function commandKnowledgeList(args: Args) {
   }
 }
 
-async function existingRunSession({
-  root,
-  sessionId,
-  args,
-}: {
-  root: string
-  sessionId: string
-  args: Args
-}) {
-  const sessionState = await readRunSessionState({ root, sessionId, args })
-  if (sessionState.session.status !== "running") {
-    throw new Error(
-      `Research session ${sessionId} is ${sessionState.session.status}; cannot supervise new workers.`
-    )
-  }
-  if (
-    args.options.campaign &&
-    sessionState.campaign.name !== args.options.campaign
-  ) {
-    throw new Error(
-      `Session ${sessionId} belongs to ${sessionState.campaign.name}, not ${args.options.campaign}.`
-    )
-  }
-  await assertLocalSessionSchedulerSite({
-    root,
-    sessionId,
-    schedulerSiteId: sessionState.session.schedulerSiteId,
-  })
-  return sessionState
-}
-
 function supervisorWorkerTarget(args: Args, fallback: number) {
   const target = positiveIntegerOption(args, "workers", fallback)
   if (target > MAX_LOCAL_SUPERVISOR_WORKERS) {
@@ -5341,6 +5303,112 @@ function supervisorWorkerTarget(args: Args, fallback: number) {
     )
   }
   return target
+}
+
+async function resolveCommitRef(root: string, ref: string) {
+  return (await git(["rev-parse", "--verify", `${ref}^{commit}`], root)).trim()
+}
+
+async function committedSetupAt({
+  root,
+  projectPath,
+  commitSha,
+}: {
+  root: string
+  projectPath: string
+  commitSha: string
+}) {
+  const path = [projectPath, "onyx", "setup.json"].filter(Boolean).join("/")
+  const raw = await git(["show", `${commitSha}:${path}`], root)
+  const setup = normalizeSetupFile(JSON.parse(raw))
+  const evaluation = await evaluationFingerprint({
+    root,
+    projectPath,
+    commitSha,
+    setup,
+  })
+  return { setup, setupHash: setupHash(setup), ...evaluation }
+}
+
+function selectRunHypotheses(args: Args, hypotheses: ApiHypothesis[]) {
+  const active = hypotheses.filter(
+    (hypothesis) => hypothesis.status === "active"
+  )
+  const selected = optionValues(args, "hypothesis")
+  if (selected.length === 0) return active
+  const resolved = selected.map((selector) => {
+    const hypothesis = active.find(
+      (candidate) => candidate.id === selector || candidate.name === selector
+    )
+    if (!hypothesis) {
+      throw new Error(
+        `Active hypothesis ${JSON.stringify(selector)} was not found. Run \`onyx research hypothesis list --campaign ${args.options.campaign ?? "<name>"}\`.`
+      )
+    }
+    return hypothesis
+  })
+  if (new Set(resolved.map((item) => item.id)).size !== resolved.length) {
+    throw new Error("Each --hypothesis selection must be unique.")
+  }
+  return resolved
+}
+
+async function resolveHypothesisBaseOverrides({
+  campaignId,
+  hypotheses,
+  args,
+}: {
+  campaignId: string
+  hypotheses: ApiHypothesis[]
+  args: Args
+}) {
+  const overrides = new Map<
+    string,
+    { ref: string; sourceExperimentId?: string }
+  >()
+  for (const value of optionValues(args, "hypothesis-base")) {
+    const split = value.indexOf("=")
+    if (split <= 0 || split === value.length - 1) {
+      throw new Error(
+        `Invalid --hypothesis-base ${JSON.stringify(value)}; expected <hypothesis>=<ref|experiment:id>.`
+      )
+    }
+    const selector = value.slice(0, split)
+    const hypothesis = hypotheses.find(
+      (candidate) => candidate.id === selector || candidate.name === selector
+    )
+    if (!hypothesis) {
+      throw new Error(
+        `--hypothesis-base refers to unselected hypothesis ${selector}.`
+      )
+    }
+    const rawRef = value.slice(split + 1)
+    if (rawRef.startsWith("experiment:")) {
+      const experimentId = rawRef.slice("experiment:".length)
+      let cursor: string | undefined
+      let experiment: ApiCampaignExperiment | undefined
+      do {
+        const page = await listCampaignExperiments(campaignId, args, {
+          limit: 100,
+          ...(cursor ? { cursor } : {}),
+        })
+        experiment = page.items.find((item) => item.id === experimentId)
+        cursor = page.page.nextCursor ?? undefined
+      } while (!experiment && cursor)
+      if (!experiment) {
+        throw new Error(
+          `Experiment ${experimentId} was not found in this campaign.`
+        )
+      }
+      overrides.set(hypothesis.id, {
+        ref: experiment.resultCommitSha,
+        sourceExperimentId: experiment.id,
+      })
+    } else {
+      overrides.set(hypothesis.id, { ref: rawRef })
+    }
+  }
+  return overrides
 }
 
 function defaultPresenceIntervalSeconds(workerTarget: number) {
@@ -5459,6 +5527,158 @@ function freshSupervisorTelemetry(
   return supervisor
 }
 
+function inspectProcessIdentity(pid: number) {
+  const inspect = (field: "lstart" | "command") => {
+    const result = spawnSync("ps", ["-p", String(pid), "-o", `${field}=`], {
+      encoding: "utf8",
+    })
+    return typeof result?.stdout === "string" ? result.stdout.trim() : ""
+  }
+  const startedAt = inspect("lstart")
+  const command = inspect("command")
+  return startedAt && command ? { startedAt, command } : null
+}
+
+type SupervisorProcessManifest = {
+  schemaVersion: 1
+  sessionId: string
+  pid: number
+  supervisorRunId: string
+  processStartedAt: string
+  commandIdentity: string
+  mode: "detached" | "foreground"
+  createdAt: string
+}
+
+async function supervisorProcessManifestPath(root: string, sessionId: string) {
+  return join(
+    await onyxStateDir(root),
+    "worker-runtime",
+    sessionId,
+    "supervisor-process.json"
+  )
+}
+
+async function writeSupervisorProcessManifest({
+  root,
+  manifest,
+}: {
+  root: string
+  manifest: SupervisorProcessManifest
+}) {
+  const path = await supervisorProcessManifestPath(root, manifest.sessionId)
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
+}
+
+async function readSupervisorProcessManifest(
+  root: string,
+  sessionId: string
+): Promise<SupervisorProcessManifest | null> {
+  const path = await supervisorProcessManifestPath(root, sessionId)
+  try {
+    const value = JSON.parse(
+      await readFile(path, "utf8")
+    ) as Partial<SupervisorProcessManifest>
+    if (
+      value.schemaVersion !== 1 ||
+      value.sessionId !== sessionId ||
+      typeof value.pid !== "number" ||
+      typeof value.supervisorRunId !== "string" ||
+      typeof value.processStartedAt !== "string" ||
+      typeof value.commandIdentity !== "string" ||
+      (value.mode !== "detached" && value.mode !== "foreground") ||
+      typeof value.createdAt !== "string"
+    ) {
+      return null
+    }
+    return value as SupervisorProcessManifest
+  } catch {
+    return null
+  }
+}
+
+function supervisorProcessIdentityMatches({
+  runtime,
+  manifest,
+  identity,
+}: {
+  runtime: NonNullable<NonNullable<CliState["sessions"]>[string]["supervisor"]>
+  manifest: SupervisorProcessManifest | null
+  identity: ReturnType<typeof inspectProcessIdentity>
+}) {
+  return Boolean(
+    manifest &&
+    identity &&
+    runtime.pid === manifest.pid &&
+    runtime.supervisorRunId === manifest.supervisorRunId &&
+    runtime.processStartedAt === manifest.processStartedAt &&
+    runtime.commandIdentity === manifest.commandIdentity &&
+    identity.startedAt === manifest.processStartedAt &&
+    identity.command === manifest.commandIdentity &&
+    (manifest.mode === "foreground" ||
+      identity.command.includes(`--supervise-session ${manifest.sessionId}`))
+  )
+}
+
+async function cleanupIdentityVerifiedOrphanWorkers({
+  root,
+  sessionId,
+  supervisorRunId,
+}: {
+  root: string
+  sessionId: string
+  supervisorRunId: string | null | undefined
+}) {
+  if (!supervisorRunId) return 0
+  const manifests = await readWorkerLaunchManifests(root, sessionId).catch(
+    () => []
+  )
+  let stopped = 0
+  for (const manifest of manifests) {
+    if (
+      manifestIsTerminal(manifest) ||
+      manifest.supervisorRunId !== supervisorRunId ||
+      !manifest.pid ||
+      !manifest.processStartedAt ||
+      !manifest.commandIdentity
+    ) {
+      continue
+    }
+    const identity = inspectProcessIdentity(manifest.pid)
+    const matches = Boolean(
+      identity &&
+      identity.startedAt === manifest.processStartedAt &&
+      identity.command === manifest.commandIdentity
+    )
+    if (!matches) {
+      console.warn(
+        `Worker ${manifest.workerId} process identity could not be verified; no orphan signal was sent.`
+      )
+      continue
+    }
+    try {
+      process.kill(-manifest.pid, "SIGTERM")
+    } catch {
+      try {
+        process.kill(manifest.pid, "SIGTERM")
+      } catch {
+        continue
+      }
+    }
+    stopped += 1
+    await writeWorkerLaunchManifest({
+      ...manifest,
+      status: "stopped",
+      completedAt: new Date().toISOString(),
+      signal: "SIGTERM",
+      error:
+        "Identity-verified orphan process stopped after supervisor failure",
+    }).catch(() => {})
+  }
+  return stopped
+}
+
 async function persistSupervisorTelemetry({
   root,
   sessionId,
@@ -5519,7 +5739,7 @@ function researchRunChildArgv({
 }) {
   const options: Record<string, string | undefined> = {
     ...args.options,
-    session: sessionId,
+    "supervise-session": sessionId,
     cwd: root,
     foreground: "true",
     "supervisor-log-path": logPath,
@@ -5618,6 +5838,24 @@ async function launchDetachedResearchSupervisor({
     closeSync(outputFd)
   }
 
+  const processIdentity = pid ? inspectProcessIdentity(pid) : null
+
+  if (pid && processIdentity) {
+    await writeSupervisorProcessManifest({
+      root,
+      manifest: {
+        schemaVersion: 1,
+        sessionId,
+        pid,
+        supervisorRunId,
+        processStartedAt: processIdentity.startedAt,
+        commandIdentity: processIdentity.command,
+        mode: "detached",
+        createdAt: new Date().toISOString(),
+      },
+    })
+  }
+
   await persistSupervisorTelemetry({
     root,
     sessionId,
@@ -5626,6 +5864,8 @@ async function launchDetachedResearchSupervisor({
     telemetry: {
       pid,
       supervisorRunId,
+      processStartedAt: processIdentity?.startedAt ?? null,
+      commandIdentity: processIdentity?.command ?? null,
       logPath,
       activeProcessCount: 0,
       launchRate,
@@ -5658,56 +5898,122 @@ async function launchDetachedResearchSupervisor({
 
 export async function commandResearchRun(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const projectPath = await resolveProjectPath(root, args)
-  const state = await readState(root)
-  const explicitSessionId = args.options.session
-  const cachedSessionId =
-    explicitSessionId === undefined
-      ? activeSessionIdFromState({
-          state,
-          projectPath,
-          campaignName: args.options.campaign,
-        })
+  const internalSessionId =
+    process.env.ONYX_LAUNCHER_BYPASS === "1"
+      ? args.options["supervise-session"]
       : undefined
-  let requestedSessionId = explicitSessionId ?? cachedSessionId
-  if (cachedSessionId) {
-    const cachedSessionState = await readRunSessionState({
-      root,
-      sessionId: cachedSessionId,
-      args,
-    })
-    if (sessionStatusIsTerminal(cachedSessionState.session.status)) {
-      requestedSessionId = undefined
-      if (args.options.json !== "true") {
-        console.error(
-          `Cached research session ${cachedSessionId} is ${cachedSessionState.session.status}; creating a fresh session.`
-        )
+  if (
+    args.options.session ||
+    (args.options["supervise-session"] && !internalSessionId)
+  ) {
+    throw new Error(
+      "--session was removed from `onyx research run`; every run creates a new bounded session."
+    )
+  }
+  if (args.options.hypotheses) {
+    throw new Error(
+      "--hypotheses was removed. Add durable hypotheses with `onyx research hypothesis add`, then select them with repeated --hypothesis flags."
+    )
+  }
+  const state = await readState(root)
+  const campaignInfo = await campaignForName(root, args)
+  const campaign = campaignInfo.campaign
+  const effectiveProjectPath = campaignInfo.projectPath
+  const internalSession = internalSessionId
+    ? await getResearchSessionState(internalSessionId, args)
+    : null
+  if (campaign.status === "archived") {
+    throw new Error(
+      `Campaign ${campaign.name} is archived. Unarchive it before starting research.`
+    )
+  }
+  if (!internalSessionId) {
+    for (const [cachedSessionId, local] of Object.entries(
+      state.sessions ?? {}
+    )) {
+      if (
+        local.campaignId !== campaign.id ||
+        local.status !== "running" ||
+        !local.supervisor?.pid
+      ) {
+        continue
       }
-    } else if (cachedSessionState.session.status === "stop_requested") {
+      const processManifest = await readSupervisorProcessManifest(
+        root,
+        cachedSessionId
+      )
+      const supervisorAlive = supervisorProcessIdentityMatches({
+        runtime: local.supervisor,
+        manifest: processManifest,
+        identity: inspectProcessIdentity(local.supervisor.pid),
+      })
+      if (supervisorAlive) continue
+      await cleanupIdentityVerifiedOrphanWorkers({
+        root,
+        sessionId: cachedSessionId,
+        supervisorRunId: local.supervisor.supervisorRunId,
+      })
+      await stopCampaignSession(
+        cachedSessionId,
+        {
+          campaignId: campaign.id,
+          endReason: "supervisor_failed",
+          reason: "cached local supervisor process is no longer running",
+        },
+        args
+      ).catch((error) => {
+        console.warn(
+          `Could not persist supervisor_failed for ${cachedSessionId}: ${errorMessage(error)}. Server abandonment reconciliation remains authoritative.`
+        )
+      })
+      local.status = "failed"
+      local.stopRequested = false
+      local.stopPendingRemote = false
+    }
+    await writeState(root, state)
+  }
+  if (!internalSessionId && args.options.new !== "true") {
+    const live = Object.entries(state.sessions ?? {}).find(([, local]) => {
+      if (local.campaignId !== campaign.id || local.status !== "running")
+        return false
+      const pid = local.supervisor?.pid
+      if (!pid) return false
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    })
+    if (live) {
       throw new Error(
-        `Cached research session ${cachedSessionId} is stop_requested; finish or stop it before starting a new session.`
+        `This machine already has a live supervisor for ${campaign.name} (${live[0]}). Pass --new to create a concurrent session.`
       )
     }
   }
-  const hypotheses = await hypothesisPlansOption(args)
-  if (requestedSessionId && hypotheses) {
+  const internalAssignmentHypothesisIds = new Set(
+    internalSession?.session.assignments.map(
+      (assignment) => assignment.hypothesisId
+    ) ?? []
+  )
+  const selectedHypotheses = internalSession
+    ? internalSession.hypotheses.filter((hypothesis) =>
+        internalAssignmentHypothesisIds.has(hypothesis.id)
+      )
+    : selectRunHypotheses(args, campaignInfo.overview.hypotheses)
+  if (selectedHypotheses.length === 0) {
     throw new Error(
-      "--hypotheses can only be used when creating a new research session. Use `onyx research hypothesis add --session <id>` for an existing session."
+      `Campaign ${campaign.name} has no active hypotheses. Add one with: onyx research hypothesis add --campaign ${campaign.name} --focus <focus> --hypothesis <statement>`
     )
   }
-
-  const sessionState = requestedSessionId
-    ? await existingRunSession({ root, sessionId: requestedSessionId, args })
-    : null
-  const campaignInfo = sessionState ? null : await campaignForName(root, args)
-  const campaign = sessionState?.campaign ?? campaignInfo!.campaign
-  const effectiveProjectPath = campaignInfo?.projectPath ?? projectPath
   const { setup } = await assertLocalSetupReady(root, effectiveProjectPath)
+  const sessionBaseCommitSha = internalSession
+    ? internalSession.session.baseCommitSha
+    : await resolveCommitRef(root, args.options.base ?? "HEAD")
   await assertSetupCommitted({
     root,
     projectPath: effectiveProjectPath,
-    baseCommitSha: campaign.baseCommitSha,
-    requireBaseMatchesHead: true,
+    baseCommitSha: sessionBaseCommitSha,
   })
   await assertMainWorktreeClean(root, "before running research")
 
@@ -5717,12 +6023,11 @@ export async function commandResearchRun(args: Args) {
   if (args.options["max-worker-iterations"] !== undefined) {
     throw new Error("--max-worker-iterations is no longer a worker option.")
   }
-  const sessionMetadata = sessionState?.session.metadata ?? {}
   const workerSettings = args.options["worker-command"]
     ? ({ agentKind: "codex", workerModel: null } satisfies WorkerSettings)
     : await resolveWorkerSettings({
         args,
-        sessionMetadata: sessionState ? sessionMetadata : null,
+        sessionMetadata: null,
         cwd: root,
       })
   const agentKind = workerSettings.agentKind
@@ -5748,29 +6053,16 @@ export async function commandResearchRun(args: Args) {
     throw new Error("--max-launches was removed.")
   }
   const experimentTarget =
-    optionalPositiveIntegerOption(args, "experiments") ??
-    sessionState?.session.experimentTarget ??
-    (typeof sessionMetadata.experimentTarget === "number"
-      ? sessionMetadata.experimentTarget
-      : null)
+    optionalPositiveIntegerOption(args, "experiments") ?? null
   const maxMinutes =
     args.options["max-minutes"] === undefined
       ? null
       : positiveNumberOption(args, "max-minutes", 120)
-  const workerFallback = sessionState
-    ? (sessionState.session.workerTarget ?? 1)
-    : (hypotheses?.length ?? 1)
-  const workerTarget = supervisorWorkerTarget(args, workerFallback)
-  const sessionTarget = sessionState?.session.workerTarget ?? workerTarget
-  if (workerTarget > sessionTarget) {
-    throw new Error(
-      `Session ${sessionState?.session.id} has ${sessionTarget} worker slot(s). Create a new session with --workers ${workerTarget}, or omit --session.`
-    )
-  }
+  const workerTarget = supervisorWorkerTarget(args, 1)
   const maxConcurrency = positiveIntegerOption(
     args,
     "max-concurrency",
-    workerTarget
+    MAX_LOCAL_SUPERVISOR_WORKERS
   )
   if (maxConcurrency > MAX_LOCAL_SUPERVISOR_WORKERS) {
     throw new Error(
@@ -5778,17 +6070,11 @@ export async function commandResearchRun(args: Args) {
     )
   }
   const now = Date.now()
-  const existingDeadlineAt =
-    sessionState?.session.deadlineAt ??
-    (requestedSessionId
-      ? state.sessions?.[requestedSessionId]?.deadlineAt
-      : null) ??
-    null
   const deadlineAt =
     maxMinutes === null
-      ? existingDeadlineAt
+      ? null
       : new Date(now + maxMinutes * 60_000).toISOString()
-  if (!requestedSessionId && experimentTarget === null && deadlineAt === null) {
+  if (experimentTarget === null && deadlineAt === null) {
     throw new Error("Pass --experiments <n> or --max-minutes <n>.")
   }
   const endTimeMs = deadlineAt
@@ -5850,41 +6136,113 @@ export async function commandResearchRun(args: Args) {
   const finalRefPushTimeoutMs =
     positiveNumberOption(args, "final-ref-push-timeout", 120) * 1000
 
-  let sessionId = requestedSessionId
-  let schedulerSiteId = sessionState?.session.schedulerSiteId ?? null
-  if (!sessionId) {
-    schedulerSiteId = await getResearchSiteId(root)
-    const result = await createCampaignSession(
-      campaign.id,
-      {
-        name: args.options.name ?? `research-${new Date().toISOString()}`,
-        workerTarget,
-        hypotheses,
-        ...(experimentTarget === null ? {} : { experimentTarget }),
-        ...(deadlineAt === null ? {} : { deadlineAt }),
-        ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
-        metadata: {
-          startedBy: "onyx-research-supervisor",
-          experimentTarget,
-          maxMinutes,
-          agentKind: sessionAgentKind,
-          ...workerModelMetadata(workerModel),
-          maxConcurrency,
-          launchBatchSize,
-          launchIntervalSeconds: launchIntervalMs / 1000,
-          presenceIntervalSeconds: presenceIntervalMs / 1000,
-        },
-      },
-      args
+  const schedulerSiteId = await getResearchSiteId(root)
+  const sessionEvaluation = await committedSetupAt({
+    root,
+    projectPath: effectiveProjectPath,
+    commitSha: sessionBaseCommitSha,
+  })
+  if (
+    sessionEvaluation.setup.metric.name !== campaign.metricName ||
+    sessionEvaluation.setup.metric.unit !== campaign.metricUnit ||
+    sessionEvaluation.setup.metric.direction !== campaign.metricDirection
+  ) {
+    throw new Error(
+      `Committed setup metric does not match immutable campaign metric ${campaign.metricName}. Create a new campaign for a different metric contract.`
     )
-    sessionId = result.session.id
-    await cacheResearchSessionState({
-      root,
-      campaign,
-      session: result.session,
-      hypotheses: result.hypotheses,
-    }).catch(() => {})
   }
+  const overrides = internalSession
+    ? new Map<string, { ref: string; sourceExperimentId?: string }>(
+        internalSession.session.assignments.map((assignment) => [
+          assignment.hypothesisId,
+          {
+            ref: assignment.startingCommitSha,
+            ...(assignment.sourceExperimentId
+              ? { sourceExperimentId: assignment.sourceExperimentId }
+              : {}),
+          },
+        ])
+      )
+    : await resolveHypothesisBaseOverrides({
+        campaignId: campaign.id,
+        hypotheses: selectedHypotheses,
+        args,
+      })
+  const assignments = [] as Array<{
+    hypothesisId: string
+    startingCommitSha: string
+    sourceExperimentId?: string
+    setupHash: string
+    evaluationFingerprint: string
+  }>
+  for (const hypothesis of selectedHypotheses) {
+    const override = overrides.get(hypothesis.id)
+    const startingCommitSha = await resolveCommitRef(
+      root,
+      override?.ref ?? sessionBaseCommitSha
+    )
+    const snapshot = await committedSetupAt({
+      root,
+      projectPath: effectiveProjectPath,
+      commitSha: startingCommitSha,
+    })
+    if (
+      snapshot.setupHash !== sessionEvaluation.setupHash ||
+      snapshot.fingerprint !== sessionEvaluation.fingerprint
+    ) {
+      throw new Error(
+        `Hypothesis ${hypothesis.name} base ${startingCommitSha} does not contain the session setup/evaluation snapshot. Rebase or cherry-pick the code onto a commit containing the current setup.`
+      )
+    }
+    assignments.push({
+      hypothesisId: hypothesis.id,
+      startingCommitSha,
+      ...(override?.sourceExperimentId
+        ? { sourceExperimentId: override.sourceExperimentId }
+        : {}),
+      setupHash: snapshot.setupHash,
+      evaluationFingerprint: snapshot.fingerprint,
+    })
+  }
+  const result = internalSession
+    ? {
+        session: internalSession.session,
+        hypotheses: internalSession.hypotheses,
+      }
+    : await createCampaignSession(
+        campaign.id,
+        {
+          name: args.options.name ?? `research-${new Date().toISOString()}`,
+          baseCommitSha: sessionBaseCommitSha,
+          setupHash: sessionEvaluation.setupHash,
+          evaluationFingerprint: sessionEvaluation.fingerprint,
+          evaluationManifest: sessionEvaluation.manifest,
+          workerTarget,
+          assignments,
+          ...(experimentTarget === null ? {} : { experimentTarget }),
+          ...(deadlineAt === null ? {} : { deadlineAt }),
+          schedulerSiteId,
+          metadata: {
+            startedBy: "onyx-research-supervisor",
+            experimentTarget,
+            maxMinutes,
+            agentKind: sessionAgentKind,
+            ...workerModelMetadata(workerModel),
+            maxConcurrency,
+            launchBatchSize,
+            launchIntervalSeconds: launchIntervalMs / 1000,
+            presenceIntervalSeconds: presenceIntervalMs / 1000,
+          },
+        },
+        args
+      )
+  const sessionId = result.session.id
+  await cacheResearchSessionState({
+    root,
+    campaign,
+    session: result.session,
+    hypotheses: result.hypotheses,
+  }).catch(() => {})
 
   const nextState = await readState(root)
   const key = campaignStateKey(effectiveProjectPath, campaign.name)
@@ -5901,15 +6259,9 @@ export async function commandResearchRun(args: Args) {
     campaignId: campaign.id,
     deadlineAt,
     experimentTarget,
-    acceptedExperimentCount: sessionState?.session.acceptedExperimentCount ?? 0,
+    acceptedExperimentCount: 0,
     remainingExperimentCount:
-      experimentTarget === null
-        ? null
-        : Math.max(
-            0,
-            experimentTarget -
-              (sessionState?.session.acceptedExperimentCount ?? 0)
-          ),
+      experimentTarget === null ? null : Math.max(0, experimentTarget - 0),
     schedulerSiteId,
     status: "running",
   }
@@ -6005,6 +6357,22 @@ export async function commandResearchRun(args: Args) {
   let gitVerificationPausedUntil = 0
   let gitVerificationInFlight: Promise<unknown> | null = null
   const supervisorPid = process.pid
+  const supervisorProcessIdentity = inspectProcessIdentity(supervisorPid)
+  if (supervisorProcessIdentity) {
+    await writeSupervisorProcessManifest({
+      root,
+      manifest: {
+        schemaVersion: 1,
+        sessionId,
+        pid: supervisorPid,
+        supervisorRunId,
+        processStartedAt: supervisorProcessIdentity.startedAt,
+        commandIdentity: supervisorProcessIdentity.command,
+        mode: "foreground",
+        createdAt: new Date().toISOString(),
+      },
+    })
+  }
   const supervisorLogPath = args.options["supervisor-log-path"] ?? null
   let lastTelemetryAt = 0
   let stopLogged = false
@@ -6052,6 +6420,8 @@ export async function commandResearchRun(args: Args) {
       telemetry: {
         pid: supervisorPid,
         supervisorRunId,
+        processStartedAt: supervisorProcessIdentity?.startedAt ?? null,
+        commandIdentity: supervisorProcessIdentity?.command ?? null,
         logPath: supervisorLogPath,
         activeProcessCount: options.activeProcessCount ?? activeRuns.size,
         launchRate,
@@ -6124,8 +6494,7 @@ export async function commandResearchRun(args: Args) {
               ? verification.rateLimit.retryAfterSeconds
               : null
             if (retryAfterSeconds && retryAfterSeconds > 0) {
-              gitVerificationPausedUntil =
-                Date.now() + retryAfterSeconds * 1000
+              gitVerificationPausedUntil = Date.now() + retryAfterSeconds * 1000
             }
             return null
           })
@@ -6497,7 +6866,7 @@ export async function commandResearchRun(args: Args) {
           controlState?.launch.activeHypothesisCount === undefined ||
           controlState.launch.activeHypothesisCount > 0
         if (activeRuns.size === 0 && openSlots > 0 && !hasActiveHypotheses) {
-          terminalReason = "no_active_hypotheses"
+          terminalReason = "all_hypotheses_closed"
           break
         }
         if (activeRuns.size === 0 && !waitingLogged) {
@@ -6531,13 +6900,13 @@ export async function commandResearchRun(args: Args) {
     () => null
   )
   terminalReason =
-    (explicitStop ? "stop_requested" : terminalReason) ??
+    (explicitStop ? "user_stopped" : terminalReason) ??
     (lastStopCheck ? terminalReasonForStopCheck(lastStopCheck) : null) ??
     postLoopLocal?.session.terminalReason ??
     (Number.isFinite(endTimeMs) && Date.now() >= endTimeMs
       ? "deadline_reached"
       : null) ??
-    "no_active_hypotheses"
+    "all_hypotheses_closed"
   let finalStatus: ApiSession["status"] = providerTerminalFailure
     ? "failed"
     : explicitStop
@@ -6655,8 +7024,7 @@ export async function commandResearchRun(args: Args) {
     ).length
   const discardedAfterCompletionCount = completionManifests.filter(
     (manifest) =>
-      manifest.finalization?.finalizationStatus ===
-      "discarded_after_completion"
+      manifest.finalization?.finalizationStatus === "discarded_after_completion"
   ).length
   const acceptedExperiments =
     completionLive?.session.acceptedExperimentCount ??

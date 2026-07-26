@@ -122,12 +122,10 @@ export { commandStatus } from "./commands/status"
 export { commandToolsRun } from "./commands/tools"
 export {
   commandResearchBrief,
-  commandResearchFinish,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
   commandResearchSessionStateBrief,
   commandResearchRun,
-  commandResearchStart,
   commandResearchStatus,
   commandResearchStop,
   commandKnowledgeAdd,

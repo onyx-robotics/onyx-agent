@@ -123,6 +123,7 @@ function defaultSetupFile(projectPath: string, args: Args): ResearchSetupFile {
         timeoutSeconds: 600,
         leaseTimeoutSeconds: 120,
         outputLimitBytes: 4000,
+        fingerprintPaths: ["onyx/tools/evaluation"],
       },
     },
     workflow: [

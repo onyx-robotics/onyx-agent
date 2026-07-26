@@ -24,6 +24,8 @@ const CAMPAIGN_ID = "20000000-0000-4000-8000-000000000001"
 const SESSION_ID = "30000000-0000-4000-8000-000000000001"
 const HYPOTHESIS_ID = "40000000-0000-4000-8000-000000000001"
 const SITE_ID = "50000000-0000-4000-8000-000000000001"
+const ASSIGNMENT_ID = "55000000-0000-4000-8000-000000000001"
+const EVALUATION_REVISION_ID = "56000000-0000-4000-8000-000000000001"
 
 let previousApiUrl: string | undefined
 let previousApiKey: string | undefined
@@ -107,6 +109,7 @@ function setupFile(): ResearchSetupFile {
         timeoutSeconds: 30,
         leaseTimeoutSeconds: 30,
         outputLimitBytes: 4000,
+        fingerprintPaths: ["onyx/tools/evaluation"],
       },
     },
     workflow: [
@@ -339,6 +342,23 @@ function installSupervisorApi({
   const leasedWorkers: string[] = []
   const currentCampaign = campaign(baseCommitSha)
   const currentHypothesis = hypothesis(baseCommitSha)
+  const currentAssignment = {
+    id: ASSIGNMENT_ID,
+    sessionId: SESSION_ID,
+    campaignId: CAMPAIGN_ID,
+    hypothesisId: HYPOTHESIS_ID,
+    startingCommitSha: baseCommitSha,
+    sourceExperimentId: null,
+    setupHash: "smoke-setup-hash",
+    evaluationFingerprint: "smoke-evaluation-fingerprint",
+    gitStatus: "local_reported",
+    gitVerifiedAt: null,
+    gitStatusReason: null,
+    canceledAt: null,
+    cancellationReason: null,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  }
 
   globalThis.fetch = (async (input, init) => {
     const url = new URL(
@@ -358,6 +378,12 @@ function installSupervisorApi({
       workerTarget,
       status: terminal ? "completed" : "running",
       acceptedExperimentCount,
+    })
+    Object.assign(runningSession, {
+      baseCommitSha,
+      setupHash: currentAssignment.setupHash,
+      evaluationRevisionId: EVALUATION_REVISION_ID,
+      assignments: [currentAssignment],
     })
 
     let data: unknown
@@ -487,6 +513,7 @@ function installSupervisorApi({
               },
               leaseToken: `lease-token-${workerSequence}`.padEnd(16, "x"),
               leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+              assignment: currentAssignment,
               hypothesis: currentHypothesis,
               session: runningSession,
               campaign: currentCampaign,
@@ -543,6 +570,7 @@ function installSupervisorApi({
         worker: worker(workerId, "registered"),
         leaseToken: `lease-token-${workerSequence}`.padEnd(16, "x"),
         leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        assignment: currentAssignment,
         hypothesis: currentHypothesis,
         session: runningSession,
         campaign: currentCampaign,
@@ -576,6 +604,8 @@ function installSupervisorApi({
           id: `70000000-0000-4000-8000-${String(calls.length).padStart(12, "0")}`,
           campaignId: CAMPAIGN_ID,
           sessionId: SESSION_ID,
+          evaluationRevisionId: EVALUATION_REVISION_ID,
+          assignmentId: ASSIGNMENT_ID,
           hypothesisId: HYPOTHESIS_ID,
           workerId,
           experimentId: null,
@@ -648,6 +678,8 @@ function installSupervisorApi({
           id: "80000000-0000-4000-8000-000000000001",
           campaignId: CAMPAIGN_ID,
           sessionId: SESSION_ID,
+          evaluationRevisionId: EVALUATION_REVISION_ID,
+          assignmentId: ASSIGNMENT_ID,
           hypothesisId: HYPOTHESIS_ID,
           workerId: body?.workerId ?? leasedWorkers[0] ?? null,
           acceptedIndex: reportDisposition === "accepted" ? 1 : null,
@@ -1100,8 +1132,7 @@ describe("remote-first research supervisor smoke", () => {
       const reportCall = calls.find(
         (call) =>
           call.method === "POST" &&
-          call.path ===
-            `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+          call.path === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
       )
       expect(reportCall).toBeDefined()
       expect(reportCall?.body).toMatchObject({

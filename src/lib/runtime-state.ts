@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { gitCommonDir } from "./git"
 
 export type CliState = {
+  schemaVersion?: 2
   projectId?: string
   projectCache?: {
     id: string
@@ -57,6 +58,7 @@ export type CliState = {
       remainingExperimentCount?: number | null
       schedulerSiteId?: string | null
       stopRequested?: boolean
+      stopPendingRemote?: boolean
       status?: string
       terminalReason?: string | null
       finalizationStatus?:
@@ -93,6 +95,8 @@ export type CliState = {
       supervisor?: {
         pid?: number | null
         supervisorRunId?: string | null
+        processStartedAt?: string | null
+        commandIdentity?: string | null
         logPath?: string | null
         activeProcessCount?: number
         launchRate?: {
@@ -206,7 +210,19 @@ export async function readState(root: string): Promise<CliState> {
     const parsed = JSON.parse(
       await readFile(await statePath(root), "utf8")
     ) as Partial<CliState>
+    if (parsed.schemaVersion !== 2) {
+      return {
+        schemaVersion: 2,
+        projectId: parsed.projectId,
+        projectCache: parsed.projectCache,
+        projectPath: parsed.projectPath,
+        activeCampaign: parsed.activeCampaign,
+        campaigns: {},
+        sessions: {},
+      }
+    }
     return {
+      schemaVersion: 2,
       projectId: parsed.projectId,
       projectCache: parsed.projectCache,
       projectPath: parsed.projectPath,
@@ -215,7 +231,7 @@ export async function readState(root: string): Promise<CliState> {
       sessions: parsed.sessions ?? {},
     }
   } catch {
-    return { campaigns: {}, sessions: {} }
+    return { schemaVersion: 2, campaigns: {}, sessions: {} }
   }
 }
 
@@ -228,7 +244,11 @@ export async function writeState(root: string, state: CliState) {
 async function writeStateUnlocked(root: string, state: CliState) {
   const path = await statePath(root)
   const tmp = uniqueTempPath(path)
-  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8")
+  await writeFile(
+    tmp,
+    `${JSON.stringify({ ...state, schemaVersion: 2 }, null, 2)}\n`,
+    "utf8"
+  )
   await rename(tmp, path)
 }
 

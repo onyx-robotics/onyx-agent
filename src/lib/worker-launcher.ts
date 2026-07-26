@@ -101,6 +101,10 @@ export type WorkerLaunchManifest = {
   hypothesisName: string
   workerId: string
   workerName: string
+  supervisorRunId?: string | null
+  pid?: number | null
+  processStartedAt?: string | null
+  commandIdentity?: string | null
   /** Stable 1-based supervisor capacity slot; null on manifests written
    * before slots existed or outside a supervised run. */
   slotIndex?: number | null

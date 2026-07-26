@@ -497,10 +497,12 @@ describe("worker launchers", () => {
     await writeWorkerRuntimeContext({
       paths,
       context: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         campaignId: "campaign-id",
         campaignName: "campaign",
         sessionId: "session/one",
+        assignmentId: "assignment-id",
+        startingCommitSha: "abc123",
         hypothesisId: "hypothesis-id",
         hypothesisName: "hypothesis",
         workerId: "worker/one",
