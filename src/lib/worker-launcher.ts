@@ -59,29 +59,48 @@ export type WorkerRuntimePaths = {
   tempDir: string
 }
 
-export type WorkerFinalizationStatus =
+export type WorkerAttemptDeliveryStatus =
   | "none"
-  | "already_logged"
-  | "measured_and_logged"
-  | "salvaged_unmeasured"
-  | "discarded_after_completion"
+  | "delivered"
+  | "duplicate"
   | "failed"
+  | "ambiguous_discarded"
 
-export type WorkerFinalizationManifest = {
-  attempted: boolean
-  salvaged: boolean
-  finalizationStatus: WorkerFinalizationStatus
-  commitSha: string | null
-  measurementBaseCommitSha: string | null
-  unloggedCommitCount: number
-  workerBranchPushStatus: "not_attempted" | "pushed" | "failed"
-  rootDriftStatus: "not_checked" | "clean" | "dirty"
+export type WorkerTerminalReasonCode =
+  | "completed"
+  | "provider_failure"
+  | "startup_failure"
+  | "timeout"
+  | "stopped"
+  | "worker_protocol_violation"
+  | "terminal_attempt_delivery_failed"
+  | "cleanup_failure"
+
+export type WorkerTeardownManifest = {
+  attemptDelivery: WorkerAttemptDeliveryStatus
+  runRef: string | null
+  resultCommitSha: string | null
+  resultRefPushStatus: "not_attempted" | "pushed" | "failed"
+  resultRefPushError: string | null
+  headCommitSha: string | null
+  commitsAhead: number
+  dirty: boolean
+  changedPaths: string[]
+  diffStat: string | null
+  worktreeCleanup: "pending" | "removed" | "failed"
+  providerExitCode: number | null
+  providerSignal: string | null
+  timedOut: boolean
+  startupTimedOut: boolean
+  phase: "completed" | "failed" | "stopped"
+  providerError: string | null
+  reasonCode: WorkerTerminalReasonCode
   error: string | null
   warnings?: string[]
 }
 
 export type WorkerLaunchManifest = {
-  schemaVersion: 1
+  schemaVersion: 2
   agentKind: WorkerAgentKind
   workerModel: string | null
   command: string
@@ -97,6 +116,7 @@ export type WorkerLaunchManifest = {
   latestStatePath: string
   manifestPath: string
   sessionId: string
+  startingCommitSha: string
   hypothesisId: string
   hypothesisName: string
   workerId: string
@@ -120,7 +140,7 @@ export type WorkerLaunchManifest = {
   error: string | null
   warnings?: string[]
   preflight: WorkerPreflightResult | null
-  finalization: WorkerFinalizationManifest | null
+  teardown: WorkerTeardownManifest | null
 }
 
 /** Smallest 1-based slot index not currently in use. */
@@ -726,7 +746,10 @@ export async function readWorkerLaunchManifests(
             parsed &&
             typeof parsed === "object" &&
             "schemaVersion" in parsed &&
-            parsed.schemaVersion === 1
+            parsed.schemaVersion === 2 &&
+            "startingCommitSha" in parsed &&
+            typeof parsed.startingCommitSha === "string" &&
+            parsed.startingCommitSha.length > 0
           ) {
             manifests.push(parsed as WorkerLaunchManifest)
           }

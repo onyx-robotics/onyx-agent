@@ -38,7 +38,7 @@ The command validates the committed setup and fingerprint inputs, snapshots hypo
 
 - Monitor: `onyx research status`, `onyx research status --json`, `onyx listen`, and the web campaign page.
 - Scale: `onyx research scale --workers <n> --session <id>`. Scale-down drains existing workers; use stop instead of zero.
-- Stop: `onyx research stop --session <id>`. A local stop marker suppresses crash salvage; uncertain process identity is never killed.
+- Stop: `onyx research stop --session <id>`. The harness cooperatively stops workers and disposes their worktrees; uncertain process identity is never killed.
 - Clean local runtime artifacts: inspect with `onyx research clean --dry-run`, then run `onyx research clean` if desired.
 
 Evaluator changes remain in the campaign but create a separate evaluation revision. Never compare metrics across revisions as a single leaderboard.
@@ -49,4 +49,4 @@ Workers use `ONYX_PROJECT_ROOT` as their source-editing root and `onyx-worker re
 
 For each attempt, a worker runs `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, makes exactly one scoped clean commit, resumes with `onyx-worker exp run --resume --auto`, and reports with `onyx-worker exp log`. It publishes useful reusable knowledge when appropriate. Git holds immutable experiment commits/refs; Supabase owns session settlement, accepted indexes, projections, and provenance.
 
-The harness monitors server cutoffs and assignment cancellation, gives cooperative stop grace, then terminates the provider. It salvages unexpected crashes only while both session and assignment still accept reports. Deliberate local stop, closed hypotheses, or ended sessions never become ranking inputs; late reports remain discarded diagnostics.
+The harness monitors server cutoffs and assignment cancellation, gives cooperative stop grace, then terminates the provider. Workers use detached disposable worktrees and never create worker branches. Teardown may deliver exactly one already-terminal measured attempt, but it never commits, measures, or reports scratch work. Partial work is retained only as bounded terminal telemetry with stable reason, provider-exit, delivery, and cleanup outcomes, and a fresh worker starts clean; server settlement remains authoritative for late reports. Monitor systemic replacement loops through the no-progress breaker in `onyx research status` or `onyx listen`.

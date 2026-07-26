@@ -269,8 +269,7 @@ async function buildModel(
   const metricName = meta?.metricName ?? rows[0]?.primaryMetricName ?? null
   const metricDirection = meta?.metricDirection ?? "maximize"
   const measured = rows.filter(
-    (row) =>
-      row.status === "succeeded" && row.primaryMetricValue !== null
+    (row) => row.status === "succeeded" && row.primaryMetricValue !== null
   )
   const computedBest = measured.length
     ? measured.reduce(
@@ -322,7 +321,9 @@ async function buildModel(
   const workerIds = new Set([...workersById.keys(), ...manifestByWorker.keys()])
   const sessionStatus =
     localSession?.session.status ??
-    (activeSessionId ? (state.sessions?.[activeSessionId]?.status ?? null) : null)
+    (activeSessionId
+      ? (state.sessions?.[activeSessionId]?.status ?? null)
+      : null)
   const sessionTerminal =
     sessionStatus !== null &&
     ["completed", "failed", "stopped"].includes(sessionStatus)
@@ -342,8 +343,8 @@ async function buildModel(
       // exit, so a terminal manifest wins over stale snapshot status/phase.
       const manifestTerminal = Boolean(
         manifest &&
-          (manifest.completedAt !== null ||
-            ["completed", "failed", "stopped"].includes(manifest.status))
+        (manifest.completedAt !== null ||
+          ["completed", "failed", "stopped"].includes(manifest.status))
       )
       const activityLogPath = manifest?.activityLogPath ?? null
       const logPath = manifest?.logPath ?? null
@@ -358,7 +359,9 @@ async function buildModel(
         status: manifestTerminal
           ? manifest!.status
           : (latest?.status ?? worker?.status ?? manifest?.status ?? "running"),
-        phase: manifestTerminal ? null : (latest?.phase ?? worker?.phase ?? null),
+        phase: manifestTerminal
+          ? null
+          : (latest?.phase ?? worker?.phase ?? null),
         progressMessage: manifestTerminal
           ? null
           : (latest?.progressMessage ?? worker?.progressMessage ?? null),
@@ -369,7 +372,16 @@ async function buildModel(
         lastOutputAt: manifest?.lastOutputAt ?? null,
         startedAt: manifest?.startedAt ?? null,
         completedAt: manifest?.completedAt ?? null,
-        finalizationStatus: manifest?.finalization?.finalizationStatus ?? null,
+        attemptDelivery: manifest?.teardown?.attemptDelivery ?? null,
+        resultRefPushStatus: manifest?.teardown?.resultRefPushStatus ?? null,
+        terminalReasonCode: manifest?.teardown?.reasonCode ?? null,
+        worktreeCleanup: manifest?.teardown?.worktreeCleanup ?? null,
+        terminalError:
+          manifest?.teardown?.error ??
+          manifest?.teardown?.resultRefPushError ??
+          manifest?.teardown?.providerError ??
+          manifest?.error ??
+          null,
         activityLogPath,
         logPath,
       }
@@ -395,6 +407,10 @@ async function buildModel(
     rows,
     providerBackoff: activeSessionId
       ? (state.sessions?.[activeSessionId]?.providerBackoff ?? null)
+      : null,
+    noProgressBreaker: activeSessionId
+      ? (state.sessions?.[activeSessionId]?.supervisor?.noProgressBreaker ??
+        null)
       : null,
     workers,
     workerTarget: localSession?.session.workerTarget ?? null,

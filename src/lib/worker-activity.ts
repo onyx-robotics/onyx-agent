@@ -65,8 +65,15 @@ export function activitySummaryForManifest(
     startupTimedOut: manifest.startupTimedOut,
     warningCount:
       (manifest.warnings?.length ?? 0) +
-      (manifest.finalization?.warnings?.length ?? 0),
-    finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
-    finalizationError: manifest.finalization?.error ?? manifest.error ?? null,
+      (manifest.teardown?.warnings?.length ?? 0),
+    teardownStatus: manifest.teardown?.attemptDelivery ?? null,
+    resultRefPushStatus: manifest.teardown?.resultRefPushStatus ?? null,
+    terminalReasonCode: manifest.teardown?.reasonCode ?? null,
+    worktreeCleanup: manifest.teardown?.worktreeCleanup ?? null,
+    teardownError:
+      manifest.teardown?.error ??
+      manifest.teardown?.providerError ??
+      manifest.error ??
+      null,
   }
 }

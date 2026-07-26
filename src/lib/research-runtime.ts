@@ -1324,7 +1324,6 @@ export async function upsertWorkerLaunch(_input: {
     workerId: string
     status: string
     worktree?: string | null
-    branchName?: string | null
     promptPath?: string | null
     logPath?: string | null
     activityLogPath?: string | null
@@ -1334,7 +1333,6 @@ export async function upsertWorkerLaunch(_input: {
     timedOut?: boolean
     startupTimedOut?: boolean
     lastOutputAt?: string | null
-    finalizationStatus?: string | null
     error?: string | null
     metadata?: Record<string, unknown>
     startedAt?: string | null

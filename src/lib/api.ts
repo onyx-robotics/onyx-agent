@@ -314,7 +314,6 @@ export type ApiSessionLive = {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
     terminalReason: ApiSession["terminalReason"]
-    unmeasuredSalvageCount: number
   }
   livenessCounts: Record<string, number>
   phaseCounts: Record<string, number>
@@ -409,7 +408,6 @@ export type ApiSessionControlState = {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
     terminalReason: ApiSession["terminalReason"]
-    unmeasuredSalvageCount: number
   }
   updatedAt: string
 }
@@ -843,7 +841,6 @@ function normalizeResearchResponse(value: unknown): unknown {
       status: normalized.finalizationStatus,
       reasons: normalized.endReason ? [normalized.endReason] : [],
       terminalReason: normalized.endReason ?? null,
-      unmeasuredSalvageCount: 0,
     }
   }
   if (
@@ -1611,7 +1608,6 @@ export async function upsertResearchPresence(
       uploadedWorkerCount?: number
       unchangedWorkerCount?: number
       droppedOrDeferredWorkerCount?: number
-      unmeasuredSalvageCount?: number
       lastUploadAt?: string | null
       metadata?: Record<string, unknown>
     }

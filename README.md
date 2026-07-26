@@ -196,20 +196,22 @@ per-worker latest-state JSON snapshots, and launch manifests under
 server lease acquisition, session-state brief refreshes, adaptive coalesced
 presence updates, batch heartbeats, stop handling, and local child cleanup. `onyx research status --json` reports fresh
 supervisor telemetry when available, including active process count, launch
-rate, provider backoff, recent launch failures, PID, and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
-as a low-level debugging and recovery primitive.
+rate, provider backoff, the no-progress breaker, recent launch failures, PID,
+and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
+as a low-level debugging primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
 errors when local manifests are available. `--experiments` is the exact accepted
 experiment target and `--max-minutes` is the optional deadline.
-`onyx listen` shows the same local worker latest-state/manifests and active
-provider backoff metadata alongside the experiment/outbox view.
+`onyx listen` shows the same local worker latest-state/manifests, terminal
+reason and cleanup outcomes, active provider backoff, and no-progress breaker
+alongside the remote experiment view.
 `onyx workflow status --active` shows only actionable running or paused
 workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked
 diagnostics.
 
-Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
-and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
+Each worker gets a detached disposable worktree at
+`.git/onyx/worktrees/<sessionId>/<workerId>`, while
 worker prompts and logs live under `.git/onyx/`. Workers run
 `onyx-worker research session-state-brief --json` for routine context and
 worker-specific stop guidance. They inspect `stop.shouldStopStartingNewWork`
@@ -225,24 +227,16 @@ soon as worker slots open. Workers publish shared learning with
 `onyx-worker knowledge add` and read it back through the session-state brief or
 fuller research brief, but successor hypothesis selection remains an
 orchestrator/human decision.
-After the agent exits, the worker harness performs one final best-effort
-commit, checks whether HEAD is already represented by a reported experiment,
-measures/logs exactly one unreported HEAD commit using that commit's parent as
-the workflow base when the session is still accepting experiments, pushes the
-immutable experiment ref, reports directly to `/api/v1`, and pushes the worker
-branch for recovery. If git push or API reporting fails, the manifest records
-the pushed/missing refs and retry instructions; it does not create local
-product state. If the session is already terminal, finalization records
-`discarded_after_completion` locally and does not create an experiment, ranking
-input, result ref, or recovery artifact. Multi-commit, restore-forward, or
-dirty salvage preserves the branch without producing a measured experiment or
-blocked workflow run. Worker
-manifests report `finalizationStatus` as `none`, `already_logged`,
-`measured_and_logged`, `salvaged_unmeasured`,
-`discarded_after_completion`, or `failed`. If
+Workers run in detached disposable worktrees and never create or push worker
+branches. After the agent exits, the harness may deliver exactly one already
+terminal measured attempt, then removes the worktree. It never creates a final
+commit, runs evaluation, or reports dirty, partial, multi-commit, or ambiguous
+scratch work. Manifests retain bounded diagnostics and report terminal attempt
+delivery plus worktree cleanup outcomes, provider exit/signal/timeout details,
+and stable terminal reason codes. If
 `onyx research stop` is requested while a provider process is still running,
 the harness gives it the configured stop grace (30 seconds by default),
-terminates it if needed, then runs the same finalization path. Use
+terminates it if needed, then runs the same teardown path. Use
 `--worker-command` only for custom harnesses.
 
 Stop sessions explicitly:
@@ -250,6 +244,7 @@ Stop sessions explicitly:
 ```bash
 onyx research stop --session <id>
 ```
+
 Campaigns remain active until explicitly archived.
 
 To delete a research direction entirely — the campaign record with all its

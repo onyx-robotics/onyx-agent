@@ -23,7 +23,6 @@ export type HypothesisWorkerPromptInput = {
   researchSpecPath: string
   sessionId: string
   worktreeRoot: string
-  workerBranch: string
 }
 
 function markdownList(items: string[]) {
@@ -47,7 +46,7 @@ You are an autonomous Onyx research hypothesis worker. Do not ask the user quest
 - Setup: local repo files
 - Session: ${input.sessionId}
 - Hypothesis: ${input.hypothesisId} (${input.hypothesisName})
-- Worker branch: ${input.workerBranch}
+- Workspace: detached disposable worktree. Only commits recorded through a terminal measured attempt are durable.
 - Worktree root: ${input.worktreeRoot}
 - Project root: ${input.projectRoot}
 - Session target: keep producing measured attempts until the session-state brief stop guidance asks you to stop, the hypothesis is exhausted, or the supervisor ends the session.
@@ -133,5 +132,5 @@ The supervisor launched this worker with \`onyx-worker\`, \`ONYX_WORKER_CONTEXT\
 - Do not edit \`.git/onyx/worker-logs\`, \`.git/onyx/worker-runtime\`, \`.git/onyx/workflow-runs\`, \`.git/onyx/attempts\`, worker manifests, or latest-state JSON directly. Those files are owned by the Onyx CLI and supervisor.
 - Product state is remote-first. \`onyx-worker exp log\`, \`onyx-worker knowledge add\`, and heartbeats call the Onyx API directly. \`onyx-worker exp log\` attempts to push the immutable experiment ref before it reports; failed pushes are recorded as local-reported evidence, so do not patch local files by hand to compensate.
 
-On stop: leave the worktree clean, make sure every committed attempt is logged, and summarize best result, failed ideas, and next promising ideas. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, immutable-ref push, and API report.`
+On stop: leave the worktree clean, make sure every already-measured terminal attempt is logged, and summarize best result, failed ideas, and next promising ideas. Do not rely on teardown to save partial work: the harness may deliver one existing terminal attempt, but it never commits, measures, or reports scratch changes and will discard the disposable worktree.`
 }

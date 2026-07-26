@@ -167,7 +167,6 @@ export async function collectLocalResearchStopReasons({
         status: brief.session.finalizationStatus,
         reasons: [],
         terminalReason: brief.session.terminalReason,
-        unmeasuredSalvageCount: 0,
       },
       updatedAt: brief.updatedAt,
     }

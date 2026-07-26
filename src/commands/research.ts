@@ -17,7 +17,10 @@ import {
   type ResearchHypothesisPlan,
 } from "../protocol"
 import { optionValues, type Args } from "../lib/args"
-import { commandExpLog, commandExpRun } from "./exp"
+import {
+  deliverTerminalExperimentAttempt,
+  ExperimentDeliveryError,
+} from "./exp"
 import {
   ApiError,
   closeCampaignHypothesis,
@@ -80,7 +83,7 @@ import {
   type BuiltInWorkerAgent,
 } from "../lib/config"
 import { emitEvent } from "../lib/events"
-import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
+import { currentCommit, git, repoRoot } from "../lib/git"
 import {
   onyxStateDir,
   readState,
@@ -108,7 +111,7 @@ import {
 import { resolveOpenCodeModelId } from "../lib/opencode-models"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
 import {
-  abandonBlockedWorkflowRunsForSession,
+  clearLocalAttempt,
   cacheLocalCampaign,
   cacheResearchSessionState,
   applyRemoteProjectionDeltas,
@@ -143,13 +146,13 @@ import {
   writeWorkerCliWrapper,
   writeWorkerLaunchManifest,
   writeWorkerRuntimeContext,
-  type WorkerFinalizationManifest,
-  type WorkerFinalizationStatus,
+  type WorkerTeardownManifest,
   type WorkerInvocation,
   type WorkerLaunchManifest,
   type WorkerAgentKind,
   type WorkerCliWrapper,
   type WorkerRuntimePaths,
+  type WorkerTerminalReasonCode,
 } from "../lib/worker-launcher"
 import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
 
@@ -160,11 +163,9 @@ const BUILTIN_AGENT_MIN_USEFUL_LAUNCH_MS = 5 * 60_000
 const CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS = 30_000
 const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
 const MAX_LOCAL_SUPERVISOR_WORKERS = 250
-const DEFAULT_REF_PUSH_QUEUE_CONCURRENCY = 4
 // Server-side verification is push-webhook-first; the supervisor sweep is a
 // backstop for lost webhooks, not the primary heal path.
 const GIT_VERIFICATION_BACKSTOP_INTERVAL_MS = 10 * 60_000
-const MAX_REF_PUSH_QUEUE_DEPTH = 500
 const SUPERVISOR_TELEMETRY_STALE_MS = 45_000
 const SUPERVISOR_LOG_DIR = "supervisor-logs"
 
@@ -216,6 +217,13 @@ type ProviderLaunchFailure = {
   hypothesisId: string
   errorSummary: string | null
 }
+type NoProgressWorkerExit = {
+  at: string
+  workerId: string | null
+  hypothesisId: string
+  status: HypothesisRunResult["status"]
+  errorSummary: string | null
+}
 type SupervisorRuntimeTelemetry = NonNullable<
   NonNullable<CliState["sessions"]>[string]["supervisor"]
 >
@@ -226,23 +234,6 @@ type WorkerActivityEvent = {
   summary?: string
   metadata?: Record<string, unknown>
 }
-
-type RefPushQueueJob = {
-  reason: string
-  cwd: string
-  sourceRef: string
-  targetRef: string
-  manifest?: WorkerLaunchManifest | null
-  resolve: (result: ProcessResult) => void
-}
-
-type WorkerBranchPusher = (input: {
-  cwd: string
-  sourceRef: string
-  targetRef: string
-  reason: string
-  manifest?: WorkerLaunchManifest | null
-}) => Promise<ProcessResult>
 
 async function appendWorkerActivityEvent(
   manifest: WorkerLaunchManifest,
@@ -778,6 +769,16 @@ function workerStatusFromManifest(
   return manifest.status === "starting" ? "registered" : "running"
 }
 
+function durableTeardownResultCommit(
+  teardown: WorkerTeardownManifest | null | undefined
+) {
+  return teardown &&
+    (teardown.attemptDelivery === "delivered" ||
+      teardown.attemptDelivery === "duplicate")
+    ? teardown.resultCommitSha
+    : null
+}
+
 function apiWorkerFromManifest({
   manifest,
   campaignId,
@@ -801,7 +802,7 @@ function apiWorkerFromManifest({
     currentExperimentId: null,
     phase: manifest.status,
     progressMessage: null,
-    gitLabel: manifest.finalization?.commitSha ?? null,
+    gitLabel: durableTeardownResultCommit(manifest.teardown),
     lastSeenAt:
       manifest.lastOutputAt ??
       manifest.completedAt ??
@@ -851,12 +852,11 @@ async function reconcileTerminalWorkerManifests({
       event: "manifest_reconciled",
       progressMessage: `Worker manifest shows ${status}`,
       gitLabel:
-        manifest.finalization?.commitSha ??
-        manifest.finalization?.measurementBaseCommitSha ??
-        worker.gitLabel,
+        durableTeardownResultCommit(manifest.teardown) ?? worker.gitLabel,
       metadata: {
         manifestPath: manifest.manifestPath,
         reconciledFrom: "worker-manifest",
+        ...(manifest.teardown ? { terminal: manifest.teardown } : {}),
       },
     })
     repaired += 1
@@ -939,145 +939,6 @@ function launchSuggestionsForSession({
   }
 
   return []
-}
-
-function createRefPushQueue({ args }: { args: Args }) {
-  const maxConcurrency = positiveIntegerOption(
-    args,
-    "ref-push-concurrency",
-    DEFAULT_REF_PUSH_QUEUE_CONCURRENCY
-  )
-  const queue: RefPushQueueJob[] = []
-  const idleWaiters = new Set<() => void>()
-  let active = 0
-  let stopped = false
-
-  const depth = () => queue.length + active
-  const notifyIdle = () => {
-    if (depth() > 0) return
-    for (const resolve of idleWaiters) resolve()
-    idleWaiters.clear()
-  }
-  const emitJobEvent = async (
-    job: RefPushQueueJob,
-    summary: string,
-    metadata: Record<string, unknown>
-  ) => {
-    if (!job.manifest) return
-    await appendWorkerActivityEvent(job.manifest, {
-      type: "push_result",
-      phase: "pushing",
-      summary,
-      metadata: {
-        reason: job.reason,
-        ...metadata,
-      },
-    })
-  }
-  const failedProcessResult = (message: string): ProcessResult => ({
-    code: 1,
-    stdout: "",
-    stderr: message,
-    timedOut: false,
-  })
-  const runPushRefJob = async (job: RefPushQueueJob) => {
-    try {
-      const result = await gitResult(
-        ["push", "origin", `${job.sourceRef}:${job.targetRef}`],
-        job.cwd
-      )
-      if (result.code === 0 && !result.timedOut) {
-        await emitJobEvent(job, "Git ref pushed", {
-          ref: job.targetRef,
-        })
-      } else {
-        await emitJobEvent(job, "Git ref push failed", {
-          ref: job.targetRef,
-          error: result.stderr.trim() || result.stdout.trim(),
-        })
-      }
-      job.resolve(result)
-    } catch (error) {
-      await emitJobEvent(job, "Git ref push failed", {
-        ref: job.targetRef,
-        error: errorMessage(error),
-      })
-      job.resolve(failedProcessResult(errorMessage(error)))
-    }
-  }
-  const runJob = async (job: RefPushQueueJob) => {
-    await runPushRefJob(job).finally(() => {
-      active -= 1
-      pump()
-      notifyIdle()
-    })
-  }
-  const pump = () => {
-    while (active < maxConcurrency && queue.length > 0) {
-      const job = queue.shift()!
-      active += 1
-      void runJob(job)
-    }
-  }
-  const enqueue = (job: RefPushQueueJob) => {
-    if (stopped) return null
-    if (depth() >= MAX_REF_PUSH_QUEUE_DEPTH) return null
-    queue.push(job)
-    pump()
-    return depth()
-  }
-  const waitForIdle = async (timeoutMs: number) => {
-    const deadline = Date.now() + timeoutMs
-    while (depth() > 0 && Date.now() < deadline) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, Math.max(1, deadline - Date.now()))
-        idleWaiters.add(() => {
-          clearTimeout(timer)
-          resolve()
-        })
-      })
-    }
-    return depth()
-  }
-
-  return {
-    pushRef({
-      cwd,
-      sourceRef,
-      targetRef,
-      reason,
-      manifest,
-    }: {
-      cwd: string
-      sourceRef: string
-      targetRef: string
-      reason: string
-      manifest?: WorkerLaunchManifest | null
-    }) {
-      return new Promise<ProcessResult>((resolve) => {
-        const accepted = enqueue({
-          reason,
-          cwd,
-          sourceRef,
-          targetRef,
-          manifest,
-          resolve,
-        })
-        if (accepted === null) {
-          resolve(failedProcessResult("ref push queue rejected job"))
-        }
-      })
-    },
-    depth,
-    waitForIdle,
-    async drain(timeoutMs: number) {
-      stopped = true
-      return waitForIdle(timeoutMs)
-    },
-    stop() {
-      stopped = true
-    },
-  }
 }
 
 function createPresenceSupervisor({
@@ -1202,13 +1063,6 @@ function createPresenceSupervisor({
             status: snapshotStatus({ worker, manifest, latest }),
           })
         }).length
-    const unmeasuredSalvageCount = manifests.filter(
-      (manifest) =>
-        manifest.finalization?.salvaged &&
-        manifest.finalization.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        )
-    ).length
     const workerSnapshots = workersForPresence.map((worker) => {
       const manifest = manifestByWorker.get(worker.id)
       const latest = manifest ? latestByWorker.get(worker.id) : null
@@ -1223,8 +1077,7 @@ function createPresenceSupervisor({
             manifestPath: manifest.manifestPath,
             latestObservedAt: latest?.at ?? null,
             warnings: manifest.warnings ?? [],
-            finalizationStatus:
-              manifest.finalization?.finalizationStatus ?? null,
+            teardown: manifest.teardown,
           }
         : {}
       const status = snapshotStatus({ worker, manifest, latest })
@@ -1233,7 +1086,10 @@ function createPresenceSupervisor({
         status,
         phase: latest?.phase ?? manifest?.status ?? worker.phase,
         progressMessage: latest?.progressMessage ?? worker.progressMessage,
-        gitLabel: worker.gitLabel ?? manifest?.finalization?.commitSha ?? null,
+        gitLabel:
+          worker.gitLabel ??
+          durableTeardownResultCommit(manifest?.teardown) ??
+          null,
         lastOutputAt: manifest?.lastOutputAt ?? null,
         activitySummary: manifest
           ? activitySummaryForManifest(manifest, latest)
@@ -1282,7 +1138,6 @@ function createPresenceSupervisor({
             uploadedWorkerCount: selectedWorkers.length,
             unchangedWorkerCount,
             droppedOrDeferredWorkerCount,
-            unmeasuredSalvageCount,
             providerBackoff: terminal ? null : providerBackoff,
             ignoredPresence:
               cliState?.sessions?.[sessionId]?.ignoredPresence ?? {},
@@ -1291,6 +1146,7 @@ function createPresenceSupervisor({
               splitIndex: index + 1,
               splitCount,
               terminal,
+              noProgressBreaker: supervisorTelemetry?.noProgressBreaker ?? null,
             },
           },
           workers: chunk.map((worker) => worker.snapshot),
@@ -1504,43 +1360,24 @@ async function computeSessionFinalizationStatus({
           `worker ${manifest.workerId} still ${manifest.status}`
         )
       }
-      const finalization = manifest.finalization
-      if (!finalization) {
+      const teardown = manifest.teardown
+      if (!teardown) {
         if (
           manifest.status === "completed" ||
           manifest.status === "failed" ||
           manifest.status === "stopped"
         ) {
           incompleteReasons.push(
-            `worker ${manifest.workerId} has no finalization result`
+            `worker ${manifest.workerId} has no teardown result`
           )
         }
         continue
       }
-      if (finalization.finalizationStatus === "failed") {
-        failedReasons.push(
-          `worker ${manifest.workerId} finalization failed${
-            finalization.error ? `: ${finalization.error}` : ""
+      if (teardown.worktreeCleanup === "failed") {
+        incompleteReasons.push(
+          `worker ${manifest.workerId} worktree cleanup failed${
+            teardown.error ? `: ${teardown.error}` : ""
           }`
-        )
-        continue
-      }
-      const cleanFinalizationStatus =
-        finalization.finalizationStatus === "measured_and_logged" ||
-        finalization.finalizationStatus === "already_logged" ||
-        finalization.finalizationStatus === "none" ||
-        finalization.finalizationStatus === "discarded_after_completion"
-      const hasUnresolvedSalvage =
-        finalization.finalizationStatus.startsWith("salvaged_unmeasured") ||
-        (!cleanFinalizationStatus && finalization.unloggedCommitCount > 0)
-      if (hasUnresolvedSalvage) {
-        incompleteReasons.push(
-          `worker ${manifest.workerId} has unlogged or salvaged work`
-        )
-      }
-      if (finalization.rootDriftStatus === "dirty") {
-        incompleteReasons.push(
-          `worker ${manifest.workerId} detected root drift`
         )
       }
     }
@@ -1567,6 +1404,7 @@ async function writeRemoteSessionFinalization({
   status,
   finalization,
   terminalReason,
+  metadata,
   args,
   requireOnline = false,
 }: {
@@ -1575,6 +1413,7 @@ async function writeRemoteSessionFinalization({
   status: "completed" | "failed" | "stopped"
   finalization: SessionFinalizationComputation
   terminalReason?: SessionTerminalReason | null
+  metadata?: Record<string, unknown>
   args: Args
   requireOnline?: boolean
 }) {
@@ -1596,6 +1435,7 @@ async function writeRemoteSessionFinalization({
         metadata: {
           ...(terminalReason ? { terminalReason } : {}),
           finalizationReasons: finalization.reasons,
+          ...metadata,
         },
       },
       args
@@ -1788,7 +1628,6 @@ async function ensureWorktree({
   sessionId: string
   workerId: string
 }) {
-  const branch = workerBranchName({ sessionId, workerId })
   const dir = join(await onyxStateDir(root), "worktrees", sessionId, workerId)
   if (!(await pathExists(dir))) {
     await withOnyxLock(root, "git-worktree", async () => {
@@ -1796,17 +1635,15 @@ async function ensureWorktree({
       await mkdir(join(await onyxStateDir(root), "worktrees", sessionId), {
         recursive: true,
       })
-      await git(["worktree", "add", "-B", branch, dir, startingCommitSha], root)
+      await git(["worktree", "add", "--detach", dir, startingCommitSha], root)
     })
   }
-  return { dir, branch }
+  return { dir }
 }
 
 /**
- * Removes a finished worker's worktree so a 100-worker session does not
- * leave 100 working trees on disk. The worker branch and any pushed refs
- * survive removal, so salvage/recovery evidence is unaffected. Set
- * ONYX_KEEP_WORKTREES=1 to keep worktrees for debugging.
+ * Removes a finished worker's disposable worktree. Experiment refs are the
+ * only durable Git output; incomplete workspace state is intentionally lost.
  */
 async function removeWorkerWorktree({
   root,
@@ -1817,72 +1654,16 @@ async function removeWorkerWorktree({
   sessionId: string
   workerId: string
 }) {
-  if (process.env.ONYX_KEEP_WORKTREES === "1") return
   const sessionDir = join(await onyxStateDir(root), "worktrees", sessionId)
   const dir = join(sessionDir, workerId)
   if (!(await pathExists(dir))) return
   await withOnyxLock(root, "git-worktree", async () => {
-    try {
-      await git(["worktree", "remove", "--force", dir], root)
-    } catch {
-      // Leave the directory for the next prune rather than failing the
-      // worker lifecycle over cleanup.
-      await git(["worktree", "prune"], root).catch(() => {})
-    }
+    await git(["worktree", "remove", "--force", dir], root)
+    await git(["worktree", "prune"], root).catch(() => {})
     // Last worker out removes the session directory; rmdir refuses to
     // delete a non-empty directory, so earlier workers no-op here.
     await rmdir(sessionDir).catch(() => {})
   })
-}
-
-function workerBranchName({
-  sessionId,
-  workerId,
-}: {
-  sessionId: string
-  workerId: string
-}) {
-  return [
-    "onyx",
-    safeBranchSegment(sessionId),
-    safeBranchSegment(workerId),
-  ].join("/")
-}
-
-async function commitIfNeeded(worktree: string, hypothesis: ApiHypothesis) {
-  const status = await git(["status", "--porcelain"], worktree)
-  if (!status.trim()) {
-    return { commitSha: await currentCommit(worktree), changed: false }
-  }
-  await git(["add", "-A"], worktree)
-  await git(
-    ["commit", "-m", `onyx: ${hypothesis.name} research attempt`],
-    worktree
-  )
-  return { commitSha: await currentCommit(worktree), changed: true }
-}
-
-async function localExperimentCommitSetFor({
-  root,
-  campaignName,
-  hypothesisId,
-}: {
-  root: string
-  campaignName: string
-  hypothesisId: string
-}) {
-  const attempts = await listLocalAttempts(root).catch(() => [])
-  const commits = new Set<string>()
-  for (const record of attempts) {
-    if (
-      record.campaignName === campaignName &&
-      record.hypothesisId === hypothesisId &&
-      record.resultCommitSha
-    ) {
-      commits.add(record.resultCommitSha)
-    }
-  }
-  return commits
 }
 
 async function hasWorkerLoggedAttempt({
@@ -1896,129 +1677,6 @@ async function hasWorkerLoggedAttempt({
   return attempts.some((record) => record.workerId === workerId)
 }
 
-async function findRemoteWorkerExperimentForCommit({
-  campaignId,
-  sessionId,
-  workerId,
-  resultCommitSha,
-  args,
-}: {
-  campaignId: string
-  sessionId: string
-  workerId: string
-  resultCommitSha: string
-  args: Args
-}) {
-  const page = await listCampaignExperiments(campaignId, args, {
-    limit: 5,
-    sessionId,
-    workerId,
-    resultCommitSha,
-  })
-  return (
-    page.items.find(
-      (experiment) =>
-        experiment.sessionId === sessionId &&
-        experiment.workerId === workerId &&
-        experiment.resultCommitSha === resultCommitSha
-    ) ?? null
-  )
-}
-
-type FinalizationCommitAnalysis =
-  | {
-      kind: "already_logged"
-      unloggedCommits: string[]
-      measurementBaseCommitSha: null
-      reason: null
-    }
-  | {
-      kind: "single_unlogged_head"
-      unloggedCommits: string[]
-      measurementBaseCommitSha: string
-      reason: null
-    }
-  | {
-      kind: "salvage_only"
-      unloggedCommits: string[]
-      measurementBaseCommitSha: null
-      reason: string
-    }
-
-async function analyzeFinalizationCommits({
-  worktree,
-  baseCommitSha,
-  headCommitSha,
-  loggedCommits,
-}: {
-  worktree: string
-  baseCommitSha: string
-  headCommitSha: string
-  loggedCommits: Set<string>
-}): Promise<FinalizationCommitAnalysis> {
-  if (loggedCommits.has(headCommitSha)) {
-    return {
-      kind: "already_logged",
-      unloggedCommits: [],
-      measurementBaseCommitSha: null,
-      reason: null,
-    }
-  }
-
-  let commits: string[]
-  try {
-    commits = (
-      await git(
-        ["rev-list", "--reverse", `${baseCommitSha}..${headCommitSha}`],
-        worktree
-      )
-    )
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-  } catch (error) {
-    return {
-      kind: "salvage_only",
-      unloggedCommits: [headCommitSha],
-      measurementBaseCommitSha: null,
-      reason: `Unable to inspect commits between hypothesis base and worker HEAD: ${errorMessage(error)}`,
-    }
-  }
-
-  const unloggedCommits = commits.filter((commit) => !loggedCommits.has(commit))
-  if (unloggedCommits.length === 1 && unloggedCommits[0] === headCommitSha) {
-    const parentLine = await git(
-      ["rev-list", "--parents", "-n", "1", headCommitSha],
-      worktree
-    )
-    const [, parentCommitSha] = parentLine.trim().split(/\s+/)
-    if (!parentCommitSha) {
-      return {
-        kind: "salvage_only",
-        unloggedCommits,
-        measurementBaseCommitSha: null,
-        reason: "Unable to find a parent commit for the unlogged worker HEAD.",
-      }
-    }
-    return {
-      kind: "single_unlogged_head",
-      unloggedCommits,
-      measurementBaseCommitSha: parentCommitSha,
-      reason: null,
-    }
-  }
-
-  return {
-    kind: "salvage_only",
-    unloggedCommits,
-    measurementBaseCommitSha: null,
-    reason:
-      unloggedCommits.length === 0
-        ? "Worker HEAD was not locally logged, but no unlogged commit range could be measured safely."
-        : `Worker HEAD contains ${unloggedCommits.length} unlogged commits; finalization only measures exactly one unlogged HEAD commit.`,
-  }
-}
-
 async function withoutProcessExitCode<T>(fn: () => Promise<T>) {
   const previous = process.exitCode
   process.exitCode = undefined
@@ -2029,322 +1687,229 @@ async function withoutProcessExitCode<T>(fn: () => Promise<T>) {
   }
 }
 
-export async function finalizeHypothesisAttempt({
+function boundedText(value: string, limit: number) {
+  return value.length <= limit ? value : `${value.slice(0, limit - 3)}...`
+}
+
+async function workspaceDiagnostics({
+  worktree,
+  startingCommitSha,
+}: {
+  worktree: string
+  startingCommitSha: string
+}) {
+  const headCommitSha = await currentCommit(worktree).catch(() => null)
+  const commitsAhead = headCommitSha
+    ? Number(
+        await git(
+          ["rev-list", "--count", `${startingCommitSha}..${headCommitSha}`],
+          worktree
+        ).catch(() => "0")
+      ) || 0
+    : 0
+  const status = await git(["status", "--porcelain"], worktree).catch(() => "")
+  const changedPaths = status
+    .split("\n")
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean)
+    .slice(0, 50)
+  const committedDiff = headCommitSha
+    ? await git(
+        ["diff", "--stat", startingCommitSha, headCommitSha],
+        worktree
+      ).catch(() => "")
+    : ""
+  const dirtyDiff = await git(["diff", "--stat", "HEAD"], worktree).catch(
+    () => ""
+  )
+  const diffStat = boundedText(
+    [committedDiff.trim(), dirtyDiff.trim()].filter(Boolean).join("\n"),
+    4096
+  )
+  return {
+    headCommitSha,
+    commitsAhead,
+    dirty: Boolean(status.trim()),
+    changedPaths,
+    diffStat: diffStat || null,
+  }
+}
+
+export async function teardownHypothesisAttempt({
   root,
   worktree,
+  projectPath,
   campaign,
+  setup,
   hypothesis,
   startingCommitSha,
   sessionId,
   assignmentId,
   workerId,
-  workerBranch,
   activityManifest,
   args,
-  workerFailed,
-  pushWorkerBranch,
+  providerExitCode,
+  providerSignal,
+  timedOut,
+  startupTimedOut,
+  phase,
+  providerError,
+  reasonCode,
 }: {
   root: string
   worktree: string
+  projectPath: string
   campaign: ApiCampaign
+  setup: ResearchSetupFile
   hypothesis: ApiHypothesis
   startingCommitSha: string
   sessionId: string
   assignmentId: string
   workerId: string
-  workerBranch: string
   activityManifest?: WorkerLaunchManifest | null
   args: Args
-  workerFailed: boolean
-  pushWorkerBranch: WorkerBranchPusher
-}): Promise<WorkerFinalizationManifest> {
-  const manifest: WorkerFinalizationManifest = {
-    attempted: false,
-    salvaged: workerFailed,
-    finalizationStatus: "none",
-    commitSha: null,
-    measurementBaseCommitSha: null,
-    unloggedCommitCount: 0,
-    workerBranchPushStatus: "not_attempted",
-    rootDriftStatus: "not_checked",
+  providerExitCode: number | null
+  providerSignal: string | null
+  timedOut: boolean
+  startupTimedOut: boolean
+  phase: "completed" | "failed" | "stopped"
+  providerError: string | null
+  reasonCode: WorkerTerminalReasonCode
+}): Promise<WorkerTeardownManifest> {
+  const diagnostics = await workspaceDiagnostics({
+    worktree,
+    startingCommitSha,
+  })
+  const manifest: WorkerTeardownManifest = {
+    attemptDelivery: "none",
+    runRef: null,
+    resultCommitSha: null,
+    resultRefPushStatus: "not_attempted",
+    resultRefPushError: null,
+    ...diagnostics,
+    worktreeCleanup: "pending",
+    providerExitCode,
+    providerSignal,
+    timedOut,
+    startupTimedOut,
+    phase,
+    providerError: providerError ? boundedText(providerError, 1000) : null,
+    reasonCode,
     error: null,
   }
 
   try {
     const warnings = await recordWorkerHarnessWarnings(activityManifest)
     if (warnings.length > 0) manifest.warnings = warnings
-    const headBefore = await currentCommit(worktree)
-    const dirty = (await git(["status", "--porcelain"], worktree)).trim()
-    const hasResult =
-      (Boolean(dirty) && dirty.length > 0) || headBefore !== startingCommitSha
-    if (!hasResult) {
-      const rootStatus = await mainWorktreeStatus(root)
-      manifest.rootDriftStatus = rootStatus ? "dirty" : "clean"
-      if (rootStatus) {
-        manifest.error = `main checkout changed during worker run:\n${rootStatus}`
-      }
-      return manifest
-    }
-
-    manifest.attempted = true
-    const commit = await commitIfNeeded(worktree, hypothesis)
-    manifest.commitSha = commit.commitSha
-
-    const remoteHeadExperiment = await findRemoteWorkerExperimentForCommit({
-      campaignId: campaign.id,
+    const attempts = await listLocalAttempts(root, {
       sessionId,
       workerId,
-      resultCommitSha: commit.commitSha,
-      args,
-    }).catch(() => null)
-    if (remoteHeadExperiment) {
-      manifest.unloggedCommitCount = 0
-      manifest.measurementBaseCommitSha = null
-      manifest.finalizationStatus = "already_logged"
-      manifest.salvaged = false
-    }
-
-    if (manifest.finalizationStatus === "none") {
-      const loggedCommits = await localExperimentCommitSetFor({
-        root,
-        campaignName: campaign.name,
-        hypothesisId: hypothesis.id,
-      })
-      const analysis = await analyzeFinalizationCommits({
-        worktree,
-        baseCommitSha: startingCommitSha,
-        headCommitSha: commit.commitSha,
-        loggedCommits,
-      })
-      manifest.unloggedCommitCount = analysis.unloggedCommits.length
-      manifest.measurementBaseCommitSha = analysis.measurementBaseCommitSha
-
-      if (analysis.kind === "already_logged") {
-        manifest.finalizationStatus = "already_logged"
-        manifest.salvaged = false
-        manifest.unloggedCommitCount = 0
-      } else if (analysis.kind === "salvage_only") {
-        const stopCheck = await collectResearchStopReasons({
-          root,
-          sessionId,
-        }).catch(() => null)
-        if (stopCheck?.shouldStop) {
-          manifest.finalizationStatus = "discarded_after_completion"
-          manifest.salvaged = false
-          manifest.error = [
-            "Session stop condition reached before final measurement; discarded unlogged work without creating an experiment.",
-            analysis.reason,
-          ]
-            .filter(Boolean)
-            .join(" ")
-          if (activityManifest) {
-            await appendWorkerActivityEvent(activityManifest, {
-              type: "finalization",
-              phase: "discarded",
-              summary: "Session completed before final measurement",
-              metadata: {
-                finalizationStatus: manifest.finalizationStatus,
-                unloggedCommitCount: analysis.unloggedCommits.length,
-                stopReasons: stopCheck.reasons,
-                salvageReason: analysis.reason,
-              },
-            })
-          }
-        } else {
-          manifest.finalizationStatus = "salvaged_unmeasured"
-          manifest.salvaged = true
-          manifest.error = analysis.reason
-        }
-      } else {
-        const measurementBaseCommitSha = analysis.measurementBaseCommitSha
-        const stopCheck = await collectResearchStopReasons({
-          root,
-          sessionId,
-        }).catch(() => null)
-        if (stopCheck?.shouldStop) {
-          manifest.finalizationStatus = "discarded_after_completion"
-          manifest.salvaged = false
-          manifest.error =
-            "Session stop condition reached before final measurement; discarded unlogged work without creating an experiment."
-          if (activityManifest) {
-            await appendWorkerActivityEvent(activityManifest, {
-              type: "finalization",
-              phase: "discarded",
-              summary: "Session completed before final measurement",
-              metadata: {
-                finalizationStatus: manifest.finalizationStatus,
-                measurementBaseCommitSha,
-                unloggedCommitCount: analysis.unloggedCommits.length,
-                stopReasons: stopCheck.reasons,
-              },
-            })
-          }
-        } else {
-          let measurementError: string | null = null
-          let measuredRunRef: string | null = null
-          await withoutProcessExitCode(() =>
-            commandExpRun({
-              positional: ["exp", "run"],
-              options: {
-                ...args.options,
-                cwd: worktree,
-                campaign: campaign.name,
-                base: measurementBaseCommitSha,
-                hypothesis: hypothesis.id,
-                session: sessionId,
-                assignment: assignmentId,
-                worker: workerId,
-                timeout: "120",
-                "checks-timeout": "120",
-              },
-            })
-          )
-            .then((result) => {
-              measuredRunRef = result?.runRef ?? null
-            })
-            .catch((error) => {
-              measurementError = errorMessage(error)
-              manifest.error = measurementError
-            })
-          await withoutProcessExitCode(() =>
-            commandExpLog({
-              positional: ["exp", "log"],
-              options: {
-                ...args.options,
-                cwd: worktree,
-                campaign: campaign.name,
-                base: measurementBaseCommitSha,
-                hypothesis: hypothesis.id,
-                session: sessionId,
-                assignment: assignmentId,
-                worker: workerId,
-                ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
-                ...(measurementError
-                  ? { status: "failed", "allow-unmeasured": "true" }
-                  : {}),
-                name: `${hypothesis.name}-final-${commit.commitSha.slice(0, 7)}`,
-                description: workerFailed
-                  ? `Best-effort salvage from ${hypothesis.name} after worker process failure.`
-                  : `Final ${hypothesis.name} worker result.`,
-                "agent-notes": JSON.stringify({
-                  finalizedBy: "onyx worker harness",
-                  workerFailed,
-                  measurementError,
-                  hypothesis: hypothesis.name,
-                  measurementBaseCommitSha,
-                  unloggedCommitCount: analysis.unloggedCommits.length,
-                }),
-              },
-            })
-          )
-            .then(async (record) => {
-              manifest.finalizationStatus = "measured_and_logged"
-              if (record && activityManifest) {
-                await appendWorkerActivityEvent(activityManifest, {
-                  type: "metrics",
-                  phase: "measured",
-                  summary: `${record.primaryMetricName}=${record.primaryMetricValue ?? "null"}`,
-                  metadata: {
-                    runRef: record.runRef,
-                    status: record.status,
-                    primaryMetricName: record.primaryMetricName,
-                    primaryMetricValue: record.primaryMetricValue,
-                    metrics:
-                      "metrics" in record
-                        ? record.metrics
-                        : record.secondaryMetrics,
-                    resultCommitSha: record.resultCommitSha,
-                    resultRef: record.resultRef,
-                  },
-                })
-              }
-            })
-            .catch((error) => {
-              manifest.finalizationStatus = "failed"
-              manifest.error = [
-                manifest.error,
-                `experiment log failed: ${errorMessage(error)}`,
-              ]
-                .filter(Boolean)
-                .join("; ")
-            })
-        }
-      }
-    }
-
-    if (
-      manifest.finalizationStatus.startsWith("salvaged_unmeasured") ||
-      manifest.finalizationStatus === "discarded_after_completion"
-    ) {
-      await abandonBlockedWorkflowRunsForSession({
-        root,
-        sessionId,
-        workerId,
-        hypothesisId: hypothesis.id,
-        reason: `Worker finalization ${manifest.finalizationStatus}; workflow no longer represents a loggable attempt.`,
-      }).catch(() => [])
-    }
-
-    const workerBranchPush = await pushWorkerBranch({
-      cwd: worktree,
-      sourceRef: "HEAD",
-      targetRef: `refs/heads/${workerBranch}`,
-      reason: "worker-branch-finalization",
-      manifest: activityManifest,
+      hypothesisId: hypothesis.id,
     })
-    if (workerBranchPush.code === 0 && !workerBranchPush.timedOut) {
-      manifest.workerBranchPushStatus = "pushed"
-      if (activityManifest) {
-        await appendWorkerActivityEvent(activityManifest, {
-          type: "push_result",
-          phase: "pushing",
-          summary: "Worker branch pushed",
-          metadata: {
-            ref: `refs/heads/${workerBranch}`,
-            commitSha: manifest.commitSha,
-          },
-        })
-      }
-    } else {
-      manifest.workerBranchPushStatus = "failed"
-      const workerBranchPushError =
-        workerBranchPush.stderr.trim() ||
-        workerBranchPush.stdout.trim() ||
-        "worker branch push failed"
-      manifest.error = [manifest.error, workerBranchPushError]
-        .filter(Boolean)
-        .join("; ")
-      if (activityManifest) {
-        await appendWorkerActivityEvent(activityManifest, {
-          type: "push_result",
-          phase: "pushing",
-          summary: "Worker branch push failed",
-          metadata: {
-            ref: `refs/heads/${workerBranch}`,
-            commitSha: manifest.commitSha,
-            error: manifest.error,
-          },
-        })
-      }
+    if (attempts.length > 1) {
+      manifest.attemptDelivery = "ambiguous_discarded"
+      manifest.reasonCode = "worker_protocol_violation"
+      manifest.error = `Worker produced ${attempts.length} terminal attempt manifests; none were delivered.`
+      await Promise.all(
+        attempts.map((attempt) =>
+          clearLocalAttempt(root, { runRef: attempt.runRef })
+        )
+      )
+      return manifest
     }
+    const attempt = attempts[0]
+    if (!attempt) return manifest
 
-    const rootStatus = await mainWorktreeStatus(root)
-    manifest.rootDriftStatus = rootStatus ? "dirty" : "clean"
-    if (rootStatus) {
-      manifest.error = [
-        manifest.error,
-        `main checkout changed during worker run:\n${rootStatus}`,
-      ]
-        .filter(Boolean)
-        .join("; ")
-    }
-
+    manifest.runRef = attempt.runRef
+    manifest.resultCommitSha = attempt.resultCommitSha
+    const record = await withoutProcessExitCode(() =>
+      deliverTerminalExperimentAttempt({
+        args,
+        context: {
+          root: worktree,
+          projectPath,
+          campaign,
+          setup,
+          runRef: attempt.runRef,
+          sessionId,
+          assignmentId,
+          hypothesisId: hypothesis.id,
+          workerId,
+        },
+      })
+    )
+    manifest.attemptDelivery =
+      record.deliveryOutcome === "duplicate" ? "duplicate" : "delivered"
+    manifest.resultRefPushStatus =
+      record.deliveryResultRefPushStatus === "failed" ? "failed" : "pushed"
+    manifest.resultRefPushError = record.deliveryResultRefPushError
+      ? boundedText(record.deliveryResultRefPushError, 1000)
+      : null
     return manifest
   } catch (error) {
-    manifest.finalizationStatus = "failed"
-    manifest.error = errorMessage(error)
+    manifest.attemptDelivery = "failed"
+    manifest.reasonCode = "terminal_attempt_delivery_failed"
+    manifest.error = boundedText(errorMessage(error), 1000)
+    if (error instanceof ExperimentDeliveryError) {
+      manifest.resultRefPushStatus = error.resultRefPushStatus
+      manifest.resultRefPushError = error.resultRefPushError
+        ? boundedText(error.resultRefPushError, 1000)
+        : null
+    }
+    if (manifest.runRef) {
+      await clearLocalAttempt(root, { runRef: manifest.runRef }).catch(() => {})
+    }
     return manifest
   }
+}
+
+function emptyWorkerTeardown({
+  phase,
+  reasonCode,
+  providerExitCode,
+  providerSignal,
+  timedOut,
+  startupTimedOut,
+  providerError,
+  error = null,
+}: {
+  phase: "completed" | "failed" | "stopped"
+  reasonCode: WorkerTerminalReasonCode
+  providerExitCode: number | null
+  providerSignal: string | null
+  timedOut: boolean
+  startupTimedOut: boolean
+  providerError: string | null
+  error?: string | null
+}): WorkerTeardownManifest {
+  return {
+    attemptDelivery: "none",
+    runRef: null,
+    resultCommitSha: null,
+    resultRefPushStatus: "not_attempted",
+    resultRefPushError: null,
+    headCommitSha: null,
+    commitsAhead: 0,
+    dirty: false,
+    changedPaths: [],
+    diffStat: null,
+    worktreeCleanup: "pending",
+    providerExitCode,
+    providerSignal,
+    timedOut,
+    startupTimedOut,
+    phase,
+    providerError: providerError ? boundedText(providerError, 1000) : null,
+    reasonCode,
+    error: error ? boundedText(error, 1000) : null,
+  }
+}
+
+function appendBoundedTeardownError(current: string | null, next: unknown) {
+  return boundedText(
+    [current, errorMessage(next)].filter(Boolean).join("; "),
+    1000
+  )
 }
 
 async function writeWorkerPrompt({
@@ -2356,7 +1921,6 @@ async function writeWorkerPrompt({
   sessionId,
   hypothesis,
   workerId,
-  workerBranch,
   endTimeMs,
 }: {
   root: string
@@ -2367,7 +1931,6 @@ async function writeWorkerPrompt({
   sessionId: string
   hypothesis: ApiHypothesis
   workerId: string
-  workerBranch: string
   endTimeMs: number
 }) {
   const dir = join(await onyxStateDir(root), "worker-prompts", sessionId)
@@ -2401,7 +1964,6 @@ async function writeWorkerPrompt({
     researchSpecPath: onyxPath(worktree, projectPath, "onyx.md"),
     sessionId,
     worktreeRoot: worktree,
-    workerBranch,
   })
 
   await writeFile(path, `${markdown}\n`, "utf8")
@@ -2798,20 +2360,20 @@ async function mainWorktreeStatus(root: string) {
   return (await git(["status", "--porcelain"], root)).trim()
 }
 
-export function finalizationStatusLabel(status: WorkerFinalizationStatus) {
+export function teardownStatusLabel(
+  status: WorkerTeardownManifest["attemptDelivery"]
+) {
   switch (status) {
     case "none":
-      return "no result changes"
-    case "already_logged":
-      return "already logged"
-    case "measured_and_logged":
-      return "measured and logged"
-    case "salvaged_unmeasured":
-      return "salvaged without measurement"
-    case "discarded_after_completion":
-      return "discarded after session completion"
+      return "no terminal attempt"
+    case "delivered":
+      return "terminal attempt delivered"
+    case "duplicate":
+      return "terminal attempt already delivered"
+    case "ambiguous_discarded":
+      return "ambiguous terminal attempts discarded"
     case "failed":
-      return "failed"
+      return "terminal attempt delivery failed"
   }
 }
 
@@ -2869,11 +2431,9 @@ function workerMetadata({
 async function persistWorkerLaunchState({
   root,
   manifest,
-  workerBranch,
 }: {
   root: string
   manifest: WorkerLaunchManifest
-  workerBranch: string
 }) {
   await writeWorkerLaunchManifest(manifest)
   await upsertWorkerLaunch({
@@ -2884,7 +2444,6 @@ async function persistWorkerLaunchState({
       hypothesisId: manifest.hypothesisId,
       status: manifest.status,
       worktree: manifest.cwd,
-      branchName: workerBranch,
       promptPath: manifest.promptPath,
       logPath: manifest.logPath,
       activityLogPath: manifest.activityLogPath,
@@ -2894,8 +2453,7 @@ async function persistWorkerLaunchState({
       timedOut: manifest.timedOut,
       startupTimedOut: manifest.startupTimedOut,
       lastOutputAt: manifest.lastOutputAt,
-      finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
-      error: manifest.error ?? manifest.finalization?.error ?? null,
+      error: manifest.error ?? manifest.teardown?.error ?? null,
       metadata: {
         agentKind: manifest.agentKind,
         command: manifest.command,
@@ -2904,6 +2462,7 @@ async function persistWorkerLaunchState({
         workerContextPath: manifest.workerContextPath,
         latestStatePath: manifest.latestStatePath,
         addedWritableRoots: manifest.addedWritableRoots,
+        teardown: manifest.teardown,
         ...workerModelMetadata(manifest.workerModel ?? null),
       },
       startedAt: manifest.startedAt,
@@ -2956,7 +2515,6 @@ async function runHypothesisOnce({
   startupTimeoutMs,
   stopGraceMs,
   quiet,
-  refPushQueue,
   preacquiredLease,
   slotIndex = null,
   onRegistered,
@@ -2978,7 +2536,6 @@ async function runHypothesisOnce({
   startupTimeoutMs: number
   stopGraceMs: number
   quiet: boolean
-  refPushQueue: ReturnType<typeof createRefPushQueue>
   preacquiredLease?: ApiWorkerLease | null
   /** Supervisor capacity slot this worker occupies (stable across relaunches). */
   slotIndex?: number | null
@@ -2990,18 +2547,30 @@ async function runHypothesisOnce({
   args: Args
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
+  let workerName: string | null = null
   let leaseToken: string | undefined
   let resultCommitSha: string | undefined
-  let workerBranch = "unknown"
+  let worktree: string | null = null
+  let assignmentId: string | null = null
+  let startingCommitSha: string | null = null
+  let teardown: WorkerTeardownManifest | null = null
   let launchManifest: WorkerLaunchManifest | null = null
+  let launchPaths: Awaited<ReturnType<typeof workerLaunchPaths>> | null = null
+  let terminalPhase: "completed" | "failed" | "stopped" = "failed"
+  let terminalReasonCode: WorkerTerminalReasonCode = "startup_failure"
+  let providerExitCode: number | null = null
+  let providerSignal: string | null = null
+  let providerTimedOut = false
+  let providerStartupTimedOut = false
+  let providerError: string | null = null
+  let outcome: HypothesisRunResult | null = null
+  let firstAttemptWarningTimer: ReturnType<typeof setTimeout> | null = null
   let launchPersistQueue: Promise<void> = Promise.resolve()
   const persistLaunchManifest = (manifest: WorkerLaunchManifest) => {
     const snapshot = manifest
     const write = launchPersistQueue
       .catch(() => {})
-      .then(() =>
-        persistWorkerLaunchState({ root, manifest: snapshot, workerBranch })
-      )
+      .then(() => persistWorkerLaunchState({ root, manifest: snapshot }))
     launchPersistQueue = write
     return write
   }
@@ -3045,9 +2614,12 @@ async function runHypothesisOnce({
       }
     }
     const worker = lease.worker
+    assignmentId = lease.assignment.id
+    startingCommitSha = lease.assignment.startingCommitSha
     leaseToken = lease.leaseToken
     hypothesis = lease.hypothesis
     workerId = worker.id
+    workerName = worker.workerName
     await registerLocalWorker({
       root,
       campaignId: campaign.id,
@@ -3079,14 +2651,67 @@ async function runHypothesisOnce({
       args
     )
 
+    worktree = join(await onyxStateDir(root), "worktrees", sessionId, worker.id)
+    const initialLaunchPaths = await workerLaunchPaths({
+      root,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+    })
+    launchPaths = initialLaunchPaths
+    const initialAgentKind: WorkerAgentKind = workerCommand
+      ? "custom"
+      : (agentKind as WorkerAgentKind)
+    const initialManifest: WorkerLaunchManifest = {
+      schemaVersion: 2,
+      agentKind: initialAgentKind,
+      workerModel,
+      command: workerCommand ?? agentKind,
+      args: [],
+      onyxWorkerPath: null,
+      workerContextPath: null,
+      addedWritableRoots: [],
+      cwd: worktree,
+      promptPath: "",
+      logPath: initialLaunchPaths.logPath,
+      activityLogPath: initialLaunchPaths.activityLogPath,
+      activityJsonlPath: initialLaunchPaths.activityJsonlPath,
+      latestStatePath: initialLaunchPaths.latestStatePath,
+      manifestPath: initialLaunchPaths.manifestPath,
+      sessionId,
+      startingCommitSha: lease.assignment.startingCommitSha,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+      workerName: worker.workerName,
+      supervisorRunId,
+      pid: null,
+      processStartedAt: null,
+      commandIdentity: null,
+      slotIndex,
+      version: null,
+      startedAt: new Date().toISOString(),
+      lastOutputAt: null,
+      completedAt: null,
+      status: "starting",
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+      preflight: null,
+      teardown: null,
+    }
+    launchManifest = initialManifest
+    await persistLaunchManifest(initialManifest)
     const worktreeInfo = await ensureWorktree({
       root,
       startingCommitSha: lease.assignment.startingCommitSha,
       sessionId,
       workerId: worker.id,
     })
-    const worktree = worktreeInfo.dir
-    workerBranch = worktreeInfo.branch
+    worktree = worktreeInfo.dir
     await emitEvent(root, {
       type: "hypothesis_started",
       campaignName: campaign.name,
@@ -3106,7 +2731,6 @@ async function runHypothesisOnce({
       sessionId,
       hypothesis,
       workerId: worker.id,
-      workerBranch,
       endTimeMs,
     })
     runtimePaths = await workerRuntimePaths({
@@ -3118,7 +2742,7 @@ async function runHypothesisOnce({
     await writeWorkerRuntimeContext({
       paths: runtimePaths,
       context: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         campaignId: campaign.id,
         campaignName: campaign.name,
         sessionId,
@@ -3128,7 +2752,6 @@ async function runHypothesisOnce({
         hypothesisName: hypothesis.name,
         workerId: worker.id,
         workerLeaseToken: leaseToken,
-        workerBranch,
         worktreeRoot: worktree,
         projectPath,
         projectRoot,
@@ -3152,7 +2775,6 @@ async function runHypothesisOnce({
       ONYX_SESSION_ID: sessionId,
       ONYX_HYPOTHESIS_ID: hypothesis.id,
       ONYX_HYPOTHESIS_NAME: hypothesis.name,
-      ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
       ONYX_WORKER_LEASE_TOKEN: leaseToken,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
@@ -3177,7 +2799,7 @@ async function runHypothesisOnce({
     const addedWritableRoots = workerCommand
       ? []
       : await workerGitWritableRoots(worktree)
-    const invocation = buildWorkerInvocation({
+    const preparedInvocation = buildWorkerInvocation({
       agentKind,
       workerCommand,
       worktree,
@@ -3186,6 +2808,39 @@ async function runHypothesisOnce({
       workerModel,
       workerTitle: worker.id,
     })
+    const preparedLaunchPaths = await workerLaunchPaths({
+      root,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+    })
+    launchPaths = preparedLaunchPaths
+    const readyManifest: WorkerLaunchManifest = {
+      ...initialManifest,
+      agentKind: preparedInvocation.agentKind,
+      workerModel: preparedInvocation.workerModel ?? null,
+      command: preparedInvocation.command,
+      args: preparedInvocation.redactedArgs,
+      onyxWorkerPath: workerCliWrapper.workerPath,
+      workerContextPath: runtimePaths.contextPath,
+      addedWritableRoots: preparedInvocation.addedWritableRoots,
+      cwd: worktree,
+      promptPath: prompt.path,
+      logPath: preparedLaunchPaths.logPath,
+      activityLogPath: preparedLaunchPaths.activityLogPath,
+      activityJsonlPath: preparedLaunchPaths.activityJsonlPath,
+      latestStatePath: preparedLaunchPaths.latestStatePath,
+      manifestPath: preparedLaunchPaths.manifestPath,
+      sessionId,
+      startingCommitSha: lease.assignment.startingCommitSha,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+      workerName: worker.workerName,
+    }
+    launchManifest = readyManifest
+    await persistLaunchManifest(readyManifest)
     await heartbeatWorker(
       worker.id,
       {
@@ -3200,78 +2855,37 @@ async function runHypothesisOnce({
       },
       args
     )
-    const preflight = await preflightWorkerInvocation(invocation, {
+    const preflight = await preflightWorkerInvocation(preparedInvocation, {
       cwd: worktree,
       env: workerRunEnv,
       campaignName: campaign.name,
       sessionId,
     })
-    const launchPaths = await workerLaunchPaths({
-      root,
-      sessionId,
-      hypothesisId: hypothesis.id,
-      hypothesisName: hypothesis.name,
-      workerId: worker.id,
-    })
-    launchManifest = {
-      schemaVersion: 1,
-      agentKind: invocation.agentKind,
-      workerModel: invocation.workerModel ?? null,
-      command: invocation.command,
-      args: invocation.redactedArgs,
-      onyxWorkerPath: workerCliWrapper.workerPath,
-      workerContextPath: runtimePaths.contextPath,
-      addedWritableRoots: invocation.addedWritableRoots,
-      cwd: worktree,
-      promptPath: prompt.path,
-      logPath: launchPaths.logPath,
-      activityLogPath: launchPaths.activityLogPath,
-      activityJsonlPath: launchPaths.activityJsonlPath,
-      latestStatePath: launchPaths.latestStatePath,
-      manifestPath: launchPaths.manifestPath,
-      sessionId,
-      hypothesisId: hypothesis.id,
-      hypothesisName: hypothesis.name,
-      workerId: worker.id,
-      workerName: worker.workerName,
-      supervisorRunId,
-      pid: null,
-      processStartedAt: null,
-      commandIdentity: null,
-      slotIndex,
+    const preflightManifest: WorkerLaunchManifest = {
+      ...readyManifest,
       version: preflight.version,
-      startedAt: new Date().toISOString(),
-      lastOutputAt: null,
-      completedAt: null,
-      status: "starting",
-      exitCode: null,
-      signal: null,
-      timedOut: false,
-      startupTimedOut: false,
-      error: null,
       preflight,
-      finalization: null,
     }
-    await persistLaunchManifest(launchManifest)
+    launchManifest = preflightManifest
+    await persistLaunchManifest(preflightManifest)
     console.log(`worker: ${worker.id}`)
     console.log(`hypothesis: ${hypothesis.id} ${hypothesis.name}`)
     console.log(`worktree: ${worktree}`)
-    console.log(`manifest: ${launchPaths.manifestPath}`)
-    console.log(`raw log: ${launchPaths.logPath}`)
-    console.log(`activity log: ${launchPaths.activityLogPath}`)
-    console.log(`activity events: ${launchPaths.activityJsonlPath}`)
-    await appendWorkerActivityEvent(launchManifest, {
+    console.log(`manifest: ${preparedLaunchPaths.manifestPath}`)
+    console.log(`raw log: ${preparedLaunchPaths.logPath}`)
+    console.log(`activity log: ${preparedLaunchPaths.activityLogPath}`)
+    console.log(`activity events: ${preparedLaunchPaths.activityJsonlPath}`)
+    await appendWorkerActivityEvent(preflightManifest, {
       type: "process_start",
       phase: "starting",
-      summary: `Starting ${invocation.agentKind} worker for ${hypothesis.name}`,
+      summary: `Starting ${preparedInvocation.agentKind} worker for ${hypothesis.name}`,
       metadata: {
-        command: invocation.command,
-        args: invocation.redactedArgs,
-        workerBranch,
+        command: preparedInvocation.command,
+        args: preparedInvocation.redactedArgs,
         ...workerModelMetadata(workerModel),
       },
     })
-    await appendWorkerActivityEvent(launchManifest, {
+    await appendWorkerActivityEvent(preflightManifest, {
       type: "phase_change",
       phase: "orienting",
       summary: "Worker context files are ready",
@@ -3282,7 +2896,6 @@ async function runHypothesisOnce({
         "first-attempt-warning-seconds",
         DEFAULT_FIRST_ATTEMPT_WARNING_MS / 1000
       ) * 1000
-    let firstAttemptWarningTimer: ReturnType<typeof setTimeout> | null = null
     const heartbeatSampleEveryMs =
       nonnegativeNumberOption(args, "heartbeat-sample-interval", 0) * 1000
     if (firstAttemptWarningMs > 0) {
@@ -3331,85 +2944,91 @@ async function runHypothesisOnce({
       sessionId,
       hypothesisId: hypothesis.id,
       latestStatePath:
-        launchManifest?.latestStatePath ?? launchPaths.latestStatePath,
+        launchManifest?.latestStatePath ?? preparedLaunchPaths.latestStatePath,
       phase: "running",
       progressMessage: () =>
         workerProgress({
           hypothesisName: hypothesis.name,
-          logPath: launchManifest?.logPath ?? launchPaths.logPath,
+          logPath: launchManifest?.logPath ?? preparedLaunchPaths.logPath,
           activityLogPath:
-            launchManifest?.activityLogPath ?? launchPaths.activityLogPath,
+            launchManifest?.activityLogPath ??
+            preparedLaunchPaths.activityLogPath,
           lastOutputAt: launchManifest?.lastOutputAt ?? null,
         }),
       metadata: () =>
         launchManifest
-          ? workerMetadata({ invocation, manifest: launchManifest })
+          ? workerMetadata({
+              invocation: preparedInvocation,
+              manifest: launchManifest,
+            })
           : {},
       run: () =>
-        runStreamingProcess(invocation.command, invocation.args, {
-          cwd: worktree,
-          timeoutMs: Math.max(
-            1,
-            Math.min(workerTimeoutMs, hardEndTimeMs - Date.now())
-          ),
-          startupTimeoutMs,
-          killGraceMs: 5000,
-          logPath: launchPaths.logPath,
-          activityLogPath: launchPaths.activityLogPath,
-          logHeader: [
-            `# agent: ${invocation.agentKind}`,
-            `# prompt: ${prompt.path}`,
-            `# worker: ${worker.id}`,
-            `# hypothesis: ${hypothesis.id}`,
-          ].join("\n"),
-          stdin: invocation.stdin,
-          env: workerRunEnv,
-          onSpawn: (pid) => {
-            if (!launchManifest) return
-            const identity = inspectProcessIdentity(pid)
-            launchManifest = {
-              ...launchManifest,
-              pid,
-              supervisorRunId,
-              processStartedAt: identity?.startedAt ?? null,
-              commandIdentity: identity?.command ?? null,
-            }
-            void persistLaunchManifest(launchManifest).catch(() => {})
-          },
-          cancel: {
-            graceMs: stopGraceMs,
-            pollMs: 5000,
-            shouldCancel: () =>
-              harnessShouldStopSession({ checker: stopChecker }),
-          },
-          onOutput: ({ at }) => {
-            if (!launchManifest) return
-            launchManifest = {
-              ...launchManifest,
-              status: "running",
-              lastOutputAt: at,
-            }
-            void persistLaunchManifest(launchManifest).catch(() => {})
-          },
-          terminateOnOutput:
-            invocation.agentKind === "opencode"
-              ? ({ text }) => shouldTerminateOpenCodeOnOutput(text)
-              : undefined,
-        }),
+        runStreamingProcess(
+          preparedInvocation.command,
+          preparedInvocation.args,
+          {
+            cwd: worktree!,
+            timeoutMs: Math.max(
+              1,
+              Math.min(workerTimeoutMs, hardEndTimeMs - Date.now())
+            ),
+            startupTimeoutMs,
+            killGraceMs: 5000,
+            logPath: preparedLaunchPaths.logPath,
+            activityLogPath: preparedLaunchPaths.activityLogPath,
+            logHeader: [
+              `# agent: ${preparedInvocation.agentKind}`,
+              `# prompt: ${prompt.path}`,
+              `# worker: ${worker.id}`,
+              `# hypothesis: ${hypothesis.id}`,
+            ].join("\n"),
+            stdin: preparedInvocation.stdin,
+            env: workerRunEnv,
+            onSpawn: (pid) => {
+              if (!launchManifest) return
+              const identity = inspectProcessIdentity(pid)
+              launchManifest = {
+                ...launchManifest,
+                pid,
+                supervisorRunId,
+                processStartedAt: identity?.startedAt ?? null,
+                commandIdentity: identity?.command ?? null,
+              }
+              void persistLaunchManifest(launchManifest).catch(() => {})
+            },
+            cancel: {
+              graceMs: stopGraceMs,
+              pollMs: 5000,
+              shouldCancel: () =>
+                harnessShouldStopSession({ checker: stopChecker }),
+            },
+            onOutput: ({ at }) => {
+              if (!launchManifest) return
+              launchManifest = {
+                ...launchManifest,
+                status: "running",
+                lastOutputAt: at,
+              }
+              void persistLaunchManifest(launchManifest).catch(() => {})
+            },
+            terminateOnOutput:
+              preparedInvocation.agentKind === "opencode"
+                ? ({ text }) => shouldTerminateOpenCodeOnOutput(text)
+                : undefined,
+          }
+        ),
       quiet,
       heartbeatSampleEveryMs,
     })
     if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
     const stoppedByHarness = workerResult.cancelled
+    providerExitCode = workerResult.code
+    providerSignal = workerResult.signal
+    providerTimedOut = workerResult.timedOut
+    providerStartupTimedOut = workerResult.startupTimedOut
     if (launchManifest) {
       launchManifest = {
         ...launchManifest,
-        completedAt: new Date().toISOString(),
-        status: stoppedByHarness
-          ? "stopped"
-          : workerResult.code === 0
-            ? "completed"
-            : "failed",
         exitCode: workerResult.code,
         signal: workerResult.signal,
         timedOut: workerResult.timedOut,
@@ -3419,8 +3038,12 @@ async function runHypothesisOnce({
       await persistLaunchManifest(launchManifest)
       await appendWorkerActivityEvent(launchManifest, {
         type: "process_exit",
-        phase: launchManifest.status,
-        summary: `${invocation.agentKind} exited with code ${workerResult.code ?? "null"}`,
+        phase: stoppedByHarness
+          ? "stopped"
+          : workerResult.code === 0
+            ? "completed"
+            : "failed",
+        summary: `${preparedInvocation.agentKind} exited with code ${workerResult.code ?? "null"}`,
         metadata: {
           exitCode: workerResult.code,
           signal: workerResult.signal,
@@ -3434,187 +3057,329 @@ async function runHypothesisOnce({
       workerResult,
       `Worker process for ${hypothesis.name}`
     )
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
-        status: "running",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "finalizing",
-        event: "finalization_started",
-        progressMessage: `Finalizing ${hypothesis.name} worker output`,
-        gitLabel: resultCommitSha ?? null,
-      },
-      args
-    )
-    if (launchManifest) {
-      await appendWorkerActivityEvent(launchManifest, {
-        type: "phase_change",
-        phase: "finalizing",
-        summary: "Finalizing worker output",
-      })
-    }
-    const finalization = await finalizeHypothesisAttempt({
-      root,
-      worktree,
-      campaign,
-      hypothesis,
-      startingCommitSha: lease.assignment.startingCommitSha,
-      sessionId,
-      assignmentId: lease.assignment.id,
-      workerId: worker.id,
-      workerBranch,
-      activityManifest: launchManifest,
-      args,
-      workerFailed: Boolean(workerFailure) || stoppedByHarness,
-      pushWorkerBranch: refPushQueue.pushRef,
-    })
-    if (finalization.commitSha) resultCommitSha = finalization.commitSha
-    if (launchManifest) {
-      launchManifest = {
-        ...launchManifest,
-        finalization,
-      }
-      await persistLaunchManifest(launchManifest)
-      await appendWorkerActivityEvent(launchManifest, {
-        type: "finalization_result",
-        phase: "finalizing",
-        summary: finalizationStatusLabel(finalization.finalizationStatus),
-        metadata: {
-          finalizationStatus: finalization.finalizationStatus,
-          commitSha: finalization.commitSha,
-          unloggedCommitCount: finalization.unloggedCommitCount,
-          workerBranchPushStatus: finalization.workerBranchPushStatus,
-          rootDriftStatus: finalization.rootDriftStatus,
-          error: finalization.error,
-        },
-      })
-    }
-    if (finalization.rootDriftStatus === "dirty") {
-      // Keep the worktree for inspection when the main checkout drifted.
-      throw new Error(
-        finalization.error ??
-          "Main checkout changed during worker run; see worker manifest."
-      )
-    }
-    await removeWorkerWorktree({
-      root,
-      sessionId,
-      workerId: worker.id,
-    }).catch(() => {})
-
+    terminalReasonCode = stoppedByHarness
+      ? "stopped"
+      : workerResult.startupTimedOut
+        ? "startup_failure"
+        : workerResult.timedOut
+          ? "timeout"
+          : workerFailure
+            ? "provider_failure"
+            : "completed"
     if (stoppedByHarness) {
-      if (launchManifest) {
-        await appendWorkerActivityEvent(launchManifest, {
-          type: "stop",
-          phase: "stopped",
-          summary: "Worker stopped after session stop request",
-        })
-      }
-      await heartbeatWorker(
-        worker.id,
-        {
-          leaseToken,
-          status: "stopped",
-          sessionId,
-          hypothesisId: hypothesis.id,
-          phase: "stopped",
-          event: "stop_requested",
-          progressMessage: `${hypothesis.name} stopped after session stop request`,
-          gitLabel: resultCommitSha,
-        },
-        args
-      )
-      await cleanupWorkerRuntimeTempDir()
-      return {
+      terminalPhase = "stopped"
+      outcome = {
         hypothesis,
         workerId: worker.id,
         resultCommitSha,
         status: "stopped",
         startupTimedOut: workerResult.startupTimedOut,
       }
-    }
-
-    if (workerFailure) {
-      throw new Error(
-        `${workerFailure}. ${
-          finalization.attempted
-            ? `Best-effort finalization ${finalizationStatusLabel(finalization.finalizationStatus)} for ${finalization.commitSha ?? "unknown commit"}. `
-            : ""
-        }`
-      )
-    }
-
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
+    } else if (workerFailure) {
+      terminalPhase = "failed"
+      providerError = compactProviderErrorSummary(workerFailure)
+      outcome = {
+        hypothesis,
+        workerId: worker.id,
+        resultCommitSha,
+        status: "failed",
+        error: providerError,
+        startupTimedOut: workerResult.startupTimedOut,
+      }
+    } else {
+      terminalPhase = "completed"
+      outcome = {
+        hypothesis,
+        workerId: worker.id,
+        resultCommitSha,
         status: "completed",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "completed",
-        event: "hypothesis_completed",
-        progressMessage: `${hypothesis.name} completed`,
-        gitLabel: resultCommitSha,
-      },
-      args
-    )
-    await cleanupWorkerRuntimeTempDir()
-    return {
-      hypothesis,
-      workerId: worker.id,
-      resultCommitSha,
-      status: "completed",
-      startupTimedOut: workerResult.startupTimedOut,
+        startupTimedOut: workerResult.startupTimedOut,
+      }
     }
   } catch (error) {
     const message = compactProviderErrorSummary(errorMessage(error))
-    if (launchManifest) {
-      launchManifest = {
-        ...launchManifest,
-        completedAt: new Date().toISOString(),
-        status: "failed",
-        error: message,
-      }
-      await persistLaunchManifest(launchManifest).catch(() => {})
-    }
-    if (workerId) {
-      const metadata = launchManifest
-        ? {
-            workerLogPath: launchManifest.logPath,
-            workerActivityLogPath: launchManifest.activityLogPath,
-            workerPromptPath: launchManifest.promptPath,
-            lastOutputAt: launchManifest.lastOutputAt,
-            launcher: launchManifest.agentKind,
-          }
-        : undefined
-      await heartbeatWorker(
-        workerId,
-        {
-          leaseToken,
-          status: "failed",
-          sessionId,
-          hypothesisId: hypothesis.id,
-          phase: "failed",
-          event: "worker_failed",
-          progressMessage: message.slice(0, 1000),
-          gitLabel: resultCommitSha ?? null,
-          metadata,
-        },
-        args
-      ).catch(() => {})
-    }
-    await cleanupWorkerRuntimeTempDir()
-    return {
+    providerError = message
+    terminalPhase = "failed"
+    terminalReasonCode = providerStartupTimedOut
+      ? "startup_failure"
+      : providerTimedOut
+        ? "timeout"
+        : providerExitCode === null
+          ? "startup_failure"
+          : "provider_failure"
+    outcome = {
       hypothesis,
       workerId,
       resultCommitSha,
       status: "failed",
       error: message,
-      startupTimedOut: launchManifest?.startupTimedOut,
+      startupTimedOut: providerStartupTimedOut,
     }
+  } finally {
+    if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
+    if (workerId) {
+      const terminalOutcome =
+        outcome ??
+        ({
+          hypothesis,
+          workerId,
+          resultCommitSha,
+          status: "failed",
+          error: providerError ?? "Worker did not produce a terminal outcome",
+          startupTimedOut: providerStartupTimedOut,
+        } satisfies HypothesisRunResult)
+      outcome = terminalOutcome
+      const worktreeCandidate =
+        worktree ??
+        join(await onyxStateDir(root), "worktrees", sessionId, workerId)
+      const hasWorktree = await pathExists(worktreeCandidate)
+
+      if (!launchManifest) {
+        const fallbackPaths =
+          launchPaths ??
+          (await workerLaunchPaths({
+            root,
+            sessionId,
+            hypothesisId: hypothesis.id,
+            hypothesisName: hypothesis.name,
+            workerId,
+          }).catch(() => null))
+        if (fallbackPaths) {
+          const fallbackAgentKind: WorkerAgentKind = workerCommand
+            ? "custom"
+            : (agentKind as WorkerAgentKind)
+          launchManifest = {
+            schemaVersion: 2,
+            agentKind: fallbackAgentKind,
+            workerModel,
+            command: workerCommand ?? agentKind,
+            args: [],
+            onyxWorkerPath: workerCliWrapper?.workerPath ?? null,
+            workerContextPath: runtimePaths?.contextPath ?? null,
+            addedWritableRoots: [],
+            cwd: worktreeCandidate,
+            promptPath: "",
+            logPath: fallbackPaths.logPath,
+            activityLogPath: fallbackPaths.activityLogPath,
+            activityJsonlPath: fallbackPaths.activityJsonlPath,
+            latestStatePath: fallbackPaths.latestStatePath,
+            manifestPath: fallbackPaths.manifestPath,
+            sessionId,
+            startingCommitSha: startingCommitSha ?? "",
+            hypothesisId: hypothesis.id,
+            hypothesisName: hypothesis.name,
+            workerId,
+            workerName: workerName ?? hypothesis.name,
+            supervisorRunId,
+            pid: null,
+            processStartedAt: null,
+            commandIdentity: null,
+            slotIndex,
+            version: null,
+            startedAt: new Date().toISOString(),
+            lastOutputAt: null,
+            completedAt: null,
+            status: "starting",
+            exitCode: providerExitCode,
+            signal: providerSignal,
+            timedOut: providerTimedOut,
+            startupTimedOut: providerStartupTimedOut,
+            error: providerError,
+            preflight: null,
+            teardown: null,
+          }
+        }
+      }
+
+      await heartbeatWorker(
+        workerId,
+        {
+          leaseToken,
+          status: "running",
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: "teardown",
+          event: "teardown_started",
+          progressMessage: `Delivering terminal attempt and tearing down ${hypothesis.name}`,
+          gitLabel: null,
+        },
+        args
+      ).catch(() => {})
+      if (launchManifest) {
+        await appendWorkerActivityEvent(launchManifest, {
+          type: "phase_change",
+          phase: "teardown",
+          summary: "Delivering terminal attempt before workspace disposal",
+        }).catch(() => {})
+      }
+
+      if (hasWorktree && assignmentId && startingCommitSha) {
+        teardown = await teardownHypothesisAttempt({
+          root,
+          worktree: worktreeCandidate,
+          projectPath,
+          campaign,
+          setup,
+          hypothesis,
+          startingCommitSha,
+          sessionId,
+          assignmentId,
+          workerId,
+          activityManifest: launchManifest,
+          args,
+          providerExitCode,
+          providerSignal,
+          timedOut: providerTimedOut,
+          startupTimedOut: providerStartupTimedOut,
+          phase: terminalPhase,
+          providerError,
+          reasonCode: terminalReasonCode,
+        }).catch((teardownError) =>
+          emptyWorkerTeardown({
+            phase: "failed",
+            reasonCode: "terminal_attempt_delivery_failed",
+            providerExitCode,
+            providerSignal,
+            timedOut: providerTimedOut,
+            startupTimedOut: providerStartupTimedOut,
+            providerError,
+            error: errorMessage(teardownError),
+          })
+        )
+      } else {
+        teardown = emptyWorkerTeardown({
+          phase: terminalPhase,
+          reasonCode: terminalReasonCode,
+          providerExitCode,
+          providerSignal,
+          timedOut: providerTimedOut,
+          startupTimedOut: providerStartupTimedOut,
+          providerError,
+        })
+      }
+      const durableAttemptDelivered =
+        teardown.attemptDelivery === "delivered" ||
+        teardown.attemptDelivery === "duplicate"
+      if (teardown.resultCommitSha && durableAttemptDelivered) {
+        resultCommitSha = teardown.resultCommitSha
+        terminalOutcome.resultCommitSha = teardown.resultCommitSha
+      } else {
+        resultCommitSha = undefined
+        terminalOutcome.resultCommitSha = undefined
+      }
+
+      try {
+        await removeWorkerWorktree({ root, sessionId, workerId })
+        teardown.worktreeCleanup = "removed"
+      } catch (cleanupError) {
+        teardown.worktreeCleanup = "failed"
+        teardown.phase = "failed"
+        teardown.reasonCode = "cleanup_failure"
+        teardown.error = appendBoundedTeardownError(
+          teardown.error,
+          cleanupError
+        )
+        terminalPhase = "failed"
+        terminalOutcome.status = "failed"
+        terminalOutcome.error = appendBoundedTeardownError(
+          terminalOutcome.error ?? null,
+          cleanupError
+        )
+      }
+      if (teardown.attemptDelivery === "failed") {
+        terminalPhase = "failed"
+        teardown.phase = "failed"
+        terminalOutcome.status = "failed"
+        terminalOutcome.error = appendBoundedTeardownError(
+          terminalOutcome.error ?? null,
+          teardown.error ?? "Terminal attempt delivery failed"
+        )
+      }
+
+      if (launchManifest) {
+        launchManifest = {
+          ...launchManifest,
+          completedAt: new Date().toISOString(),
+          status: terminalOutcome.status,
+          exitCode: providerExitCode,
+          signal: providerSignal,
+          timedOut: providerTimedOut,
+          startupTimedOut: providerStartupTimedOut,
+          error: terminalOutcome.error ?? providerError,
+          teardown,
+        }
+        await persistLaunchManifest(launchManifest).catch(() => {})
+        await appendWorkerActivityEvent(launchManifest, {
+          type: "teardown_result",
+          phase: terminalPhase,
+          summary: teardownStatusLabel(teardown.attemptDelivery),
+          metadata: { ...teardown },
+        }).catch(() => {})
+        if (terminalOutcome.status === "stopped") {
+          await appendWorkerActivityEvent(launchManifest, {
+            type: "stop",
+            phase: "stopped",
+            summary: "Worker stopped after session stop request",
+          }).catch(() => {})
+        }
+      }
+
+      const terminalEvent =
+        terminalOutcome.status === "stopped"
+          ? "stop_requested"
+          : terminalOutcome.status === "completed"
+            ? "hypothesis_completed"
+            : "worker_failed"
+      const terminalProgress =
+        terminalOutcome.status === "stopped"
+          ? `${hypothesis.name} stopped after session stop request`
+          : terminalOutcome.status === "completed"
+            ? `${hypothesis.name} completed`
+            : (terminalOutcome.error ?? `${hypothesis.name} failed`).slice(
+                0,
+                1000
+              )
+      const terminalMetadata = {
+        ...(launchManifest
+          ? {
+              workerLogPath: launchManifest.logPath,
+              workerActivityLogPath: launchManifest.activityLogPath,
+              workerPromptPath: launchManifest.promptPath,
+              lastOutputAt: launchManifest.lastOutputAt,
+              launcher: launchManifest.agentKind,
+            }
+          : {}),
+        terminal: teardown,
+      }
+      await heartbeatWorker(
+        workerId,
+        {
+          leaseToken,
+          status: terminalOutcome.status,
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: terminalOutcome.status,
+          event: terminalEvent,
+          progressMessage: terminalProgress,
+          gitLabel: terminalOutcome.resultCommitSha ?? null,
+          metadata: terminalMetadata,
+        },
+        args
+      ).catch(() => {})
+    }
+    await cleanupWorkerRuntimeTempDir()
   }
+
+  return (
+    outcome ?? {
+      hypothesis,
+      workerId,
+      resultCommitSha,
+      status: "failed",
+      error: providerError ?? "Worker did not produce a terminal outcome",
+      startupTimedOut: providerStartupTimedOut,
+    }
+  )
 }
 
 export async function commandResearchHypothesisAdd(args: Args) {
@@ -4079,7 +3844,7 @@ export async function commandResearchStatus(args: Args) {
           gitLabel:
             liveWorker.gitLabel ??
             worker.gitLabel ??
-            manifest?.finalization?.commitSha ??
+            durableTeardownResultCommit(manifest?.teardown) ??
             null,
           currentExperimentId:
             liveWorker.currentExperimentId ?? worker.currentExperimentId,
@@ -4090,7 +3855,9 @@ export async function commandResearchStatus(args: Args) {
           status: manifestStatus,
           phase: manifest?.status ?? worker.phase,
           gitLabel:
-            worker.gitLabel ?? manifest?.finalization?.commitSha ?? null,
+            worker.gitLabel ??
+            durableTeardownResultCommit(manifest?.teardown) ??
+            null,
         }
   })
   const activeWorkers = workersForStatus.filter(workerIsActive).length
@@ -4148,33 +3915,12 @@ export async function commandResearchStatus(args: Args) {
         logPath: manifest?.logPath ?? null,
       }
     })
-  const localDiscardedAfterCompletion = manifests
+  const localTeardownFailures = manifests
     .filter(
       (manifest) =>
-        manifest.finalization?.finalizationStatus ===
-        "discarded_after_completion"
-    )
-    .slice(0, 25)
-    .map((manifest) => ({
-      workerId: manifest.workerId,
-      workerName: manifest.workerName,
-      status: manifest.status,
-      unloggedCommitCount: manifest.finalization?.unloggedCommitCount ?? null,
-      workerBranchPushStatus:
-        manifest.finalization?.workerBranchPushStatus ?? null,
-      logPath: manifest.logPath,
-      manifestPath: manifest.manifestPath,
-    }))
-  const localUnloggedAttempts = manifests
-    .filter(
-      (manifest) =>
-        manifest.finalization?.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        ) ||
-        ((manifest.finalization?.unloggedCommitCount ?? 0) > 0 &&
-          manifest.finalization?.finalizationStatus !==
-            "discarded_after_completion") ||
-        (!manifest.finalization &&
+        manifest.teardown?.attemptDelivery === "failed" ||
+        manifest.teardown?.worktreeCleanup === "failed" ||
+        (!manifest.teardown &&
           ["completed", "failed", "stopped"].includes(manifest.status))
     )
     .slice(0, 25)
@@ -4182,8 +3928,7 @@ export async function commandResearchStatus(args: Args) {
       workerId: manifest.workerId,
       workerName: manifest.workerName,
       status: manifest.status,
-      finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
-      unloggedCommitCount: manifest.finalization?.unloggedCommitCount ?? null,
+      teardown: manifest.teardown,
       logPath: manifest.logPath,
       manifestPath: manifest.manifestPath,
     }))
@@ -4191,7 +3936,7 @@ export async function commandResearchStatus(args: Args) {
     .filter(
       (manifest) =>
         (manifest.warnings?.length ?? 0) +
-          (manifest.finalization?.warnings?.length ?? 0) >
+          (manifest.teardown?.warnings?.length ?? 0) >
         0
     )
     .map((manifest) => ({
@@ -4199,11 +3944,11 @@ export async function commandResearchStatus(args: Args) {
       workerName: manifest.workerName,
       warnings: [
         ...(manifest.warnings ?? []),
-        ...(manifest.finalization?.warnings ?? []),
+        ...(manifest.teardown?.warnings ?? []),
       ].slice(0, 10),
       warningCount:
         (manifest.warnings?.length ?? 0) +
-        (manifest.finalization?.warnings?.length ?? 0),
+        (manifest.teardown?.warnings?.length ?? 0),
       manifestPath: manifest.manifestPath,
     }))
   const progress = live?.progress ?? sessionState?.session ?? null
@@ -4268,16 +4013,13 @@ export async function commandResearchStatus(args: Args) {
           bestExperiment,
           providerBackoff,
           recentFailedLaunches,
+          noProgressBreaker: supervisorTelemetry?.noProgressBreaker ?? null,
           failures: failureSummary,
           sites: live?.sites ?? [],
           finalization: live?.finalization ?? null,
-          localUnloggedAttempts: {
-            count: localUnloggedAttempts.length,
-            workers: localUnloggedAttempts,
-          },
-          localDiscardedAfterCompletion: {
-            count: localDiscardedAfterCompletion.length,
-            workers: localDiscardedAfterCompletion,
+          localTeardownFailures: {
+            count: localTeardownFailures.length,
+            workers: localTeardownFailures,
           },
           workerWarnings,
           launchSuggestions,
@@ -4321,13 +4063,13 @@ export async function commandResearchStatus(args: Args) {
       `finalization: ${live.finalization.status} terminalReason=${live.finalization.terminalReason ?? "-"}`
     )
   }
-  if (localUnloggedAttempts.length > 0) {
-    console.log(`local unlogged attempts: ${localUnloggedAttempts.length}`)
-  }
-  if (localDiscardedAfterCompletion.length > 0) {
-    console.log(
-      `local discarded late work: ${localDiscardedAfterCompletion.length}`
-    )
+  if (localTeardownFailures.length > 0) {
+    console.log(`local teardown failures: ${localTeardownFailures.length}`)
+    for (const failure of localTeardownFailures.slice(0, 5)) {
+      console.log(
+        `  ${failure.workerName}: reason=${failure.teardown?.reasonCode ?? "missing_teardown"} delivery=${failure.teardown?.attemptDelivery ?? "unknown"} cleanup=${failure.teardown?.worktreeCleanup ?? "unknown"}${failure.teardown?.error ? ` error="${compactProviderErrorSummary(failure.teardown.error).slice(0, 160)}"` : ""}`
+      )
+    }
   }
   if (workerWarnings.length > 0) {
     console.log(
@@ -4341,6 +4083,11 @@ export async function commandResearchStatus(args: Args) {
     const latestFailure = recentFailedLaunches[recentFailedLaunches.length - 1]
     console.log(
       `recent launch failures: ${recentFailedLaunches.length} latest=${latestFailure?.reason ?? "unknown"}`
+    )
+  }
+  if (supervisorTelemetry?.noProgressBreaker?.tripped) {
+    console.log(
+      `no-progress breaker: tripped ${supervisorTelemetry.noProgressBreaker.count}/${supervisorTelemetry.noProgressBreaker.threshold}`
     )
   }
   if (ignoredPresence && ignoredPresence.total > 0) {
@@ -4410,7 +4157,7 @@ export async function commandResearchStatus(args: Args) {
       : null
     const warningCount =
       (manifest?.warnings?.length ?? 0) +
-      (manifest?.finalization?.warnings?.length ?? 0)
+      (manifest?.teardown?.warnings?.length ?? 0)
     console.log(
       [
         `  ${worker.workerName}: ${worker.status}`,
@@ -4419,6 +4166,16 @@ export async function commandResearchStatus(args: Args) {
         `seen=${lastSeen}`,
         `lastOutput=${lastOutput}`,
         manifest?.timedOut ? "timeout=true" : null,
+        manifest?.teardown ? `reason=${manifest.teardown.reasonCode}` : null,
+        manifest?.teardown
+          ? `delivery=${manifest.teardown.attemptDelivery}`
+          : null,
+        manifest?.teardown?.resultRefPushStatus === "failed"
+          ? "refPush=failed"
+          : null,
+        manifest?.teardown
+          ? `cleanup=${manifest.teardown.worktreeCleanup}`
+          : null,
         warningCount > 0 ? `warnings=${warningCount}` : null,
         manifest?.activityLogPath
           ? `activity=${manifest.activityLogPath}`
@@ -4887,10 +4644,6 @@ export async function commandResearchStop(args: Args) {
   console.log(`Stop requested for research session ${sessionId}`)
 }
 
-function safeBranchSegment(value: string) {
-  return value.replace(/[^A-Za-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
-}
-
 export async function commandKnowledgeAdd(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const { campaign } = await campaignForName(root, args)
@@ -5311,6 +5064,84 @@ function supervisorProcessIdentityMatches({
   )
 }
 
+async function discardOrphanWorkerWorkspace({
+  root,
+  sessionId,
+  manifest,
+  reason,
+}: {
+  root: string
+  sessionId: string
+  manifest: WorkerLaunchManifest
+  reason: string
+}) {
+  const phase = manifest.status === "stopped" ? "stopped" : "failed"
+  let teardown = emptyWorkerTeardown({
+    phase,
+    reasonCode:
+      phase === "stopped"
+        ? "stopped"
+        : manifest.status === "starting"
+          ? "startup_failure"
+          : "provider_failure",
+    providerExitCode: manifest.exitCode,
+    providerSignal: manifest.signal,
+    timedOut: manifest.timedOut,
+    startupTimedOut: manifest.startupTimedOut,
+    providerError: manifest.error ?? reason,
+  })
+  if (await pathExists(manifest.cwd)) {
+    const diagnostics = await workspaceDiagnostics({
+      worktree: manifest.cwd,
+      startingCommitSha: manifest.startingCommitSha,
+    }).catch(() => null)
+    if (diagnostics) teardown = { ...teardown, ...diagnostics }
+  }
+  const attempts = await listLocalAttempts(root, {
+    sessionId,
+    workerId: manifest.workerId,
+    hypothesisId: manifest.hypothesisId,
+  }).catch(() => [])
+  if (attempts.length > 0) {
+    teardown.warnings = [
+      boundedText(
+        `Orphan cleanup discarded ${attempts.length} terminal attempt manifest(s) without delivery.`,
+        500
+      ),
+    ]
+    if (attempts.length > 1) {
+      teardown.attemptDelivery = "ambiguous_discarded"
+      teardown.reasonCode = "worker_protocol_violation"
+    }
+    await Promise.all(
+      attempts.map((attempt) =>
+        clearLocalAttempt(root, { runRef: attempt.runRef }).catch(() => {})
+      )
+    )
+  }
+  try {
+    await removeWorkerWorktree({
+      root,
+      sessionId,
+      workerId: manifest.workerId,
+    })
+    teardown.worktreeCleanup = "removed"
+  } catch (error) {
+    teardown.worktreeCleanup = "failed"
+    teardown.phase = "failed"
+    teardown.reasonCode = "cleanup_failure"
+    teardown.error = appendBoundedTeardownError(teardown.error, error)
+  }
+  await writeWorkerLaunchManifest({
+    ...manifest,
+    completedAt: manifest.completedAt ?? new Date().toISOString(),
+    status: teardown.worktreeCleanup === "failed" ? "failed" : phase,
+    error: boundedText(manifest.error ?? reason, 1000),
+    teardown,
+  }).catch(() => {})
+  return teardown.worktreeCleanup === "removed"
+}
+
 async function cleanupIdentityVerifiedOrphanWorkers({
   root,
   sessionId,
@@ -5326,6 +5157,22 @@ async function cleanupIdentityVerifiedOrphanWorkers({
   )
   let stopped = 0
   for (const manifest of manifests) {
+    let identity = manifest.pid ? inspectProcessIdentity(manifest.pid) : null
+    let matchingLiveProcess = Boolean(
+      identity &&
+      manifest.processStartedAt &&
+      manifest.commandIdentity &&
+      identity.startedAt === manifest.processStartedAt &&
+      identity.command === manifest.commandIdentity
+    )
+    if (!matchingLiveProcess) {
+      await discardOrphanWorkerWorkspace({
+        root,
+        sessionId,
+        manifest,
+        reason: "No matching provider process remained during orphan cleanup",
+      })
+    }
     if (
       manifestIsTerminal(manifest) ||
       manifest.supervisorRunId !== supervisorRunId ||
@@ -5335,13 +5182,7 @@ async function cleanupIdentityVerifiedOrphanWorkers({
     ) {
       continue
     }
-    const identity = inspectProcessIdentity(manifest.pid)
-    const matches = Boolean(
-      identity &&
-      identity.startedAt === manifest.processStartedAt &&
-      identity.command === manifest.commandIdentity
-    )
-    if (!matches) {
+    if (!matchingLiveProcess) {
       console.warn(
         `Worker ${manifest.workerId} process identity could not be verified; no orphan signal was sent.`
       )
@@ -5357,14 +5198,36 @@ async function cleanupIdentityVerifiedOrphanWorkers({
       }
     }
     stopped += 1
-    await writeWorkerLaunchManifest({
-      ...manifest,
-      status: "stopped",
-      completedAt: new Date().toISOString(),
-      signal: "SIGTERM",
-      error:
-        "Identity-verified orphan process stopped after supervisor failure",
-    }).catch(() => {})
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(250)
+      identity = inspectProcessIdentity(manifest.pid)
+      matchingLiveProcess = Boolean(
+        identity &&
+        identity.startedAt === manifest.processStartedAt &&
+        identity.command === manifest.commandIdentity
+      )
+      if (!matchingLiveProcess) break
+    }
+    if (!matchingLiveProcess) {
+      await discardOrphanWorkerWorkspace({
+        root,
+        sessionId,
+        manifest: {
+          ...manifest,
+          status: "stopped",
+          completedAt: new Date().toISOString(),
+          signal: "SIGTERM",
+          error:
+            "Identity-verified orphan process stopped after supervisor failure",
+        },
+        reason:
+          "Identity-verified orphan process stopped after supervisor failure",
+      })
+    } else {
+      console.warn(
+        `Worker ${manifest.workerId} remained live after orphan stop grace; its worktree was retained.`
+      )
+    }
   }
   return stopped
 }
@@ -5823,8 +5686,6 @@ export async function commandResearchRun(args: Args) {
   }
   const providerBackoffMs =
     positiveNumberOption(args, "provider-backoff-seconds", 30) * 1000
-  const finalRefPushTimeoutMs =
-    positiveNumberOption(args, "final-ref-push-timeout", 120) * 1000
 
   const schedulerSiteId = await getResearchSiteId(root)
   const sessionEvaluation = await committedSetupAt({
@@ -5976,7 +5837,6 @@ export async function commandResearchRun(args: Args) {
     return
   }
 
-  const refPushQueue = createRefPushQueue({ args })
   const supervisorRunId =
     process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
   const leaseTokensByWorkerId = new Map<string, string>()
@@ -6000,7 +5860,6 @@ export async function commandResearchRun(args: Args) {
         finalizationReasons: [reason],
       },
     }).catch(() => {})
-    refPushQueue.stop()
     throw new Error(reason)
   }
   const sessionStateBriefRefresher = createSessionStateBriefRefresher({
@@ -6037,6 +5896,11 @@ export async function commandResearchRun(args: Args) {
   let providerBackoffAttempt = 0
   let providerBackoffLogged = false
   let recentProviderFailures: ProviderLaunchFailure[] = []
+  const noProgressThreshold = Math.max(3, Math.min(workerTarget, 20))
+  let acceptedExperimentCount = 0
+  let noProgressWorkerExitCount = 0
+  let recentNoProgressExits: NoProgressWorkerExit[] = []
+  let noProgressBreakerTripped = false
   let terminalReason: SessionTerminalReason | null = null
   let providerTerminalFailure: ProviderLaunchFailure | null = null
   let lastStopCheck: ResearchStopCheck | null = null
@@ -6097,6 +5961,9 @@ export async function commandResearchRun(args: Args) {
         delayMs?: number
         recentFailures?: ProviderLaunchFailure[]
       } | null
+      noProgressBreaker?: NonNullable<
+        NonNullable<CliState["sessions"]>[string]["supervisor"]
+      >["noProgressBreaker"]
     } = {}
   ) => {
     const now = Date.now()
@@ -6120,6 +5987,16 @@ export async function commandResearchRun(args: Args) {
             ? currentProviderBackoff()
             : options.providerBackoff,
         recentFailedLaunches: recentProviderFailures,
+        noProgressBreaker:
+          options.noProgressBreaker === undefined
+            ? {
+                tripped: noProgressBreakerTripped,
+                threshold: noProgressThreshold,
+                count: noProgressWorkerExitCount,
+                acceptedExperimentCount,
+                recentFailures: recentNoProgressExits,
+              }
+            : options.noProgressBreaker,
         status: options.status ?? "running",
       },
     })
@@ -6142,12 +6019,16 @@ export async function commandResearchRun(args: Args) {
   )
   console.log(`Presence: every ${presenceIntervalMs / 1000}s`)
 
-  let supervisorLoopCompleted = false
   try {
     while (Date.now() < hardEndTimeMs) {
       const loopNow = Date.now()
       void sessionStateBriefRefresher.refresh().catch(() => {})
       await persistRuntimeTelemetry({ activeProcessCount: activeRuns.size })
+      if (noProgressBreakerTripped && activeRuns.size === 0) break
+      if (noProgressBreakerTripped) {
+        await Promise.race([...activeRuns.values(), sleep(2000)])
+        continue
+      }
       if (providerTerminalFailure && activeRuns.size === 0) break
       if (providerTerminalFailure) {
         await Promise.race([
@@ -6221,6 +6102,14 @@ export async function commandResearchRun(args: Args) {
         ).catch(() => undefined)
       }
       if (controlState?.status && controlState.status !== "running") break
+      const observedAccepted =
+        controlState?.progress.acceptedExperimentCount ??
+        acceptedExperimentCount
+      if (observedAccepted > acceptedExperimentCount) {
+        acceptedExperimentCount = observedAccepted
+        noProgressWorkerExitCount = 0
+        recentNoProgressExits = []
+      }
       if (!controlState) {
         const local = await getLocalSessionState(root, sessionId).catch(
           () => null
@@ -6375,6 +6264,7 @@ export async function commandResearchRun(args: Args) {
           const runKey = `${Date.now()}:${launched}:${grant.worker.id}`
           const slotIndex = lowestFreeSlot(activeSlotsByRunKey.values())
           activeSlotsByRunKey.set(runKey, slotIndex)
+          const acceptedAtLaunch = acceptedExperimentCount
           const run = runHypothesisOnce({
             root,
             projectPath: effectiveProjectPath,
@@ -6394,7 +6284,6 @@ export async function commandResearchRun(args: Args) {
             startupTimeoutMs,
             stopGraceMs,
             quiet: args.options.quiet === "true",
-            refPushQueue,
             preacquiredLease: grant,
             slotIndex,
             onRegistered: ({ workerId, leaseToken }) => {
@@ -6517,6 +6406,59 @@ export async function commandResearchRun(args: Args) {
                   },
                 })
               }
+              if (!backoffReason && result.status !== "stopped") {
+                const latestControl = await getResearchSessionControlState(
+                  sessionId,
+                  args
+                ).catch(() => null)
+                const latestAccepted =
+                  latestControl?.progress.acceptedExperimentCount ??
+                  acceptedExperimentCount
+                if (latestAccepted > acceptedExperimentCount) {
+                  acceptedExperimentCount = latestAccepted
+                  noProgressWorkerExitCount = 0
+                  recentNoProgressExits = []
+                }
+                if (latestAccepted <= acceptedAtLaunch) {
+                  noProgressWorkerExitCount += 1
+                  recentNoProgressExits = [
+                    ...recentNoProgressExits,
+                    {
+                      at: new Date().toISOString(),
+                      workerId: result.workerId ?? null,
+                      hypothesisId: result.hypothesis.id,
+                      status: result.status,
+                      errorSummary: result.error
+                        ? compactProviderErrorSummary(result.error)
+                        : null,
+                    },
+                  ].slice(-20)
+                }
+                if (
+                  noProgressWorkerExitCount >= noProgressThreshold &&
+                  !noProgressBreakerTripped
+                ) {
+                  noProgressBreakerTripped = true
+                  terminalReason = "failed"
+                  const breakerMetadata = {
+                    reasonCode: "worker_no_progress_breaker",
+                    threshold: noProgressThreshold,
+                    count: noProgressWorkerExitCount,
+                    recentFailures: recentNoProgressExits,
+                  }
+                  await persistRuntimeTelemetry({ force: true })
+                  await stopCampaignSession(
+                    sessionId,
+                    {
+                      campaignId: campaign.id,
+                      endReason: "failed",
+                      reason: `No accepted experiment progress across ${noProgressWorkerExitCount} worker exits`,
+                      metadata: breakerMetadata,
+                    },
+                    args
+                  ).catch(() => null)
+                }
+              }
               return result
             })
             .catch((error) => {
@@ -6577,11 +6519,9 @@ export async function commandResearchRun(args: Args) {
       console.log(`Waiting for ${activeRuns.size} active worker(s) to finish.`)
       await Promise.allSettled(activeRuns.values())
     }
-    supervisorLoopCompleted = true
   } finally {
     presenceSupervisor.request()
     await presenceSupervisor.stop()
-    if (!supervisorLoopCompleted) refPushQueue.stop()
   }
 
   const finalState = await readState(root)
@@ -6597,14 +6537,22 @@ export async function commandResearchRun(args: Args) {
       ? "deadline_reached"
       : null) ??
     "all_hypotheses_closed"
-  let finalStatus: ApiSession["status"] = providerTerminalFailure
-    ? "failed"
-    : explicitStop
-      ? "stopped"
-      : "completed"
+  let finalStatus: ApiSession["status"] =
+    providerTerminalFailure || noProgressBreakerTripped
+      ? "failed"
+      : explicitStop
+        ? "stopped"
+        : "completed"
   const initialTerminalMetadata = {
     terminalReason,
     providerFailure: providerTerminalFailure,
+    noProgressBreaker: {
+      tripped: noProgressBreakerTripped,
+      threshold: noProgressThreshold,
+      count: noProgressWorkerExitCount,
+      acceptedExperimentCount,
+      recentFailures: recentNoProgressExits,
+    },
     finalizationReasons: [],
   }
   finalState.sessions = finalState.sessions ?? {}
@@ -6632,7 +6580,6 @@ export async function commandResearchRun(args: Args) {
         : "research run completed",
     metadata: initialTerminalMetadata,
   }).catch(() => {})
-  await refPushQueue.drain(finalRefPushTimeoutMs)
   const finalization = await computeSessionFinalizationStatus({
     root,
     sessionId,
@@ -6654,6 +6601,14 @@ export async function commandResearchRun(args: Args) {
     status: finalStatus,
     finalization,
     terminalReason,
+    metadata: noProgressBreakerTripped
+      ? {
+          reasonCode: "worker_no_progress_breaker",
+          threshold: noProgressThreshold,
+          count: noProgressWorkerExitCount,
+          recentFailures: recentNoProgressExits,
+        }
+      : undefined,
     args,
   })
   const finalSessionState = await readState(root)
@@ -6699,23 +6654,6 @@ export async function commandResearchRun(args: Args) {
   const completionLocal = await getLocalSessionState(root, sessionId).catch(
     () => null
   )
-  const completionManifests = await readWorkerLaunchManifests(
-    root,
-    sessionId
-  ).catch(() => [])
-  const unmeasuredSalvageCount =
-    completionLive?.finalization?.unmeasuredSalvageCount ??
-    completionManifests.filter(
-      (manifest) =>
-        manifest.finalization?.salvaged &&
-        manifest.finalization.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        )
-    ).length
-  const discardedAfterCompletionCount = completionManifests.filter(
-    (manifest) =>
-      manifest.finalization?.finalizationStatus === "discarded_after_completion"
-  ).length
   const acceptedExperiments =
     completionLive?.session.acceptedExperimentCount ??
     completionLocal?.session.acceptedExperimentCount ??
@@ -6739,7 +6677,7 @@ export async function commandResearchRun(args: Args) {
     `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
   )
   console.log(
-    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount} discardedAfterCompletion=${discardedAfterCompletionCount}.`
+    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`}.`
   )
   const apiTimingSummary = renderApiTimingSummary(args)
   if (apiTimingSummary) console.error(apiTimingSummary)
@@ -6847,9 +6785,6 @@ export async function commandWorkerRun(args: Args) {
       "Sync tuning flags were removed. Workers now push refs and report directly to the Onyx API."
     )
   }
-  const finalRefPushTimeoutMs =
-    positiveNumberOption(args, "final-ref-push-timeout", 120) * 1000
-  const refPushQueue = createRefPushQueue({ args })
   const supervisorRunId =
     process.env.ONYX_SUPERVISOR_RUN_ID ?? `manual-${randomUUID()}`
 
@@ -6877,7 +6812,6 @@ export async function commandWorkerRun(args: Args) {
     startupTimeoutMs,
     stopGraceMs,
     quiet: args.options.quiet === "true",
-    refPushQueue,
     args,
   })
   if (result.workerId) {
@@ -6893,13 +6827,12 @@ export async function commandWorkerRun(args: Args) {
       gitLabel: result.resultCommitSha ?? null,
     }).catch(() => {})
   }
-  const pendingRefPushes = await refPushQueue.drain(finalRefPushTimeoutMs)
   if (result.status === "failed") {
     throw new Error(
       `Worker failed for ${hypothesis.name}: ${result.error ?? "unknown error"}`
     )
   }
   console.log(
-    `Worker ${result.status} ${hypothesis.name} at ${result.resultCommitSha ?? "unknown"}; ${pendingRefPushes} ref push(es) pending.`
+    `Worker ${result.status} ${hypothesis.name} at ${result.resultCommitSha ?? "no durable experiment commit"}.`
   )
 }

@@ -447,7 +447,7 @@ describe("worker launchers", () => {
     const manifestPath = join(root, "missing", "worker.manifest.json")
 
     await writeWorkerLaunchManifest({
-      schemaVersion: 1,
+      schemaVersion: 2,
       agentKind: "codex",
       workerModel: null,
       command: "codex",
@@ -463,6 +463,7 @@ describe("worker launchers", () => {
       latestStatePath: join(root, "worker.latest.json"),
       manifestPath,
       sessionId: "session",
+      startingCommitSha: "base-commit",
       hypothesisId: "hypothesis",
       hypothesisName: "hypothesis-one",
       workerId: "worker",
@@ -478,10 +479,10 @@ describe("worker launchers", () => {
       startupTimedOut: false,
       error: null,
       preflight: null,
-      finalization: null,
+      teardown: null,
     })
 
-    expect(await readFile(manifestPath, "utf8")).toContain('"schemaVersion": 1')
+    expect(await readFile(manifestPath, "utf8")).toContain('"schemaVersion": 2')
   })
 
   test("creates isolated worker runtime context and environment", async () => {
@@ -496,7 +497,7 @@ describe("worker launchers", () => {
     await writeWorkerRuntimeContext({
       paths,
       context: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         campaignId: "campaign-id",
         campaignName: "campaign",
         sessionId: "session/one",
@@ -506,7 +507,6 @@ describe("worker launchers", () => {
         hypothesisName: "hypothesis",
         workerId: "worker/one",
         workerLeaseToken: "lease-token",
-        workerBranch: "onyx/session/worker",
         worktreeRoot: join(root, "worktree"),
         projectPath: "",
         projectRoot: join(root, "worktree"),

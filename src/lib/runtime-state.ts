@@ -36,7 +36,6 @@ export type CliState = {
       sessionId?: string
       hypothesisId?: string
       hypothesisName?: string
-      workerBranch?: string
       workers?: Record<
         string,
         {
@@ -125,6 +124,19 @@ export type CliState = {
           error?: string | null
           errorSummary?: string | null
         }>
+        noProgressBreaker?: {
+          tripped: boolean
+          threshold: number
+          count: number
+          acceptedExperimentCount: number
+          recentFailures: Array<{
+            at: string
+            workerId: string | null
+            hypothesisId: string
+            status: string
+            errorSummary: string | null
+          }>
+        } | null
         status?: string
         updatedAt?: string
       }

@@ -34,9 +34,12 @@ let previousFetch: typeof fetch | null = null
 type ApiCall = { method: string; path: string; body: unknown }
 
 const FAKE_WORKER_COMMAND = [
+  'onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto',
   "printf 'result\\n' > src/result.txt",
   "git add src/result.txt",
   "git commit -m 'fake worker result'",
+  "onyx-worker exp run --resume --auto",
+  "onyx-worker exp log",
 ].join(" && ")
 
 function nowIso() {
@@ -318,12 +321,14 @@ function installSupervisorApi({
   reportDisposition = "received",
   leaseMode = "normal",
   reportFailure = false,
+  terminalOnWorkerExit = true,
 }: {
   baseCommitSha: string
   workerTarget: number
   reportDisposition?: "received" | "accepted" | "discarded"
   leaseMode?: "normal" | "no_slots"
   reportFailure?: boolean
+  terminalOnWorkerExit?: boolean
 }) {
   previousApiUrl = process.env.ONYX_API_URL
   previousApiKey = process.env.ONYX_API_KEY
@@ -430,7 +435,6 @@ function installSupervisorApi({
           status: runningSession.finalizationStatus,
           reasons: [],
           terminalReason: runningSession.terminalReason,
-          unmeasuredSalvageCount: 0,
         },
         updatedAt: nowIso(),
       }
@@ -464,7 +468,6 @@ function installSupervisorApi({
           status: runningSession.finalizationStatus,
           reasons: [],
           terminalReason: terminal ? "experiment_target_reached" : null,
-          unmeasuredSalvageCount: 0,
         },
         updatedAt: nowIso(),
       }
@@ -589,7 +592,9 @@ function installSupervisorApi({
         body?.status === "failed" ||
         body?.status === "stopped"
       ) {
-        terminal = true
+        const index = leasedWorkers.indexOf(workerId)
+        if (index >= 0) leasedWorkers.splice(index, 1)
+        if (terminalOnWorkerExit) terminal = true
       }
       data = {
         worker: worker(
@@ -811,7 +816,6 @@ function installSupervisorApi({
           status: "complete",
           reasons: [],
           terminalReason: "experiment_target_reached",
-          unmeasuredSalvageCount: 0,
         },
         livenessCounts: {},
         phaseCounts: {},
@@ -878,7 +882,6 @@ describe("remote-first research supervisor smoke", () => {
               "startup-timeout": "5",
               "heartbeat-sample-interval": "0",
               "first-attempt-warning-seconds": "0",
-              "final-ref-push-timeout": "5",
             },
           })
         )
@@ -946,6 +949,17 @@ describe("remote-first research supervisor smoke", () => {
         }
         requireExperimentReport(calls)
         expect(
+          (
+            await git(
+              ["for-each-ref", "--format=%(refname)", "refs/heads/onyx"],
+              root
+            )
+          ).trim()
+        ).toBe("")
+        expect(
+          await pathExists(join(root, ".git", "onyx", "worktrees", SESSION_ID))
+        ).toBe(false)
+        expect(
           await pathExists(join(root, ".git", "onyx", "research.db"))
         ).toBe(false)
         expect(
@@ -983,7 +997,6 @@ describe("remote-first research supervisor smoke", () => {
             "startup-timeout": "5",
             "heartbeat-sample-interval": "0",
             "first-attempt-warning-seconds": "0",
-            "final-ref-push-timeout": "5",
           },
         })
       )
@@ -1007,9 +1020,9 @@ describe("remote-first research supervisor smoke", () => {
           .map(
             async (file) =>
               JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
-                finalization?: {
-                  finalizationStatus?: string
-                  workerBranchPushStatus?: string
+                teardown?: {
+                  attemptDelivery?: string
+                  resultRefPushStatus?: string
                   error?: string | null
                 }
               }
@@ -1017,8 +1030,7 @@ describe("remote-first research supervisor smoke", () => {
       )
       expect(
         manifests.some(
-          (manifest) =>
-            manifest.finalization?.finalizationStatus === "measured_and_logged"
+          (manifest) => manifest.teardown?.attemptDelivery === "delivered"
         )
       ).toBe(true)
     } finally {
@@ -1080,6 +1092,66 @@ describe("remote-first research supervisor smoke", () => {
     }
   }, 60_000)
 
+  test("stops a session after a bounded streak of no-progress worker exits", async () => {
+    const { root, origin, baseCommitSha } = await createSmokeRepo()
+    const calls = installSupervisorApi({
+      baseCommitSha,
+      workerTarget: 1,
+      terminalOnWorkerExit: false,
+    })
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            "max-concurrency": "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "worker-command": "true",
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "5",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+          },
+        })
+      )
+
+      const breakerStop = calls.find(
+        (call) =>
+          call.method === "POST" &&
+          call.path === `/api/v1/research/sessions/${SESSION_ID}/stop` &&
+          (call.body as { metadata?: { reasonCode?: string } }).metadata
+            ?.reasonCode === "worker_no_progress_breaker"
+      )
+      expect(breakerStop?.body).toMatchObject({
+        endReason: "failed",
+        metadata: {
+          threshold: 3,
+          count: 3,
+        },
+      })
+      expect(
+        (
+          await git(
+            ["for-each-ref", "--format=%(refname)", "refs/heads/onyx"],
+            root
+          )
+        ).trim()
+      ).toBe("")
+      expect(
+        await pathExists(join(root, ".git", "onyx", "worktrees", SESSION_ID))
+      ).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(origin, { recursive: true, force: true })
+    }
+  }, 60_000)
+
   test("records failed immutable ref pushes in the worker manifest", async () => {
     const { root, origin, baseCommitSha } = await createSmokeRepo()
     await rm(origin, { recursive: true, force: true })
@@ -1102,7 +1174,6 @@ describe("remote-first research supervisor smoke", () => {
             "startup-timeout": "5",
             "heartbeat-sample-interval": "0",
             "first-attempt-warning-seconds": "0",
-            "final-ref-push-timeout": "5",
           },
         })
       )
@@ -1116,41 +1187,15 @@ describe("remote-first research supervisor smoke", () => {
       expect(reportCall?.body).toMatchObject({
         resultRefPushStatus: "failed",
       })
-      const workerLogRoot = join(
-        root,
-        ".git",
-        "onyx",
-        "worker-logs",
-        SESSION_ID
-      )
-      const manifests = await Promise.all(
-        (await readdir(workerLogRoot))
-          .filter((file) => file.endsWith(".manifest.json"))
-          .map(
-            async (file) =>
-              JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
-                finalization?: {
-                  finalizationStatus?: string
-                  error?: string | null
-                  workerBranchPushStatus?: string | null
-                }
-              }
-          )
-      )
       expect(
-        manifests.some(
-          (manifest) =>
-            manifest.finalization?.finalizationStatus ===
-              "measured_and_logged" &&
-            manifest.finalization.workerBranchPushStatus === "failed"
-        )
-      ).toBe(true)
+        await pathExists(join(root, ".git", "onyx", "worktrees", SESSION_ID))
+      ).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
   }, 60_000)
 
-  test("keeps pushed refs recoverable when API report fails after push", async () => {
+  test("drops local delivery state when API report fails after push", async () => {
     const { root, origin, baseCommitSha } = await createSmokeRepo()
     const calls = installSupervisorApi({
       baseCommitSha,
@@ -1175,7 +1220,6 @@ describe("remote-first research supervisor smoke", () => {
             "startup-timeout": "5",
             "heartbeat-sample-interval": "0",
             "first-attempt-warning-seconds": "0",
-            "final-ref-push-timeout": "5",
           },
         })
       )
@@ -1206,8 +1250,8 @@ describe("remote-first research supervisor smoke", () => {
           .map(
             async (file) =>
               JSON.parse(await readFile(join(workerLogRoot, file), "utf8")) as {
-                finalization?: {
-                  finalizationStatus?: string
+                teardown?: {
+                  attemptDelivery?: string
                   error?: string | null
                 }
               }
@@ -1216,8 +1260,8 @@ describe("remote-first research supervisor smoke", () => {
       expect(
         manifests.some(
           (manifest) =>
-            manifest.finalization?.finalizationStatus === "failed" &&
-            manifest.finalization.error?.includes("experiment log failed")
+            manifest.teardown?.attemptDelivery === "failed" &&
+            manifest.teardown.error?.includes("API reporting failed")
         )
       ).toBe(true)
     } finally {

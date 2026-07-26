@@ -907,7 +907,6 @@ export const researchPresenceSiteSnapshotSchema = z.object({
   uploadedWorkerCount: z.number().int().nonnegative().default(0),
   unchangedWorkerCount: z.number().int().nonnegative().default(0),
   droppedOrDeferredWorkerCount: z.number().int().nonnegative().default(0),
-  unmeasuredSalvageCount: z.number().int().nonnegative().default(0),
   lastUploadAt: z.iso.datetime().nullable().optional(),
   metadata: metadataSchema.default({}),
 })
@@ -925,7 +924,6 @@ export const upsertResearchPresenceRequestSchema = z.object({
     uploadedWorkerCount: 0,
     unchangedWorkerCount: 0,
     droppedOrDeferredWorkerCount: 0,
-    unmeasuredSalvageCount: 0,
     metadata: {},
   }),
   workers: z.array(researchPresenceWorkerSnapshotSchema).max(250),

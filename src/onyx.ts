@@ -130,8 +130,8 @@ export {
   commandResearchStop,
   commandKnowledgeAdd,
   commandKnowledgeList,
-  finalizationStatusLabel,
-  finalizeHypothesisAttempt,
+  teardownStatusLabel,
+  teardownHypothesisAttempt,
   summarizeWorkerOutput,
   commandWorkerRun,
 } from "./commands/research"

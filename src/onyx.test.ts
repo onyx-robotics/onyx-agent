@@ -67,7 +67,7 @@ async function writeTestWorkerContext({
   await writeWorkerRuntimeContext({
     paths,
     context: {
-      schemaVersion: 2,
+      schemaVersion: 3,
       campaignId,
       campaignName,
       sessionId: SESSION_ID,
@@ -77,7 +77,6 @@ async function writeTestWorkerContext({
       hypothesisName,
       workerId,
       workerLeaseToken: "lease-token",
-      workerBranch: "onyx/worker",
       worktreeRoot: root,
       projectPath: "",
       projectRoot: root,
@@ -677,7 +676,6 @@ describe("remote-first agent architecture", () => {
             status: "complete",
             reasons: [],
             terminalReason: "experiment_target_reached",
-            unmeasuredSalvageCount: 0,
           },
           livenessCounts: {
             active: 0,

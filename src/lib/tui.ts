@@ -287,6 +287,12 @@ export type ListenModel = {
     attempt?: number
     delayMs?: number
   } | null
+  noProgressBreaker?: {
+    tripped: boolean
+    threshold: number
+    count: number
+    acceptedExperimentCount?: number
+  } | null
   workers?: ListenWorkerRow[]
   /** Desired worker capacity — slot rows render 1..workerTarget. */
   workerTarget?: number | null
@@ -307,7 +313,11 @@ export type ListenWorkerRow = {
   lastOutputAt: string | null
   startedAt: string | null
   completedAt: string | null
-  finalizationStatus: string | null
+  attemptDelivery: string | null
+  resultRefPushStatus: string | null
+  terminalReasonCode: string | null
+  worktreeCleanup: string | null
+  terminalError: string | null
   activityLogPath: string | null
   logPath: string | null
 }
@@ -416,6 +426,9 @@ function renderWorkerPanel(
         options.nowMs
       )}`
     : ""
+  const breaker = model.noProgressBreaker?.tripped
+    ? ` · breaker ${model.noProgressBreaker.count}/${model.noProgressBreaker.threshold}`
+    : ""
 
   // Terminal sessions collapse to one summary line — the per-worker rows are
   // history, and the experiment table gets the vertical space back.
@@ -423,8 +436,8 @@ function renderWorkerPanel(
     const finalizationCounts = new Map<string, number>()
     for (const worker of workers) {
       const key =
-        worker.finalizationStatus && worker.finalizationStatus !== "none"
-          ? worker.finalizationStatus
+        worker.attemptDelivery && worker.attemptDelivery !== "none"
+          ? worker.attemptDelivery
           : worker.status
       finalizationCounts.set(key, (finalizationCounts.get(key) ?? 0) + 1)
     }
@@ -434,8 +447,18 @@ function renderWorkerPanel(
       ...[...finalizationCounts.entries()].map(
         ([status, count]) => `${count} ${status}`
       ),
+      ...(workers.some((worker) => worker.worktreeCleanup === "failed")
+        ? [
+            `${workers.filter((worker) => worker.worktreeCleanup === "failed").length} cleanup failed`,
+          ]
+        : []),
     ].join(" · ")
-    return [bold(truncate(summary + backoff, options.columns), options.color)]
+    return [
+      bold(
+        truncate(summary + backoff + breaker, options.columns),
+        options.color
+      ),
+    ]
   }
 
   const active = workers.filter((worker) => !workerIsTerminal(worker.status))
@@ -443,7 +466,9 @@ function renderWorkerPanel(
     [
       `session ${model.sessionStatus ?? model.sessionId ?? "local"}`,
       `workers ${active.length}/${model.workerTarget ?? workers.length}`,
-    ].join(" · ") + backoff,
+    ].join(" · ") +
+      backoff +
+      breaker,
     options.columns
   )
   const lines = [bold(summary, options.color)]
@@ -515,9 +540,14 @@ export function renderFocusFrame(
         worker.hypothesisName,
         `${worker.status}${worker.phase ? ` ${worker.phase}` : ""}`,
         `seen ${formatAge(workerActivityAt(worker), size.nowMs)}`,
-        worker.finalizationStatus && worker.finalizationStatus !== "none"
-          ? `final ${worker.finalizationStatus}`
+        worker.attemptDelivery && worker.attemptDelivery !== "none"
+          ? `delivery ${worker.attemptDelivery}`
           : null,
+        worker.resultRefPushStatus === "failed" ? "ref push failed" : null,
+        worker.terminalReasonCode
+          ? `reason ${worker.terminalReasonCode}`
+          : null,
+        worker.worktreeCleanup ? `cleanup ${worker.worktreeCleanup}` : null,
       ]
         .filter(Boolean)
         .join(" · ")
@@ -526,8 +556,16 @@ export function renderFocusFrame(
 
   // Newest at the bottom; clip to the space between header and border.
   const bodyRows = Math.max(1, size.rows - 7)
-  const tail = focus.logLines.slice(-bodyRows)
-  const body = tail.length > 0 ? tail : [dim("no activity yet", color)]
+  const terminalDiagnostic = worker?.terminalError
+    ? `terminal: ${worker.terminalError}`
+    : null
+  const tailLimit = Math.max(0, bodyRows - (terminalDiagnostic ? 1 : 0))
+  const tail = tailLimit > 0 ? focus.logLines.slice(-tailLimit) : []
+  const body = terminalDiagnostic
+    ? [terminalDiagnostic, ...tail]
+    : tail.length > 0
+      ? tail
+      : [dim("no activity yet", color)]
 
   return [
     "",
@@ -604,10 +642,7 @@ export function renderFrame(
   // Newest at the bottom: keep the tail when the table outgrows the budget,
   // and never more than MAX_TABLE_ROWS so the box stays compact on tall
   // terminals. `onyx exp list` is the full history view.
-  const tableRows = Math.min(
-    MAX_TABLE_ROWS,
-    Math.max(1, size.rows - chrome)
-  )
+  const tableRows = Math.min(MAX_TABLE_ROWS, Math.max(1, size.rows - chrome))
   const shown = model.rows.slice(-tableRows)
   const hiddenCount = model.rows.length - shown.length
   const table = renderExperimentTable(shown, {
@@ -632,7 +667,11 @@ export function renderFrame(
         : table
   const body =
     workerLines.length > 0
-      ? [...workerLines, dim("─".repeat(Math.min(inner, 24)), color), ...tableBody]
+      ? [
+          ...workerLines,
+          dim("─".repeat(Math.min(inner, 24)), color),
+          ...tableBody,
+        ]
       : tableBody
 
   const bottom = dim(`╰${"─".repeat(columns - 2)}╯`, color)
@@ -643,7 +682,8 @@ export function renderFrame(
     `Research Agent: ${model.activity ?? "waiting for activity…"}`,
     columns - 4
   )}`
-  const hasSlots = (model.workers ?? []).length > 0 || (model.workerTarget ?? 0) > 0
+  const hasSlots =
+    (model.workers ?? []).length > 0 || (model.workerTarget ?? 0) > 0
   const hints = [
     "q quit",
     hasSlots && !sessionIsTerminal(model.sessionStatus)

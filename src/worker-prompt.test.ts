@@ -7,7 +7,6 @@ const baseInput = {
   goal: "Minimize drone tracking error",
   hypothesisId: "hypothesis_123",
   hypothesisName: "hypothesis-1",
-  workerBranch: "onyx/session/hypothesis-1/worker",
   hypothesisPlan: {
     focus: "Reduce controller overshoot",
     statement: "Smoother gains can reduce tracking error.",
