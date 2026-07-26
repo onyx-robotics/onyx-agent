@@ -1540,7 +1540,7 @@ export const researchSessionControlStateResponseSchema = z.object({
       activeHypothesisCount: z.number().int().nonnegative(),
       acceptingExperiments: z.boolean(),
     }),
-    assignments: z.array(researchSessionHypothesisAssignmentSchema),
+    canceledAssignmentIds: z.array(z.uuid()),
     updatedAt: z.iso.datetime(),
   }),
 })
@@ -1609,19 +1609,53 @@ export const acquireResearchWorkerLeaseResponseSchema = z.object({
     leaseExpiresAt: z.iso.datetime(),
     assignment: researchSessionHypothesisAssignmentSchema,
     hypothesis: researchHypothesisSchema,
-    session: researchSessionSchema,
-    campaign: researchCampaignSchema,
-    project: researchProjectSchema,
+    session: researchSessionSchema.pick({
+      id: true,
+      campaignId: true,
+      name: true,
+      evaluationRevisionId: true,
+      baseCommitSha: true,
+      setupHash: true,
+      workerTarget: true,
+      experimentTarget: true,
+      acceptedExperimentCount: true,
+      remainingExperimentCount: true,
+      deadlineAt: true,
+      endedAt: true,
+      endReason: true,
+    }),
+    campaign: researchCampaignSchema.pick({
+      id: true,
+      projectId: true,
+      name: true,
+      description: true,
+      currentEvaluationRevisionId: true,
+      status: true,
+      metricName: true,
+      metricUnit: true,
+      metricDirection: true,
+    }),
+    project: researchProjectSchema.pick({
+      id: true,
+      name: true,
+      repositoryUrl: true,
+      repositoryAccessMode: true,
+      repositoryFullName: true,
+      defaultBranch: true,
+      projectPath: true,
+    }),
   }),
+})
+
+const researchWorkerLeaseContextSchema = z.object({
+  session: acquireResearchWorkerLeaseResponseSchema.shape.data.shape.session,
+  campaign: acquireResearchWorkerLeaseResponseSchema.shape.data.shape.campaign,
+  project: acquireResearchWorkerLeaseResponseSchema.shape.data.shape.project,
 })
 
 export const acquireResearchWorkerLeaseBatchResponseSchema = z.object({
   data: z.object({
-    context: z.object({
-      session: researchSessionSchema,
-      campaign: researchCampaignSchema,
-      project: researchProjectSchema,
-    }),
+    context: researchWorkerLeaseContextSchema,
     grants: z.array(
       z.object({
         workerRef: z.string().min(1),

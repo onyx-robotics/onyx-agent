@@ -1,4 +1,6 @@
 import type {
+  AcquireResearchWorkerLeaseBatchResponse,
+  AcquireResearchWorkerLeaseResponse,
   CreateResearchCampaignExperimentRequest,
   CreateResearchCampaignRequest,
   ResearchEvaluationManifest,
@@ -408,7 +410,7 @@ export type ApiSessionControlState = {
     activeHypothesisCount: number
     acceptingExperiments: boolean
   }
-  assignments: ResearchSessionHypothesisAssignment[]
+  canceledAssignmentIds: string[]
   finalization: {
     status: ApiSession["finalizationStatus"]
     reasons: string[]
@@ -453,42 +455,29 @@ export type ApiExperimentReportResult = {
   session: ApiSession | null
 }
 
-export type ApiWorkerLease = {
-  worker: ApiWorker
-  leaseToken: string
-  leaseExpiresAt: string
-  assignment: ResearchSessionHypothesisAssignment
+type ApiWorkerLeaseWire = AcquireResearchWorkerLeaseResponse["data"]
+
+export type ApiWorkerLease = Omit<ApiWorkerLeaseWire, "hypothesis"> & {
   hypothesis: ApiHypothesis
-  session: ApiSession
-  campaign: ApiCampaign
-  project: ApiProject
 }
 
-export type ApiWorkerLeaseBatch = {
-  context: {
-    session: ApiSession
-    campaign: ApiCampaign
-    project: ApiProject
-  }
+type ApiWorkerLeaseBatchWire = AcquireResearchWorkerLeaseBatchResponse["data"]
+
+export type ApiWorkerLeaseBatch = Omit<ApiWorkerLeaseBatchWire, "grants"> & {
   grants: Array<
-    Omit<ApiWorkerLease, "session" | "campaign" | "project"> & {
-      workerRef: string
-      existing: boolean
+    Omit<ApiWorkerLeaseBatchWire["grants"][number], "hypothesis"> & {
+      hypothesis: ApiHypothesis
     }
   >
-  unavailable: Array<{
-    workerRef: string
-    workerName: string
-    code: "no_worker_slots" | "settlement_pending" | "worker_ref_terminal"
-    message: string
-  }>
-  capacity: {
-    workerTarget: number
-    occupied: number
-    requested: number
-    granted: number
-    existing: number
-    openSlots: number
+}
+
+function hypothesisFromWorkerLease({
+  hypothesis,
+  assignment,
+}: Pick<ApiWorkerLeaseWire, "hypothesis" | "assignment">): ApiHypothesis {
+  return {
+    ...hypothesis,
+    baseCommitSha: assignment.startingCommitSha,
   }
 }
 
@@ -1440,7 +1429,7 @@ export async function acquireResearchWorkerLease(
   },
   args?: Args
 ): Promise<ApiWorkerLease> {
-  return apiData<ApiWorkerLease>(
+  const lease = apiData<ApiWorkerLeaseWire>(
     await callApi(
       "POST",
       `/api/v1/research/sessions/${sessionId}/worker-leases`,
@@ -1448,6 +1437,10 @@ export async function acquireResearchWorkerLease(
       args
     )
   )
+  return {
+    ...lease,
+    hypothesis: hypothesisFromWorkerLease(lease),
+  }
 }
 
 export async function acquireResearchWorkerLeasesBatch(
@@ -1466,7 +1459,7 @@ export async function acquireResearchWorkerLeasesBatch(
   },
   args?: Args
 ): Promise<ApiWorkerLeaseBatch> {
-  return apiData<ApiWorkerLeaseBatch>(
+  const batch = apiData<ApiWorkerLeaseBatchWire>(
     await callApi(
       "POST",
       `/api/v1/research/sessions/${sessionId}/worker-leases/batch`,
@@ -1474,6 +1467,13 @@ export async function acquireResearchWorkerLeasesBatch(
       args
     )
   )
+  return {
+    ...batch,
+    grants: batch.grants.map((grant) => ({
+      ...grant,
+      hypothesis: hypothesisFromWorkerLease(grant),
+    })),
+  }
 }
 
 export async function heartbeatWorker(

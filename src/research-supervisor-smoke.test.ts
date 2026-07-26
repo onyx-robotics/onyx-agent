@@ -432,6 +432,7 @@ function installSupervisorApi({
           acceptingExperiments:
             runningSession.status === "running" && acceptedExperimentCount < 1,
         },
+        canceledAssignmentIds: [],
         finalization: {
           status: runningSession.finalizationStatus,
           reasons: [],

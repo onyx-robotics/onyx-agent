@@ -154,7 +154,7 @@ export async function collectLocalResearchStopReasons({
       status: brief.session.status,
       runtimeState: brief.session.status === "running" ? "active" : "ended",
       finalizationStatus: brief.session.finalizationStatus,
-      assignments: [],
+      canceledAssignmentIds: [],
       progress: brief.progress,
       launch: {
         activeWorkerCount: 0,

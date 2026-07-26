@@ -174,7 +174,10 @@ For large local runs, the supervisor ramps launches in batches
 jitter when provider startup, rate-limit, overload, auth, or degraded-service
 failures happen, and asks the server for worker leases in idempotent batches.
 The server enforces the worker target, assigns hypotheses, records reports, and
-settles accepted/discarded disposition idempotently after completion.
+settles accepted/discarded disposition idempotently after completion. Batch
+leases return one compact shared research context plus per-worker grants, while
+the supervisor's control poll reads aggregate progress/capacity and canceled
+assignment IDs instead of full worker or assignment lists.
 Use `onyx research scale --workers <n> --session <id>` to change capacity;
 scale-down drains naturally. New hypotheses join future sessions only, while
 closing a hypothesis cancels its open assignments and workers immediately.

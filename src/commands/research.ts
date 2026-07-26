@@ -2165,10 +2165,7 @@ export function createResearchSessionStopChecker({
         }
         if (
           assignmentId &&
-          control.assignments.some(
-            (assignment) =>
-              assignment.id === assignmentId && assignment.canceledAt !== null
-          )
+          control.canceledAssignmentIds.includes(assignmentId)
         ) {
           add("stop_requested", "hypothesis assignment canceled")
         }
@@ -6273,13 +6270,15 @@ export async function commandResearchRun(args: Args) {
             workersById.set(grant.worker.id, grant.worker)
             hypothesesById.set(grant.hypothesis.id, grant.hypothesis)
           }
-          await cacheResearchSessionState({
-            root,
-            campaign,
-            session: leaseBatch!.context.session,
-            hypotheses: [...hypothesesById.values()],
-            workers: [...workersById.values()],
-          }).catch(() => {})
+          if (existingLocal) {
+            await cacheResearchSessionState({
+              root,
+              campaign,
+              session: existingLocal.session,
+              hypotheses: [...hypothesesById.values()],
+              workers: [...workersById.values()],
+            }).catch(() => {})
+          }
         }
 
         for (const grant of grants) {
