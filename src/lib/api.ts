@@ -247,29 +247,6 @@ export type ApiHypothesis = {
   updatedAt: string
 }
 
-export type ApiSummary = {
-  id: string
-  campaignId: string
-  sessionId: string | null
-  hypothesisId: string | null
-  authoredByWorkerId: string | null
-  evaluationRevisionId: string | null
-  watermarkAcceptedCount: number | null
-  watermarkExperimentId: string | null
-  summaryKind:
-    | "campaign_brief"
-    | "session_brief"
-    | "hypothesis_summary"
-    | "transfer_brief"
-    | "setup_notes"
-  title: string
-  body: string
-  isCurrent: boolean
-  metadata: Record<string, unknown>
-  createdAt: string
-  updatedAt: string
-}
-
 export type ApiKnowledge = {
   id: string
   campaignId: string
@@ -296,7 +273,6 @@ export type ApiCampaignTimeline = {
   gitVerification?: ApiCampaignGitVerificationSummary
   workers: ApiWorker[]
   hypotheses: ApiHypothesis[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
 }
 
@@ -318,7 +294,6 @@ export type ApiSessionState = {
   bestExperiment: ApiCampaignExperiment | null
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
   updatedAt: string
 }
@@ -447,7 +422,6 @@ export type ApiSessionBrief = {
   latestExperiments: ApiCampaignExperiment[]
   bestExperiment: ApiCampaignExperiment | null
   activeHypotheses: ApiHypothesis[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
   updatedAt: string
 }
@@ -461,7 +435,6 @@ export type ApiSessionStateBrief = {
   latestExperiments: ApiCampaignExperiment[]
   bestExperiment: ApiCampaignExperiment | null
   activeHypotheses: ApiHypothesis[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
   updatedAt: string
 }
@@ -1569,35 +1542,6 @@ export async function heartbeatWorkersBatch(
     await callApi(
       "POST",
       `/api/v1/research/worker-heartbeats/batch`,
-      body,
-      args
-    )
-  )
-}
-
-export async function upsertCampaignSummary(
-  campaignId: string,
-  body: {
-    sessionId?: string
-    hypothesisId?: string
-    authoredByWorkerId?: string
-    summaryKind:
-      | "campaign_brief"
-      | "session_brief"
-      | "hypothesis_summary"
-      | "transfer_brief"
-      | "setup_notes"
-    title: string
-    body: string
-    isCurrent?: boolean
-    metadata?: Record<string, unknown>
-  },
-  args?: Args
-): Promise<ApiSummary> {
-  return apiData<ApiSummary>(
-    await callApi(
-      "POST",
-      `/api/v1/research/campaigns/${campaignId}/summaries`,
       body,
       args
     )

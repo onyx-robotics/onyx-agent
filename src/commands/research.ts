@@ -35,7 +35,6 @@ import {
   heartbeatWorkersBatch,
   heartbeatWorker,
   listCampaignExperiments,
-  listCampaignEvaluationRevisions,
   listCampaignHypotheses,
   listCampaignKnowledge,
   listProjectCampaigns,
@@ -46,7 +45,6 @@ import {
   settleResearchSession,
   scaleCampaignSession,
   stopCampaignSession,
-  upsertCampaignSummary,
   upsertResearchPresence,
   verifyResearchCampaignGit,
   resolveProject,
@@ -58,7 +56,6 @@ import {
   type ApiSessionBrief,
   type ApiSessionControlState,
   type ApiSessionLive,
-  type ApiSummary,
   type ApiWorker,
   type ApiWorkerLease,
 } from "../lib/api"
@@ -513,7 +510,7 @@ function setupAwareHypothesisDefaults({
     scope,
     protectedPaths,
     startingPoints: uniqueStrings([
-      "Review recent experiments, hypothesis summaries, and shared knowledge before editing.",
+      "Review recent experiments, experiment notes, and shared knowledge before editing.",
       ...scope,
     ]),
     successSignals: [
@@ -740,16 +737,6 @@ export function summarizeWorkerOutput(result: StreamingProcessResult) {
   return raw ? raw.slice(-1200) : null
 }
 
-const SUMMARY_KINDS = [
-  "campaign_brief",
-  "session_brief",
-  "hypothesis_summary",
-  "transfer_brief",
-  "setup_notes",
-] as const
-
-type SummaryKind = ApiSummary["summaryKind"]
-
 type ResearchLaunchSuggestion =
   | {
       kind: "launch_worker"
@@ -765,18 +752,6 @@ type ResearchLaunchSuggestion =
       sessionId: string
       reason: string
     }
-
-function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
-  const kind = args.options.kind ?? fallback
-  if (!SUMMARY_KINDS.includes(kind as SummaryKind)) {
-    const hint =
-      kind === "hypothesis" ? " Did you mean hypothesis_summary?" : ""
-    throw new Error(
-      `--kind must be campaign_brief, session_brief, hypothesis_summary, transfer_brief, or setup_notes.${hint}`
-    )
-  }
-  return kind as SummaryKind
-}
 
 function workerIsActive(worker: Pick<ApiWorker, "status">) {
   return ["registered", "running"].includes(worker.status)
@@ -964,17 +939,6 @@ function launchSuggestionsForSession({
   }
 
   return []
-}
-
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-
-function optionalUuid(value: string | undefined, label: string) {
-  if (value === undefined) return undefined
-  if (!UUID_PATTERN.test(value)) {
-    throw new Error(`${label} must be a UUID, not "${value}".`)
-  }
-  return value
 }
 
 function createRefPushQueue({ args }: { args: Args }) {
@@ -3562,40 +3526,6 @@ async function runHypothesisOnce({
         },
         args
       )
-      await upsertCampaignSummary(
-        campaign.id,
-        {
-          sessionId,
-          hypothesisId: hypothesis.id,
-          authoredByWorkerId: worker.id,
-          summaryKind: "hypothesis_summary",
-          title: `${hypothesis.name} worker stopped`,
-          body: [
-            `Outcome: stopped`,
-            `Latest commit: ${resultCommitSha ?? "n/a"}`,
-            `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
-            finalization.workerBranchPushStatus === "failed"
-              ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-              : `Worker branch push: ${finalization.workerBranchPushStatus}`,
-            finalization.error
-              ? `Finalization note: ${finalization.error}`
-              : "",
-            `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
-            `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
-            `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          isCurrent: false,
-          metadata: {
-            authoredBy: "worker-harness",
-            outcome: "stopped",
-            resultCommitSha: resultCommitSha ?? null,
-            finalization,
-          },
-        },
-        args
-      )
       await cleanupWorkerRuntimeTempDir()
       return {
         hypothesis,
@@ -3627,38 +3557,6 @@ async function runHypothesisOnce({
         event: "hypothesis_completed",
         progressMessage: `${hypothesis.name} completed`,
         gitLabel: resultCommitSha,
-      },
-      args
-    )
-    await upsertCampaignSummary(
-      campaign.id,
-      {
-        sessionId,
-        hypothesisId: hypothesis.id,
-        authoredByWorkerId: worker.id,
-        summaryKind: "hypothesis_summary",
-        title: `${hypothesis.name} worker finalization`,
-        body: [
-          `Outcome: completed`,
-          `Latest commit: ${resultCommitSha ?? "n/a"}`,
-          `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
-          finalization.workerBranchPushStatus === "failed"
-            ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-            : `Worker branch push: ${finalization.workerBranchPushStatus}`,
-          finalization.error ? `Finalization note: ${finalization.error}` : "",
-          `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
-          `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
-          `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        isCurrent: false,
-        metadata: {
-          authoredBy: "worker-harness",
-          outcome: "completed",
-          resultCommitSha: resultCommitSha ?? null,
-          finalization,
-        },
       },
       args
     )
@@ -3703,41 +3601,6 @@ async function runHypothesisOnce({
           progressMessage: message.slice(0, 1000),
           gitLabel: resultCommitSha ?? null,
           metadata,
-        },
-        args
-      ).catch(() => {})
-    }
-    if (workerId) {
-      await upsertCampaignSummary(
-        campaign.id,
-        {
-          sessionId,
-          hypothesisId: hypothesis.id,
-          authoredByWorkerId: workerId,
-          summaryKind: "hypothesis_summary",
-          title: `${hypothesis.name} worker finalization failed`,
-          body: [
-            `Outcome: failed`,
-            `Error: ${message}`,
-            resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
-            launchManifest?.manifestPath
-              ? `Worker manifest: ${launchManifest.manifestPath}`
-              : "",
-            launchManifest?.activityLogPath
-              ? `Worker activity log: ${launchManifest.activityLogPath}`
-              : "",
-            launchManifest?.logPath
-              ? `Worker raw log: ${launchManifest.logPath}`
-              : "",
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          isCurrent: false,
-          metadata: {
-            authoredBy: "worker-harness",
-            outcome: "failed",
-            resultCommitSha: resultCommitSha ?? null,
-          },
         },
         args
       ).catch(() => {})
@@ -3835,7 +3698,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
       ],
       workers: before.workers,
       experiments: before.latestExperiments,
-      summaries: before.summaries,
       knowledge: before.knowledge,
     }).catch(() => {})
   }
@@ -4115,7 +3977,6 @@ export async function commandResearchStatus(args: Args) {
         gitVerification: freshOverview.gitVerification,
         hypotheses: localSessionState.hypotheses,
         workers: localSessionState.workers,
-        summaries: localSessionState.summaries,
         knowledge: localSessionState.knowledge,
       }
     : freshOverview
@@ -4611,7 +4472,7 @@ export async function commandResearchHypotheses(args: Args) {
       statement:
         "A focused follow-up based on previous hypothesis results can test a different mechanism or exploit a promising partial result.",
       startingPoints: [
-        "Review hypothesis summaries, experiment notes, and current best metric before choosing edits.",
+        "Review experiment history, shared knowledge, and the current best metric before choosing edits.",
         ...scope,
       ],
       avoidList: protectedPaths,
@@ -4726,14 +4587,6 @@ function renderSessionBrief(brief: ApiSessionBrief) {
       )
     }
   }
-  if (brief.summaries.length > 0) {
-    lines.push("", "## Summaries")
-    for (const summary of brief.summaries.slice(0, 8)) {
-      lines.push(`- ${summary.summaryKind}: ${summary.title}`)
-      const preview = summary.body.replace(/\s+/g, " ").trim().slice(0, 240)
-      if (preview) lines.push(`  ${preview}`)
-    }
-  }
   if (brief.knowledge.length > 0) {
     lines.push("", "## Knowledge")
     for (const item of brief.knowledge.slice(0, 12)) {
@@ -4778,7 +4631,6 @@ async function reconcileCampaignIntoLocalState({
       hypotheses: response.hypotheses,
       workers: response.workers,
       experiments: response.experiments,
-      summaries: [],
       knowledge: [],
     },
   }).catch(() => {})
@@ -5037,168 +4889,6 @@ export async function commandResearchStop(args: Args) {
 
 function safeBranchSegment(value: string) {
   return value.replace(/[^A-Za-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
-}
-
-export async function commandResearchSummarize(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
-  await reconcileCampaign(campaign.id, args).catch(() => null)
-  const overview = await getCampaignOverview(campaign.id, args)
-  const revisionRows = await listCampaignEvaluationRevisions(campaign.id, args)
-  const experiments = [] as typeof overview.latestExperiments
-  let cursor: string | undefined
-  do {
-    const page = await listCampaignExperiments(campaign.id, args, {
-      limit: 100,
-      cursor,
-    })
-    experiments.push(...page.items)
-    cursor = page.page.nextCursor ?? undefined
-  } while (cursor)
-  const revisions = new Map<string, typeof experiments>()
-  for (const experiment of experiments) {
-    const items = revisions.get(experiment.evaluationRevisionId) ?? []
-    items.push(experiment)
-    revisions.set(experiment.evaluationRevisionId, items)
-  }
-  const body = [
-    `Campaign checkpoint for ${campaign.name}.`,
-    `Accepted experiments: ${overview.campaign.experimentCount}.`,
-    `Current evaluation revision: ${overview.campaign.currentEvaluationRevisionId ?? "none"}.`,
-    ...revisionRows.map((revision) => {
-      const experiments = revisions.get(revision.id) ?? []
-      const measured = experiments.filter(
-        (experiment) => experiment.primaryMetricValue !== null
-      )
-      const best = measured.sort((left, right) =>
-        campaign.metricDirection === "maximize"
-          ? (right.primaryMetricValue ?? -Infinity) -
-            (left.primaryMetricValue ?? -Infinity)
-          : (left.primaryMetricValue ?? Infinity) -
-            (right.primaryMetricValue ?? Infinity)
-      )[0]
-      return `Revision ${revision.id}${revision.id === campaign.currentEvaluationRevisionId ? " (current)" : ""}: ${experiments.length} experiment(s); best=${best?.primaryMetricValue ?? "n/a"} (${best?.resultCommitSha ?? "n/a"}).`
-    }),
-  ].join("\n")
-  const summary = await upsertCampaignSummary(
-    campaign.id,
-    {
-      summaryKind: "campaign_brief",
-      title: `${campaign.name} checkpoint`,
-      body,
-      isCurrent: true,
-      metadata: { authoredBy: "onyx-research-summarize" },
-    },
-    args
-  )
-  console.log(summary.body)
-}
-
-export async function commandSummaryUpsert(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  const kind = summaryKindOption(args, "hypothesis_summary")
-  const { campaign } = await campaignForName(root, args)
-  const title = args.options.title ?? `${kind} ${new Date().toISOString()}`
-  const body = args.options.body
-  if (!body) throw new Error("Pass --body <text>.")
-  const sessionId = optionalUuid(
-    args.options.session ?? process.env.ONYX_SESSION_ID,
-    "--session"
-  )
-  const hypothesisId = optionalUuid(
-    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
-    "--hypothesis"
-  )
-  const authoredByWorkerId = optionalUuid(
-    args.options.worker ?? process.env.ONYX_WORKER_ID,
-    "--worker"
-  )
-  if (args.options.sync === "true" || args.options.offline === "true") {
-    throw new Error(
-      "`--sync` and `--offline` were removed. Summaries are written directly to the Onyx API."
-    )
-  }
-  const summary = await upsertCampaignSummary(
-    campaign.id,
-    {
-      sessionId,
-      hypothesisId,
-      authoredByWorkerId,
-      summaryKind: kind,
-      title,
-      body,
-    },
-    args
-  )
-  if (args.options.json === "true") {
-    console.log(JSON.stringify(summary, null, 2))
-    return
-  }
-  console.log(`Updated ${summary.summaryKind} for ${campaign.name}`)
-}
-
-function summaryScope(summary: ApiSummary) {
-  return [
-    summary.sessionId ? `session=${summary.sessionId}` : null,
-    summary.hypothesisId ? `hypothesis=${summary.hypothesisId}` : null,
-    summary.authoredByWorkerId ? `worker=${summary.authoredByWorkerId}` : null,
-  ]
-    .filter(Boolean)
-    .join(" ")
-}
-
-export async function commandSummaryList(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
-  const kind = args.options.kind
-    ? summaryKindOption(args, "hypothesis_summary")
-    : null
-  const limit = positiveIntegerOption(args, "limit", 20)
-  if (args.options.offline === "true") {
-    throw new Error(
-      "`--offline` was removed. Summaries are read directly from the Onyx API."
-    )
-  }
-  const sourceSummaries = await getCampaignOverview(campaign.id, args).then(
-    (overview) => overview.summaries
-  )
-  const matchingSummaries = sourceSummaries.filter(
-    (summary) => !kind || summary.summaryKind === kind
-  )
-  const summaries = matchingSummaries.slice(0, limit)
-
-  if (args.options.json === "true") {
-    console.log(JSON.stringify(summaries, null, 2))
-    return
-  }
-
-  if (summaries.length === 0) {
-    console.log(
-      kind
-        ? `No ${kind} summaries found for ${campaign.name}.`
-        : `No summaries found for ${campaign.name}.`
-    )
-    return
-  }
-
-  for (const summary of summaries) {
-    const scope = summaryScope(summary)
-    const preview = summary.body.replace(/\s+/g, " ").trim().slice(0, 180)
-    console.log(
-      [
-        `${summary.summaryKind}${summary.isCurrent ? " current" : ""}: ${summary.title}`,
-        scope || null,
-        preview ? `- ${preview}` : null,
-      ]
-        .filter(Boolean)
-        .join(" ")
-    )
-  }
-  if (matchingSummaries.length > summaries.length) {
-    console.log(
-      `... ${matchingSummaries.length - summaries.length} more; raise --limit to see more.`
-    )
-  }
 }
 
 export async function commandKnowledgeAdd(args: Args) {

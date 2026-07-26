@@ -82,14 +82,11 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).not.toContain("onyx research status --json")
     expect(prompt).not.toContain("onyx exp list --json")
     expect(prompt).not.toContain("onyx knowledge list --json")
-    expect(prompt).not.toContain("onyx summary list --json")
     expect(prompt).toContain("Default to one measured candidate per workflow")
     expect(prompt).toContain(
       "Do not run tuning sweeps, grid searches, or batch candidate evaluation unless your hypothesis plan or the research spec explicitly calls for it"
     )
-    expect(prompt).toContain(
-      'onyx-worker summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"'
-    )
+    expect(prompt).not.toContain("onyx-worker summary")
     expect(prompt).toContain("onyx-worker knowledge add")
     expect(prompt).toContain("onyx-worker research session-state-brief --json")
     expect(prompt).not.toContain("onyx-worker research should-stop --json")

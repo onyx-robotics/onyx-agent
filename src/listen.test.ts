@@ -387,7 +387,6 @@ describe("onyx listen", () => {
               sessions: [],
               workers: [],
               hypotheses: [],
-              summaries: [],
               knowledge: [],
               counts: { experiments: 2, hypothesisCount: 0, activeWorkers: 0 },
             },

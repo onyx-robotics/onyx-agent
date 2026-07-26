@@ -130,8 +130,6 @@ export {
   commandResearchStop,
   commandKnowledgeAdd,
   commandKnowledgeList,
-  commandSummaryList,
-  commandSummaryUpsert,
   finalizationStatusLabel,
   finalizeHypothesisAttempt,
   summarizeWorkerOutput,

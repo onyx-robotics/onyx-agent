@@ -56,10 +56,7 @@ function requireExperimentReport(calls: ApiCall[]) {
       call.path === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
   )
   if (report) return report
-  const diagnostics = calls.filter(
-    (call) =>
-      call.path.includes("/heartbeat") || call.path.endsWith("/summaries")
-  )
+  const diagnostics = calls.filter((call) => call.path.includes("/heartbeat"))
   throw new Error(
     `Expected an experiment report. Worker diagnostics: ${JSON.stringify(diagnostics)}`
   )
@@ -397,7 +394,6 @@ function installSupervisorApi({
         latestExperiments: [],
         workers: [],
         hypotheses: [currentHypothesis],
-        summaries: [],
         knowledge: [],
         sessions: [],
         counts: { experiments: 0, hypothesisCount: 1, activeWorkers: 0 },
@@ -758,24 +754,6 @@ function installSupervisorApi({
           recommendedAction: "none",
           message: "No accepted experiment refs need Git verification yet.",
         },
-      }
-    } else if (
-      method === "POST" &&
-      url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}/summaries`
-    ) {
-      data = {
-        id: "90000000-0000-4000-8000-000000000001",
-        campaignId: CAMPAIGN_ID,
-        sessionId: body?.sessionId ?? null,
-        hypothesisId: body?.hypothesisId ?? null,
-        authoredByWorkerId: body?.authoredByWorkerId ?? null,
-        summaryKind: body?.summaryKind ?? "hypothesis_summary",
-        title: body?.title ?? "summary",
-        body: body?.body ?? "",
-        isCurrent: body?.isCurrent ?? false,
-        metadata: body?.metadata ?? {},
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
       }
     } else if (
       method === "POST" &&

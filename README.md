@@ -88,7 +88,7 @@ onyx listen
 ```
 
 The CLI writes research product state directly to `/api/v1`. Supabase/API owns
-campaigns, sessions, hypotheses, worker leases, experiments, summaries,
+campaigns, sessions, hypotheses, worker leases, experiments,
 knowledge, stop state, report settlement, and accepted experiment ordering.
 Local `.git/onyx/` files are runtime artifacts: logs, manifests, workflow
 runs, attempts, session-state briefs, resource locks, and a small `state.json`
@@ -121,7 +121,7 @@ recorded as local-reported evidence instead of blocking metrics. Experiment
 report calls return `recorded` or `duplicate`, and later settlement assigns
 accepted/discarded disposition plus accepted indexes. `onyx exp list`,
 `onyx research status`,
-`onyx listen`, `knowledge list`, and `summary list` read remote API state
+`onyx listen` and `knowledge list` read remote API state
 instead of offline local projections.
 
 `onyx campaign setup` and `onyx research run` require the `onyx/` setup
@@ -245,15 +245,11 @@ the harness gives it the configured stop grace (30 seconds by default),
 terminates it if needed, then runs the same finalization path. Use
 `--worker-command` only for custom harnesses.
 
-Stop sessions and create campaign checkpoints explicitly:
+Stop sessions explicitly:
 
 ```bash
 onyx research stop --session <id>
-onyx research summarize --campaign fast-eval
 ```
-
-`summarize` reconciles reports and creates an immutable watermark checkpoint.
-Repeating it without new accepted experiments returns the existing checkpoint.
 Campaigns remain active until explicitly archived.
 
 To delete a research direction entirely — the campaign record with all its

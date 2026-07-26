@@ -80,13 +80,6 @@ export const researchSessionEndReasonSchema = z.enum([
   "failed",
   "abandoned",
 ])
-export const researchSummaryKindSchema = z.enum([
-  "campaign_brief",
-  "session_brief",
-  "hypothesis_summary",
-  "transfer_brief",
-  "setup_notes",
-])
 export const researchWorkerRuntimeSchema = z.enum(["local", "hosted"])
 export const researchWorkerStatusSchema = z.enum([
   "registered",
@@ -732,24 +725,6 @@ export const researchHypothesisSchema = z.object({
   updatedAt: z.iso.datetime(),
 })
 
-export const researchSummarySchema = z.object({
-  id: z.uuid(),
-  campaignId: z.uuid(),
-  sessionId: z.uuid().nullable(),
-  hypothesisId: z.uuid().nullable(),
-  authoredByWorkerId: z.uuid().nullable(),
-  evaluationRevisionId: z.uuid().nullable(),
-  watermarkAcceptedCount: z.number().int().nonnegative().nullable(),
-  watermarkExperimentId: z.uuid().nullable(),
-  summaryKind: researchSummaryKindSchema,
-  title: z.string().min(1),
-  body: z.string().min(1),
-  isCurrent: z.boolean(),
-  metadata: metadataSchema,
-  createdAt: z.iso.datetime(),
-  updatedAt: z.iso.datetime(),
-})
-
 export const researchKnowledgeSchema = z.object({
   id: z.uuid(),
   campaignId: z.uuid(),
@@ -775,17 +750,6 @@ export const createResearchKnowledgeRequestSchema = z.object({
   title: z.string().trim().min(1).max(200),
   body: z.string().trim().min(1).max(4000),
   confidence: z.number().min(0).max(1).nullable().optional(),
-  metadata: metadataSchema.default({}),
-})
-
-export const upsertResearchSummaryRequestSchema = z.object({
-  sessionId: z.uuid().optional(),
-  hypothesisId: z.uuid().optional(),
-  authoredByWorkerId: z.uuid().optional(),
-  summaryKind: researchSummaryKindSchema,
-  title: z.string().trim().min(1).max(200),
-  body: z.string().trim().min(1).max(20000),
-  isCurrent: z.boolean().default(true),
   metadata: metadataSchema.default({}),
 })
 
@@ -1170,7 +1134,6 @@ export const researchCampaignOverviewResponseSchema = z.object({
     sessions: z.array(researchSessionSchema),
     workers: z.array(researchWorkerSchema),
     hypotheses: z.array(researchHypothesisSchema),
-    summaries: z.array(researchSummarySchema),
     knowledge: z.array(researchKnowledgeSchema),
     counts: z.object({
       experiments: z.number().int().nonnegative(),
@@ -1453,7 +1416,6 @@ export const researchSessionStateResponseSchema = z.object({
     bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
     hypotheses: z.array(researchHypothesisSchema),
     workers: z.array(researchWorkerSchema),
-    summaries: z.array(researchSummarySchema),
     knowledge: z.array(researchKnowledgeSchema),
     updatedAt: z.iso.datetime(),
   }),
@@ -1468,7 +1430,6 @@ export const researchSessionBriefResponseSchema = z.object({
     latestExperiments: z.array(researchCampaignExperimentSummarySchema),
     bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
     activeHypotheses: z.array(researchHypothesisSchema),
-    summaries: z.array(researchSummarySchema),
     knowledge: z.array(researchKnowledgeSchema),
     updatedAt: z.iso.datetime(),
   }),
@@ -1540,7 +1501,6 @@ export const researchSessionStateBriefResponseSchema = z.object({
     latestExperiments: z.array(researchCampaignExperimentSummarySchema),
     bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
     activeHypotheses: z.array(researchHypothesisSchema),
-    summaries: z.array(researchSummarySchema),
     knowledge: z.array(researchKnowledgeSchema),
     updatedAt: z.iso.datetime(),
   }),
@@ -1722,10 +1682,6 @@ export const researchWorkerHeartbeatBatchResponseSchema = z.object({
       })
     ),
   }),
-})
-
-export const upsertResearchSummaryResponseSchema = z.object({
-  data: researchSummarySchema,
 })
 
 export const researchFileTreeNodeSchema = z.object({
@@ -1950,7 +1906,6 @@ export type ResearchCampaignStatus = z.infer<
 export type ResearchHypothesisStatus = z.infer<
   typeof researchHypothesisStatusSchema
 >
-export type ResearchSummaryKind = z.infer<typeof researchSummaryKindSchema>
 export type ResearchWorkerRuntime = z.infer<typeof researchWorkerRuntimeSchema>
 export type ResearchWorkerStatus = z.infer<typeof researchWorkerStatusSchema>
 export type ResearchExperimentGitStatus = z.infer<
@@ -2150,7 +2105,6 @@ export type GetResearchEvaluationRevisionResponse = z.infer<
   typeof getResearchEvaluationRevisionResponseSchema
 >
 export type ResearchHypothesis = z.infer<typeof researchHypothesisSchema>
-export type ResearchSummary = z.infer<typeof researchSummarySchema>
 export type ResearchKnowledge = z.infer<typeof researchKnowledgeSchema>
 export type CreateResearchKnowledgeRequest = z.infer<
   typeof createResearchKnowledgeRequestSchema
@@ -2160,12 +2114,6 @@ export type CreateResearchKnowledgeResponse = z.infer<
 >
 export type ListResearchKnowledgeResponse = z.infer<
   typeof listResearchKnowledgeResponseSchema
->
-export type UpsertResearchSummaryRequest = z.infer<
-  typeof upsertResearchSummaryRequestSchema
->
-export type UpsertResearchSummaryResponse = z.infer<
-  typeof upsertResearchSummaryResponseSchema
 >
 export type ResearchWorker = z.infer<typeof researchWorkerSchema>
 export type RegisterResearchWorkerRequest = z.infer<
@@ -2317,15 +2265,6 @@ export const researchHypothesisUpsertedEventSchema = z.object({
   }),
 })
 
-export const researchSummaryUpsertedEventSchema = z.object({
-  type: z.literal("research.summary.upserted"),
-  data: z.object({
-    projectId: z.uuid(),
-    campaignId: z.uuid(),
-    summary: researchSummarySchema,
-  }),
-})
-
 export const researchKnowledgeUpsertedEventSchema = z.object({
   type: z.literal("research.knowledge.upserted"),
   data: z.object({
@@ -2386,7 +2325,6 @@ export const researchEventSchema = z.discriminatedUnion("type", [
   researchCampaignExperimentUpsertedEventSchema,
   researchCampaignExperimentDeletedEventSchema,
   researchHypothesisUpsertedEventSchema,
-  researchSummaryUpsertedEventSchema,
   researchKnowledgeUpsertedEventSchema,
   researchWorkerUpsertedEventSchema,
   researchWorkersUpsertedEventSchema,
@@ -2411,9 +2349,6 @@ export type ResearchCampaignExperimentDeletedEvent = z.infer<
 >
 export type ResearchHypothesisUpsertedEvent = z.infer<
   typeof researchHypothesisUpsertedEventSchema
->
-export type ResearchSummaryUpsertedEvent = z.infer<
-  typeof researchSummaryUpsertedEventSchema
 >
 export type ResearchKnowledgeUpsertedEvent = z.infer<
   typeof researchKnowledgeUpsertedEventSchema

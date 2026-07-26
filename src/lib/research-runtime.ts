@@ -22,7 +22,6 @@ import type {
   ApiKnowledge,
   ApiSession,
   ApiSessionState,
-  ApiSummary,
   ApiWorker,
 } from "./api"
 import {
@@ -116,7 +115,6 @@ export type LocalWorkflowStep = {
   updatedAt: string
 }
 
-type LocalSummaryKind = ApiSummary["summaryKind"]
 type LocalKnowledgeKind = ApiKnowledge["kind"]
 
 export type LocalDiscardedAttempt = {
@@ -155,7 +153,6 @@ type LocalSessionRecord = {
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
   experiments: ApiCampaignExperiment[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
 }
 
@@ -710,7 +707,6 @@ export async function createLocalSession({
     hypotheses: createdHypotheses,
     workers: [],
     experiments: [],
-    summaries: [],
     knowledge: [],
   }
   await writeSessionRecord(root, record)
@@ -747,7 +743,6 @@ export async function cacheResearchSessionState({
   hypotheses = [],
   workers = [],
   experiments = [],
-  summaries = [],
   knowledge = [],
 }: {
   root: string
@@ -756,7 +751,6 @@ export async function cacheResearchSessionState({
   hypotheses?: ApiHypothesis[]
   workers?: ApiWorker[]
   experiments?: ApiCampaignExperiment[]
-  summaries?: ApiSummary[]
   knowledge?: ApiKnowledge[]
 }) {
   const existing = await readSessionRecord(root, session.id).catch(() => null)
@@ -768,7 +762,6 @@ export async function cacheResearchSessionState({
     workers: workers.length > 0 ? workers : (existing?.workers ?? []),
     experiments:
       experiments.length > 0 ? experiments : (existing?.experiments ?? []),
-    summaries: summaries.length > 0 ? summaries : (existing?.summaries ?? []),
     knowledge: knowledge.length > 0 ? knowledge : (existing?.knowledge ?? []),
   }
   await writeSessionRecord(root, record)
@@ -1080,7 +1073,6 @@ export async function applyRemoteProjectionDeltas(_input: {
     hypotheses: ApiHypothesis[]
     workers: ApiWorker[]
     experiments: ApiCampaignExperiment[]
-    summaries: ApiSummary[]
     knowledge: ApiKnowledge[]
   }
 }) {
@@ -1270,47 +1262,6 @@ export async function listWorkflowSteps(root: string, runId: string) {
   return jsonFile<LocalWorkflowStep[]>(await workflowStepsPath(root, runId), [])
 }
 
-export async function upsertLocalSummary(input: {
-  root: string
-  campaignId: string
-  sessionId?: string
-  hypothesisId?: string
-  authoredByWorkerId?: string
-  summaryKind: LocalSummaryKind
-  title: string
-  body: string
-  isCurrent?: boolean
-  metadata?: Record<string, unknown>
-}) {
-  const at = nowIso()
-  return {
-    id: randomUUID(),
-    campaignId: input.campaignId,
-    sessionId: input.sessionId ?? null,
-    hypothesisId: input.hypothesisId ?? null,
-    authoredByWorkerId: input.authoredByWorkerId ?? null,
-    evaluationRevisionId: null,
-    watermarkAcceptedCount: null,
-    watermarkExperimentId: null,
-    summaryKind: input.summaryKind,
-    title: input.title,
-    body: input.body,
-    isCurrent: input.isCurrent ?? true,
-    metadata: input.metadata ?? {},
-    createdAt: at,
-    updatedAt: at,
-  } satisfies ApiSummary
-}
-
-export async function listLocalSummaries(
-  _root: string,
-  _campaignId: string
-): Promise<ApiSummary[]> {
-  void _root
-  void _campaignId
-  return []
-}
-
 export async function createLocalKnowledge(input: {
   root: string
   campaignId: string
@@ -1434,7 +1385,6 @@ export type LocalResearchBrief = {
   session: ApiSession | null
   hypothesis: ApiHypothesis | null
   latestExperiments: ApiCampaignExperiment[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
 }
 
@@ -1446,7 +1396,6 @@ export async function localResearchBrief(): Promise<LocalResearchBrief> {
     session: null,
     hypothesis: null,
     latestExperiments: [],
-    summaries: [],
     knowledge: [],
   }
 }

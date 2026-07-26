@@ -25,11 +25,8 @@ import {
   commandResearchScale,
   commandResearchStatus,
   commandResearchStop,
-  commandResearchSummarize,
   commandKnowledgeAdd,
   commandKnowledgeList,
-  commandSummaryList,
-  commandSummaryUpsert,
   commandWorkerRun,
 } from "./commands/research"
 import { commandSetupInit, commandSetupValidate } from "./commands/setup"
@@ -79,11 +76,8 @@ Usage:
   onyx research stop [--session <id>] [--reason <text>]
   onyx research scale --workers <n> [--session <id>]
   onyx research clean [--dry-run]
-  onyx research summarize --campaign <name>
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
-  onyx summary upsert [--campaign <name>] [--kind <kind>] [--session <uuid>] [--hypothesis <uuid>] [--worker <uuid>] [--title <text>] --body <text> [--require-online]
-  onyx summary list [--campaign <name>] [--kind <kind>] [--limit <n>] [--json]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--require-online]
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
@@ -104,7 +98,7 @@ Research control-plane state is remote-first through /api/v1. Local files under
 .git/onyx/ hold runtime logs, workflow runs, attempt manifests, resource locks,
 session-state briefs, and convenience state only. Workers push immutable
 experiment refs before reporting results; \`onyx exp list\`, \`onyx research status\`,
-summaries, and knowledge read from the remote API.
+and knowledge read from the remote API.
 
 Env:
   ONYX_API_KEY   overrides the selected profile API key
@@ -204,15 +198,10 @@ export async function main(argv = process.argv.slice(2)) {
       return commandResearchScale(args)
     if (command === "research" && sub === "clean")
       return commandResearchClean(args)
-    if (command === "research" && sub === "summarize")
-      return commandResearchSummarize(args)
     if (command === "research" && sub === "brief")
       return commandResearchBrief(args)
     if (command === "research" && sub === "status")
       return commandResearchStatus(args)
-    if (command === "summary" && sub === "upsert")
-      return commandSummaryUpsert(args)
-    if (command === "summary" && sub === "list") return commandSummaryList(args)
     if (command === "knowledge" && sub === "add")
       return commandKnowledgeAdd(args)
     if (command === "knowledge" && sub === "list")

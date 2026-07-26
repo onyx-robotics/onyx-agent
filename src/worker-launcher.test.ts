@@ -83,7 +83,6 @@ async function writeFakeOnyx(path: string) {
       '  echo "onyx research session-state-brief"',
       '  echo "onyx knowledge add"',
       '  echo "onyx knowledge list"',
-      '  echo "onyx summary upsert"',
       '  echo "onyx exp run (--campaign"',
       "  exit 0",
       "fi",
@@ -555,7 +554,6 @@ describe("worker launchers", () => {
         'if (process.argv.includes("--help")) {',
         '  console.log("onyx-worker research session-state-brief")',
         '  console.log("onyx-worker knowledge add")',
-        '  console.log("onyx-worker summary upsert")',
         '  console.log("onyx-worker exp run [--campaign")',
         "  process.exit(0)",
         "}",
@@ -599,7 +597,7 @@ describe("worker launchers", () => {
       expect(help.code).toBe(0)
       expect(help.stdout).toContain("onyx-worker research session-state-brief")
       expect(help.stdout).not.toContain("onyx-worker research should-stop")
-      expect(help.stdout).toContain("onyx-worker summary upsert")
+      expect(help.stdout).not.toContain("onyx-worker summary")
     } finally {
       if (previousConfigHome === undefined) {
         delete process.env.XDG_CONFIG_HOME

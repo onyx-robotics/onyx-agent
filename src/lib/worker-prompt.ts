@@ -100,7 +100,6 @@ The supervisor launched this worker with \`onyx-worker\`, \`ONYX_WORKER_CONTEXT\
 5. Edit only in-scope project files to implement the experiment idea, make exactly one clean commit, then resume the same workflow with \`onyx-worker exp run --resume --auto\`. If blocked, inspect \`onyx-worker workflow status --blocked\`; use \`onyx-worker tools run <tool-id>\` only for diagnostics.
 6. Inspect the workflow output, metrics, and observations. Record every terminal attempt with \`onyx-worker exp log --campaign "$ONYX_CAMPAIGN_NAME" --name <short-name> --description <what changed> --agent-notes <json-or-text>\` only after \`exp run --resume --auto\` has reached a terminal workflow status. After logging, return to step 1 before choosing any new work. If \`exp log\` says there are zero unlogged attempts, do not amend, reset, or rewrite history; start the missing workflow with \`exp run --auto\` or resume the existing one properly, then log the terminal attempt.
 7. Optionally, publish concise shared learnings with \`onyx-worker knowledge add --kind insight|dead_end|promising_direction|risk|transfer_note --title <title> --body <body>\`, especially after pivots, dead ends, and transferable wins.
-8. Periodically update a concise hypothesis summary with \`onyx-worker summary upsert --hypothesis "$ONYX_HYPOTHESIS_ID" --worker "$ONYX_WORKER_ID"\` if available (current summaries are already in the brief, so do not re-list them); otherwise include the summary in final output. Do not pipe mutation commands through \`tail\`, \`head\`, or other filters that can hide failed exits.
 
 ### Research Rules
 
@@ -122,7 +121,7 @@ The supervisor launched this worker with \`onyx-worker\`, \`ONYX_WORKER_CONTEXT\
 - Do not thrash. If you keep circling the same idea, try something structurally different.
 - Crashes: fix trivial issues, otherwise log what failed and move on.
 - When stuck, slow down: re-read source, inspect eval output, search history with \`onyx-worker exp list --grep\`, study profiling or papers if useful, and reason from evidence instead of random variation.
-- Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: finish/log the current one-commit workflow if possible, publish any important knowledge/summary updates, and exit before ${input.shutdownDeadlineIso}. Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow. Do not start new exploration after ${input.researchDeadlineIso}.
+- Reserve the final ${input.shutdownCushionSeconds} second(s) for shutdown: finish/log the current one-commit workflow if possible, publish any important reusable knowledge, and exit before ${input.shutdownDeadlineIso}. Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow. Do not start new exploration after ${input.researchDeadlineIso}.
 - Keep going only while useful work remains. Stop when the hypothesis is exhausted, when the supervisor/harness stops you, or when the session budget is nearly finished. If \`onyx-worker exp log\` says the attempt was discarded, treat the session as complete and exit cleanly.
 
 ### Git And State Rules
@@ -132,7 +131,7 @@ The supervisor launched this worker with \`onyx-worker\`, \`ONYX_WORKER_CONTEXT\
 - Restoring an earlier best with \`git checkout <best-sha> -- <scoped files>\` is allowed only inside a normal \`onyx-worker exp run\` attempt that produces exactly one measured forward commit.
 - Do not delete campaigns or experiments. Deletion/tombstones are human/orchestrator actions.
 - Do not edit \`.git/onyx/worker-logs\`, \`.git/onyx/worker-runtime\`, \`.git/onyx/workflow-runs\`, \`.git/onyx/attempts\`, worker manifests, or latest-state JSON directly. Those files are owned by the Onyx CLI and supervisor.
-- Product state is remote-first. \`onyx-worker exp log\`, \`onyx-worker knowledge add\`, \`onyx-worker summary upsert\`, and heartbeats call the Onyx API directly. \`onyx-worker exp log\` attempts to push the immutable experiment ref before it reports; failed pushes are recorded as local-reported evidence, so do not patch local files by hand to compensate.
+- Product state is remote-first. \`onyx-worker exp log\`, \`onyx-worker knowledge add\`, and heartbeats call the Onyx API directly. \`onyx-worker exp log\` attempts to push the immutable experiment ref before it reports; failed pushes are recorded as local-reported evidence, so do not patch local files by hand to compensate.
 
 On stop: leave the worktree clean, make sure every committed attempt is logged, and summarize best result, failed ideas, and next promising ideas. If the model exits with unlogged changes, the worker harness will try one final commit, measurement, immutable-ref push, and API report.`
 }

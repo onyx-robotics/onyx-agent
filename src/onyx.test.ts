@@ -26,7 +26,8 @@ import {
   writeWorkerRuntimeContext,
   type WorkerRuntimePaths,
 } from "./lib/worker-launcher"
-import { main } from "./main"
+import { main, USAGE } from "./main"
+import { WORKER_USAGE } from "./worker-main"
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111"
 const MOCK_API_ORIGIN = "https://api.onyx.test"
@@ -165,7 +166,6 @@ function makeSessionStateBrief(): ApiSessionStateBrief {
     latestExperiments: [],
     bestExperiment: null,
     activeHypotheses: [],
-    summaries: [],
     knowledge: [],
     updatedAt: now,
   }
@@ -240,6 +240,35 @@ describe("remote-first agent architecture", () => {
       await expect(main(["push"])).rejects.toThrow("exit 1")
       await expect(main(["sync"])).rejects.toThrow("exit 1")
       expect(errors.join("\n")).toContain("removed")
+    } finally {
+      console.error = originalError
+      process.exit = originalExit
+    }
+  })
+
+  test("summary commands and help are removed", async () => {
+    expect(USAGE).not.toContain("research summarize")
+    expect(USAGE).not.toContain("onyx summary")
+    expect(WORKER_USAGE).not.toContain("summary upsert")
+
+    const originalError = console.error
+    const originalExit = process.exit
+    const errors: string[] = []
+    console.error = (message?: unknown) => {
+      errors.push(String(message))
+    }
+    process.exit = ((code?: number) => {
+      throw new Error(`exit ${code ?? 0}`)
+    }) as typeof process.exit
+    try {
+      for (const argv of [
+        ["research", "summarize"],
+        ["summary", "upsert"],
+        ["summary", "list"],
+      ]) {
+        await expect(main(argv)).rejects.toThrow("exit 1")
+      }
+      expect(errors.join("\n")).toContain("Unknown command")
     } finally {
       console.error = originalError
       process.exit = originalExit
@@ -625,7 +654,6 @@ describe("remote-first agent architecture", () => {
           sessions: [completedSession],
           workers: [],
           hypotheses: [],
-          summaries: [],
           knowledge: [],
           counts: {
             experiments: 50,

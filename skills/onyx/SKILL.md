@@ -1,6 +1,6 @@
 ---
 name: onyx
-description: Coordinate endless additive Onyx research campaigns, bounded sessions, hypotheses, workers, checkpoints, and metric optimization.
+description: Coordinate endless additive Onyx research campaigns, bounded sessions, hypotheses, workers, and metric optimization.
 ---
 
 # Onyx Parallel Auto Research
@@ -39,15 +39,14 @@ The command validates the committed setup and fingerprint inputs, snapshots hypo
 - Monitor: `onyx research status`, `onyx research status --json`, `onyx listen`, and the web campaign page.
 - Scale: `onyx research scale --workers <n> --session <id>`. Scale-down drains existing workers; use stop instead of zero.
 - Stop: `onyx research stop --session <id>`. A local stop marker suppresses crash salvage; uncertain process identity is never killed.
-- Checkpoint: `onyx research summarize --campaign <slug>`. Repeating without accepted research returns the existing immutable checkpoint.
 - Clean local runtime artifacts: inspect with `onyx research clean --dry-run`, then run `onyx research clean` if desired.
 
 Evaluator changes remain in the campaign but create a separate evaluation revision. Never compare metrics across revisions as a single leaderboard.
 
 ## Worker contract
 
-Workers use `ONYX_PROJECT_ROOT` as their source-editing root and `onyx-worker research session-state-brief --json` for routine session, assignment, stop, knowledge, summary, and progress context. They must not ask the user questions, launch agents, use the full control-plane CLI, or mutate protected setup paths/runtime files.
+Workers use `ONYX_PROJECT_ROOT` as their source-editing root and `onyx-worker research session-state-brief --json` for routine session, assignment, stop, knowledge, and progress context. They must not ask the user questions, launch agents, use the full control-plane CLI, or mutate protected setup paths/runtime files.
 
-For each attempt, a worker runs `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, makes exactly one scoped clean commit, resumes with `onyx-worker exp run --resume --auto`, and reports with `onyx-worker exp log`. It publishes useful knowledge and hypothesis summaries as it works. Git holds immutable experiment commits/refs; Supabase owns session settlement, accepted indexes, projections, checkpoints, and provenance.
+For each attempt, a worker runs `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, makes exactly one scoped clean commit, resumes with `onyx-worker exp run --resume --auto`, and reports with `onyx-worker exp log`. It publishes useful reusable knowledge when appropriate. Git holds immutable experiment commits/refs; Supabase owns session settlement, accepted indexes, projections, and provenance.
 
 The harness monitors server cutoffs and assignment cancellation, gives cooperative stop grace, then terminates the provider. It salvages unexpected crashes only while both session and assignment still accept reports. Deliberate local stop, closed hypotheses, or ended sessions never become ranking inputs; late reports remain discarded diagnostics.

@@ -37,16 +37,17 @@ export type WorkerSessionStateBrief = {
   message: string | null
   warnings: string[]
   session: ApiSessionStateBrief["session"] | null
-  campaign: ApiSessionStateBrief["campaign"] | {
-    id: string
-    name: string
-  }
+  campaign:
+    | ApiSessionStateBrief["campaign"]
+    | {
+        id: string
+        name: string
+      }
   project: ApiSessionStateBrief["project"] | null
   progress: ApiSessionStateBrief["progress"] | null
   activeHypotheses: ApiSessionStateBrief["activeHypotheses"]
   latestExperiments: ApiSessionStateBrief["latestExperiments"]
   bestExperiment: ApiSessionStateBrief["bestExperiment"]
-  summaries: ApiSessionStateBrief["summaries"]
   knowledge: ApiSessionStateBrief["knowledge"]
   updatedAt: string | null
   stop: WorkerSessionStopGuidance
@@ -116,7 +117,9 @@ export async function readSessionStateBriefSnapshot({
       record.refreshStatus !== "failed") ||
     typeof record.generatedAt !== "string"
   ) {
-    throw new Error(`Invalid session state brief at ${path}: unsupported schema`)
+    throw new Error(
+      `Invalid session state brief at ${path}: unsupported schema`
+    )
   }
   return record as SessionStateBriefSnapshot
 }
@@ -163,7 +166,9 @@ export function workerSessionStateBriefFromSnapshot({
       snapshot.message ?? "Supervisor session state brief is initializing."
     )
   } else if (snapshot.refreshStatus === "failed" && snapshot.lastError) {
-    outputWarnings.push(`Supervisor session state brief refresh failed: ${snapshot.lastError}`)
+    outputWarnings.push(
+      `Supervisor session state brief refresh failed: ${snapshot.lastError}`
+    )
   }
   return {
     schemaVersion: 1,
@@ -183,7 +188,9 @@ export function workerSessionStateBriefFromSnapshot({
     lastError: snapshot?.lastError ?? null,
     message:
       snapshot?.message ??
-      (snapshot ? null : "Supervisor session state brief is not available yet."),
+      (snapshot
+        ? null
+        : "Supervisor session state brief is not available yet."),
     warnings: outputWarnings,
     session: brief?.session ?? null,
     campaign: brief?.campaign ?? {
@@ -195,7 +202,6 @@ export function workerSessionStateBriefFromSnapshot({
     activeHypotheses: brief?.activeHypotheses ?? [],
     latestExperiments: brief?.latestExperiments ?? [],
     bestExperiment: brief?.bestExperiment ?? null,
-    summaries: brief?.summaries ?? [],
     knowledge: brief?.knowledge ?? [],
     updatedAt: brief?.updatedAt ?? null,
     stop:
