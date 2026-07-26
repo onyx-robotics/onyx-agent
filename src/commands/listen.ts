@@ -38,7 +38,7 @@ const ACTIVE_WINDOW_MS = 2 * 60_000
 const IDLE_REBUILD_EVERY = 4
 // Remote experiment poll cadence: logged experiments live in the Onyx API
 // (local files only hold unlogged attempt manifests), so the table refreshes
-// from remote projections — eagerly while live, gently while idle.
+// from authoritative remote reads — eagerly while live, gently while idle.
 const REMOTE_POLL_ACTIVE_MS = 5_000
 const REMOTE_POLL_IDLE_MS = 30_000
 // Experiments shown are the table tail; cap the pages fetched per refresh.
@@ -50,7 +50,7 @@ const REMOTE_FETCH_TIMEOUT_MS = 10_000
 type RemoteExperimentCache = {
   campaignId: string | null
   rows: LocalResearchHistoryRecord[]
-  /** Campaign best projection from the overview — the fetched page window
+  /** Campaign best value from the overview — the fetched page window
    * can miss the best experiment on large campaigns. */
   bestValue: number | null
   fetchedAt: number
@@ -58,7 +58,7 @@ type RemoteExperimentCache = {
 }
 
 /**
- * Fetches the campaign's logged experiments and best projection from the
+ * Fetches the campaign's logged experiments and computed best value from the
  * Onyx API. Returns null on any failure (offline, expired key, missing
  * campaign) so the caller keeps rendering the previous rows — listen
  * degrades, it never crashes.
@@ -214,7 +214,7 @@ async function buildModel(
     )
   )
 
-  // Logged experiments come from the Onyx API projection; ascending so the
+  // Logged experiments come from the Onyx API; ascending so the
   // most recent experiment renders at the bottom of the table. Copy before
   // sorting/pushing so the cached array stays untouched.
   const rows = (
@@ -280,9 +280,9 @@ async function buildModel(
         metricDirection === "minimize" ? Infinity : -Infinity
       )
     : null
-  // Combine the campaign's best projection (covers experiments beyond the
+  // Combine the campaign's computed best (covers experiments beyond the
   // fetched page window) with the locally computed best (covers unlogged
-  // attempts the projection cannot know about).
+  // attempts the remote read cannot know about).
   const bestCandidates = [computedBest, remote.bestValue].filter(
     (value): value is number => value !== null
   )

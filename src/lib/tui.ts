@@ -291,7 +291,6 @@ export type ListenModel = {
     tripped: boolean
     threshold: number
     count: number
-    acceptedExperimentCount?: number
   } | null
   workers?: ListenWorkerRow[]
   /** Desired worker capacity — slot rows render 1..workerTarget. */

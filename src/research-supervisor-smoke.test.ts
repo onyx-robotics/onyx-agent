@@ -419,6 +419,7 @@ function installSupervisorApi({
         progress: {
           experimentTarget: 1,
           acceptedExperimentCount,
+          receivedExperimentCount,
           remainingExperimentCount: Math.max(0, 1 - acceptedExperimentCount),
           deadlineAt: null,
           terminalReason: runningSession.terminalReason,
@@ -453,6 +454,7 @@ function installSupervisorApi({
         progress: {
           experimentTarget: 1,
           acceptedExperimentCount,
+          receivedExperimentCount,
           remainingExperimentCount: Math.max(0, 1 - acceptedExperimentCount),
           deadlineAt: null,
           terminalReason: terminal ? "experiment_target_reached" : null,
@@ -479,6 +481,18 @@ function installSupervisorApi({
       if (leaseMode === "no_slots") {
         terminal = true
         data = {
+          context: {
+            session: runningSession,
+            campaign: currentCampaign,
+            project: {
+              id: PROJECT_ID,
+              name: "Smoke project",
+              repositoryUrl: "https://github.com/onyx/smoke",
+              repositoryFullName: "onyx/smoke",
+              defaultBranch: "main",
+              projectPath: "",
+            },
+          },
           grants: [],
           unavailable: (body?.workers ?? []).map(
             (requested: { workerRef: string; workerName: string }) => ({
@@ -514,30 +528,32 @@ function installSupervisorApi({
               leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
               assignment: currentAssignment,
               hypothesis: currentHypothesis,
-              session: runningSession,
-              campaign: currentCampaign,
-              project: {
-                id: PROJECT_ID,
-                name: "Smoke project",
-                repositoryUrl: "https://github.com/onyx/smoke",
-                repositoryFullName: "onyx/smoke",
-                defaultBranch: "main",
-                projectPath: "",
-              },
               existing: false,
             }
           }
         )
         data = {
+          context: {
+            session: runningSession,
+            campaign: currentCampaign,
+            project: {
+              id: PROJECT_ID,
+              name: "Smoke project",
+              repositoryUrl: "https://github.com/onyx/smoke",
+              repositoryFullName: "onyx/smoke",
+              defaultBranch: "main",
+              projectPath: "",
+            },
+          },
           grants,
           unavailable: [],
           capacity: {
             workerTarget,
-            occupied: 0,
+            occupied: leasedWorkers.length,
             requested: body?.workers?.length ?? 0,
             granted: grants.length,
             existing: 0,
-            openSlots: workerTarget,
+            openSlots: Math.max(0, workerTarget - leasedWorkers.length),
           },
         }
       }

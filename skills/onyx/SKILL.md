@@ -36,6 +36,8 @@ Every run creates a new remote session. Never resume or attach to an old session
 
 The command validates the committed setup and fingerprint inputs, snapshots hypothesis assignments, starts a detached supervisor, and prints its session ID, PID, log, status, and listen commands. Use `--json` for orchestration and `--foreground` only for debugging.
 
+Reports are delivered independently and normally appear first as `received`. A small server settler assigns accepted indexes in receipt order. The supervisor nudges settlement with jitter while the session is open; accepted progress is authoritative, while received progress only shows the short settlement backlog. At an exact experiment target, overflow work is retained as discarded diagnostics and never enters rankings.
+
 - Monitor: `onyx research status`, `onyx research status --json`, `onyx listen`, and the web campaign page.
 - Scale: `onyx research scale --workers <n> --session <id>`. Scale-down drains existing workers; use stop instead of zero.
 - Stop: `onyx research stop --session <id>`. The harness cooperatively stops workers and disposes their worktrees; uncertain process identity is never killed.
@@ -47,6 +49,6 @@ Evaluator changes remain in the campaign but create a separate evaluation revisi
 
 Workers use `ONYX_PROJECT_ROOT` as their source-editing root and `onyx-worker research session-state-brief --json` for routine session, assignment, stop, knowledge, and progress context. They must not ask the user questions, launch agents, use the full control-plane CLI, or mutate protected setup paths/runtime files.
 
-For each attempt, a worker runs `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, makes exactly one scoped clean commit, resumes with `onyx-worker exp run --resume --auto`, and reports with `onyx-worker exp log`. It publishes useful reusable knowledge when appropriate. Git holds immutable experiment commits/refs; Supabase owns session settlement, accepted indexes, projections, and provenance.
+For each attempt, a worker runs `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, makes exactly one scoped clean commit, resumes with `onyx-worker exp run --resume --auto`, and reports with `onyx-worker exp log`. A `recorded` response means delivery succeeded; the worker does not wait for acceptance. It publishes useful reusable knowledge when appropriate. Git holds immutable experiment commits/refs; Supabase owns session settlement, accepted indexes, experiment facts, and provenance. Best results and summary counts are computed from indexed experiment facts when read.
 
 The harness monitors server cutoffs and assignment cancellation, gives cooperative stop grace, then terminates the provider. Workers use detached disposable worktrees and never create worker branches. Teardown may deliver exactly one already-terminal measured attempt, but it never commits, measures, or reports scratch work. Partial work is retained only as bounded terminal telemetry with stable reason, provider-exit, delivery, and cleanup outcomes, and a fresh worker starts clean; server settlement remains authoritative for late reports. Monitor systemic replacement loops through the no-progress breaker in `onyx research status` or `onyx listen`.

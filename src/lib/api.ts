@@ -236,10 +236,13 @@ export type ApiHypothesis = {
   name: string
   description: string | null
   status: "active" | "closed"
-  /** Assignment bases and revision projections supersede these local fallbacks. */
+  /** Assignment bases supersede this local-only fallback. */
   baseCommitSha: string
+  summaryEvaluationRevisionId: string | null
   bestExperimentId: string | null
   bestMetricValue: number | null
+  bestCommitSha: string | null
+  experimentCount: number
   lastWorkedAt: string | null
   plan: ResearchHypothesisPlan
   metadata: Record<string, unknown>
@@ -304,6 +307,7 @@ export type ApiSessionLive = {
   progress: {
     experimentTarget: number | null
     acceptedExperimentCount: number
+    receivedExperimentCount: number
     remainingExperimentCount: number | null
     deadlineAt: string | null
     endedAt: string | null
@@ -390,6 +394,7 @@ export type ApiSessionControlState = {
   progress: {
     experimentTarget: number | null
     acceptedExperimentCount: number
+    receivedExperimentCount: number
     remainingExperimentCount: number | null
     deadlineAt: string | null
     endedAt: string | null
@@ -460,8 +465,13 @@ export type ApiWorkerLease = {
 }
 
 export type ApiWorkerLeaseBatch = {
+  context: {
+    session: ApiSession
+    campaign: ApiCampaign
+    project: ApiProject
+  }
   grants: Array<
-    ApiWorkerLease & {
+    Omit<ApiWorkerLease, "session" | "campaign" | "project"> & {
       workerRef: string
       existing: boolean
     }
@@ -469,7 +479,7 @@ export type ApiWorkerLeaseBatch = {
   unavailable: Array<{
     workerRef: string
     workerName: string
-    code: "no_worker_slots" | "worker_ref_terminal"
+    code: "no_worker_slots" | "settlement_pending" | "worker_ref_terminal"
     message: string
   }>
   capacity: {
@@ -862,10 +872,13 @@ function normalizeResearchResponse(value: unknown): unknown {
     typeof normalized.plan === "object" &&
     (normalized.status === "active" || normalized.status === "closed")
   ) {
-    normalized.baseCommitSha = ""
-    normalized.bestExperimentId = null
-    normalized.bestMetricValue = null
-    normalized.lastWorkedAt = null
+    normalized.baseCommitSha ??= ""
+    normalized.summaryEvaluationRevisionId ??= null
+    normalized.bestExperimentId ??= null
+    normalized.bestMetricValue ??= null
+    normalized.bestCommitSha ??= null
+    normalized.experimentCount ??= 0
+    normalized.lastWorkedAt ??= null
   }
   return normalized
 }
@@ -1336,16 +1349,12 @@ export async function getResearchSessionControlState(
 
 export async function settleResearchSession(
   sessionId: string,
-  args?: Args,
-  options: { mode?: "try" | "blocking" } = {}
+  args?: Args
 ): Promise<ApiSessionControlState> {
-  const params = new URLSearchParams()
-  if (options.mode) params.set("mode", options.mode)
-  const suffix = params.size > 0 ? `?${params.toString()}` : ""
   return apiData<ApiSessionControlState>(
     await callApi(
       "POST",
-      `/api/v1/research/sessions/${sessionId}/settle${suffix}`,
+      `/api/v1/research/sessions/${sessionId}/settle`,
       {},
       args
     )
@@ -1413,28 +1422,6 @@ export async function verifyResearchCampaignGit(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/verify-git${suffix}`,
       {},
-      args
-    )
-  )
-}
-
-export async function registerCampaignWorker(
-  campaignId: string,
-  body: {
-    sessionId?: string
-    hypothesisId: string
-    workerName: string
-    agentKind?: string
-    runtime?: "local" | "hosted"
-    metadata?: Record<string, unknown>
-  },
-  args?: Args
-): Promise<ApiWorker> {
-  return apiData<ApiWorker>(
-    await callApi(
-      "POST",
-      `/api/v1/research/campaigns/${campaignId}/workers`,
-      body,
       args
     )
   )

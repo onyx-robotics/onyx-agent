@@ -720,6 +720,12 @@ export const researchHypothesisSchema = z.object({
   description: z.string().nullable(),
   status: researchHypothesisStatusSchema,
   plan: researchHypothesisPlanSchema,
+  summaryEvaluationRevisionId: z.uuid().nullable(),
+  bestExperimentId: z.uuid().nullable(),
+  bestMetricValue: z.number().finite().nullable(),
+  bestCommitSha: z.string().nullable(),
+  experimentCount: z.number().int().nonnegative(),
+  lastWorkedAt: z.iso.datetime().nullable(),
   metadata: metadataSchema,
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -778,16 +784,6 @@ export const researchWorkerSchema = z.object({
   metadata: metadataSchema,
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
-})
-
-export const registerResearchWorkerRequestSchema = z.object({
-  sessionId: z.uuid(),
-  assignmentId: z.uuid(),
-  hypothesisId: z.uuid(),
-  workerName: z.string().trim().min(1).max(160),
-  agentKind: z.string().trim().min(1).max(80).default("codex"),
-  runtime: researchWorkerRuntimeSchema.default("local"),
-  metadata: metadataSchema.default({}),
 })
 
 export const researchWorkerHeartbeatSchema = z.object({
@@ -1027,9 +1023,12 @@ export const listResearchCampaignsResponseSchema = z.object({
 
 export const createResearchCampaignExperimentResponseSchema = z.object({
   data: z.object({
-    outcome: z.enum(["recorded", "duplicate"]),
+    outcome: z
+      .enum(["recorded", "duplicate"])
+      .describe(
+        "Delivery outcome. A newly recorded report normally has disposition received; workers must not wait for acceptance."
+      ),
     experiment: researchCampaignExperimentSchema,
-    session: researchSessionSchema.nullable(),
   }),
 })
 
@@ -1483,10 +1482,13 @@ export const researchLiveWorkerSummarySchema = z.object({
 export const researchSessionProgressSchema = z.object({
   experimentTarget: z.number().int().positive().nullable(),
   acceptedExperimentCount: z.number().int().nonnegative(),
+  receivedExperimentCount: z.number().int().nonnegative().default(0),
   remainingExperimentCount: z.number().int().nonnegative().nullable(),
   deadlineAt: z.iso.datetime().nullable(),
+  cutoffAt: z.iso.datetime().nullable().optional(),
   endedAt: z.iso.datetime().nullable(),
   endReason: researchSessionEndReasonSchema.nullable(),
+  asOf: z.iso.datetime().optional(),
 })
 
 export const researchSessionStateBriefResponseSchema = z.object({
@@ -1541,10 +1543,6 @@ export const researchSessionControlStateResponseSchema = z.object({
     assignments: z.array(researchSessionHypothesisAssignmentSchema),
     updatedAt: z.iso.datetime(),
   }),
-})
-
-export const settleResearchSessionQuerySchema = z.object({
-  mode: z.enum(["try", "blocking"]).default("blocking"),
 })
 
 export const createResearchSessionResponseSchema = z.object({
@@ -1604,10 +1602,6 @@ export const getResearchEvaluationRevisionResponseSchema = z.object({
   data: researchEvaluationRevisionSchema,
 })
 
-export const registerResearchWorkerResponseSchema = z.object({
-  data: researchWorkerSchema,
-})
-
 export const acquireResearchWorkerLeaseResponseSchema = z.object({
   data: z.object({
     worker: researchWorkerSchema,
@@ -1623,6 +1617,11 @@ export const acquireResearchWorkerLeaseResponseSchema = z.object({
 
 export const acquireResearchWorkerLeaseBatchResponseSchema = z.object({
   data: z.object({
+    context: z.object({
+      session: researchSessionSchema,
+      campaign: researchCampaignSchema,
+      project: researchProjectSchema,
+    }),
     grants: z.array(
       z.object({
         workerRef: z.string().min(1),
@@ -1631,9 +1630,6 @@ export const acquireResearchWorkerLeaseBatchResponseSchema = z.object({
         leaseExpiresAt: z.iso.datetime(),
         assignment: researchSessionHypothesisAssignmentSchema,
         hypothesis: researchHypothesisSchema,
-        session: researchSessionSchema,
-        campaign: researchCampaignSchema,
-        project: researchProjectSchema,
         existing: z.boolean().default(false),
       })
     ),
@@ -1641,7 +1637,11 @@ export const acquireResearchWorkerLeaseBatchResponseSchema = z.object({
       z.object({
         workerRef: z.string().min(1),
         workerName: z.string().min(1),
-        code: z.enum(["no_worker_slots", "worker_ref_terminal"]),
+        code: z.enum([
+          "no_worker_slots",
+          "settlement_pending",
+          "worker_ref_terminal",
+        ]),
         message: z.string().min(1),
       })
     ),
@@ -1825,21 +1825,8 @@ export const researchCampaignGraphResponseSchema = z.object({
   }),
 })
 
-export const reconcileResearchCampaignQuerySchema = z.object({
+export const verifyResearchCampaignGitQuerySchema = z.object({
   gitVerifyLimit: z.coerce.number().int().min(1).max(500).default(100),
-})
-
-export const reconcileResearchCampaignResponseSchema = z.object({
-  data: z.object({
-    campaign: researchCampaignSchema,
-    hypotheses: z.array(researchHypothesisSchema),
-    workers: z.array(researchWorkerSchema),
-    // Deltas: only the experiments this reconcile pass touched (git-status
-    // repairs), not a full campaign reload. Full lists come from the
-    // paginated experiments endpoint.
-    experiments: z.array(researchCampaignExperimentSchema),
-    gitVerification: researchCampaignGitVerificationCountsSchema,
-  }),
 })
 
 export const verifyResearchCampaignGitResponseSchema = z.object({
@@ -2114,12 +2101,6 @@ export type ListResearchKnowledgeResponse = z.infer<
   typeof listResearchKnowledgeResponseSchema
 >
 export type ResearchWorker = z.infer<typeof researchWorkerSchema>
-export type RegisterResearchWorkerRequest = z.infer<
-  typeof registerResearchWorkerRequestSchema
->
-export type RegisterResearchWorkerResponse = z.infer<
-  typeof registerResearchWorkerResponseSchema
->
 export type AcquireResearchWorkerLeaseRequest = z.infer<
   typeof acquireResearchWorkerLeaseRequestSchema
 >
@@ -2175,9 +2156,6 @@ export type ResearchSessionLiveResponse = z.infer<
 export type ResearchSessionControlStateResponse = z.infer<
   typeof researchSessionControlStateResponseSchema
 >
-export type SettleResearchSessionQuery = z.infer<
-  typeof settleResearchSessionQuerySchema
->
 export type ResearchCodeAccess = z.infer<typeof researchCodeAccessSchema>
 export type ResearchCampaignFileTreeResponse = z.infer<
   typeof researchCampaignFileTreeResponseSchema
@@ -2194,11 +2172,8 @@ export type ResearchCampaignExperimentCodeResponse = z.infer<
 export type ResearchCampaignGraphResponse = z.infer<
   typeof researchCampaignGraphResponseSchema
 >
-export type ReconcileResearchCampaignQuery = z.infer<
-  typeof reconcileResearchCampaignQuerySchema
->
-export type ReconcileResearchCampaignResponse = z.infer<
-  typeof reconcileResearchCampaignResponseSchema
+export type VerifyResearchCampaignGitQuery = z.infer<
+  typeof verifyResearchCampaignGitQuerySchema
 >
 export type VerifyResearchCampaignGitResponse = z.infer<
   typeof verifyResearchCampaignGitResponseSchema
@@ -2302,6 +2277,16 @@ export const researchSessionUpsertedEventSchema = z.object({
   }),
 })
 
+export const researchSessionProgressInvalidatedEventSchema = z.object({
+  type: z.literal("research.session.progress.invalidated"),
+  data: z.object({
+    projectId: z.uuid(),
+    campaignId: z.uuid(),
+    sessionId: z.uuid(),
+    asOf: z.iso.datetime(),
+  }),
+})
+
 export const researchSessionLiveChangedEventSchema = z.object({
   type: z.literal("research.session.live.changed"),
   data: z.object({
@@ -2327,6 +2312,7 @@ export const researchEventSchema = z.discriminatedUnion("type", [
   researchWorkerUpsertedEventSchema,
   researchWorkersUpsertedEventSchema,
   researchSessionUpsertedEventSchema,
+  researchSessionProgressInvalidatedEventSchema,
   researchSessionLiveChangedEventSchema,
 ])
 
@@ -2359,6 +2345,9 @@ export type ResearchWorkersUpsertedEvent = z.infer<
 >
 export type ResearchSessionUpsertedEvent = z.infer<
   typeof researchSessionUpsertedEventSchema
+>
+export type ResearchSessionProgressInvalidatedEvent = z.infer<
+  typeof researchSessionProgressInvalidatedEventSchema
 >
 export type ResearchSessionLiveChangedEvent = z.infer<
   typeof researchSessionLiveChangedEventSchema

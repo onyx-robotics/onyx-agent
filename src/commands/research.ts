@@ -1283,9 +1283,11 @@ function createPresenceSupervisor({
     return running
   }
 
+  const jitteredIntervalMs =
+    intervalMs + Math.floor(Math.random() * Math.max(1, intervalMs * 0.2))
   timer = setInterval(() => {
     if (!stopped) void run()
-  }, intervalMs)
+  }, jitteredIntervalMs)
 
   return {
     request() {
@@ -2099,7 +2101,8 @@ export function createResearchSessionStopChecker({
   assignmentId,
   args,
   settleBeforeCheck = false,
-  settlementNudgeIntervalMs = 5_000,
+  settlementNudgeIntervalMs = 1_000,
+  controlPollIntervalMs = 1_000,
 }: {
   root: string
   sessionId: string
@@ -2107,20 +2110,31 @@ export function createResearchSessionStopChecker({
   args: Args
   settleBeforeCheck?: boolean
   settlementNudgeIntervalMs?: number
+  controlPollIntervalMs?: number
 }) {
-  let lastSettlementNudgeMs = 0
+  let nextSettlementNudgeMs = 0
+  let nextControlPollMs = 0
+  let cachedResult: ResearchStopCheck | null = null
   return {
     async check({ nowMs = Date.now() }: { nowMs?: number } = {}) {
+      if (cachedResult && nowMs < nextControlPollMs) return cachedResult
+      nextControlPollMs =
+        nowMs +
+        controlPollIntervalMs +
+        Math.floor(Math.random() * Math.max(1, controlPollIntervalMs * 0.25))
       try {
-        const shouldNudge =
-          settleBeforeCheck &&
-          nowMs - lastSettlementNudgeMs >= settlementNudgeIntervalMs
+        const shouldNudge = settleBeforeCheck && nowMs >= nextSettlementNudgeMs
         let control: Awaited<ReturnType<typeof getResearchSessionControlState>>
         if (shouldNudge) {
-          lastSettlementNudgeMs = nowMs
-          control = await settleResearchSession(sessionId, args, {
-            mode: "try",
-          }).catch(() => getResearchSessionControlState(sessionId, args))
+          nextSettlementNudgeMs =
+            nowMs +
+            settlementNudgeIntervalMs +
+            Math.floor(
+              Math.random() * Math.max(1, settlementNudgeIntervalMs * 0.25)
+            )
+          control = await settleResearchSession(sessionId, args).catch(() =>
+            getResearchSessionControlState(sessionId, args)
+          )
         } else {
           control = await getResearchSessionControlState(sessionId, args)
         }
@@ -2158,13 +2172,14 @@ export function createResearchSessionStopChecker({
         ) {
           add("stop_requested", "hypothesis assignment canceled")
         }
-        return {
+        cachedResult = {
           shouldStop: reasons.length > 0,
           sessionId,
           reasonCodes: [...reasonCodes],
           reasons,
           controlState: control,
         }
+        return cachedResult
       } catch {
         return collectResearchStopReasons({
           root,
@@ -2998,7 +3013,7 @@ async function runHypothesisOnce({
             },
             cancel: {
               graceMs: stopGraceMs,
-              pollMs: 5000,
+              pollMs: 5000 + Math.floor(Math.random() * 1250),
               shouldCancel: () =>
                 harnessShouldStopSession({ checker: stopChecker }),
             },
@@ -3486,14 +3501,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
         before?.session.experimentTarget ??
         state.sessions[sessionId]?.experimentTarget ??
         null,
-      acceptedExperimentCount:
-        before?.session.acceptedExperimentCount ??
-        state.sessions[sessionId]?.acceptedExperimentCount ??
-        0,
-      remainingExperimentCount:
-        before?.session.remainingExperimentCount ??
-        state.sessions[sessionId]?.remainingExperimentCount ??
-        null,
       schedulerSiteId:
         before?.session.schedulerSiteId ??
         state.sessions[sessionId]?.schedulerSiteId ??
@@ -3704,6 +3711,9 @@ export async function commandResearchStatus(args: Args) {
     )
   }
   const state = await readState(root)
+  const remoteSessionsById = new Map(
+    freshOverview.sessions.map((session) => [session.id, session])
+  )
   const locallyOwnedOpenSessions = Object.entries(state.sessions ?? {})
     .filter(
       ([, session]) =>
@@ -3712,7 +3722,22 @@ export async function commandResearchStatus(args: Args) {
           session.status === "stop_requested" ||
           session.stopPendingRemote === true)
     )
-    .map(([id, session]) => ({ id, ...session }))
+    .map(([id, session]) => {
+      const remote = remoteSessionsById.get(id)
+      return {
+        id,
+        campaignName: session.campaignName,
+        campaignId: session.campaignId,
+        status: remote?.status ?? session.status,
+        experimentTarget: remote?.experimentTarget ?? session.experimentTarget,
+        acceptedExperimentCount: remote?.acceptedExperimentCount ?? null,
+        remainingExperimentCount: remote?.remainingExperimentCount ?? null,
+        deadlineAt: remote?.deadlineAt ?? session.deadlineAt,
+        schedulerSiteId: remote?.schedulerSiteId ?? session.schedulerSiteId,
+        providerBackoff: session.providerBackoff ?? null,
+        supervisor: session.supervisor ?? null,
+      }
+    })
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   const scopeAll = args.options["all-sessions"] === "true"
@@ -5810,9 +5835,6 @@ export async function commandResearchRun(args: Args) {
     campaignId: campaign.id,
     deadlineAt,
     experimentTarget,
-    acceptedExperimentCount: 0,
-    remainingExperimentCount:
-      experimentTarget === null ? null : Math.max(0, experimentTarget - 0),
     schedulerSiteId,
     status: "running",
   }
@@ -5897,7 +5919,9 @@ export async function commandResearchRun(args: Args) {
   let providerBackoffLogged = false
   let recentProviderFailures: ProviderLaunchFailure[] = []
   const noProgressThreshold = Math.max(3, Math.min(workerTarget, 20))
-  let acceptedExperimentCount = 0
+  // Monotonic cache of the authoritative server cursor, used only between
+  // control polls. This is not a locally produced progress counter.
+  let observedAcceptedExperimentCount = 0
   let noProgressWorkerExitCount = 0
   let recentNoProgressExits: NoProgressWorkerExit[] = []
   let noProgressBreakerTripped = false
@@ -5993,7 +6017,6 @@ export async function commandResearchRun(args: Args) {
                 tripped: noProgressBreakerTripped,
                 threshold: noProgressThreshold,
                 count: noProgressWorkerExitCount,
-                acceptedExperimentCount,
                 recentFailures: recentNoProgressExits,
               }
             : options.noProgressBreaker,
@@ -6104,9 +6127,9 @@ export async function commandResearchRun(args: Args) {
       if (controlState?.status && controlState.status !== "running") break
       const observedAccepted =
         controlState?.progress.acceptedExperimentCount ??
-        acceptedExperimentCount
-      if (observedAccepted > acceptedExperimentCount) {
-        acceptedExperimentCount = observedAccepted
+        observedAcceptedExperimentCount
+      if (observedAccepted > observedAcceptedExperimentCount) {
+        observedAcceptedExperimentCount = observedAccepted
         noProgressWorkerExitCount = 0
         recentNoProgressExits = []
       }
@@ -6224,7 +6247,11 @@ export async function commandResearchRun(args: Args) {
           }
         }
 
-        const grants = leaseBatch?.grants ?? []
+        const grants: ApiWorkerLease[] =
+          leaseBatch?.grants.map((grant) => ({
+            ...grant,
+            ...leaseBatch.context,
+          })) ?? []
         for (const grant of grants) {
           leaseTokensByWorkerId.set(grant.worker.id, grant.leaseToken)
         }
@@ -6249,7 +6276,7 @@ export async function commandResearchRun(args: Args) {
           await cacheResearchSessionState({
             root,
             campaign,
-            session: grants[0]!.session,
+            session: leaseBatch!.context.session,
             hypotheses: [...hypothesesById.values()],
             workers: [...workersById.values()],
           }).catch(() => {})
@@ -6264,7 +6291,7 @@ export async function commandResearchRun(args: Args) {
           const runKey = `${Date.now()}:${launched}:${grant.worker.id}`
           const slotIndex = lowestFreeSlot(activeSlotsByRunKey.values())
           activeSlotsByRunKey.set(runKey, slotIndex)
-          const acceptedAtLaunch = acceptedExperimentCount
+          const acceptedAtLaunch = observedAcceptedExperimentCount
           const run = runHypothesisOnce({
             root,
             projectPath: effectiveProjectPath,
@@ -6413,9 +6440,9 @@ export async function commandResearchRun(args: Args) {
                 ).catch(() => null)
                 const latestAccepted =
                   latestControl?.progress.acceptedExperimentCount ??
-                  acceptedExperimentCount
-                if (latestAccepted > acceptedExperimentCount) {
-                  acceptedExperimentCount = latestAccepted
+                  observedAcceptedExperimentCount
+                if (latestAccepted > observedAcceptedExperimentCount) {
+                  observedAcceptedExperimentCount = latestAccepted
                   noProgressWorkerExitCount = 0
                   recentNoProgressExits = []
                 }
@@ -6508,9 +6535,12 @@ export async function commandResearchRun(args: Args) {
           )
         }
         if (activeRuns.size > 0) {
-          await Promise.race([...activeRuns.values(), sleep(2000)])
+          await Promise.race([
+            ...activeRuns.values(),
+            sleep(2000 + Math.floor(Math.random() * 500)),
+          ])
         } else {
-          await sleep(3000)
+          await sleep(3000 + Math.floor(Math.random() * 750))
         }
       }
     }
@@ -6550,7 +6580,6 @@ export async function commandResearchRun(args: Args) {
       tripped: noProgressBreakerTripped,
       threshold: noProgressThreshold,
       count: noProgressWorkerExitCount,
-      acceptedExperimentCount,
       recentFailures: recentNoProgressExits,
     },
     finalizationReasons: [],

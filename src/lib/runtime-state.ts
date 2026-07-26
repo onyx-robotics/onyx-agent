@@ -53,8 +53,6 @@ export type CliState = {
       campaignId?: string
       deadlineAt?: string | null
       experimentTarget?: number | null
-      acceptedExperimentCount?: number
-      remainingExperimentCount?: number | null
       schedulerSiteId?: string | null
       stopRequested?: boolean
       stopPendingRemote?: boolean
@@ -128,7 +126,6 @@ export type CliState = {
           tripped: boolean
           threshold: number
           count: number
-          acceptedExperimentCount: number
           recentFailures: Array<{
             at: string
             workerId: string | null

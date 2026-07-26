@@ -156,6 +156,7 @@ function makeSessionStateBrief(): ApiSessionStateBrief {
     progress: {
       experimentTarget: 100,
       acceptedExperimentCount: 7,
+      receivedExperimentCount: 0,
       remainingExperimentCount: 93,
       deadlineAt: null,
       endedAt: null,
