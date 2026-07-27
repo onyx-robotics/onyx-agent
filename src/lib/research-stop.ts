@@ -149,29 +149,31 @@ export async function collectLocalResearchStopReasons({
       : snapshot
   const brief = resolvedSnapshot?.brief ?? null
   if (brief) {
-    controlState = {
+    const derivedControlState: ApiSessionControlState = {
       sessionId,
+      campaignStatus: brief.campaign.status,
       status: brief.session.status,
-      runtimeState: brief.session.status === "running" ? "active" : "ended",
+      runtimeState: brief.session.runtimeState,
       finalizationStatus: brief.session.finalizationStatus,
       canceledAssignmentIds: [],
       progress: brief.progress,
       launch: {
         activeWorkerCount: 0,
-        workerTarget: brief.session.workerTarget ?? 0,
+        workerTarget: brief.session.workerTarget,
         openWorkerSlotCount: 0,
-        activeHypothesisCount: brief.activeHypotheses.length,
+        activeHypothesisCount: brief.peerHypothesisCount,
         acceptingExperiments: brief.session.status === "running",
       },
       finalization: {
         status: brief.session.finalizationStatus,
         reasons: [],
-        terminalReason: brief.session.terminalReason,
+        terminalReason: brief.session.endReason,
       },
       updatedAt: brief.updatedAt,
     }
+    controlState = derivedControlState
     addControlStateReasons({
-      control: controlState,
+      control: derivedControlState,
       nowMs,
       reasonCodes,
       reasons,

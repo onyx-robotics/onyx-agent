@@ -47,7 +47,7 @@ Evaluator changes remain in the campaign but create a separate evaluation revisi
 
 ## Worker contract
 
-Workers use `ONYX_PROJECT_ROOT` as their source-editing root and `onyx-worker research session-state-brief --json` for routine session, assignment, stop, knowledge, and progress context. They must not ask the user questions, launch agents, use the full control-plane CLI, or mutate protected setup paths/runtime files.
+Workers use `ONYX_PROJECT_ROOT` as their source-editing root and `onyx-worker research session-state-brief --json` for their single bounded routine context. The brief contains complete immutable assigned-hypothesis guidance, concise peer and accepted-result summaries, complete selected knowledge items, stop guidance, and progress; workers can use explicit list commands for deeper history. They must not ask the user questions, launch agents, use the full control-plane CLI, or mutate protected setup paths/runtime files.
 
 For each attempt, a worker runs `onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto`, makes exactly one scoped clean commit, resumes with `onyx-worker exp run --resume --auto`, and reports with `onyx-worker exp log`. A `recorded` response means delivery succeeded; the worker does not wait for acceptance. It publishes useful reusable knowledge when appropriate. Git holds immutable experiment commits/refs; Supabase owns session settlement, accepted indexes, experiment facts, and provenance. Best results and summary counts are computed from indexed experiment facts when read.
 

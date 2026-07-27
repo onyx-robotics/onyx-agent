@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { request } from "node:http"
 
 import { waitForCliLogin } from "./lib/login"
 
@@ -24,13 +25,30 @@ const validParams = {
 async function waitForListen(port: number) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     try {
-      await fetch(`http://127.0.0.1:${port}/`, { method: "HEAD" })
+      await localRequest(`http://127.0.0.1:${port}/`, "HEAD")
       return
     } catch {
       await new Promise((resolve) => setTimeout(resolve, 20))
     }
   }
   throw new Error(`Callback server on port ${port} never started listening.`)
+}
+
+function localRequest(url: string, method = "GET") {
+  return new Promise<{ status: number; text: string }>((resolve, reject) => {
+    const outgoing = request(url, { method }, (response) => {
+      const chunks: Buffer[] = []
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)))
+      response.on("end", () =>
+        resolve({
+          status: response.statusCode ?? 0,
+          text: Buffer.concat(chunks).toString("utf8"),
+        })
+      )
+    })
+    outgoing.on("error", reject)
+    outgoing.end()
+  })
 }
 
 describe("waitForCliLogin callback server", () => {
@@ -44,15 +62,15 @@ describe("waitForCliLogin callback server", () => {
     })
     await waitForListen(port)
 
-    const first = await fetch(callbackUrl(port, validParams))
+    const first = await localRequest(callbackUrl(port, validParams))
     expect(first.status).toBe(200)
-    expect(await first.text()).toContain("login complete")
+    expect(first.text).toContain("login complete")
 
     // A browser replay (retry, duplicate submit, refresh) inside the linger
     // window must land on the success page, not a refused connection.
-    const replay = await fetch(callbackUrl(port, validParams))
+    const replay = await localRequest(callbackUrl(port, validParams))
     expect(replay.status).toBe(200)
-    expect(await replay.text()).toContain("login complete")
+    expect(replay.text).toContain("login complete")
 
     const result = await login
     expect(result.teamId).toBe("team-1")
@@ -75,7 +93,7 @@ describe("waitForCliLogin callback server", () => {
     ).rejects.toThrow(/already in use/)
 
     // Release the holder so the test suite exits cleanly.
-    const release = await fetch(
+    const release = await localRequest(
       callbackUrl(port, { ...validParams, state: "holder" })
     )
     expect(release.status).toBe(200)
@@ -91,11 +109,15 @@ describe("waitForCliLogin callback server", () => {
       lingerMs: 0,
     })
     await waitForListen(port)
+    const rejection = login.then(
+      () => null,
+      (error: Error) => error
+    )
 
-    const response = await fetch(
+    const response = await localRequest(
       callbackUrl(port, { ...validParams, state: "wrong" })
     )
     expect(response.status).toBe(400)
-    await expect(login).rejects.toThrow(/invalid state/)
+    expect((await rejection)?.message).toMatch(/invalid state/)
   })
 })

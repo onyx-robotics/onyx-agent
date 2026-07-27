@@ -497,7 +497,7 @@ describe("worker launchers", () => {
     await writeWorkerRuntimeContext({
       paths,
       context: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         campaignId: "campaign-id",
         campaignName: "campaign",
         sessionId: "session/one",
@@ -505,6 +505,29 @@ describe("worker launchers", () => {
         startingCommitSha: "abc123",
         hypothesisId: "hypothesis-id",
         hypothesisName: "hypothesis",
+        assignment: {
+          id: "assignment-id",
+          startingCommitSha: "abc123",
+          sourceExperimentId: null,
+        },
+        hypothesis: {
+          id: "hypothesis-id",
+          name: "hypothesis",
+          description: null,
+          status: "active",
+          plan: {
+            focus: "Test worker isolation",
+            statement: "The worker receives immutable hypothesis guidance.",
+            startingPoints: [],
+            avoidList: [],
+            successSignals: [],
+            giveUpSignals: [],
+          },
+          bestMetricValue: null,
+          bestCommitSha: null,
+          experimentCount: 0,
+          lastWorkedAt: null,
+        },
         workerId: "worker/one",
         workerLeaseToken: "lease-token",
         worktreeRoot: join(root, "worktree"),

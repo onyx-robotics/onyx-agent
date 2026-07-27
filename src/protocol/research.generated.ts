@@ -1194,9 +1194,7 @@ export const listResearchCampaignExperimentsQuerySchema = z.object({
   resultCommitSha: z.string().trim().min(1).max(80).optional(),
   runRef: z.string().trim().min(1).max(500).optional(),
   status: researchExperimentStatusSchema.optional(),
-  disposition: z
-    .union([researchExperimentDispositionSchema, z.literal("all")])
-    .default("accepted"),
+  disposition: z.literal("accepted").default("accepted"),
   order: z.enum(["asc", "desc"]).default("desc"),
 })
 
@@ -1491,17 +1489,75 @@ export const researchSessionProgressSchema = z.object({
   asOf: z.iso.datetime().optional(),
 })
 
+const researchSessionStateBriefSessionSchema = z.object({
+  id: z.uuid(),
+  name: z.string().min(1),
+  runtimeState: researchSessionRuntimeStateSchema,
+  status: z.enum(["running", "completed", "failed", "stopped"]),
+  finalizationStatus: z.enum(["running", "complete", "incomplete", "failed"]),
+  workerTarget: z.number().int().positive(),
+  deadlineAt: z.iso.datetime().nullable(),
+  endedAt: z.iso.datetime().nullable(),
+  endReason: researchSessionEndReasonSchema.nullable(),
+})
+
+const researchSessionStateBriefCampaignSchema = z.object({
+  id: z.uuid(),
+  name: z.string().min(1),
+  status: researchCampaignStatusSchema,
+  metricName: z.string().min(1),
+  metricUnit: z.string().nullable(),
+  metricDirection: researchMetricDirectionSchema,
+})
+
+const researchSessionStateBriefHypothesisSchema = z.object({
+  id: z.uuid(),
+  name: z.string().min(1),
+  status: researchHypothesisStatusSchema,
+  bestMetricValue: z.number().finite().nullable(),
+  bestCommitSha: z.string().nullable(),
+  experimentCount: z.number().int().nonnegative(),
+  lastWorkedAt: z.iso.datetime().nullable(),
+})
+
+const researchSessionStateBriefExperimentSchema = z.object({
+  id: z.uuid(),
+  hypothesisId: z.uuid(),
+  acceptedIndex: z.number().int().positive(),
+  name: z.string().min(1),
+  resultCommitSha: z.string().min(1),
+  primaryMetricName: z.string().min(1),
+  primaryMetricValue: z.number().finite().nullable(),
+  createdAt: z.iso.datetime(),
+})
+
+const researchSessionStateBriefKnowledgeSchema = z.object({
+  id: z.uuid(),
+  hypothesisId: z.uuid().nullable(),
+  experimentId: z.uuid().nullable(),
+  kind: researchKnowledgeKindSchema,
+  title: z.string().min(1),
+  body: z.string().min(1),
+  confidence: z.number().min(0).max(1).nullable(),
+  createdAt: z.iso.datetime(),
+})
+
 export const researchSessionStateBriefResponseSchema = z.object({
   data: z.object({
     generatedAt: z.iso.datetime(),
-    session: researchSessionSchema,
-    campaign: researchCampaignSchema,
-    project: researchProjectSchema,
+    session: researchSessionStateBriefSessionSchema,
+    campaign: researchSessionStateBriefCampaignSchema,
     progress: researchSessionProgressSchema,
-    latestExperiments: z.array(researchCampaignExperimentSummarySchema),
-    bestExperiment: researchCampaignExperimentSummarySchema.nullable(),
-    activeHypotheses: z.array(researchHypothesisSchema),
-    knowledge: z.array(researchKnowledgeSchema),
+    peerHypothesisCount: z.number().int().nonnegative(),
+    peerHypotheses: z.array(researchSessionStateBriefHypothesisSchema).max(10),
+    results: z.object({
+      latest: z.array(researchSessionStateBriefExperimentSchema).max(10),
+      best: researchSessionStateBriefExperimentSchema.nullable(),
+    }),
+    knowledge: z.object({
+      items: z.array(researchSessionStateBriefKnowledgeSchema).max(3),
+      hasMore: z.boolean(),
+    }),
     updatedAt: z.iso.datetime(),
   }),
 })
@@ -1531,7 +1587,10 @@ export const researchSessionLiveResponseSchema = z.object({
 export const researchSessionControlStateResponseSchema = z.object({
   data: z.object({
     sessionId: z.uuid(),
+    campaignStatus: researchCampaignStatusSchema,
     runtimeState: researchSessionRuntimeStateSchema,
+    status: z.enum(["running", "completed", "failed", "stopped"]),
+    finalizationStatus: z.enum(["running", "complete", "incomplete", "failed"]),
     progress: researchSessionProgressSchema,
     launch: z.object({
       activeWorkerCount: z.number().int().nonnegative(),
@@ -1541,6 +1600,11 @@ export const researchSessionControlStateResponseSchema = z.object({
       acceptingExperiments: z.boolean(),
     }),
     canceledAssignmentIds: z.array(z.uuid()),
+    finalization: z.object({
+      status: z.enum(["running", "complete", "incomplete", "failed"]),
+      reasons: z.array(z.string()),
+      terminalReason: researchSessionEndReasonSchema.nullable(),
+    }),
     updatedAt: z.iso.datetime(),
   }),
 })

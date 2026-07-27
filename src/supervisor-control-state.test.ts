@@ -4,7 +4,10 @@ import { join } from "node:path"
 
 import { afterEach, describe, expect, test } from "bun:test"
 
-import { createResearchSessionStopChecker } from "./commands/research"
+import {
+  createResearchSessionStopChecker,
+  sessionStateBriefControlSignature,
+} from "./commands/research"
 import { git } from "./lib/git"
 import {
   readSupervisorControlStateSnapshot,
@@ -29,6 +32,7 @@ function snapshot(fetchedAt: string): SupervisorControlStateSnapshot {
     fetchedAt,
     control: {
       sessionId: "30000000-0000-4000-8000-000000000001",
+      campaignStatus: "active",
       runtimeState: "active",
       status: "running",
       finalizationStatus: "running",
@@ -67,6 +71,43 @@ afterEach(async () => {
 })
 
 describe("supervisor control state snapshots", () => {
+  test("refreshes full brief context when meaningful control facts change", () => {
+    const control = snapshot(new Date().toISOString()).control
+    const baseline = sessionStateBriefControlSignature(control)
+    expect(
+      sessionStateBriefControlSignature({
+        ...control,
+        canceledAssignmentIds: [...control.canceledAssignmentIds].reverse(),
+      })
+    ).toBe(baseline)
+    expect(
+      sessionStateBriefControlSignature({
+        ...control,
+        progress: {
+          ...control.progress,
+          acceptedExperimentCount:
+            control.progress.acceptedExperimentCount + 1,
+        },
+      })
+    ).not.toBe(baseline)
+    expect(
+      sessionStateBriefControlSignature({
+        ...control,
+        launch: {
+          ...control.launch,
+          activeHypothesisCount: control.launch.activeHypothesisCount + 1,
+        },
+      })
+    ).not.toBe(baseline)
+    expect(
+      sessionStateBriefControlSignature({
+        ...control,
+        status: "completed",
+        runtimeState: "ended",
+      })
+    ).not.toBe(baseline)
+  })
+
   test("atomically persists complete control state for worker harnesses", async () => {
     const root = await createRepo()
     const fetchedAt = new Date().toISOString()

@@ -224,7 +224,7 @@ diagnostics.
 Each worker gets a detached disposable worktree at
 `.git/onyx/worktrees/<sessionId>/<workerId>`, while
 worker prompts and logs live under `.git/onyx/`. Workers run
-`onyx-worker research session-state-brief --json` for routine context and
+`onyx-worker research session-state-brief --json` for bounded routine context and
 worker-specific stop guidance. They inspect `stop.shouldStopStartingNewWork`
 and `stop.recommendedAction` at the start of each loop, use
 `onyx-worker research brief` only for fuller prose memory, run the setup
@@ -235,8 +235,9 @@ setup/session/hypothesis/worker context. `onyx research hypothesis add`
 can create another campaign hypothesis at any time from a JSON plan file or inline
 focus/hypothesis flags; a running supervisor picks up new active hypotheses as
 soon as worker slots open. Workers publish shared learning with
-`onyx-worker knowledge add` and read it back through the session-state brief or
-fuller research brief, but successor hypothesis selection remains an
+`onyx-worker knowledge add` and read selected complete items through the
+session-state brief. `onyx-worker knowledge list --json` provides deeper
+history when needed, but successor hypothesis selection remains an
 orchestrator/human decision.
 Workers run in detached disposable worktrees and never create or push worker
 branches. After the agent exits, the harness may deliver exactly one already

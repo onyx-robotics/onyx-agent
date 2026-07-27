@@ -1,11 +1,12 @@
 import { readFile } from "node:fs/promises"
 
+import type { ResearchHypothesisPlan } from "../protocol"
 import type { Args } from "./args"
 
 export const ONYX_WORKER_CONTEXT = "ONYX_WORKER_CONTEXT"
 
 export type WorkerRuntimeContext = {
-  schemaVersion: 3
+  schemaVersion: 4
   campaignId: string
   campaignName: string
   sessionId: string
@@ -13,6 +14,22 @@ export type WorkerRuntimeContext = {
   startingCommitSha: string
   hypothesisId: string
   hypothesisName: string
+  assignment: {
+    id: string
+    startingCommitSha: string
+    sourceExperimentId: string | null
+  }
+  hypothesis: {
+    id: string
+    name: string
+    description: string | null
+    status: "active" | "closed"
+    plan: ResearchHypothesisPlan
+    bestMetricValue: number | null
+    bestCommitSha: string | null
+    experimentCount: number
+    lastWorkedAt: string | null
+  }
   workerId: string
   workerLeaseToken: string
   worktreeRoot: string
@@ -33,6 +50,13 @@ function stringField(record: Record<string, unknown>, key: string) {
   return typeof value === "string" ? value : null
 }
 
+function objectField(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null
+}
+
 export async function readWorkerRuntimeContext() {
   const path = contextPath()
   if (!path) return null
@@ -41,12 +65,21 @@ export async function readWorkerRuntimeContext() {
     throw new Error(`Invalid worker context at ${path}: expected object`)
   }
   const record = parsed as Record<string, unknown>
-  if (record.schemaVersion !== 3) {
+  if (record.schemaVersion !== 4) {
     throw new Error(`Invalid worker context at ${path}: unsupported schema`)
   }
 
+  const assignment = objectField(record, "assignment")
+  const hypothesis = objectField(record, "hypothesis")
+  const plan = hypothesis ? objectField(hypothesis, "plan") : null
+  if (!assignment || !hypothesis || !plan) {
+    throw new Error(
+      `Invalid worker context at ${path}: missing assignment or hypothesis guidance`
+    )
+  }
+
   const context: WorkerRuntimeContext = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     campaignId: stringField(record, "campaignId") ?? "",
     campaignName: stringField(record, "campaignName") ?? "",
     sessionId: stringField(record, "sessionId") ?? "",
@@ -54,6 +87,28 @@ export async function readWorkerRuntimeContext() {
     startingCommitSha: stringField(record, "startingCommitSha") ?? "",
     hypothesisId: stringField(record, "hypothesisId") ?? "",
     hypothesisName: stringField(record, "hypothesisName") ?? "",
+    assignment: {
+      id: stringField(assignment, "id") ?? "",
+      startingCommitSha: stringField(assignment, "startingCommitSha") ?? "",
+      sourceExperimentId: stringField(assignment, "sourceExperimentId") ?? null,
+    },
+    hypothesis: {
+      id: stringField(hypothesis, "id") ?? "",
+      name: stringField(hypothesis, "name") ?? "",
+      description: stringField(hypothesis, "description") ?? null,
+      status: hypothesis.status === "closed" ? "closed" : "active",
+      plan: plan as ResearchHypothesisPlan,
+      bestMetricValue:
+        typeof hypothesis.bestMetricValue === "number"
+          ? hypothesis.bestMetricValue
+          : null,
+      bestCommitSha: stringField(hypothesis, "bestCommitSha") ?? null,
+      experimentCount:
+        typeof hypothesis.experimentCount === "number"
+          ? hypothesis.experimentCount
+          : 0,
+      lastWorkedAt: stringField(hypothesis, "lastWorkedAt") ?? null,
+    },
     workerId: stringField(record, "workerId") ?? "",
     workerLeaseToken: stringField(record, "workerLeaseToken") ?? "",
     worktreeRoot: stringField(record, "worktreeRoot") ?? "",
@@ -65,8 +120,17 @@ export async function readWorkerRuntimeContext() {
   }
 
   const missing = Object.entries(context)
-    .filter(([key, value]) => key !== "projectPath" && value === "")
+    .filter(
+      ([key, value]) =>
+        key !== "projectPath" && typeof value === "string" && value === ""
+    )
     .map(([key]) => key)
+  if (!context.assignment.id || !context.assignment.startingCommitSha) {
+    missing.push("assignment")
+  }
+  if (!context.hypothesis.id || !context.hypothesis.name) {
+    missing.push("hypothesis")
+  }
   if (missing.length > 0) {
     throw new Error(
       `Invalid worker context at ${path}: missing ${missing.join(", ")}`

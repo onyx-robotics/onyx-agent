@@ -27,6 +27,7 @@ export type WorkerSessionStateBrief = {
     campaignName: string
     hypothesisId: string
     hypothesisName: string
+    assignment: WorkerRuntimeContext["assignment"]
   }
   sequence: number
   refreshStatus: SessionStateBriefSnapshot["refreshStatus"]
@@ -43,12 +44,12 @@ export type WorkerSessionStateBrief = {
         id: string
         name: string
       }
-  project: ApiSessionStateBrief["project"] | null
   progress: ApiSessionStateBrief["progress"] | null
-  activeHypotheses: ApiSessionStateBrief["activeHypotheses"]
-  latestExperiments: ApiSessionStateBrief["latestExperiments"]
-  bestExperiment: ApiSessionStateBrief["bestExperiment"]
-  knowledge: ApiSessionStateBrief["knowledge"]
+  currentHypothesis: WorkerRuntimeContext["hypothesis"]
+  peerHypothesisCount: number
+  peerHypotheses: ApiSessionStateBrief["peerHypotheses"]
+  results: ApiSessionStateBrief["results"]
+  knowledge: ApiSessionStateBrief["knowledge"] & { moreCommand: string | null }
   updatedAt: string | null
   stop: WorkerSessionStopGuidance
 }
@@ -179,6 +180,7 @@ export function workerSessionStateBriefFromSnapshot({
       campaignName: context.campaignName,
       hypothesisId: context.hypothesisId,
       hypothesisName: context.hypothesisName,
+      assignment: context.assignment,
     },
     sequence: snapshot?.sequence ?? 0,
     refreshStatus: snapshot?.refreshStatus ?? "initializing",
@@ -197,12 +199,21 @@ export function workerSessionStateBriefFromSnapshot({
       id: context.campaignId,
       name: context.campaignName,
     },
-    project: brief?.project ?? null,
     progress: brief?.progress ?? null,
-    activeHypotheses: brief?.activeHypotheses ?? [],
-    latestExperiments: brief?.latestExperiments ?? [],
-    bestExperiment: brief?.bestExperiment ?? null,
-    knowledge: brief?.knowledge ?? [],
+    currentHypothesis: context.hypothesis,
+    peerHypothesisCount: brief?.peerHypothesisCount ?? 0,
+    peerHypotheses:
+      brief?.peerHypotheses.filter(
+        (hypothesis) => hypothesis.id !== context.hypothesisId
+      ) ?? [],
+    results: brief?.results ?? { latest: [], best: null },
+    knowledge: {
+      items: brief?.knowledge.items ?? [],
+      hasMore: brief?.knowledge.hasMore ?? false,
+      moreCommand: brief?.knowledge.hasMore
+        ? `onyx-worker knowledge list --campaign ${JSON.stringify(context.campaignName)} --limit 50`
+        : null,
+    },
     updatedAt: brief?.updatedAt ?? null,
     stop:
       stop ??

@@ -3,6 +3,7 @@ import packageJson from "../package.json"
 import { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 import {
   commandKnowledgeAdd,
+  commandKnowledgeList,
   commandResearchBrief,
   commandResearchSessionStateBrief,
 } from "./commands/research"
@@ -23,6 +24,7 @@ Usage:
   onyx-worker exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx-worker exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
   onyx-worker knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--require-online]
+  onyx-worker knowledge list [--campaign <name>] [--limit <n>] [--json]
 
 This CLI exposes the worker-safe primitive command surface. Users and
 orchestrators may run it directly for debugging. Supervised workers are launched
@@ -70,6 +72,8 @@ export async function workerMain(argv = process.argv.slice(2)) {
     if (command === "exp" && sub === "list") return commandExpList(args)
     if (command === "knowledge" && sub === "add")
       return commandKnowledgeAdd(args)
+    if (command === "knowledge" && sub === "list")
+      return commandKnowledgeList(args)
     console.error(`Unknown worker command: ${args.positional.join(" ")}`)
     console.error(WORKER_USAGE)
     process.exit(1)

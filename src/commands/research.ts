@@ -2238,7 +2238,7 @@ function createSessionStateBriefRefresher({
   root,
   sessionId,
   args,
-  intervalMs = 5_000,
+  intervalMs = 30_000,
 }: {
   root: string
   sessionId: string
@@ -2260,9 +2260,42 @@ function createSessionStateBriefRefresher({
     await write(placeholderSessionStateBrief())
   }
 
-  const refresh = ({ force = false }: { force?: boolean } = {}) => {
+  const patchControlState = async (control: ApiSessionControlState) => {
+    const previous = latestSnapshot
+    if (!previous?.brief) return
+    const now = new Date().toISOString()
+    await write({
+      ...previous,
+      sequence: previous.sequence + 1,
+      generatedAt: now,
+      brief: {
+        ...previous.brief,
+        session: {
+          ...previous.brief.session,
+          runtimeState: control.runtimeState,
+          status: control.status,
+          finalizationStatus: control.finalizationStatus,
+          deadlineAt: control.progress.deadlineAt,
+          endedAt: control.progress.endedAt,
+          endReason: control.progress.endReason,
+        },
+        campaign: {
+          ...previous.brief.campaign,
+          status: control.campaignStatus,
+        },
+        progress: control.progress,
+        updatedAt: control.updatedAt,
+      },
+    })
+  }
+
+  const refresh = ({
+    force = false,
+  }: { force?: boolean } = {}): Promise<void> => {
     const nowMs = Date.now()
-    if (inFlight) return inFlight
+    if (inFlight) {
+      return force ? inFlight.then(() => refresh({ force: true })) : inFlight
+    }
     if (!force && nowMs - lastRefreshAttemptMs < intervalMs) {
       return Promise.resolve()
     }
@@ -2304,7 +2337,20 @@ function createSessionStateBriefRefresher({
     return inFlight
   }
 
-  return { writePlaceholder, refresh }
+  return { writePlaceholder, refresh, patchControlState }
+}
+
+export function sessionStateBriefControlSignature(
+  control: ApiSessionControlState
+) {
+  return JSON.stringify({
+    acceptedExperimentCount: control.progress.acceptedExperimentCount,
+    activeHypothesisCount: control.launch.activeHypothesisCount,
+    canceledAssignmentIds: [...control.canceledAssignmentIds].sort(),
+    campaignStatus: control.campaignStatus,
+    sessionStatus: control.status,
+    finalizationStatus: control.finalizationStatus,
+  })
 }
 
 async function harnessShouldStopSession({
@@ -2410,6 +2456,85 @@ async function withWorkerHeartbeat<T>({
   }
 }
 
+type LifecycleHeartbeat = Parameters<
+  typeof heartbeatWorkersBatch
+>[0]["heartbeats"][number]
+
+export function createLifecycleHeartbeatPublisher(
+  args: Args,
+  send: typeof heartbeatWorkersBatch = heartbeatWorkersBatch
+) {
+  const pending = new Map<
+    string,
+    {
+      heartbeat: LifecycleHeartbeat
+      waiters: Array<{ resolve: () => void; reject: (error: Error) => void }>
+    }
+  >()
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let flushing: Promise<void> | null = null
+
+  const flush = async (): Promise<void> => {
+    if (flushing) return flushing
+    if (timer) clearTimeout(timer)
+    timer = null
+    const entries = [...pending.entries()].slice(0, 500)
+    if (entries.length === 0) return
+    for (const [workerId] of entries) pending.delete(workerId)
+    flushing = (async () => {
+      try {
+        const response = await send(
+          { heartbeats: entries.map(([, entry]) => entry.heartbeat) },
+          args
+        )
+        const resultByWorkerId = new Map(
+          response.results.map((result) => [result.workerId, result])
+        )
+        for (const [workerId, entry] of entries) {
+          const result = resultByWorkerId.get(workerId)
+          if (result?.ok) {
+            for (const waiter of entry.waiters) waiter.resolve()
+            continue
+          }
+          const error = new Error(
+            `Lifecycle heartbeat failed for worker ${workerId}: ${
+              result && !result.ok
+                ? result.error.message
+                : "batch response omitted worker"
+            }`
+          )
+          for (const waiter of entry.waiters) waiter.reject(error)
+        }
+      } catch (error) {
+        const failure = new Error(
+          `Lifecycle heartbeat batch failed: ${errorMessage(error)}`
+        )
+        for (const [, entry] of entries) {
+          for (const waiter of entry.waiters) waiter.reject(failure)
+        }
+      } finally {
+        flushing = null
+      }
+      if (pending.size > 0) await flush()
+    })()
+    return flushing
+  }
+
+  const enqueue = (heartbeat: LifecycleHeartbeat) =>
+    new Promise<void>((resolve, reject) => {
+      const current = pending.get(heartbeat.workerId)
+      pending.set(heartbeat.workerId, {
+        heartbeat,
+        waiters: [...(current?.waiters ?? []), { resolve, reject }],
+      })
+      if (!timer) {
+        timer = setTimeout(() => void flush(), 50)
+      }
+    })
+
+  return { enqueue, flush }
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -2446,20 +2571,16 @@ async function assertMainWorktreeClean(root: string, label: string) {
 function workerProgress({
   hypothesisName,
   logPath,
-  activityLogPath,
   lastOutputAt,
 }: {
   hypothesisName: string
   logPath: string
-  activityLogPath?: string | null
   lastOutputAt: string | null
 }) {
   const output = lastOutputAt
     ? `last output ${formatAge(lastOutputAt, Date.now())} ago`
     : "no output yet"
-  return `${hypothesisName} worker running; ${output}; log ${logPath}${
-    activityLogPath ? `; activity ${activityLogPath}` : ""
-  }`
+  return `${hypothesisName} phase=running; ${output}; log=${logPath}`
 }
 
 function workerMetadata({
@@ -2576,6 +2697,7 @@ async function runHypothesisOnce({
   preacquiredLease,
   slotIndex = null,
   onRegistered,
+  lifecycleHeartbeats,
   args,
 }: {
   root: string
@@ -2602,6 +2724,7 @@ async function runHypothesisOnce({
     hypothesisId: string
     leaseToken: string
   }) => void
+  lifecycleHeartbeats?: ReturnType<typeof createLifecycleHeartbeatPublisher>
   args: Args
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
@@ -2694,20 +2817,21 @@ async function runHypothesisOnce({
       hypothesisId: hypothesis.id,
       leaseToken,
     })
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
-        status: "running",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "starting",
-        event: "hypothesis_started",
-        progressMessage: `Preparing ${hypothesis.name} worker preflight`,
-        metadata: workerModelMetadata(workerModel),
-      },
-      args
-    )
+    if (!lifecycleHeartbeats)
+      await heartbeatWorker(
+        worker.id,
+        {
+          leaseToken,
+          status: "running",
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: "starting",
+          event: "hypothesis_started",
+          progressMessage: `Preparing ${hypothesis.name} worker preflight`,
+          metadata: workerModelMetadata(workerModel),
+        },
+        args
+      )
 
     worktree = join(await onyxStateDir(root), "worktrees", sessionId, worker.id)
     const initialLaunchPaths = await workerLaunchPaths({
@@ -2800,7 +2924,7 @@ async function runHypothesisOnce({
     await writeWorkerRuntimeContext({
       paths: runtimePaths,
       context: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         campaignId: campaign.id,
         campaignName: campaign.name,
         sessionId,
@@ -2808,6 +2932,22 @@ async function runHypothesisOnce({
         startingCommitSha: lease.assignment.startingCommitSha,
         hypothesisId: hypothesis.id,
         hypothesisName: hypothesis.name,
+        assignment: {
+          id: lease.assignment.id,
+          startingCommitSha: lease.assignment.startingCommitSha,
+          sourceExperimentId: lease.assignment.sourceExperimentId,
+        },
+        hypothesis: {
+          id: hypothesis.id,
+          name: hypothesis.name,
+          description: hypothesis.description,
+          status: hypothesis.status,
+          plan: hypothesis.plan,
+          bestMetricValue: hypothesis.bestMetricValue,
+          bestCommitSha: hypothesis.bestCommitSha,
+          experimentCount: hypothesis.experimentCount,
+          lastWorkedAt: hypothesis.lastWorkedAt,
+        },
         workerId: worker.id,
         workerLeaseToken: leaseToken,
         worktreeRoot: worktree,
@@ -2899,20 +3039,21 @@ async function runHypothesisOnce({
     }
     launchManifest = readyManifest
     await persistLaunchManifest(readyManifest)
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
-        status: "running",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "orienting",
-        event: "context_ready",
-        progressMessage: `Worker context files are ready for ${hypothesis.name}`,
-        metadata: workerModelMetadata(workerModel),
-      },
-      args
-    )
+    if (!lifecycleHeartbeats)
+      await heartbeatWorker(
+        worker.id,
+        {
+          leaseToken,
+          status: "running",
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: "orienting",
+          event: "context_ready",
+          progressMessage: `Worker context files are ready for ${hypothesis.name}`,
+          metadata: workerModelMetadata(workerModel),
+        },
+        args
+      )
     const preflight = await preflightWorkerInvocation(preparedInvocation, {
       cwd: worktree,
       env: workerRunEnv,
@@ -2926,13 +3067,9 @@ async function runHypothesisOnce({
     }
     launchManifest = preflightManifest
     await persistLaunchManifest(preflightManifest)
-    console.log(`worker: ${worker.id}`)
-    console.log(`hypothesis: ${hypothesis.id} ${hypothesis.name}`)
-    console.log(`worktree: ${worktree}`)
-    console.log(`manifest: ${preparedLaunchPaths.manifestPath}`)
-    console.log(`raw log: ${preparedLaunchPaths.logPath}`)
-    console.log(`activity log: ${preparedLaunchPaths.activityLogPath}`)
-    console.log(`activity events: ${preparedLaunchPaths.activityJsonlPath}`)
+    console.log(
+      `worker=${worker.id} hypothesis=${JSON.stringify(hypothesis.name)} status=started log=${preparedLaunchPaths.logPath}`
+    )
     await appendWorkerActivityEvent(preflightManifest, {
       type: "process_start",
       phase: "starting",
@@ -2957,11 +3094,24 @@ async function runHypothesisOnce({
     const heartbeatSampleEveryMs =
       nonnegativeNumberOption(args, "heartbeat-sample-interval", 0) * 1000
     if (firstAttemptWarningMs > 0) {
+      const warningManifest = launchManifest
       firstAttemptWarningTimer = setTimeout(() => {
         void hasWorkerLoggedAttempt({ root, workerId: worker.id })
-          .then((hasAttempt) => {
+          .then(async (hasAttempt) => {
             if (hasAttempt) return
-            return heartbeatWorker(
+            if (lifecycleHeartbeats) {
+              await appendWorkerActivityEvent(warningManifest, {
+                type: "warning",
+                phase: "orienting",
+                summary:
+                  "No logged workflow attempt yet; worker may still be orienting or sweeping.",
+                metadata: {
+                  warningAfterSeconds: Math.round(firstAttemptWarningMs / 1000),
+                },
+              })
+              return
+            }
+            await heartbeatWorker(
               worker.id,
               {
                 leaseToken,
@@ -3009,9 +3159,6 @@ async function runHypothesisOnce({
         workerProgress({
           hypothesisName: hypothesis.name,
           logPath: launchManifest?.logPath ?? preparedLaunchPaths.logPath,
-          activityLogPath:
-            launchManifest?.activityLogPath ??
-            preparedLaunchPaths.activityLogPath,
           lastOutputAt: launchManifest?.lastOutputAt ?? null,
         }),
       metadata: () =>
@@ -3077,7 +3224,8 @@ async function runHypothesisOnce({
           }
         ),
       quiet,
-      heartbeatSampleEveryMs,
+      consoleEveryMs: 60_000,
+      heartbeatSampleEveryMs: lifecycleHeartbeats ? 0 : heartbeatSampleEveryMs,
     })
     if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
     const stoppedByHarness = workerResult.cancelled
@@ -3250,20 +3398,21 @@ async function runHypothesisOnce({
         }
       }
 
-      await heartbeatWorker(
-        workerId,
-        {
-          leaseToken,
-          status: "running",
-          sessionId,
-          hypothesisId: hypothesis.id,
-          phase: "teardown",
-          event: "teardown_started",
-          progressMessage: `Delivering terminal attempt and tearing down ${hypothesis.name}`,
-          gitLabel: null,
-        },
-        args
-      ).catch(() => {})
+      if (!lifecycleHeartbeats)
+        await heartbeatWorker(
+          workerId,
+          {
+            leaseToken,
+            status: "running",
+            sessionId,
+            hypothesisId: hypothesis.id,
+            phase: "teardown",
+            event: "teardown_started",
+            progressMessage: `Delivering terminal attempt and tearing down ${hypothesis.name}`,
+            gitLabel: null,
+          },
+          args
+        ).catch(() => {})
       if (launchManifest) {
         await appendWorkerActivityEvent(launchManifest, {
           type: "phase_change",
@@ -3410,21 +3559,39 @@ async function runHypothesisOnce({
           : {}),
         terminal: teardown,
       }
-      await heartbeatWorker(
+      const terminalHeartbeat = {
         workerId,
-        {
-          leaseToken,
-          status: terminalOutcome.status,
-          sessionId,
-          hypothesisId: hypothesis.id,
-          phase: terminalOutcome.status,
-          event: terminalEvent,
-          progressMessage: terminalProgress,
-          gitLabel: terminalOutcome.resultCommitSha ?? null,
-          metadata: terminalMetadata,
-        },
-        args
-      ).catch(() => {})
+        leaseToken,
+        status: terminalOutcome.status,
+        sessionId,
+        hypothesisId: hypothesis.id,
+        phase: terminalOutcome.status,
+        event: terminalEvent,
+        progressMessage: terminalProgress,
+        gitLabel: terminalOutcome.resultCommitSha ?? null,
+        metadata: terminalMetadata,
+      } satisfies LifecycleHeartbeat
+      await (
+        lifecycleHeartbeats
+          ? lifecycleHeartbeats.enqueue(terminalHeartbeat)
+          : heartbeatWorker(
+              workerId,
+              {
+                leaseToken,
+                status: terminalOutcome.status,
+                sessionId,
+                hypothesisId: hypothesis.id,
+                phase: terminalOutcome.status,
+                event: terminalEvent,
+                progressMessage: terminalProgress,
+                gitLabel: terminalOutcome.resultCommitSha ?? null,
+                metadata: terminalMetadata,
+              },
+              args
+            )
+      ).catch((error) => {
+        console.warn(errorMessage(error))
+      })
     }
     await cleanupWorkerRuntimeTempDir()
   }
@@ -3742,13 +3909,26 @@ function supervisorTelemetryForStatus(
   return freshSupervisorTelemetry(supervisor)
 }
 
-function uniqueWorkerWarnings(manifest: WorkerLaunchManifest) {
-  return [
+export function uniqueWorkerWarnings(manifest: WorkerLaunchManifest) {
+  const warnings = [
     ...new Set([
       ...(manifest.warnings ?? []),
       ...(manifest.teardown?.warnings ?? []),
     ]),
   ]
+  const expectedHarnessStop =
+    (manifest.status === "stopped" ||
+      manifest.teardown?.reasonCode === "stopped" ||
+      manifest.teardown?.phase === "stopped") &&
+    (manifest.signal === "SIGTERM" ||
+      manifest.signal === "SIGKILL" ||
+      manifest.teardown?.providerSignal === "SIGTERM" ||
+      manifest.teardown?.providerSignal === "SIGKILL")
+  return expectedHarnessStop
+    ? warnings.filter(
+        (warning) => !warning.startsWith("provider stream/API error detected:")
+      )
+    : warnings
 }
 
 async function commandResearchStatusSummary({
@@ -3826,7 +4006,7 @@ async function commandResearchStatusSummary({
     campaign: {
       id: campaignId,
       name: fallbackCampaign?.name ?? campaignName,
-      status: fallbackCampaign?.status ?? null,
+      status: control?.campaignStatus ?? fallbackCampaign?.status ?? null,
     },
     session: sessionId
       ? {
@@ -4684,6 +4864,11 @@ async function workerSessionStopGuidance({
 }
 
 export async function commandResearchSessionStateBrief(args: Args) {
+  if (args.options.compact !== undefined) {
+    throw new Error(
+      "`--compact` was removed; session-state-brief now returns the single bounded worker context."
+    )
+  }
   const context = await readWorkerRuntimeContext()
   if (!context) {
     throw new Error(
@@ -4873,7 +5058,10 @@ export async function commandResearchStop(args: Args) {
 
 export async function commandKnowledgeAdd(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
+  const workerContext = await readWorkerRuntimeContext()
+  const campaign = workerContext
+    ? { id: workerContext.campaignId, name: workerContext.campaignName }
+    : (await campaignForName(root, args)).campaign
   const kind = args.options.kind ?? "insight"
   if (
     kind !== "insight" &&
@@ -4922,7 +5110,10 @@ export async function commandKnowledgeAdd(args: Args) {
 
 export async function commandKnowledgeList(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
+  const workerContext = await readWorkerRuntimeContext()
+  const campaign = workerContext
+    ? { id: workerContext.campaignId, name: workerContext.campaignName }
+    : (await campaignForName(root, args)).campaign
   const limit = positiveIntegerOption(args, "limit", 50)
   if (args.options.offline === "true") {
     throw new Error(
@@ -5050,15 +5241,23 @@ function selectRunHypotheses(args: Args, hypotheses: ApiHypothesis[]) {
   return resolved
 }
 
-async function resolveHypothesisBaseOverrides({
+export async function resolveHypothesisBaseOverrides({
   campaignId,
   hypotheses,
   args,
+  listExperiments = listCampaignExperiments,
 }: {
   campaignId: string
   hypotheses: ApiHypothesis[]
   args: Args
+  listExperiments?: typeof listCampaignExperiments
 }) {
+  const parsed: Array<{
+    hypothesis: ApiHypothesis
+    rawRef: string
+    experimentId?: string
+  }> = []
+  const experimentIds = new Set<string>()
   const overrides = new Map<
     string,
     { ref: string; sourceExperimentId?: string }
@@ -5082,28 +5281,50 @@ async function resolveHypothesisBaseOverrides({
     const rawRef = value.slice(split + 1)
     if (rawRef.startsWith("experiment:")) {
       const experimentId = rawRef.slice("experiment:".length)
-      let cursor: string | undefined
-      let experiment: ApiCampaignExperiment | undefined
-      do {
-        const page = await listCampaignExperiments(campaignId, args, {
-          limit: 100,
-          ...(cursor ? { cursor } : {}),
-        })
-        experiment = page.items.find((item) => item.id === experimentId)
-        cursor = page.page.nextCursor ?? undefined
-      } while (!experiment && cursor)
-      if (!experiment) {
+      if (!experimentId) {
         throw new Error(
-          `Experiment ${experimentId} was not found in this campaign.`
+          `Invalid --hypothesis-base ${JSON.stringify(value)}; experiment id is required.`
         )
       }
-      overrides.set(hypothesis.id, {
-        ref: experiment.resultCommitSha,
-        sourceExperimentId: experiment.id,
-      })
+      experimentIds.add(experimentId)
+      parsed.push({ hypothesis, rawRef, experimentId })
     } else {
-      overrides.set(hypothesis.id, { ref: rawRef })
+      parsed.push({ hypothesis, rawRef })
     }
+  }
+
+  const experimentsById = new Map<string, ApiCampaignExperiment>()
+  if (experimentIds.size > 0) {
+    let cursor: string | undefined
+    do {
+      const page = await listExperiments(campaignId, args, {
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      })
+      for (const experiment of page.items) {
+        if (experimentIds.has(experiment.id)) {
+          experimentsById.set(experiment.id, experiment)
+        }
+      }
+      cursor = page.page.nextCursor ?? undefined
+    } while (experimentsById.size < experimentIds.size && cursor)
+  }
+
+  for (const entry of parsed) {
+    if (!entry.experimentId) {
+      overrides.set(entry.hypothesis.id, { ref: entry.rawRef })
+      continue
+    }
+    const experiment = experimentsById.get(entry.experimentId)
+    if (!experiment) {
+      throw new Error(
+        `Experiment ${entry.experimentId} was not found in this campaign.`
+      )
+    }
+    overrides.set(entry.hypothesis.id, {
+      ref: experiment.resultCommitSha,
+      sourceExperimentId: experiment.id,
+    })
   }
   return overrides
 }
@@ -6132,6 +6353,7 @@ export async function commandResearchRun(args: Args) {
   })
   await sessionStateBriefRefresher.writePlaceholder().catch(() => {})
   await sessionStateBriefRefresher.refresh({ force: true }).catch(() => {})
+  const lifecycleHeartbeats = createLifecycleHeartbeatPublisher(args)
   const presenceSupervisor = createPresenceSupervisor({
     root,
     args,
@@ -6198,6 +6420,7 @@ export async function commandResearchRun(args: Args) {
   // Clear stale worktree bookkeeping left by crashed runs before launching.
   await git(["worktree", "prune"], root).catch(() => {})
   let controlSnapshotSequence = 0
+  let briefRefreshControlSignature: string | null = null
   const sessionStopChecker = createResearchSessionStopChecker({
     root,
     sessionId,
@@ -6215,6 +6438,16 @@ export async function commandResearchRun(args: Args) {
           control,
         },
       })
+      await sessionStateBriefRefresher.patchControlState(control)
+      const nextBriefRefreshControlSignature =
+        sessionStateBriefControlSignature(control)
+      const contextChanged =
+        briefRefreshControlSignature !== null &&
+        briefRefreshControlSignature !== nextBriefRefreshControlSignature
+      briefRefreshControlSignature = nextBriefRefreshControlSignature
+      if (contextChanged) {
+        await sessionStateBriefRefresher.refresh({ force: true })
+      }
     },
   })
   const currentProviderBackoff = () => {
@@ -6573,6 +6806,7 @@ export async function commandResearchRun(args: Args) {
             onRegistered: ({ workerId, leaseToken }) => {
               leaseTokensByWorkerId.set(workerId, leaseToken)
             },
+            lifecycleHeartbeats,
             args,
           })
             .then(async (result) => {
@@ -6866,6 +7100,9 @@ export async function commandResearchRun(args: Args) {
         : "research run completed",
     metadata: initialTerminalMetadata,
   }).catch(() => {})
+  await lifecycleHeartbeats.flush().catch((error) => {
+    console.warn(errorMessage(error))
+  })
   const finalization = await computeSessionFinalizationStatus({
     root,
     sessionId,

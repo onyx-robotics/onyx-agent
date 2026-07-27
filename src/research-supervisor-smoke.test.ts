@@ -426,6 +426,8 @@ function installSupervisorApi({
     ) {
       data = {
         sessionId: SESSION_ID,
+        campaignStatus: "active",
+        runtimeState: terminal ? "ended" : "active",
         status: runningSession.status,
         finalizationStatus: runningSession.finalizationStatus,
         progress: {
@@ -462,6 +464,8 @@ function installSupervisorApi({
       }
       data = {
         sessionId: SESSION_ID,
+        campaignStatus: "active",
+        runtimeState: terminal ? "ended" : "active",
         status: terminal ? "completed" : "running",
         finalizationStatus: runningSession.finalizationStatus,
         progress: {
@@ -654,6 +658,17 @@ function installSupervisorApi({
       method === "POST" &&
       url.pathname === "/api/v1/research/worker-heartbeats/batch"
     ) {
+      for (const heartbeat of body?.heartbeats ?? []) {
+        if (
+          heartbeat.status === "completed" ||
+          heartbeat.status === "failed" ||
+          heartbeat.status === "stopped"
+        ) {
+          const index = leasedWorkers.indexOf(heartbeat.workerId)
+          if (index >= 0) leasedWorkers.splice(index, 1)
+          if (terminalOnWorkerExit) terminal = true
+        }
+      }
       data = {
         results: (body?.heartbeats ?? []).map(
           (heartbeat: {
@@ -1057,6 +1072,8 @@ describe("remote-first research supervisor smoke", () => {
       const summary = JSON.parse(output) as Record<string, unknown>
       expect(summary).toHaveProperty("campaign")
       expect(summary).toHaveProperty("session")
+      expect(summary).toHaveProperty("campaign.status", "active")
+      expect(summary).toHaveProperty("session.finalizationStatus")
       expect(summary).not.toHaveProperty("hypotheses")
       expect(summary).not.toHaveProperty("workers")
     } finally {

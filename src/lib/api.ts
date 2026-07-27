@@ -390,6 +390,7 @@ export type ApiSessionLive = {
 
 export type ApiSessionControlState = {
   sessionId: string
+  campaignStatus: ApiCampaign["status"]
   runtimeState: ApiSession["runtimeState"]
   status: ApiSession["status"]
   finalizationStatus: ApiSession["finalizationStatus"]
@@ -433,14 +434,78 @@ export type ApiSessionBrief = {
 
 export type ApiSessionStateBrief = {
   generatedAt: string
-  session: ApiSession
-  campaign: ApiCampaign
-  project: ApiProject
+  session: Pick<
+    ApiSession,
+    | "id"
+    | "name"
+    | "runtimeState"
+    | "status"
+    | "finalizationStatus"
+    | "workerTarget"
+    | "deadlineAt"
+    | "endedAt"
+    | "endReason"
+  >
+  campaign: Pick<
+    ApiCampaign,
+    "id" | "name" | "status" | "metricName" | "metricUnit" | "metricDirection"
+  >
   progress: ApiSessionControlState["progress"]
-  latestExperiments: ApiCampaignExperiment[]
-  bestExperiment: ApiCampaignExperiment | null
-  activeHypotheses: ApiHypothesis[]
-  knowledge: ApiKnowledge[]
+  peerHypothesisCount: number
+  peerHypotheses: Array<
+    Pick<
+      ApiHypothesis,
+      | "id"
+      | "name"
+      | "status"
+      | "bestMetricValue"
+      | "bestCommitSha"
+      | "experimentCount"
+      | "lastWorkedAt"
+    >
+  >
+  results: {
+    latest: Array<
+      Pick<
+        ApiCampaignExperiment,
+        | "id"
+        | "hypothesisId"
+        | "acceptedIndex"
+        | "name"
+        | "resultCommitSha"
+        | "primaryMetricName"
+        | "primaryMetricValue"
+        | "createdAt"
+      >
+    >
+    best: Pick<
+      ApiCampaignExperiment,
+      | "id"
+      | "hypothesisId"
+      | "acceptedIndex"
+      | "name"
+      | "resultCommitSha"
+      | "primaryMetricName"
+      | "primaryMetricValue"
+      | "createdAt"
+    > | null
+  }
+  knowledge: {
+    items: Array<
+      Pick<
+        ApiKnowledge,
+        | "id"
+        | "hypothesisId"
+        | "experimentId"
+        | "kind"
+        | "title"
+        | "body"
+        | "confidence"
+        | "createdAt"
+      >
+    >
+    hasMore: boolean
+  }
   updatedAt: string
 }
 
@@ -826,8 +891,14 @@ function normalizeResearchResponse(value: unknown): unknown {
     const failed =
       normalized.endReason === "failed" ||
       normalized.endReason === "supervisor_failed"
-    normalized.status = ended ? (failed ? "failed" : "completed") : "running"
-    normalized.finalizationStatus = ended
+    normalized.status ??= ended
+      ? normalized.endReason === "user_stopped"
+        ? "stopped"
+        : failed
+          ? "failed"
+          : "completed"
+      : "running"
+    normalized.finalizationStatus ??= ended
       ? failed
         ? "failed"
         : "complete"

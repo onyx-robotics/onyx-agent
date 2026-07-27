@@ -95,7 +95,7 @@ Worker primitives are exposed through the separate worker-safe entrypoint:
   onyx-worker tools run <name> [args...]
 
 Research control-plane state is remote-first through /api/v1. Local files under
-.git/onyx/ hold runtime logs, workflow runs, attempt manifests, resource locks,
+.git/onyx/ hold runtime logs, workflow runs, transient pending-report outbox entries, resource locks,
 session-state briefs, and convenience state only. Workers push immutable
 experiment refs before reporting results; \`onyx exp list\`, \`onyx research status\`,
 and knowledge read from the remote API.
