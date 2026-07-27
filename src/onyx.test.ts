@@ -35,6 +35,7 @@ const MOCK_API_ORIGIN = "https://api.onyx.test"
 
 let previousApiUrl: string | undefined
 let previousApiKey: string | undefined
+let previousWorkerCredential: string | undefined
 let previousFetch: typeof fetch | null = null
 
 async function tempRepo(prefix = "onyx-remote-first-") {
@@ -68,7 +69,7 @@ async function writeTestWorkerContext({
   await writeWorkerRuntimeContext({
     paths,
     context: {
-      schemaVersion: 4,
+      schemaVersion: 5,
       campaignId,
       campaignName,
       sessionId: SESSION_ID,
@@ -100,7 +101,7 @@ async function writeTestWorkerContext({
         lastWorkedAt: null,
       },
       workerId,
-      workerLeaseToken: "lease-token",
+      workerCredential: "owx_worker_v1_test-credential-0000000000000000",
       worktreeRoot: root,
       projectPath: "",
       projectRoot: root,
@@ -121,7 +122,13 @@ function makeSessionStateBrief(): ApiSessionStateBrief {
       name: "scale-run",
       runtimeState: "active",
       status: "running",
-      finalizationStatus: "running",
+      outcome: { status: "running", endedAt: null, endReason: null },
+      cleanup: {
+        status: "running",
+        startedAt: null,
+        completedAt: null,
+        summary: {},
+      },
       workerTarget: 100,
       deadlineAt: null,
       endedAt: null,
@@ -158,9 +165,12 @@ function installMockApi(
 ) {
   previousApiUrl = process.env.ONYX_API_URL
   previousApiKey = process.env.ONYX_API_KEY
+  previousWorkerCredential = process.env.ONYX_WORKER_CREDENTIAL
   previousFetch = globalThis.fetch
   process.env.ONYX_API_URL = MOCK_API_ORIGIN
   process.env.ONYX_API_KEY = "test-key"
+  process.env.ONYX_WORKER_CREDENTIAL =
+    "owx_worker_v1_test-credential-0000000000000000"
   globalThis.fetch = (async (input, init) => {
     const url = new URL(
       typeof input === "string"
@@ -194,6 +204,9 @@ afterEach(() => {
   else process.env.ONYX_API_URL = previousApiUrl
   if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
   else process.env.ONYX_API_KEY = previousApiKey
+  if (previousWorkerCredential === undefined)
+    delete process.env.ONYX_WORKER_CREDENTIAL
+  else process.env.ONYX_WORKER_CREDENTIAL = previousWorkerCredential
 })
 
 describe("remote-first agent architecture", () => {
@@ -388,7 +401,9 @@ describe("remote-first agent architecture", () => {
     const brief = makeSessionStateBrief()
     brief.session.status = "completed"
     brief.session.runtimeState = "ended"
-    brief.session.finalizationStatus = "complete"
+    brief.session.outcome.status = "completed"
+    brief.session.outcome.endedAt = brief.generatedAt
+    brief.session.cleanup.status = "complete"
     brief.session.endReason = "experiment_target_reached"
     brief.progress.acceptedExperimentCount = 100
     brief.progress.remainingExperimentCount = 0
@@ -482,7 +497,9 @@ describe("remote-first agent architecture", () => {
     const brief = makeSessionStateBrief()
     brief.session.status = "completed"
     brief.session.runtimeState = "ended"
-    brief.session.finalizationStatus = "complete"
+    brief.session.outcome.status = "completed"
+    brief.session.outcome.endedAt = brief.generatedAt
+    brief.session.cleanup.status = "complete"
     brief.session.endReason = "experiment_target_reached"
     brief.progress.acceptedExperimentCount = 100
     brief.progress.remainingExperimentCount = 0
@@ -620,7 +637,7 @@ describe("remote-first agent architecture", () => {
       ) {
         throw new Error(`unexpected fanout read: ${path}`)
       }
-      if (path === `/api/v1/research/campaigns/${campaignId}/experiments`) {
+      if (path === "/api/v1/research/worker/experiments") {
         return { items: [], page: { nextCursor: null } }
       }
       throw new Error(`unexpected API call: ${method} ${path}`)
@@ -633,9 +650,7 @@ describe("remote-first agent architecture", () => {
       expect(logs.join("\n")).toContain(
         "No experiments recorded in the Onyx API yet."
       )
-      expect(calls).toEqual([
-        `GET /api/v1/research/campaigns/${campaignId}/experiments`,
-      ])
+      expect(calls).toEqual(["GET /api/v1/research/worker/experiments"])
     } finally {
       console.log = originalLog
       if (previousWorkerContext === undefined)
@@ -657,7 +672,7 @@ describe("remote-first agent architecture", () => {
     process.env.ONYX_WORKER_CONTEXT = paths.contextPath
     installMockApi(({ method, path }) => {
       calls.push(`${method} ${path}`)
-      if (path === `/api/v1/research/campaigns/${campaignId}/knowledge`) {
+      if (path === "/api/v1/research/worker/knowledge") {
         return []
       }
       throw new Error(`unexpected API call: ${method} ${path}`)
@@ -668,9 +683,7 @@ describe("remote-first agent architecture", () => {
         options: { cwd: root, campaign: "scale-test", json: "true" },
       })
       expect(JSON.parse(logs.join("\n"))).toEqual([])
-      expect(calls).toEqual([
-        `GET /api/v1/research/campaigns/${campaignId}/knowledge`,
-      ])
+      expect(calls).toEqual(["GET /api/v1/research/worker/knowledge"])
     } finally {
       console.log = originalLog
       if (previousWorkerContext === undefined)
@@ -703,6 +716,7 @@ describe("remote-first agent architecture", () => {
     const freshCampaign = { ...brief.campaign, experimentCount: 50 }
     const completedSession: ApiSession = {
       ...brief.session,
+      cleanupStatus: "complete",
       campaignId: brief.campaign.id,
       evaluationRevisionId: "77777777-7777-4777-8777-777777777777",
       baseCommitSha: "abc123",
@@ -776,7 +790,7 @@ describe("remote-first agent architecture", () => {
             deadlineAt: null,
             terminalReason: "experiment_target_reached",
           },
-          finalization: {
+          cleanup: {
             status: "complete",
             reasons: [],
             terminalReason: "experiment_target_reached",

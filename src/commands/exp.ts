@@ -12,6 +12,8 @@ import {
   listCampaignExperiments,
   listProjectCampaigns,
   reportCampaignExperiment,
+  reportWorkerExperiment,
+  listWorkerExperiments,
   resolveProject,
   type ApiCampaign,
 } from "../lib/api"
@@ -1337,6 +1339,7 @@ export type FrozenExperimentDeliveryContext = {
   assignmentId: string
   hypothesisId: string
   workerId: string
+  workerCredential: string
 }
 
 export class ExperimentDeliveryError extends Error {
@@ -1382,9 +1385,7 @@ async function logExperiment(
         campaignName,
       })
   const setup = frozen?.setup ?? (await readSetupFile(root, projectPath))
-  const workerRuntimeContext = frozen
-    ? null
-    : await readWorkerRuntimeContext().catch(() => null)
+  const workerRuntimeContext = frozen ? null : await readWorkerRuntimeContext()
   if (setup.projectPath !== projectPath) {
     throw new Error(
       `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
@@ -1600,45 +1601,48 @@ async function logExperiment(
   } finally {
     await releasePushSlot?.()
   }
-  const report = await reportCampaignExperiment(
-    campaign.campaignId,
-    {
-      sessionId,
-      assignmentId,
-      hypothesisId,
-      workerId,
-      name: record.name,
-      ...(record.description ? { description: record.description } : {}),
-      runRef,
-      baseCommitSha,
-      resultCommitSha,
-      resultRef,
-      resultRefPushStatus,
-      ...(resultRefPushedAt ? { resultRefPushedAt } : {}),
-      ...(resultRefPushError ? { resultRefPushError } : {}),
-      status: loggedStatus,
-      setupCompliance: loggedCompliance,
-      primaryMetricName: metricName,
-      ...(metricValue === null ? {} : { primaryMetricValue: metricValue }),
-      secondaryMetrics: metrics,
-      artifactRefs: {},
-      agentNotes: record.agentNotes,
-      ...(checks
-        ? {
-            checks: {
-              status: checks.status,
-              durationMs: checks.durationMs ?? null,
-              outputSummary: checks.outputSummary ?? null,
-            },
-          }
-        : {}),
-      ...(record.durationMs === null ? {} : { durationMs: record.durationMs }),
-      ...(record.outputSummary ? { outputSummary: record.outputSummary } : {}),
-      ...(record.startedAt ? { startedAt: record.startedAt } : {}),
-      completedAt: record.completedAt ?? completedAt,
-      provenance: [],
-    },
-    args
+  const reportBody = {
+    sessionId,
+    assignmentId,
+    hypothesisId,
+    workerId,
+    name: record.name,
+    ...(record.description ? { description: record.description } : {}),
+    runRef,
+    baseCommitSha,
+    resultCommitSha,
+    resultRef,
+    resultRefPushStatus,
+    ...(resultRefPushedAt ? { resultRefPushedAt } : {}),
+    ...(resultRefPushError ? { resultRefPushError } : {}),
+    status: loggedStatus,
+    setupCompliance: loggedCompliance,
+    primaryMetricName: metricName,
+    ...(metricValue === null ? {} : { primaryMetricValue: metricValue }),
+    secondaryMetrics: metrics,
+    artifactRefs: {},
+    agentNotes: record.agentNotes,
+    ...(checks
+      ? {
+          checks: {
+            status: checks.status,
+            durationMs: checks.durationMs ?? null,
+            outputSummary: checks.outputSummary ?? null,
+          },
+        }
+      : {}),
+    ...(record.durationMs === null ? {} : { durationMs: record.durationMs }),
+    ...(record.outputSummary ? { outputSummary: record.outputSummary } : {}),
+    ...(record.startedAt ? { startedAt: record.startedAt } : {}),
+    completedAt: record.completedAt ?? completedAt,
+    provenance: [],
+  }
+  const scopedWorkerCredential =
+    frozen?.workerCredential ?? workerRuntimeContext?.workerCredential
+  const report = await (
+    scopedWorkerCredential
+      ? reportWorkerExperiment(reportBody, args, scopedWorkerCredential)
+      : reportCampaignExperiment(campaign.campaignId, reportBody, args)
   ).catch((error) => {
     throw new ExperimentDeliveryError({
       message: `API reporting failed after local measurement${resultRefPushStatus === "pushed" ? " and ref push" : ""}. ${errorMessage(error)}`,
@@ -1754,10 +1758,25 @@ export async function commandExpList(args: Args) {
   for (const { campaign } of resolvedCampaigns) {
     let cursor: string | null = null
     do {
-      const page = await listCampaignExperiments(campaign.id, args, {
-        limit: Math.min(100, Math.max(limit, 1)),
-        cursor: cursor ?? undefined,
-      })
+      const disposition =
+        (args.options.disposition as
+          | "all"
+          | "received"
+          | "accepted"
+          | "discarded"
+          | undefined) ?? "all"
+      const page: Awaited<ReturnType<typeof listCampaignExperiments>> =
+        workerContext
+          ? await listWorkerExperiments(args, {
+              limit: Math.min(100, Math.max(limit, 1)),
+              cursor: cursor ?? undefined,
+              disposition,
+            })
+          : await listCampaignExperiments(campaign.id, args, {
+              limit: Math.min(100, Math.max(limit, 1)),
+              cursor: cursor ?? undefined,
+              disposition,
+            })
       for (const experiment of page.items) {
         const row = apiExperimentToHistory(campaign, experiment)
         if (row) rows.push(row)

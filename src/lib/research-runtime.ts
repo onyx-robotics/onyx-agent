@@ -337,7 +337,7 @@ function defaultSession({
     terminalReason: null,
     schedulerSiteId,
     assignments: [],
-    finalizationStatus: "running",
+    cleanupStatus: "running",
     metadata,
     startedAt: at,
     completedAt: null,
@@ -957,14 +957,14 @@ export async function stopLocalSession({
   root,
   sessionId,
   status,
-  finalizationStatus,
+  cleanupStatus,
   terminalReason,
   metadata,
 }: {
   root: string
   sessionId: string
   status: ApiSession["status"]
-  finalizationStatus?: ApiSession["finalizationStatus"] | null
+  cleanupStatus?: ApiSession["cleanupStatus"] | null
   terminalReason?: ApiSession["terminalReason"] | null
   reason?: string | null
   metadata?: Record<string, unknown>
@@ -973,7 +973,7 @@ export async function stopLocalSession({
   record.session = {
     ...record.session,
     status,
-    finalizationStatus: finalizationStatus ?? record.session.finalizationStatus,
+    cleanupStatus: cleanupStatus ?? record.session.cleanupStatus,
     terminalReason: terminalReason ?? record.session.terminalReason,
     metadata: { ...record.session.metadata, ...(metadata ?? {}) },
     completedAt: status === "running" ? record.session.completedAt : nowIso(),

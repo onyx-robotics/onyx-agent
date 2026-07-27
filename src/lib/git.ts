@@ -20,7 +20,10 @@ export async function gitDir(root: string) {
 /** Absolute path to the shared git common directory (shared across worktrees). */
 export async function gitCommonDir(root: string) {
   try {
-    return git(["rev-parse", "--path-format=absolute", "--git-common-dir"], root)
+    return git(
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      root
+    )
   } catch {
     return gitDir(root)
   }

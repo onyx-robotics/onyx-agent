@@ -58,11 +58,12 @@ export type CliState = {
       stopPendingRemote?: boolean
       status?: string
       terminalReason?: string | null
-      finalizationStatus?:
+      cleanupStatus?:
         | "not_started"
         | "running"
         | "complete"
-        | "incomplete"
+        | "draining"
+        | "abandoned"
         | "failed"
       ignoredPresence?: {
         total: number

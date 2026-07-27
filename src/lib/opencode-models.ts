@@ -11,7 +11,10 @@ function opencodeModelIds(output: string) {
 }
 
 function modelTokens(value: string) {
-  return value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
 }
 
 function modelSimilarity(left: string, right: string) {

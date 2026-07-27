@@ -6,7 +6,7 @@ import type { Args } from "./args"
 export const ONYX_WORKER_CONTEXT = "ONYX_WORKER_CONTEXT"
 
 export type WorkerRuntimeContext = {
-  schemaVersion: 4
+  schemaVersion: 5
   campaignId: string
   campaignName: string
   sessionId: string
@@ -31,7 +31,7 @@ export type WorkerRuntimeContext = {
     lastWorkedAt: string | null
   }
   workerId: string
-  workerLeaseToken: string
+  workerCredential: string
   worktreeRoot: string
   projectPath: string
   projectRoot: string
@@ -65,7 +65,7 @@ export async function readWorkerRuntimeContext() {
     throw new Error(`Invalid worker context at ${path}: expected object`)
   }
   const record = parsed as Record<string, unknown>
-  if (record.schemaVersion !== 4) {
+  if (record.schemaVersion !== 5) {
     throw new Error(`Invalid worker context at ${path}: unsupported schema`)
   }
 
@@ -79,7 +79,7 @@ export async function readWorkerRuntimeContext() {
   }
 
   const context: WorkerRuntimeContext = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     campaignId: stringField(record, "campaignId") ?? "",
     campaignName: stringField(record, "campaignName") ?? "",
     sessionId: stringField(record, "sessionId") ?? "",
@@ -110,7 +110,7 @@ export async function readWorkerRuntimeContext() {
       lastWorkedAt: stringField(hypothesis, "lastWorkedAt") ?? null,
     },
     workerId: stringField(record, "workerId") ?? "",
-    workerLeaseToken: stringField(record, "workerLeaseToken") ?? "",
+    workerCredential: stringField(record, "workerCredential") ?? "",
     worktreeRoot: stringField(record, "worktreeRoot") ?? "",
     projectPath: stringField(record, "projectPath") ?? "",
     projectRoot: stringField(record, "projectRoot") ?? "",

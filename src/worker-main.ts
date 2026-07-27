@@ -1,5 +1,3 @@
-import packageJson from "../package.json"
-
 import { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 import {
   commandKnowledgeAdd,
@@ -11,6 +9,8 @@ import { commandToolsRun } from "./commands/tools"
 import { commandWorkflowStatus } from "./commands/workflow"
 import { parseArgs } from "./lib/args"
 import { assertWorkerContextArgs } from "./lib/worker-context"
+import { cliVersionInfo, renderCliVersion } from "./lib/version"
+import { commandResearchFinish } from "./lib/worker-finish"
 
 export const WORKER_USAGE = `onyx-worker - worker-safe Onyx research CLI
 
@@ -18,6 +18,7 @@ Usage:
   onyx-worker --version
   onyx-worker research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx-worker research session-state-brief [--json]
+  onyx-worker research finish --reason hypothesis_exhausted|goal_satisfied|no_viable_change --summary <text>
   onyx-worker tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
   onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx-worker workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
@@ -44,7 +45,11 @@ export async function workerMain(argv = process.argv.slice(2)) {
       command === "-v" ||
       command === "version"
     ) {
-      console.log(packageJson.version)
+      console.log(
+        args.options.json === "true"
+          ? JSON.stringify(cliVersionInfo("onyx-worker"), null, 2)
+          : renderCliVersion("onyx-worker")
+      )
       return
     }
 
@@ -58,12 +63,35 @@ export async function workerMain(argv = process.argv.slice(2)) {
       return
     }
 
+    if (command === "diagnostics" && sub === "handshake") {
+      console.log(
+        JSON.stringify(
+          {
+            ...cliVersionInfo("onyx-worker"),
+            capabilities: [
+              "session-state-brief",
+              "experiment-report",
+              "experiment-history",
+              "knowledge",
+              "heartbeat",
+              "finish-marker",
+            ],
+          },
+          null,
+          2
+        )
+      )
+      return
+    }
+
     await assertWorkerContextArgs(args)
 
     if (command === "research" && sub === "brief")
       return commandResearchBrief(args)
     if (command === "research" && sub === "session-state-brief")
       return commandResearchSessionStateBrief(args)
+    if (command === "research" && sub === "finish")
+      return commandResearchFinish(args)
     if (command === "tools" && sub === "run") return commandToolsRun(args)
     if (command === "exp" && sub === "run") return commandExpRun(args)
     if (command === "workflow" && sub === "status")

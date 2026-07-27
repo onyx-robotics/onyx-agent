@@ -1,7 +1,6 @@
-import packageJson from "../package.json"
-
 import { commandAgent } from "./commands/agent"
 import { parseArgs } from "./lib/args"
+import { cliVersionInfo, renderCliVersion } from "./lib/version"
 import {
   commandCampaignCreate,
   commandCampaignDelete,
@@ -83,7 +82,7 @@ Usage:
   onyx exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
   onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
   onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|running|queued] [--allow-unmeasured] [--project-path <path>]
-  onyx exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
+  onyx exp list [--campaign <name>] [--status <status>] [--disposition all|received|accepted|discarded] [--grep <regex>] [--limit <n>] [--json]
   onyx listen
   onyx status [--json]
 
@@ -118,7 +117,11 @@ export async function main(argv = process.argv.slice(2)) {
       command === "-v" ||
       command === "version"
     ) {
-      console.log(packageJson.version)
+      console.log(
+        args.options.json === "true"
+          ? JSON.stringify(cliVersionInfo("onyx"), null, 2)
+          : renderCliVersion("onyx")
+      )
       return
     }
 

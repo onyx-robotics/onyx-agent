@@ -117,6 +117,9 @@ deeper prose memory or history.
 
 Research commands require API access. The supervisor uses server-assigned
 leases, renews worker liveness in batches, and owns stop scheduling. Workers
+receive one short-lived scoped credential rather than the supervisor's team API
+key. The worker API derives their full assignment identity and exposes only
+brief, experiment, knowledge, and heartbeat operations.
 attempt to push immutable experiment refs while reporting; failed pushes are
 recorded as local-reported evidence instead of blocking metrics. Experiment
 report calls return `recorded` or `duplicate`, and later settlement assigns
@@ -159,6 +162,9 @@ onyx research hypothesis add --campaign fast-eval --focus "Try a fresh hypothesi
 ```
 
 `onyx research run` validates committed setup and evaluator fingerprint inputs,
+resolves the provider and worker CLI to absolute paths, performs one structured
+model probe plus a protocol handshake, and aborts before creating a session if
+any deterministic compatibility check fails. It then
 always creates a new assignment-backed session, and starts a detached supervisor by
 default, then prints the session id, supervisor PID, log path, and monitoring
 commands before returning. Use `--json` for parseable startup output in
@@ -177,8 +183,11 @@ onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --experim
 For large local runs, the supervisor ramps launches in batches
 (`--launch-batch-size`, default up to 10) separated by
 `--launch-interval-seconds` (default 5), backs off with capped exponential
-jitter when provider startup, rate-limit, overload, auth, or degraded-service
-failures happen, and asks the server for worker leases in idempotent batches.
+jitter only for transient provider rate-limit, overload, or unavailable
+failures, and asks the server for worker leases in idempotent batches.
+Deterministic auth, model, protocol, network-policy, and sandbox failures stop
+the site immediately; evaluation, git, and report-delivery failures retain
+distinct non-backoff terminal reasons.
 The server enforces the worker target, assigns hypotheses, records reports, and
 settles accepted/discarded disposition idempotently after completion. Batch
 leases return one compact shared research context plus per-worker grants, while
@@ -201,7 +210,9 @@ isolated `ONYX_HOME` plus `ONYX_WORKER_CONTEXT` under
 `.git/onyx/worker-runtime/<session>/<workerId>/`, and write raw stdout/stderr logs,
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
-`.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
+`.git/onyx/worker-logs/`. Runtime directories and context files use restrictive
+permissions, retained output is stream-redacted, and credential-bearing runtime
+directories are deleted during teardown. `onyx research run` owns local worker scheduling,
 server lease acquisition, session-state brief refreshes, supervisor-owned
 control polling, adaptive coalesced presence updates, batch heartbeats, stop
 handling, and local child cleanup. `onyx research status --summary --json`

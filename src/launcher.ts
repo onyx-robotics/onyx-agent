@@ -86,7 +86,7 @@ export async function runLauncher({
     if (!checkout) {
       throw new Error(
         "Onyx developer mode is active, but no checkout is linked. Run `onyx developer link <path>` or switch back with `onyx developer use release`."
-    )
+      )
     }
     await validateDeveloperCheckout(checkout)
     return runDev(checkout, argv, env, entrypoint)

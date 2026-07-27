@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import { closeSync, openSync } from "node:fs"
 import {
   appendFile,
@@ -11,6 +11,7 @@ import {
 import { spawn, spawnSync } from "node:child_process"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { freemem } from "node:os"
 
 import {
   researchHypothesisPlanSchema,
@@ -30,8 +31,10 @@ import {
   createCampaignHypothesis,
   createCampaignSession,
   createCampaignKnowledge,
+  createWorkerKnowledge,
   getResearchSessionControlState,
   getResearchSessionBrief,
+  getWorkerResearchBrief,
   getResearchSessionStateBrief,
   getResearchSessionLive,
   getResearchSessionState,
@@ -40,6 +43,7 @@ import {
   listCampaignExperiments,
   listCampaignHypotheses,
   listCampaignKnowledge,
+  listWorkerKnowledge,
   listProjectCampaigns,
   reconcileCampaign,
   reopenCampaignHypothesis,
@@ -75,7 +79,6 @@ import {
 import { evaluationFingerprint } from "../lib/evaluation-fingerprint"
 import {
   apiBaseUrl,
-  apiKey,
   normalizeWorkerModel,
   profileNameFromArgs,
   readConfig,
@@ -106,6 +109,10 @@ import {
   writeSupervisorControlStateSnapshot,
 } from "../lib/supervisor-control-state"
 import { readWorkerRuntimeContext } from "../lib/worker-context"
+import {
+  readWorkerFinishMarker,
+  type WorkerFinishMarker,
+} from "../lib/worker-finish"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
   pathExists,
@@ -141,9 +148,14 @@ import {
 } from "../lib/worker-activity"
 import {
   buildWorkerInvocation,
+  classifyProviderFailure,
   lowestFreeSlot,
   manifestIsTerminal,
   preflightWorkerInvocation,
+  preflightProviderModel,
+  preflightWorkerProtocol,
+  providerRuntimeEnvironment,
+  resolveProviderExecutable,
   readWorkerLaunchManifests,
   workerRuntimeEnvironment,
   workerRuntimePaths,
@@ -159,8 +171,32 @@ import {
   type WorkerCliWrapper,
   type WorkerRuntimePaths,
   type WorkerTerminalReasonCode,
+  type ProviderFailureClass,
 } from "../lib/worker-launcher"
 import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
+
+function createWorkerCredential() {
+  return `owx_worker_v1_${randomBytes(32).toString("base64url")}`
+}
+
+function aggregateChildRssBytes(manifests: WorkerLaunchManifest[]) {
+  const pids = manifests
+    .filter(
+      (manifest) =>
+        manifest.status === "starting" || manifest.status === "running"
+    )
+    .map((manifest) => manifest.pid)
+    .filter((pid): pid is number => typeof pid === "number" && pid > 0)
+  if (pids.length === 0) return 0
+  const result = spawnSync("ps", ["-o", "rss=", "-p", pids.join(",")], {
+    encoding: "utf8",
+  })
+  if (result.status !== 0) return 0
+  return result.stdout
+    .split(/\s+/)
+    .filter(Boolean)
+    .reduce((total, value) => total + (Number(value) || 0) * 1024, 0)
+}
 
 const MAX_WORKER_SHUTDOWN_CUSHION_MS = 90_000
 const MIN_WORKER_SHUTDOWN_CUSHION_MS = 15_000
@@ -198,15 +234,10 @@ async function frozenWorkerApiEnv(args: Args) {
   } catch {
     // Leave API URL unset only for low-level local debugging.
   }
-  try {
-    env.ONYX_API_KEY = await apiKey(args)
-  } catch {
-    // Leave auth unset when the caller is intentionally offline.
-  }
   return env
 }
 
-type SessionFinalizationStatus = ApiSession["finalizationStatus"]
+type SessionCleanupStatus = ApiSession["cleanupStatus"]
 type SessionTerminalReason =
   | "experiment_target_reached"
   | "deadline_reached"
@@ -257,11 +288,21 @@ async function appendWorkerActivityEvent(
     ...(event.summary ? { summary: event.summary } : {}),
     ...(event.metadata ? { metadata: event.metadata } : {}),
   }
-  await appendFile(
-    manifest.activityJsonlPath,
-    `${JSON.stringify(record)}\n`,
-    "utf8"
-  ).catch(() => {})
+  let serialized = JSON.stringify(record)
+  const originalBytes = Buffer.byteLength(serialized)
+  if (originalBytes > 8 * 1024) {
+    serialized = JSON.stringify({
+      ...record,
+      ...(event.summary ? { summary: event.summary.slice(0, 4000) } : {}),
+      metadata: {
+        truncated: true,
+        originalBytes,
+      },
+    })
+  }
+  await appendFile(manifest.activityJsonlPath, `${serialized}\n`, "utf8").catch(
+    () => {}
+  )
 }
 
 const PIPED_ONYX_MUTATION_COMMAND =
@@ -953,14 +994,16 @@ function createPresenceSupervisor({
   sessionId,
   supervisorRunId,
   intervalMs,
-  leaseTokensByWorkerId,
+  maxConcurrency,
+  workerCredentialsByWorkerId,
 }: {
   root: string
   args: Args
   sessionId: string
   supervisorRunId: string
   intervalMs: number
-  leaseTokensByWorkerId: Map<string, string>
+  maxConcurrency: number
+  workerCredentialsByWorkerId: Map<string, string>
 }) {
   const lastSent = new Map<string, string>()
   let sequence = 0
@@ -968,12 +1011,16 @@ function createPresenceSupervisor({
   let lastLeaseRenewalAt = 0
   let running: Promise<void> | null = null
   let stopped = false
+  let memoryWarningEmitted = false
   let timer: ReturnType<typeof setInterval> | null = null
 
   type PresenceSnapshotOptions = {
     forceFull?: boolean
     terminal?: boolean
+    runtimeStatus?: "starting" | "active" | "draining" | "complete" | "failed"
   }
+
+  let cleanupStartedAt: string | null = null
 
   const normalizeSnapshotOptions = (
     options: boolean | PresenceSnapshotOptions = {}
@@ -1013,6 +1060,11 @@ function createPresenceSupervisor({
     const options = normalizeSnapshotOptions(rawOptions)
     const forceFull = options.forceFull ?? false
     const terminal = options.terminal ?? false
+    const runtimeStatus =
+      options.runtimeStatus ?? (terminal ? "complete" : "active")
+    if (runtimeStatus === "draining" && !cleanupStartedAt) {
+      cleanupStartedAt = new Date().toISOString()
+    }
     if (args.options.offline === "true") return
     const state = await getLocalSessionState(root, sessionId)
     const cliState = await readState(root).catch(() => null)
@@ -1029,6 +1081,26 @@ function createPresenceSupervisor({
       )
     )
     const observedAt = new Date().toISOString()
+    const supervisorRssBytes = process.memoryUsage().rss
+    const childRssBytes = aggregateChildRssBytes(manifests)
+    const availableHostMemoryBytes = freemem()
+    const activeChildCount = manifests.filter(
+      (manifest) =>
+        manifest.status === "starting" || manifest.status === "running"
+    ).length
+    const averageChildRssBytes =
+      activeChildCount > 0 ? childRssBytes / activeChildCount : 0
+    const projectedMemoryBytes =
+      supervisorRssBytes + averageChildRssBytes * maxConcurrency
+    if (
+      !memoryWarningEmitted &&
+      projectedMemoryBytes > availableHostMemoryBytes * 0.7
+    ) {
+      memoryWarningEmitted = true
+      console.warn(
+        `Research processes are using more than 70% of currently available host memory. Reduce --max-concurrency if the host becomes unstable.`
+      )
+    }
     const sessionRuntimeState = cliState?.sessions?.[sessionId]
     const supervisorTelemetry = freshSupervisorTelemetry(
       sessionRuntimeState?.supervisor
@@ -1138,6 +1210,15 @@ function createPresenceSupervisor({
           sequence,
           sessionId,
           site: {
+            runtimeStatus,
+            cleanupStartedAt:
+              runtimeStatus === "draining" || terminal
+                ? (cleanupStartedAt ?? observedAt)
+                : null,
+            cleanupCompletedAt: terminal ? observedAt : null,
+            cleanupSummary: terminal
+              ? { activeProcessCount: 0, workerCount: workerSnapshots.length }
+              : {},
             activeWorkerCount,
             launchedWorkerCount: workerSnapshots.length,
             failedLaunchCount,
@@ -1152,6 +1233,10 @@ function createPresenceSupervisor({
               splitIndex: index + 1,
               splitCount,
               terminal,
+              supervisorRssBytes,
+              childRssBytes,
+              availableHostMemoryBytes,
+              projectedMemoryBytes,
               noProgressBreaker: supervisorTelemetry?.noProgressBreaker ?? null,
             },
           },
@@ -1228,7 +1313,7 @@ function createPresenceSupervisor({
     if (shouldRenewLeases) {
       const heartbeats = workerSnapshots
         .flatMap((worker) => {
-          const token = leaseTokensByWorkerId.get(worker.snapshot.id)
+          const token = workerCredentialsByWorkerId.get(worker.snapshot.id)
           const durable = workerById.get(worker.snapshot.id)
           if (
             !token ||
@@ -1240,10 +1325,7 @@ function createPresenceSupervisor({
           return [
             {
               workerId: worker.snapshot.id,
-              leaseToken: token,
               status: "running" as const,
-              sessionId,
-              hypothesisId: durable.hypothesisId,
               phase: worker.snapshot.phase ?? "running",
               event: "supervisor_batch_heartbeat",
               progressMessage: worker.snapshot.progressMessage ?? null,
@@ -1258,7 +1340,10 @@ function createPresenceSupervisor({
         .slice(0, 500)
       if (heartbeats.length > 0) {
         lastLeaseRenewalAt = Date.now()
-        const response = await heartbeatWorkersBatch({ heartbeats }, args)
+        const response = await heartbeatWorkersBatch(
+          { sessionId, siteId, supervisorRunId, heartbeats },
+          args
+        )
         const failures = response.results.filter((result) => !result.ok)
         if (failures.length > 0) {
           console.warn(
@@ -1302,10 +1387,10 @@ function createPresenceSupervisor({
     async flush(options: PresenceSnapshotOptions = {}) {
       await run({ ...options, forceFull: true }).catch(() => {})
     },
-    async stop() {
+    async stop(options: PresenceSnapshotOptions = {}) {
       stopped = true
       if (timer) clearInterval(timer)
-      await run(true).catch(() => {})
+      await run({ ...options, forceFull: true }).catch(() => {})
     },
   }
 }
@@ -1336,21 +1421,20 @@ export async function waitForStartupSessionReady({
   )
 }
 
-type SessionFinalizationComputation = {
-  status: SessionFinalizationStatus
+type SessionCleanupComputation = {
+  status: SessionCleanupStatus
   reasons: string[]
   live: ApiSessionLive | null
 }
 
-async function computeSessionFinalizationStatus({
+async function computeSessionCleanupStatus({
   root,
   sessionId,
 }: {
   root: string
   sessionId: string
-}): Promise<SessionFinalizationComputation> {
-  const failedReasons: string[] = []
-  const incompleteReasons: string[] = []
+}): Promise<SessionCleanupComputation> {
+  const cleanupFailures: string[] = []
   const [manifests] = await Promise.all([
     readWorkerLaunchManifests(root, sessionId).catch(() => []),
   ])
@@ -1359,12 +1443,12 @@ async function computeSessionFinalizationStatus({
     const batch = manifests.slice(index, index + 25)
     if (manifests.length > 25) {
       console.log(
-        `finalization check: workers ${index + 1}-${index + batch.length}/${manifests.length}`
+        `cleanup check: workers ${index + 1}-${index + batch.length}/${manifests.length}`
       )
     }
     for (const manifest of batch) {
       if (manifest.status === "starting" || manifest.status === "running") {
-        incompleteReasons.push(
+        cleanupFailures.push(
           `worker ${manifest.workerId} still ${manifest.status}`
         )
       }
@@ -1375,14 +1459,14 @@ async function computeSessionFinalizationStatus({
           manifest.status === "failed" ||
           manifest.status === "stopped"
         ) {
-          incompleteReasons.push(
+          cleanupFailures.push(
             `worker ${manifest.workerId} has no teardown result`
           )
         }
         continue
       }
       if (teardown.worktreeCleanup === "failed") {
-        incompleteReasons.push(
+        cleanupFailures.push(
           `worker ${manifest.workerId} worktree cleanup failed${
             teardown.error ? `: ${teardown.error}` : ""
           }`
@@ -1393,24 +1477,19 @@ async function computeSessionFinalizationStatus({
 
   const live: ApiSessionLive | null = null
 
-  const reasons = failedReasons.length > 0 ? failedReasons : incompleteReasons
+  const reasons = cleanupFailures
   return {
-    status:
-      failedReasons.length > 0
-        ? "failed"
-        : incompleteReasons.length > 0
-          ? "incomplete"
-          : "complete",
+    status: cleanupFailures.length > 0 ? "failed" : "complete",
     reasons,
     live,
   }
 }
 
-async function writeRemoteSessionFinalization({
+async function writeRemoteSessionCleanup({
   sessionId,
   campaignId,
   status,
-  finalization,
+  cleanup,
   terminalReason,
   metadata,
   args,
@@ -1419,7 +1498,7 @@ async function writeRemoteSessionFinalization({
   sessionId: string
   campaignId: string
   status: "completed" | "failed" | "stopped"
-  finalization: SessionFinalizationComputation
+  cleanup: SessionCleanupComputation
   terminalReason?: SessionTerminalReason | null
   metadata?: Record<string, unknown>
   args: Args
@@ -1437,12 +1516,12 @@ async function writeRemoteSessionFinalization({
               ? "failed"
               : "user_stopped",
         reason:
-          finalization.reasons.length > 0
-            ? finalization.reasons.slice(0, 5).join("; ")
+          cleanup.reasons.length > 0
+            ? cleanup.reasons.slice(0, 5).join("; ")
             : "research session finalized",
         metadata: {
           ...(terminalReason ? { terminalReason } : {}),
-          finalizationReasons: finalization.reasons,
+          cleanupReasons: cleanup.reasons,
           ...metadata,
         },
       },
@@ -1451,7 +1530,7 @@ async function writeRemoteSessionFinalization({
   } catch (error) {
     if (requireOnline) throw error
     console.warn(
-      `Remote session finalization was not written: ${errorMessage(error)}`
+      `Remote session cleanup was not written: ${errorMessage(error)}`
     )
     return null
   }
@@ -1754,6 +1833,7 @@ export async function teardownHypothesisAttempt({
   sessionId,
   assignmentId,
   workerId,
+  workerCredential,
   activityManifest,
   args,
   providerExitCode,
@@ -1774,6 +1854,7 @@ export async function teardownHypothesisAttempt({
   sessionId: string
   assignmentId: string
   workerId: string
+  workerCredential: string
   activityManifest?: WorkerLaunchManifest | null
   args: Args
   providerExitCode: number | null
@@ -1855,6 +1936,7 @@ export async function teardownHypothesisAttempt({
           assignmentId,
           hypothesisId: hypothesis.id,
           workerId,
+          workerCredential,
         },
       })
     )
@@ -2047,6 +2129,7 @@ export function compactProviderErrorSummary(input: string | null | undefined) {
 export type ResearchStopReasonCode =
   | "stop_requested"
   | "session_terminal"
+  | "assignment_canceled"
   | "deadline_reached"
   | "experiment_target_reached"
 
@@ -2119,7 +2202,7 @@ export function createResearchSessionStopChecker({
   assignmentId,
   args,
   settleBeforeCheck = false,
-  settlementNudgeIntervalMs = 1_000,
+  settlementNudgeIntervalMs = 5_000,
   controlPollIntervalMs = 1_000,
   preferLocalSupervisorControl = false,
   onRemoteControlState,
@@ -2156,7 +2239,10 @@ export function createResearchSessionStopChecker({
             return cachedResult
           }
         }
-        const shouldNudge = settleBeforeCheck && nowMs >= nextSettlementNudgeMs
+        const shouldNudge =
+          settleBeforeCheck &&
+          nowMs >= nextSettlementNudgeMs &&
+          Boolean(cachedResult?.controlState?.progress.receivedExperimentCount)
         let control: Awaited<ReturnType<typeof getResearchSessionControlState>>
         const localSnapshot = preferLocalSupervisorControl
           ? await readSupervisorControlStateSnapshot({ root, sessionId }).catch(
@@ -2213,7 +2299,7 @@ export function createResearchSessionStopChecker({
           assignmentId &&
           control.canceledAssignmentIds.includes(assignmentId)
         ) {
-          add("stop_requested", "hypothesis assignment canceled")
+          add("assignment_canceled", "hypothesis assignment canceled")
         }
         cachedResult = {
           shouldStop: reasons.length > 0,
@@ -2274,7 +2360,8 @@ function createSessionStateBriefRefresher({
           ...previous.brief.session,
           runtimeState: control.runtimeState,
           status: control.status,
-          finalizationStatus: control.finalizationStatus,
+          outcome: control.outcome,
+          cleanup: control.cleanup,
           deadlineAt: control.progress.deadlineAt,
           endedAt: control.progress.endedAt,
           endReason: control.progress.endReason,
@@ -2349,24 +2436,16 @@ export function sessionStateBriefControlSignature(
     canceledAssignmentIds: [...control.canceledAssignmentIds].sort(),
     campaignStatus: control.campaignStatus,
     sessionStatus: control.status,
-    finalizationStatus: control.finalizationStatus,
+    outcomeStatus: control.outcome.status,
+    cleanupStatus: control.cleanup.status,
   })
-}
-
-async function harnessShouldStopSession({
-  checker,
-}: {
-  checker: ReturnType<typeof createResearchSessionStopChecker>
-}) {
-  const result = await checker.check()
-  return result.shouldStop
 }
 
 async function withWorkerHeartbeat<T>({
   root,
   args,
   workerId,
-  leaseToken,
+  workerCredential,
   sessionId,
   hypothesisId,
   latestStatePath,
@@ -2381,7 +2460,7 @@ async function withWorkerHeartbeat<T>({
   root: string
   args: Args
   workerId: string
-  leaseToken?: string
+  workerCredential?: string
   sessionId: string
   hypothesisId: string
   latestStatePath?: string | null
@@ -2426,7 +2505,7 @@ async function withWorkerHeartbeat<T>({
       void heartbeatWorker(
         workerId,
         {
-          leaseToken,
+          workerCredential,
           status: "running",
           sessionId,
           hypothesisId,
@@ -2461,7 +2540,12 @@ type LifecycleHeartbeat = Parameters<
 >[0]["heartbeats"][number]
 
 export function createLifecycleHeartbeatPublisher(
-  args: Args,
+  context: {
+    args: Args
+    sessionId: string
+    siteId: string
+    supervisorRunId: string
+  },
   send: typeof heartbeatWorkersBatch = heartbeatWorkersBatch
 ) {
   const pending = new Map<
@@ -2484,8 +2568,13 @@ export function createLifecycleHeartbeatPublisher(
     flushing = (async () => {
       try {
         const response = await send(
-          { heartbeats: entries.map(([, entry]) => entry.heartbeat) },
-          args
+          {
+            sessionId: context.sessionId,
+            siteId: context.siteId,
+            supervisorRunId: context.supervisorRunId,
+            heartbeats: entries.map(([, entry]) => entry.heartbeat),
+          },
+          context.args
         )
         const resultByWorkerId = new Map(
           response.results.map((result) => [result.workerId, result])
@@ -2658,6 +2747,127 @@ type HypothesisRunResult = {
   error?: string
   leaseUnavailable?: boolean
   startupTimedOut?: boolean
+  terminalReason?: DurableWorkerTerminalReason
+  siteFatal?: boolean
+  providerFailureClass?: ProviderFailureClass | null
+}
+
+type DurableWorkerTerminalReason = NonNullable<
+  ApiWorker["terminalOutcome"]
+>["reason"]
+
+export function classifyDurableWorkerTerminalReason({
+  stoppedByHarness,
+  stopReasonCodes,
+  cleanupFailed,
+  attemptDeliveryFailed,
+  attemptDelivered,
+  explicitFinishReason,
+  timedOut,
+  protocolViolation,
+  processFailed,
+  providerFailureClass,
+  error,
+}: {
+  stoppedByHarness: boolean
+  stopReasonCodes?: ResearchStopReasonCode[]
+  cleanupFailed: boolean
+  attemptDeliveryFailed: boolean
+  attemptDelivered: boolean
+  explicitFinishReason: WorkerFinishMarker["reason"] | null
+  timedOut: boolean
+  protocolViolation: boolean
+  processFailed: boolean
+  providerFailureClass: ProviderFailureClass | null
+  error: string | null
+}): DurableWorkerTerminalReason {
+  if (stoppedByHarness) {
+    if (stopReasonCodes?.includes("assignment_canceled")) {
+      return "assignment_canceled"
+    }
+    if (
+      stopReasonCodes?.includes("deadline_reached") ||
+      stopReasonCodes?.includes("experiment_target_reached")
+    ) {
+      return "session_cutoff"
+    }
+    return "session_stopped"
+  }
+  if (cleanupFailed) return "cleanup_failed"
+  if (attemptDeliveryFailed) return "worker_report_delivery_failed"
+  if (timedOut) return "worker_timeout"
+
+  const message = error ?? ""
+  if (
+    protocolViolation ||
+    /protocol mismatch|unsupported (?:worker )?context|worker context .*mismatch|handshake failed/i.test(
+      message
+    )
+  ) {
+    return "worker_protocol_mismatch"
+  }
+  if (
+    /network policy|network access (?:is )?(?:denied|disabled|blocked)|egress (?:denied|blocked)/i.test(
+      message
+    )
+  ) {
+    return "worker_network_policy"
+  }
+  if (
+    /sandbox violation|sandbox denied|outside (?:the )?workspace|read-only file system|operation not permitted by sandbox/i.test(
+      message
+    )
+  ) {
+    return "worker_sandbox_failed"
+  }
+  if (
+    /evaluation failed|metric tool failed|checks_failed|setup_violation|invalid metric output/i.test(
+      message
+    )
+  ) {
+    return "worker_evaluation_failed"
+  }
+  if (
+    /git (?:push|commit|checkout|worktree) failed|failed to (?:push|commit|checkout)|result ref .*failed/i.test(
+      message
+    )
+  ) {
+    return "worker_git_failed"
+  }
+  if (processFailed) {
+    switch (providerFailureClass) {
+      case "auth":
+        return "provider_auth"
+      case "quota":
+        return "provider_quota_exhausted"
+      case "model_unsupported":
+        return "provider_model_unsupported"
+      case "rate_limit":
+        return "provider_rate_limited"
+      case "overloaded":
+        return "provider_overloaded"
+      case "unavailable":
+        return "provider_unavailable"
+      default:
+        return "provider_process_failed"
+    }
+  }
+  if (attemptDelivered) return "completed_with_experiments"
+  if (explicitFinishReason) return explicitFinishReason
+  return "worker_no_progress"
+}
+
+export function durableWorkerReasonIsSiteFatal(
+  reason: DurableWorkerTerminalReason
+) {
+  return (
+    reason === "provider_auth" ||
+    reason === "provider_quota_exhausted" ||
+    reason === "provider_model_unsupported" ||
+    reason === "worker_protocol_mismatch" ||
+    reason === "worker_network_policy" ||
+    reason === "worker_sandbox_failed"
+  )
 }
 
 function isLeaseUnavailableError(error: unknown) {
@@ -2698,6 +2908,7 @@ async function runHypothesisOnce({
   slotIndex = null,
   onRegistered,
   lifecycleHeartbeats,
+  providerExecutable,
   args,
 }: {
   root: string
@@ -2722,14 +2933,15 @@ async function runHypothesisOnce({
   onRegistered?: (worker: {
     workerId: string
     hypothesisId: string
-    leaseToken: string
+    workerCredential: string
   }) => void
   lifecycleHeartbeats?: ReturnType<typeof createLifecycleHeartbeatPublisher>
+  providerExecutable?: string
   args: Args
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
   let workerName: string | null = null
-  let leaseToken: string | undefined
+  let workerCredential: string | undefined
   let resultCommitSha: string | undefined
   let worktree: string | null = null
   let assignmentId: string | null = null
@@ -2743,7 +2955,11 @@ async function runHypothesisOnce({
   let providerSignal: string | null = null
   let providerTimedOut = false
   let providerStartupTimedOut = false
+  let stoppedByHarness = false
+  let harnessStopReasonCodes: ResearchStopReasonCode[] = []
+  let explicitFinishMarker: WorkerFinishMarker | null = null
   let providerError: string | null = null
+  let providerFailureClass: ProviderFailureClass | null = null
   let outcome: HypothesisRunResult | null = null
   let firstAttemptWarningTimer: ReturnType<typeof setTimeout> | null = null
   let launchPersistQueue: Promise<void> = Promise.resolve()
@@ -2757,12 +2973,6 @@ async function runHypothesisOnce({
   }
   let workerCliWrapper: WorkerCliWrapper | null = null
   let runtimePaths: WorkerRuntimePaths | null = null
-  const cleanupWorkerRuntimeTempDir = async () => {
-    if (!runtimePaths) return
-    await rm(runtimePaths.tempDir, { recursive: true, force: true }).catch(
-      () => {}
-    )
-  }
 
   try {
     const effectiveAgentKind = workerCommand ? "custom" : agentKind
@@ -2777,6 +2987,7 @@ async function runHypothesisOnce({
           agentKind: effectiveAgentKind,
           runtime: "local",
           leaseSeconds: 180,
+          leaseCredential: createWorkerCredential(),
           metadata: workerModelMetadata(workerModel),
         },
         args
@@ -2797,7 +3008,7 @@ async function runHypothesisOnce({
     const worker = lease.worker
     assignmentId = lease.assignment.id
     startingCommitSha = lease.assignment.startingCommitSha
-    leaseToken = lease.leaseToken
+    workerCredential = lease.workerCredential
     hypothesis = lease.hypothesis
     workerId = worker.id
     workerName = worker.workerName
@@ -2815,13 +3026,13 @@ async function runHypothesisOnce({
     onRegistered?.({
       workerId: worker.id,
       hypothesisId: hypothesis.id,
-      leaseToken,
+      workerCredential,
     })
     if (!lifecycleHeartbeats)
       await heartbeatWorker(
         worker.id,
         {
-          leaseToken,
+          workerCredential,
           status: "running",
           sessionId,
           hypothesisId: hypothesis.id,
@@ -2924,7 +3135,7 @@ async function runHypothesisOnce({
     await writeWorkerRuntimeContext({
       paths: runtimePaths,
       context: {
-        schemaVersion: 4,
+        schemaVersion: 5,
         campaignId: campaign.id,
         campaignName: campaign.name,
         sessionId,
@@ -2949,7 +3160,7 @@ async function runHypothesisOnce({
           lastWorkedAt: hypothesis.lastWorkedAt,
         },
         workerId: worker.id,
-        workerLeaseToken: leaseToken,
+        workerCredential: workerCredential,
         worktreeRoot: worktree,
         projectPath,
         projectRoot,
@@ -2974,7 +3185,8 @@ async function runHypothesisOnce({
       ONYX_HYPOTHESIS_ID: hypothesis.id,
       ONYX_HYPOTHESIS_NAME: hypothesis.name,
       ONYX_WORKER_ID: worker.id,
-      ONYX_WORKER_LEASE_TOKEN: leaseToken,
+      ONYX_WORKER_CREDENTIAL: workerCredential,
+      ONYX_WORKER_BIN: workerCliWrapper.workerPath,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
       ONYX_PROJECT_ROOT: projectRoot,
@@ -3005,6 +3217,7 @@ async function runHypothesisOnce({
       addedWritableRoots,
       workerModel,
       workerTitle: worker.id,
+      providerExecutable,
     })
     const preparedLaunchPaths = await workerLaunchPaths({
       root,
@@ -3043,7 +3256,7 @@ async function runHypothesisOnce({
       await heartbeatWorker(
         worker.id,
         {
-          leaseToken,
+          workerCredential,
           status: "running",
           sessionId,
           hypothesisId: hypothesis.id,
@@ -3059,6 +3272,9 @@ async function runHypothesisOnce({
       env: workerRunEnv,
       campaignName: campaign.name,
       sessionId,
+      assignmentId: lease.assignment.id,
+      workerId: worker.id,
+      onyxWorkerPath: workerCliWrapper.workerPath,
     })
     const preflightManifest: WorkerLaunchManifest = {
       ...readyManifest,
@@ -3114,7 +3330,7 @@ async function runHypothesisOnce({
             await heartbeatWorker(
               worker.id,
               {
-                leaseToken,
+                workerCredential,
                 status: "running",
                 sessionId,
                 hypothesisId: hypothesis.id,
@@ -3149,7 +3365,7 @@ async function runHypothesisOnce({
       root,
       args,
       workerId: worker.id,
-      leaseToken,
+      workerCredential,
       sessionId,
       hypothesisId: hypothesis.id,
       latestStatePath:
@@ -3190,6 +3406,17 @@ async function runHypothesisOnce({
             ].join("\n"),
             stdin: preparedInvocation.stdin,
             env: workerRunEnv,
+            redactValues: [
+              ...(workerCredential ? [workerCredential] : []),
+              ...Object.entries(workerRunEnv)
+                .filter(([name, value]) =>
+                  Boolean(
+                    value &&
+                    /(?:KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD)$/i.test(name)
+                  )
+                )
+                .map(([, value]) => value as string),
+            ],
             onSpawn: (pid) => {
               if (!launchManifest) return
               const identity = inspectProcessIdentity(pid)
@@ -3205,8 +3432,13 @@ async function runHypothesisOnce({
             cancel: {
               graceMs: stopGraceMs,
               pollMs: 5000 + Math.floor(Math.random() * 1250),
-              shouldCancel: () =>
-                harnessShouldStopSession({ checker: stopChecker }),
+              shouldCancel: async () => {
+                const check = await stopChecker.check()
+                if (check.shouldStop) {
+                  harnessStopReasonCodes = check.reasonCodes
+                }
+                return check.shouldStop
+              },
             },
             onOutput: ({ at }) => {
               if (!launchManifest) return
@@ -3228,7 +3460,10 @@ async function runHypothesisOnce({
       heartbeatSampleEveryMs: lifecycleHeartbeats ? 0 : heartbeatSampleEveryMs,
     })
     if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
-    const stoppedByHarness = workerResult.cancelled
+    stoppedByHarness = workerResult.cancelled
+    explicitFinishMarker = runtimePaths?.contextPath
+      ? await readWorkerFinishMarker(runtimePaths.contextPath)
+      : null
     providerExitCode = workerResult.code
     providerSignal = workerResult.signal
     providerTimedOut = workerResult.timedOut
@@ -3285,6 +3520,7 @@ async function runHypothesisOnce({
     } else if (workerFailure) {
       terminalPhase = "failed"
       providerError = compactProviderErrorSummary(workerFailure)
+      providerFailureClass = classifyProviderFailure(workerFailure)
       outcome = {
         hypothesis,
         workerId: worker.id,
@@ -3306,6 +3542,7 @@ async function runHypothesisOnce({
   } catch (error) {
     const message = compactProviderErrorSummary(errorMessage(error))
     providerError = message
+    providerFailureClass = classifyProviderFailure(message)
     terminalPhase = "failed"
     terminalReasonCode = providerStartupTimedOut
       ? "startup_failure"
@@ -3402,7 +3639,7 @@ async function runHypothesisOnce({
         await heartbeatWorker(
           workerId,
           {
-            leaseToken,
+            workerCredential,
             status: "running",
             sessionId,
             hypothesisId: hypothesis.id,
@@ -3421,7 +3658,12 @@ async function runHypothesisOnce({
         }).catch(() => {})
       }
 
-      if (hasWorktree && assignmentId && startingCommitSha) {
+      if (
+        hasWorktree &&
+        assignmentId &&
+        startingCommitSha &&
+        workerCredential
+      ) {
         teardown = await teardownHypothesisAttempt({
           root,
           worktree: worktreeCandidate,
@@ -3433,6 +3675,7 @@ async function runHypothesisOnce({
           sessionId,
           assignmentId,
           workerId,
+          workerCredential,
           activityManifest: launchManifest,
           args,
           providerExitCode,
@@ -3504,6 +3747,66 @@ async function runHypothesisOnce({
         )
       }
 
+      let runtimeCleanup: "removed" | "failed" = "removed"
+      if (runtimePaths) {
+        try {
+          await rm(runtimePaths.dir, { recursive: true, force: true })
+        } catch (runtimeCleanupError) {
+          runtimeCleanup = "failed"
+          teardown.worktreeCleanup = "failed"
+          teardown.phase = "failed"
+          teardown.reasonCode = "cleanup_failure"
+          teardown.error = appendBoundedTeardownError(
+            teardown.error,
+            runtimeCleanupError
+          )
+          terminalOutcome.status = "failed"
+          terminalOutcome.error = appendBoundedTeardownError(
+            terminalOutcome.error ?? null,
+            runtimeCleanupError
+          )
+        }
+      }
+
+      const durableReason = classifyDurableWorkerTerminalReason({
+        stoppedByHarness,
+        stopReasonCodes: harnessStopReasonCodes,
+        cleanupFailed: teardown.worktreeCleanup === "failed",
+        attemptDeliveryFailed: teardown.attemptDelivery === "failed",
+        attemptDelivered: durableAttemptDelivered,
+        explicitFinishReason: explicitFinishMarker?.reason ?? null,
+        timedOut: providerTimedOut,
+        protocolViolation: teardown.reasonCode === "worker_protocol_violation",
+        processFailed: terminalOutcome.status === "failed",
+        providerFailureClass,
+        error: terminalOutcome.error ?? providerError,
+      })
+      if (
+        durableReason === "completed_with_experiments" ||
+        durableReason === "hypothesis_exhausted" ||
+        durableReason === "goal_satisfied" ||
+        durableReason === "no_viable_change"
+      ) {
+        terminalOutcome.status = "completed"
+        terminalOutcome.error = undefined
+      } else if (
+        durableReason === "session_stopped" ||
+        durableReason === "session_cutoff" ||
+        durableReason === "assignment_canceled"
+      ) {
+        terminalOutcome.status = "stopped"
+      } else {
+        terminalOutcome.status = "failed"
+        if (durableReason === "worker_no_progress") {
+          terminalOutcome.error =
+            terminalOutcome.error ??
+            "Provider exited successfully without a delivered experiment or an explicit finish marker."
+        }
+      }
+      terminalOutcome.terminalReason = durableReason
+      terminalOutcome.siteFatal = durableWorkerReasonIsSiteFatal(durableReason)
+      terminalOutcome.providerFailureClass = providerFailureClass
+
       if (launchManifest) {
         launchManifest = {
           ...launchManifest,
@@ -3558,13 +3861,37 @@ async function runHypothesisOnce({
             }
           : {}),
         terminal: teardown,
+        terminalOutcome: {
+          reason: durableReason,
+          providerExitCode,
+          providerSignal,
+          timedOut: providerTimedOut,
+          reportedExperimentCount: durableAttemptDelivered ? 1 : 0,
+          teardownDelivery: durableAttemptDelivered
+            ? "delivered"
+            : teardown.attemptDelivery === "none"
+              ? "none"
+              : "failed",
+          resultRefPush:
+            teardown.resultRefPushStatus === "pushed"
+              ? "pushed"
+              : teardown.resultRefPushStatus === "failed"
+                ? "failed"
+                : "none",
+          cleanup:
+            teardown.worktreeCleanup === "removed" &&
+            runtimeCleanup === "removed"
+              ? "complete"
+              : "failed",
+          errorSummary: terminalOutcome.error
+            ? compactProviderErrorSummary(terminalOutcome.error).slice(0, 2000)
+            : null,
+          completedAt: new Date().toISOString(),
+        },
       }
       const terminalHeartbeat = {
         workerId,
-        leaseToken,
         status: terminalOutcome.status,
-        sessionId,
-        hypothesisId: hypothesis.id,
         phase: terminalOutcome.status,
         event: terminalEvent,
         progressMessage: terminalProgress,
@@ -3577,7 +3904,7 @@ async function runHypothesisOnce({
           : heartbeatWorker(
               workerId,
               {
-                leaseToken,
+                workerCredential,
                 status: terminalOutcome.status,
                 sessionId,
                 hypothesisId: hypothesis.id,
@@ -3593,7 +3920,6 @@ async function runHypothesisOnce({
         console.warn(errorMessage(error))
       })
     }
-    await cleanupWorkerRuntimeTempDir()
   }
 
   return (
@@ -3869,6 +4195,7 @@ export async function commandResearchClean(args: Args) {
 }
 
 export async function commandResearchBrief(args: Args) {
+  const workerContext = await readWorkerRuntimeContext().catch(() => null)
   let sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
   if (!sessionId) {
     const root = await repoRoot(args.options.cwd)
@@ -3892,7 +4219,9 @@ export async function commandResearchBrief(args: Args) {
   }
   const hypothesisId =
     args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID ?? undefined
-  const brief = await getResearchSessionBrief(sessionId, args, { hypothesisId })
+  const brief = workerContext
+    ? await getWorkerResearchBrief(args)
+    : await getResearchSessionBrief(sessionId, args, { hypothesisId })
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(brief, null, 2))
@@ -4013,8 +4342,8 @@ async function commandResearchStatusSummary({
           id: sessionId,
           status: control?.status ?? runtime?.status ?? null,
           runtimeState: control?.runtimeState ?? null,
-          finalizationStatus:
-            control?.finalizationStatus ?? runtime?.finalizationStatus ?? null,
+          outcome: control?.outcome ?? null,
+          cleanup: control?.cleanup ?? null,
           workerTarget: control?.launch.workerTarget ?? null,
           activeWorkers: control?.launch.activeWorkerCount ?? activeProcesses,
           openSlots: control?.launch.openWorkerSlotCount ?? null,
@@ -4154,15 +4483,9 @@ export async function commandResearchStatus(args: Args) {
       ).catch(() => localSessionState)
     }
   }
-  const overview = localSessionState
-    ? {
-        campaign: freshOverview.campaign,
-        gitVerification: freshOverview.gitVerification,
-        hypotheses: localSessionState.hypotheses,
-        workers: localSessionState.workers,
-        knowledge: localSessionState.knowledge,
-      }
-    : freshOverview
+  // Supabase/API is authoritative for durable workers, including terminal
+  // outcomes that can arrive after the local runtime snapshot was written.
+  const overview = freshOverview
   const hypotheses = overview.hypotheses
   const workers =
     activeSessionId && !scopeAll
@@ -4425,7 +4748,7 @@ export async function commandResearchStatus(args: Args) {
           noProgressBreaker: supervisorTelemetry?.noProgressBreaker ?? null,
           failures: failureSummary,
           sites: live?.sites ?? [],
-          finalization: live?.finalization ?? null,
+          cleanupSite: live?.sites?.[0] ?? null,
           localTeardownFailures: {
             count: localTeardownFailures.length,
             workers: localTeardownFailures,
@@ -4467,10 +4790,8 @@ export async function commandResearchStatus(args: Args) {
   if (providerBackoff) {
     console.log(`provider backoff: ${JSON.stringify(providerBackoff)}`)
   }
-  if (live?.finalization) {
-    console.log(
-      `finalization: ${live.finalization.status} terminalReason=${live.finalization.terminalReason ?? "-"}`
-    )
+  if (live?.sites?.[0]?.runtimeStatus) {
+    console.log(`cleanup: ${live.sites[0].runtimeStatus}`)
   }
   if (localTeardownFailures.length > 0) {
     console.log(`local teardown failures: ${localTeardownFailures.length}`)
@@ -5062,7 +5383,12 @@ export async function commandKnowledgeAdd(args: Args) {
   const campaign = workerContext
     ? { id: workerContext.campaignId, name: workerContext.campaignName }
     : (await campaignForName(root, args)).campaign
-  const kind = args.options.kind ?? "insight"
+  const kind = (args.options.kind ?? "insight") as
+    | "insight"
+    | "dead_end"
+    | "promising_direction"
+    | "risk"
+    | "transfer_note"
   if (
     kind !== "insight" &&
     kind !== "dead_end" &&
@@ -5084,23 +5410,22 @@ export async function commandKnowledgeAdd(args: Args) {
       "`--sync` and `--offline` were removed. Knowledge is written directly to the Onyx API."
     )
   }
-  const item = await createCampaignKnowledge(
-    campaign.id,
-    {
-      sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-      hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
-      authoredByWorkerId:
-        args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
-      kind,
-      title,
-      body,
-      confidence:
-        args.options.confidence === undefined
-          ? undefined
-          : Number(args.options.confidence),
-    },
-    args
-  )
+  const knowledgeBody = {
+    sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
+    hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
+    authoredByWorkerId:
+      args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+    kind,
+    title,
+    body,
+    confidence:
+      args.options.confidence === undefined
+        ? undefined
+        : Number(args.options.confidence),
+  }
+  const item = workerContext
+    ? await createWorkerKnowledge(knowledgeBody, args)
+    : await createCampaignKnowledge(campaign.id, knowledgeBody, args)
   if (args.options.json === "true") {
     console.log(JSON.stringify(item, null, 2))
     return
@@ -5120,10 +5445,11 @@ export async function commandKnowledgeList(args: Args) {
       "`--offline` was removed. Knowledge is read directly from the Onyx API."
     )
   }
-  const knowledge = (await listCampaignKnowledge(campaign.id, args)).slice(
-    0,
-    limit
-  )
+  const knowledge = (
+    workerContext
+      ? await listWorkerKnowledge(args)
+      : await listCampaignKnowledge(campaign.id, args)
+  ).slice(0, limit)
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(knowledge, null, 2))
@@ -5336,53 +5662,29 @@ function defaultPresenceIntervalSeconds(workerTarget: number) {
 }
 
 export type ProviderBackoffReason =
-  | "startup_timeout"
-  | "quota_exhausted"
   | "rate_limit"
   | "overloaded"
-  | "auth_error"
   | "provider_degraded"
 
 export function providerBackoffReasonForResult(
-  result: Pick<HypothesisRunResult, "status" | "error" | "startupTimedOut">
+  result: Pick<HypothesisRunResult, "status" | "error" | "startupTimedOut"> & {
+    terminalReason?: string
+  }
 ): ProviderBackoffReason | null {
   if (result.status !== "failed") return null
-  if (result.startupTimedOut) return "startup_timeout"
-  const message = result.error ?? ""
-  if (
-    /session limit|usage limit|out[_ -]?of[_ -]?credits|credit balance|insufficient credits|overage|spending limit|billing limit|quota exceeded/i.test(
-      message
-    )
-  ) {
-    return "quota_exhausted"
-  }
-  if (
-    /rate limit|too many requests|429|throttl|retry[- ]?after/i.test(message)
-  ) {
-    return "rate_limit"
-  }
-  if (
-    /auth|authentication|unauthorized|forbidden|401|403|invalid api key|login required|not logged in|permission denied/i.test(
-      message
-    )
-  ) {
-    return "auth_error"
-  }
-  if (
-    /overloaded|capacity|temporarily unavailable|503|529|server busy/i.test(
-      message
-    )
-  ) {
-    return "overloaded"
-  }
-  if (
-    /degraded|service unavailable|upstream|gateway|5\d\d|timeout connecting|connection timed out|network timeout/i.test(
-      message
-    )
-  ) {
+  if (result.terminalReason === "provider_rate_limited") return "rate_limit"
+  if (result.terminalReason === "provider_overloaded") return "overloaded"
+  if (result.terminalReason === "provider_unavailable") {
     return "provider_degraded"
   }
-  return null
+  const failureClass = classifyProviderFailure(result.error ?? "")
+  return failureClass === "rate_limit"
+    ? "rate_limit"
+    : failureClass === "overloaded"
+      ? "overloaded"
+      : failureClass === "unavailable"
+        ? "provider_degraded"
+        : null
 }
 
 function shouldTerminateOpenCodeOnOutput(text: string) {
@@ -5411,15 +5713,11 @@ export function providerBackoffDelayMs({
   attempt: number
   random?: () => number
 }) {
-  const maxMs = 10 * 60_000
+  const maxMs = 2 * 60_000
   const exponent = Math.max(0, Math.min(5, attempt - 1))
   const floorMs = Math.min(maxMs, Math.max(1, baseMs) * 2 ** exponent)
   const jitterMaxMs = Math.min(maxMs - floorMs, floorMs * 0.25)
   return Math.round(floorMs + jitterMaxMs * random())
-}
-
-function providerBackoffReasonIsTerminal(reason: ProviderBackoffReason) {
-  return reason === "auth_error" || reason === "quota_exhausted"
 }
 
 function sessionStopRequested({
@@ -5804,12 +6102,14 @@ async function launchDetachedResearchSupervisor({
   sessionId,
   campaign,
   launchRate,
+  supervisorRunId,
 }: {
   root: string
   args: Args
   sessionId: string
   campaign: ApiCampaign
   launchRate: { batchSize: number | null; intervalSeconds: number | null }
+  supervisorRunId: string
 }) {
   const latest = await readState(root).catch(() => null)
   const existing = freshSupervisorTelemetry(
@@ -5845,8 +6145,6 @@ async function launchDetachedResearchSupervisor({
   )
   const command = supervisorCliCommand()
   const childArgv = researchRunChildArgv({ args, root, sessionId, logPath })
-  const supervisorRunId =
-    process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
   const outputFd = openSync(logPath, "a")
   let pid: number | null = null
   try {
@@ -6163,6 +6461,8 @@ export async function commandResearchRun(args: Args) {
     positiveNumberOption(args, "provider-backoff-seconds", 30) * 1000
 
   const schedulerSiteId = await getResearchSiteId(root)
+  const supervisorRunId =
+    process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
   const sessionEvaluation = await committedSetupAt({
     root,
     projectPath: effectiveProjectPath,
@@ -6230,6 +6530,35 @@ export async function commandResearchRun(args: Args) {
       evaluationFingerprint: snapshot.fingerprint,
     })
   }
+  const workerProtocolPreflight = internalSession
+    ? { skipped: true, reason: "detached supervisor child" }
+    : await preflightWorkerProtocol({ root })
+  const providerInvocation = buildWorkerInvocation({
+    agentKind,
+    workerCommand: args.options["worker-command"],
+    worktree: root,
+    prompt: "Onyx provider preflight",
+    workerModel,
+    providerExecutable: args.options["provider-executable"],
+  })
+  const providerExecutable = args.options["worker-command"]
+    ? undefined
+    : (args.options["provider-executable"] ??
+      (await resolveProviderExecutable(
+        providerInvocation.command,
+        process.env
+      )))
+  if (providerExecutable) {
+    providerInvocation.command = providerExecutable
+    resolvedWorkerArgs.options["provider-executable"] = providerExecutable
+  }
+  const providerPreflight = internalSession
+    ? { skipped: true, version: null, marker: null }
+    : await preflightProviderModel({
+        invocation: providerInvocation,
+        cwd: root,
+        env: providerRuntimeEnvironment(process.env),
+      })
   let result: {
     session: ApiSession
     hypotheses: ApiHypothesis[]
@@ -6254,6 +6583,7 @@ export async function commandResearchRun(args: Args) {
           ...(experimentTarget === null ? {} : { experimentTarget }),
           ...(deadlineAt === null ? {} : { deadlineAt }),
           schedulerSiteId,
+          supervisorRunId,
           metadata: {
             startedBy: "onyx-research-supervisor",
             experimentTarget,
@@ -6264,6 +6594,11 @@ export async function commandResearchRun(args: Args) {
             launchBatchSize,
             launchIntervalSeconds: launchIntervalMs / 1000,
             presenceIntervalSeconds: presenceIntervalMs / 1000,
+            preflight: {
+              workerProtocol: workerProtocolPreflight,
+              provider: providerPreflight,
+              providerExecutable: providerExecutable ?? null,
+            },
           },
         },
         args
@@ -6317,13 +6652,12 @@ export async function commandResearchRun(args: Args) {
       sessionId,
       campaign,
       launchRate,
+      supervisorRunId,
     })
     return
   }
 
-  const supervisorRunId =
-    process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
-  const leaseTokensByWorkerId = new Map<string, string>()
+  const workerCredentialsByWorkerId = new Map<string, string>()
   resetApiTimingSummary()
   try {
     await waitForStartupSessionReady({
@@ -6336,12 +6670,12 @@ export async function commandResearchRun(args: Args) {
       root,
       sessionId,
       status: "failed",
-      finalizationStatus: "failed",
+      cleanupStatus: "failed",
       terminalReason: "failed",
       reason,
       metadata: {
         terminalReason: "failed",
-        finalizationReasons: [reason],
+        cleanupReasons: [reason],
       },
     }).catch(() => {})
     throw new Error(reason)
@@ -6353,14 +6687,20 @@ export async function commandResearchRun(args: Args) {
   })
   await sessionStateBriefRefresher.writePlaceholder().catch(() => {})
   await sessionStateBriefRefresher.refresh({ force: true }).catch(() => {})
-  const lifecycleHeartbeats = createLifecycleHeartbeatPublisher(args)
+  const lifecycleHeartbeats = createLifecycleHeartbeatPublisher({
+    args,
+    sessionId,
+    siteId: schedulerSiteId,
+    supervisorRunId,
+  })
   const presenceSupervisor = createPresenceSupervisor({
     root,
     args,
     sessionId,
     supervisorRunId,
     intervalMs: presenceIntervalMs,
-    leaseTokensByWorkerId,
+    maxConcurrency,
+    workerCredentialsByWorkerId,
   })
   presenceSupervisor.request()
 
@@ -6381,6 +6721,7 @@ export async function commandResearchRun(args: Args) {
   let providerBackoffAttempt = 0
   let providerBackoffLogged = false
   let recentProviderFailures: ProviderLaunchFailure[] = []
+  let deterministicSiteFailure: ProviderLaunchFailure | null = null
   const noProgressThreshold = Math.max(3, Math.min(workerTarget, 20))
   // Monotonic cache of the authoritative server cursor, used only between
   // control polls. This is not a locally produced progress counter.
@@ -6389,8 +6730,8 @@ export async function commandResearchRun(args: Args) {
   let recentNoProgressExits: NoProgressWorkerExit[] = []
   let noProgressBreakerTripped = false
   let terminalReason: SessionTerminalReason | null = null
-  let providerTerminalFailure: ProviderLaunchFailure | null = null
   let lastStopCheck: ResearchStopCheck | null = null
+  let drainingPresenceSent = false
   let lastGitVerificationAt = 0
   // Verification is push-webhook-first server-side; this loop is only the
   // slow backstop for lost webhooks, plus the final verify at completion.
@@ -6540,8 +6881,8 @@ export async function commandResearchRun(args: Args) {
         await Promise.race([...activeRuns.values(), sleep(2000)])
         continue
       }
-      if (providerTerminalFailure && activeRuns.size === 0) break
-      if (providerTerminalFailure) {
+      if (deterministicSiteFailure && activeRuns.size === 0) break
+      if (deterministicSiteFailure) {
         await Promise.race([
           ...activeRuns.values(),
           sleep(Math.min(5000, Math.max(1, hardEndTimeMs - Date.now()))),
@@ -6592,6 +6933,10 @@ export async function commandResearchRun(args: Args) {
         console.warn(
           `Stop requested for session ${sessionId}: ${stopCheck.reasons.join(", ")}`
         )
+        await presenceSupervisor
+          .flush({ runtimeStatus: "draining" })
+          .catch(() => {})
+        drainingPresenceSent = true
       }
       if (stopShouldEndSupervisor) {
         if (!terminalReason) {
@@ -6688,6 +7033,7 @@ export async function commandResearchRun(args: Args) {
               agentKind: effectiveAgentKind,
               runtime: "local" as const,
               leaseSeconds: 180,
+              leaseCredential: createWorkerCredential(),
               metadata: {
                 ...workerModelMetadata(workerModel),
                 launchOrdinal: ordinal,
@@ -6741,7 +7087,10 @@ export async function commandResearchRun(args: Args) {
             ...leaseBatch.context,
           })) ?? []
         for (const grant of grants) {
-          leaseTokensByWorkerId.set(grant.worker.id, grant.leaseToken)
+          workerCredentialsByWorkerId.set(
+            grant.worker.id,
+            grant.workerCredential
+          )
         }
         if (grants.length > 0) {
           const existingLocal = await getLocalSessionState(
@@ -6803,10 +7152,11 @@ export async function commandResearchRun(args: Args) {
             quiet: args.options.quiet === "true",
             preacquiredLease: grant,
             slotIndex,
-            onRegistered: ({ workerId, leaseToken }) => {
-              leaseTokensByWorkerId.set(workerId, leaseToken)
+            onRegistered: ({ workerId, workerCredential }) => {
+              workerCredentialsByWorkerId.set(workerId, workerCredential)
             },
             lifecycleHeartbeats,
+            providerExecutable,
             args,
           })
             .then(async (result) => {
@@ -6843,6 +7193,37 @@ export async function commandResearchRun(args: Args) {
                 }
               } else if (result.status === "stopped") stopped += 1
               else failed += 1
+              if (result.siteFatal && result.terminalReason) {
+                deterministicSiteFailure = {
+                  at: new Date().toISOString(),
+                  reason: result.terminalReason,
+                  workerId: result.workerId ?? null,
+                  hypothesisId: result.hypothesis.id,
+                  errorSummary: result.error
+                    ? compactProviderErrorSummary(result.error)
+                    : null,
+                }
+                terminalReason = "failed"
+                await persistRuntimeTelemetry({
+                  force: true,
+                  activeProcessCount: activeRuns.size,
+                  providerBackoff: null,
+                })
+                await stopCampaignSession(
+                  sessionId,
+                  {
+                    campaignId: campaign.id,
+                    endReason: "failed",
+                    reason: `Deterministic worker failure: ${result.terminalReason}`,
+                    metadata: {
+                      reasonCode: "deterministic_worker_failure",
+                      failure: deterministicSiteFailure,
+                    },
+                  },
+                  args
+                ).catch(() => null)
+                return result
+              }
               const backoffReason = providerBackoffReasonForResult(result)
               if (backoffReason) {
                 const failure: ProviderLaunchFailure = {
@@ -6858,34 +7239,11 @@ export async function commandResearchRun(args: Args) {
                   ...recentProviderFailures,
                   failure,
                 ].slice(-20)
-                const terminalProviderFailure =
-                  providerBackoffReasonIsTerminal(backoffReason)
                 providerBackoffAttempt += 1
-                const delayMs = terminalProviderFailure
-                  ? 0
-                  : providerBackoffDelayMs({
-                      baseMs: providerBackoffMs,
-                      attempt: providerBackoffAttempt,
-                    })
-                if (terminalProviderFailure) {
-                  terminalReason = "provider_capacity_exhausted"
-                  providerTerminalFailure = failure
-                  providerBackoffReason = backoffReason
-                  providerBackoffUntil = Date.now()
-                  providerBackoffLogged = true
-                  await persistRuntimeTelemetry({
-                    force: true,
-                    activeProcessCount: activeRuns.size,
-                    providerBackoff: {
-                      reason: backoffReason,
-                      until: new Date().toISOString(),
-                      attempt: providerBackoffAttempt,
-                      delayMs,
-                      recentFailures: recentProviderFailures,
-                    },
-                  })
-                  return result
-                }
+                const delayMs = providerBackoffDelayMs({
+                  baseMs: providerBackoffMs,
+                  attempt: providerBackoffAttempt,
+                })
                 providerBackoffReason = backoffReason
                 providerBackoffUntil = Date.now() + delayMs
                 providerBackoffLogged = false
@@ -6992,7 +7350,7 @@ export async function commandResearchRun(args: Args) {
               }
             })
             .finally(() => {
-              leaseTokensByWorkerId.delete(grant.worker.id)
+              workerCredentialsByWorkerId.delete(grant.worker.id)
               activeRuns.delete(runKey)
               activeSlotsByRunKey.delete(runKey)
               void persistRuntimeTelemetry({
@@ -7036,13 +7394,19 @@ export async function commandResearchRun(args: Args) {
       }
     }
 
+    if (!drainingPresenceSent) {
+      await presenceSupervisor
+        .flush({ runtimeStatus: "draining" })
+        .catch(() => {})
+      drainingPresenceSent = true
+    }
     if (activeRuns.size > 0) {
       console.log(`Waiting for ${activeRuns.size} active worker(s) to finish.`)
       await Promise.allSettled(activeRuns.values())
     }
   } finally {
     presenceSupervisor.request()
-    await presenceSupervisor.stop()
+    await presenceSupervisor.stop({ runtimeStatus: "draining" })
   }
 
   const finalState = await readState(root)
@@ -7050,6 +7414,8 @@ export async function commandResearchRun(args: Args) {
   const postLoopLocal = await getLocalSessionState(root, sessionId).catch(
     () => null
   )
+  const finalDeterministicSiteFailure =
+    deterministicSiteFailure as ProviderLaunchFailure | null
   terminalReason =
     (explicitStop ? "user_stopped" : terminalReason) ??
     (lastStopCheck ? terminalReasonForStopCheck(lastStopCheck) : null) ??
@@ -7059,21 +7425,21 @@ export async function commandResearchRun(args: Args) {
       : null) ??
     "all_hypotheses_closed"
   let finalStatus: ApiSession["status"] =
-    providerTerminalFailure || noProgressBreakerTripped
+    finalDeterministicSiteFailure || noProgressBreakerTripped
       ? "failed"
       : explicitStop
         ? "stopped"
         : "completed"
   const initialTerminalMetadata = {
     terminalReason,
-    providerFailure: providerTerminalFailure,
+    deterministicSiteFailure: finalDeterministicSiteFailure,
     noProgressBreaker: {
       tripped: noProgressBreakerTripped,
       threshold: noProgressThreshold,
       count: noProgressWorkerExitCount,
       recentFailures: recentNoProgressExits,
     },
-    finalizationReasons: [],
+    cleanupReasons: [],
   }
   finalState.sessions = finalState.sessions ?? {}
   finalState.sessions[sessionId] = {
@@ -7081,7 +7447,7 @@ export async function commandResearchRun(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     status: finalStatus,
-    finalizationStatus: "running",
+    cleanupStatus: "running",
     stopRequested: false,
     providerBackoff: null,
     terminalReason,
@@ -7091,38 +7457,36 @@ export async function commandResearchRun(args: Args) {
     root,
     sessionId,
     status: finalStatus,
-    finalizationStatus: "running",
+    cleanupStatus: "running",
     terminalReason,
     reason: explicitStop
       ? "stop requested"
-      : providerTerminalFailure
-        ? "provider capacity exhausted"
+      : finalDeterministicSiteFailure
+        ? `deterministic worker failure: ${finalDeterministicSiteFailure.reason}`
         : "research run completed",
     metadata: initialTerminalMetadata,
   }).catch(() => {})
   await lifecycleHeartbeats.flush().catch((error) => {
     console.warn(errorMessage(error))
   })
-  const finalization = await computeSessionFinalizationStatus({
+  const cleanup = await computeSessionCleanupStatus({
     root,
     sessionId,
   })
-  if (finalization.reasons.length > 0) {
+  if (cleanup.reasons.length > 0) {
     console.warn(
-      `finalization ${finalization.status}: ${finalization.reasons
-        .slice(0, 5)
-        .join("; ")}`
+      `cleanup ${cleanup.status}: ${cleanup.reasons.slice(0, 5).join("; ")}`
     )
   }
-  if (finalization.status === "failed") {
+  if (cleanup.status === "failed") {
     finalStatus = "failed"
     terminalReason = "failed"
   }
-  await writeRemoteSessionFinalization({
+  await writeRemoteSessionCleanup({
     sessionId,
     campaignId: campaign.id,
     status: finalStatus,
-    finalization,
+    cleanup,
     terminalReason,
     metadata: noProgressBreakerTripped
       ? {
@@ -7141,7 +7505,7 @@ export async function commandResearchRun(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     status: finalStatus,
-    finalizationStatus: finalization.status,
+    cleanupStatus: cleanup.status,
     stopRequested: false,
     providerBackoff: null,
     terminalReason,
@@ -7151,20 +7515,20 @@ export async function commandResearchRun(args: Args) {
     root,
     sessionId,
     status: finalStatus,
-    finalizationStatus: finalization.status,
+    cleanupStatus: cleanup.status,
     terminalReason,
     reason:
-      finalization.reasons.length > 0
-        ? finalization.reasons.slice(0, 5).join("; ")
+      cleanup.reasons.length > 0
+        ? cleanup.reasons.slice(0, 5).join("; ")
         : explicitStop
           ? "stop requested"
-          : providerTerminalFailure
-            ? "provider capacity exhausted"
+          : finalDeterministicSiteFailure
+            ? `deterministic worker failure: ${finalDeterministicSiteFailure.reason}`
             : "research run completed",
     metadata: {
       terminalReason,
-      providerFailure: providerTerminalFailure,
-      finalizationReasons: finalization.reasons,
+      deterministicSiteFailure: finalDeterministicSiteFailure,
+      cleanupReasons: cleanup.reasons,
     },
   }).catch(() => {})
   const finalGitVerificationStartedAt = Date.now()
@@ -7176,7 +7540,7 @@ export async function commandResearchRun(args: Args) {
   console.log(
     `Final Git verification: durationMs=${Date.now() - finalGitVerificationStartedAt} checked=${finalGitVerification?.checkedCount ?? 0} updated=${finalGitVerification?.updatedCount ?? 0} remaining=${finalGitVerification?.remainingCount ?? "unknown"}`
   )
-  const reportedFinalizationStatus = finalization.status
+  const reportedCleanupStatus = cleanup.status
   const completionLive = await getResearchSessionLive(sessionId, args).catch(
     () => null
   )
@@ -7198,12 +7562,15 @@ export async function commandResearchRun(args: Args) {
     activeProcessCount: 0,
   })
   await Promise.race([
-    presenceSupervisor.flush({ terminal: true }),
+    presenceSupervisor.flush({
+      terminal: true,
+      runtimeStatus: cleanup.status === "complete" ? "complete" : "failed",
+    }),
     sleep(5000),
   ]).catch(() => {})
 
   console.log(
-    `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
+    `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; cleanup=${reportedCleanupStatus}.`
   )
   console.log(
     `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`}.`

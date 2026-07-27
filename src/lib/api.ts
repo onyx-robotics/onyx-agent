@@ -7,6 +7,7 @@ import type {
   ResearchSessionHypothesisAssignment,
   ResearchHypothesisPlan,
   ResearchSetupCompliance,
+  ResearchWorker,
 } from "../protocol"
 
 import type { Args } from "./args"
@@ -83,6 +84,7 @@ export type ApiCampaignGitVerificationSummary = {
   baseGitVerifiedAt: string | null
   baseGitStatusReason: string | null
   acceptedExperimentGitStatusCounts: Record<ApiGitStatus, number>
+  discardedExperimentGitStatusCounts: Record<ApiGitStatus, number>
   needsVerificationCount: number
   hardFailureCount: number
   lastVerifiedAt: string | null
@@ -177,7 +179,7 @@ export type ApiSession = {
   runtimeState: "starting" | "active" | "stale" | "abandoned" | "ended"
   /** Derived locally from endedAt/endReason. */
   status: "running" | "completed" | "failed" | "stopped"
-  finalizationStatus: "running" | "complete" | "incomplete" | "failed"
+  cleanupStatus: "running" | "draining" | "complete" | "failed" | "abandoned"
   terminalReason: ApiSession["endReason"]
   workerTarget: number
   experimentTarget: number | null
@@ -224,6 +226,7 @@ export type ApiWorker = {
   workerRef?: string | null
   leaseExpiresAt?: string | null
   leaseReleasedAt?: string | null
+  terminalOutcome?: ResearchWorker["terminalOutcome"]
   lastSeenAt: string
   startedAt: string
   metadata: Record<string, unknown>
@@ -316,11 +319,6 @@ export type ApiSessionLive = {
     endReason: ApiSession["endReason"]
     warning?: string | null
   }
-  finalization?: {
-    status: ApiSession["finalizationStatus"]
-    reasons: string[]
-    terminalReason: ApiSession["terminalReason"]
-  }
   livenessCounts: Record<string, number>
   phaseCounts: Record<string, number>
   workers: Array<{
@@ -348,6 +346,10 @@ export type ApiSessionLive = {
     supervisorRunId: string | null
     liveness?: "active" | "stale" | "lost"
     status?: "active" | "stale" | "inactive"
+    runtimeStatus?: "starting" | "active" | "draining" | "complete" | "failed"
+    cleanupStartedAt?: string | null
+    cleanupCompletedAt?: string | null
+    cleanupSummary?: Record<string, unknown>
     lastSequence: number
     activeWorkerCount: number
     launchedWorkerCount: number
@@ -393,7 +395,17 @@ export type ApiSessionControlState = {
   campaignStatus: ApiCampaign["status"]
   runtimeState: ApiSession["runtimeState"]
   status: ApiSession["status"]
-  finalizationStatus: ApiSession["finalizationStatus"]
+  outcome: {
+    status: ApiSession["status"]
+    endedAt: string | null
+    endReason: ApiSession["endReason"]
+  }
+  cleanup: {
+    status: "running" | "draining" | "complete" | "failed" | "abandoned"
+    startedAt: string | null
+    completedAt: string | null
+    summary: Record<string, unknown>
+  }
   progress: {
     experimentTarget: number | null
     acceptedExperimentCount: number
@@ -412,11 +424,6 @@ export type ApiSessionControlState = {
     acceptingExperiments: boolean
   }
   canceledAssignmentIds: string[]
-  finalization: {
-    status: ApiSession["finalizationStatus"]
-    reasons: string[]
-    terminalReason: ApiSession["terminalReason"]
-  }
   updatedAt: string
 }
 
@@ -440,12 +447,14 @@ export type ApiSessionStateBrief = {
     | "name"
     | "runtimeState"
     | "status"
-    | "finalizationStatus"
     | "workerTarget"
     | "deadlineAt"
     | "endedAt"
     | "endReason"
-  >
+  > & {
+    outcome: ApiSessionControlState["outcome"]
+    cleanup: ApiSessionControlState["cleanup"]
+  }
   campaign: Pick<
     ApiCampaign,
     "id" | "name" | "status" | "metricName" | "metricUnit" | "metricDirection"
@@ -524,6 +533,7 @@ type ApiWorkerLeaseWire = AcquireResearchWorkerLeaseResponse["data"]
 
 export type ApiWorkerLease = Omit<ApiWorkerLeaseWire, "hypothesis"> & {
   hypothesis: ApiHypothesis
+  workerCredential: string
 }
 
 type ApiWorkerLeaseBatchWire = AcquireResearchWorkerLeaseBatchResponse["data"]
@@ -532,6 +542,7 @@ export type ApiWorkerLeaseBatch = Omit<ApiWorkerLeaseBatchWire, "grants"> & {
   grants: Array<
     Omit<ApiWorkerLeaseBatchWire["grants"][number], "hypothesis"> & {
       hypothesis: ApiHypothesis
+      workerCredential: string
     }
   >
 }
@@ -655,7 +666,7 @@ function apiTimingCategory(method: string, path: string) {
   if (method === "GET" && pathname.includes("/control-state")) {
     return "control_state"
   }
-  if (method === "POST" && pathname.includes("/settle")) {
+  if (method === "POST" && pathname.includes("/settlement-tick")) {
     return "settlement"
   }
   if (method === "GET" && pathname.includes("/live")) {
@@ -765,7 +776,8 @@ export async function callApi(
   method: string,
   path: string,
   body?: unknown,
-  args?: Args
+  args?: Args,
+  credentialOverride?: string
 ) {
   const timeoutMs = Number(args?.options["api-timeout"] ?? 120_000)
   const signal =
@@ -778,7 +790,7 @@ export async function callApi(
       method,
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${await apiKey(args)}`,
+        authorization: `Bearer ${credentialOverride ?? (await apiKey(args))}`,
       },
       body: body ? JSON.stringify(body) : undefined,
       signal,
@@ -853,6 +865,28 @@ export async function callApi(
   }
 }
 
+function workerCredential() {
+  const credential = process.env.ONYX_WORKER_CREDENTIAL
+  if (!credential?.match(/^owx_worker_v1_[A-Za-z0-9_-]{32,}$/)) {
+    throw new Error("Worker API requires ONYX_WORKER_CREDENTIAL")
+  }
+  return credential
+}
+
+export function callWorkerApi(
+  method: string,
+  path: string,
+  body?: unknown,
+  args?: Args,
+  credentialOverride?: string
+) {
+  const credential = credentialOverride ?? workerCredential()
+  if (!credential.match(/^owx_worker_v1_[A-Za-z0-9_-]{32,}$/)) {
+    throw new Error("Worker API requires a valid scoped worker credential")
+  }
+  return callApi(method, path, body, args, credential)
+}
+
 export class ApiError extends Error {
   status: number
   payload: unknown
@@ -898,21 +932,21 @@ function normalizeResearchResponse(value: unknown): unknown {
           ? "failed"
           : "completed"
       : "running"
-    normalized.finalizationStatus ??= ended
-      ? failed
-        ? "failed"
-        : "complete"
-      : "running"
+    const cleanup =
+      normalized.cleanup && typeof normalized.cleanup === "object"
+        ? (normalized.cleanup as Record<string, unknown>)
+        : null
+    normalized.cleanupStatus ??=
+      typeof cleanup?.status === "string"
+        ? cleanup.status
+        : ended
+          ? "abandoned"
+          : "running"
     normalized.terminalReason = normalized.endReason ?? null
     normalized.completedAt = normalized.endedAt ?? null
     if (normalized.progress && typeof normalized.progress === "object") {
       const progress = normalized.progress as Record<string, unknown>
       progress.terminalReason = progress.endReason ?? null
-    }
-    normalized.finalization ??= {
-      status: normalized.finalizationStatus,
-      reasons: normalized.endReason ? [normalized.endReason] : [],
-      terminalReason: normalized.endReason ?? null,
     }
   }
   if (
@@ -1080,6 +1114,7 @@ export async function listCampaignExperiments(
     resultCommitSha?: string
     runRef?: string
     status?: string
+    disposition?: "all" | "received" | "accepted" | "discarded"
   } = {}
 ): Promise<{
   items: ApiCampaignExperiment[]
@@ -1105,6 +1140,32 @@ export async function listCampaignExperiments(
   )
 }
 
+export async function listWorkerExperiments(
+  args?: Args,
+  options: {
+    limit?: number
+    cursor?: string
+    status?: string
+    disposition?: "all" | "received" | "accepted" | "discarded"
+  } = {}
+): Promise<{
+  items: ApiCampaignExperiment[]
+  page: { nextCursor: string | null }
+}> {
+  const params = new URLSearchParams({ limit: String(options.limit ?? 50) })
+  for (const [key, value] of Object.entries(options)) {
+    if (key !== "limit" && value != null) params.set(key, String(value))
+  }
+  return apiData(
+    await callWorkerApi(
+      "GET",
+      `/api/v1/research/worker/experiments?${params.toString()}`,
+      undefined,
+      args
+    )
+  )
+}
+
 export async function reportCampaignExperiment(
   campaignId: string,
   body: CreateResearchCampaignExperimentRequest,
@@ -1116,6 +1177,33 @@ export async function reportCampaignExperiment(
       `/api/v1/research/campaigns/${campaignId}/experiments`,
       body,
       args
+    )
+  )
+}
+
+export async function reportWorkerExperiment(
+  body: CreateResearchCampaignExperimentRequest,
+  args?: Args,
+  credentialOverride?: string
+): Promise<ApiExperimentReportResult> {
+  const {
+    sessionId: _sessionId,
+    assignmentId: _assignmentId,
+    hypothesisId: _hypothesisId,
+    workerId: _workerId,
+    ...workerBody
+  } = body
+  void _sessionId
+  void _assignmentId
+  void _hypothesisId
+  void _workerId
+  return apiData<ApiExperimentReportResult>(
+    await callWorkerApi(
+      "POST",
+      "/api/v1/research/worker/experiments",
+      workerBody,
+      args,
+      credentialOverride
     )
   )
 }
@@ -1169,6 +1257,7 @@ export async function createCampaignSession(
     experimentTarget?: number
     deadlineAt?: string
     schedulerSiteId?: string
+    supervisorRunId?: string
   },
   args?: Args
 ): Promise<{
@@ -1416,7 +1505,7 @@ export async function settleResearchSession(
   return apiData<ApiSessionControlState>(
     await callApi(
       "POST",
-      `/api/v1/research/sessions/${sessionId}/settle`,
+      `/api/v1/research/sessions/${sessionId}/settlement-tick`,
       {},
       args
     )
@@ -1438,6 +1527,14 @@ export async function getResearchSessionBrief(
       undefined,
       args
     )
+  )
+}
+
+export async function getWorkerResearchBrief(
+  args?: Args
+): Promise<ApiSessionBrief> {
+  return apiData<ApiSessionBrief>(
+    await callWorkerApi("GET", "/api/v1/research/worker/brief", undefined, args)
   )
 }
 
@@ -1498,6 +1595,7 @@ export async function acquireResearchWorkerLease(
     agentKind?: string
     runtime?: "local" | "hosted"
     leaseSeconds?: number
+    leaseCredential: string
     metadata?: Record<string, unknown>
   },
   args?: Args
@@ -1512,6 +1610,7 @@ export async function acquireResearchWorkerLease(
   )
   return {
     ...lease,
+    workerCredential: body.leaseCredential,
     hypothesis: hypothesisFromWorkerLease(lease),
   }
 }
@@ -1527,6 +1626,7 @@ export async function acquireResearchWorkerLeasesBatch(
       agentKind?: string
       runtime?: "local" | "hosted"
       leaseSeconds?: number
+      leaseCredential: string
       metadata?: Record<string, unknown>
     }>
   },
@@ -1544,15 +1644,18 @@ export async function acquireResearchWorkerLeasesBatch(
     ...batch,
     grants: batch.grants.map((grant) => ({
       ...grant,
+      workerCredential:
+        body.workers.find((worker) => worker.workerRef === grant.workerRef)
+          ?.leaseCredential ?? "",
       hypothesis: hypothesisFromWorkerLease(grant),
     })),
   }
 }
 
 export async function heartbeatWorker(
-  workerId: string,
+  _workerId: string,
   body: {
-    leaseToken?: string
+    workerCredential?: string
     status?: "registered" | "running" | "completed" | "failed" | "stopped"
     sessionId?: string
     hypothesisId?: string
@@ -1566,24 +1669,33 @@ export async function heartbeatWorker(
   },
   args?: Args
 ): Promise<ApiWorkerHeartbeatResponse> {
+  const {
+    workerCredential,
+    sessionId: _sessionId,
+    hypothesisId: _hypothesisId,
+    ...workerBody
+  } = body
+  void _sessionId
+  void _hypothesisId
   return apiData<ApiWorkerHeartbeatResponse>(
-    await callApi(
+    await callWorkerApi(
       "POST",
-      `/api/v1/research/workers/${workerId}/heartbeat`,
-      body,
-      args
+      "/api/v1/research/worker/heartbeat",
+      workerBody,
+      args,
+      workerCredential
     )
   )
 }
 
 export async function heartbeatWorkersBatch(
   body: {
+    sessionId: string
+    siteId: string
+    supervisorRunId: string
     heartbeats: Array<{
       workerId: string
-      leaseToken?: string
       status?: "registered" | "running" | "completed" | "failed" | "stopped"
-      sessionId?: string
-      hypothesisId?: string
       experimentId?: string | null
       phase?: string | null
       event?: string | null
@@ -1630,6 +1742,42 @@ export async function createCampaignKnowledge(
   )
 }
 
+export async function createWorkerKnowledge(
+  body: Parameters<typeof createCampaignKnowledge>[1],
+  args?: Args
+): Promise<ApiKnowledge> {
+  const {
+    sessionId: _sessionId,
+    hypothesisId: _hypothesisId,
+    authoredByWorkerId: _authoredByWorkerId,
+    ...workerBody
+  } = body
+  void _sessionId
+  void _hypothesisId
+  void _authoredByWorkerId
+  return apiData<ApiKnowledge>(
+    await callWorkerApi(
+      "POST",
+      "/api/v1/research/worker/knowledge",
+      workerBody,
+      args
+    )
+  )
+}
+
+export async function listWorkerKnowledge(
+  args?: Args
+): Promise<ApiKnowledge[]> {
+  return apiData<ApiKnowledge[]>(
+    await callWorkerApi(
+      "GET",
+      "/api/v1/research/worker/knowledge",
+      undefined,
+      args
+    )
+  )
+}
+
 export async function listCampaignKnowledge(
   campaignId: string,
   args?: Args
@@ -1660,6 +1808,10 @@ export async function upsertResearchPresence(
     sequence: number
     sessionId: string
     site?: {
+      runtimeStatus?: "starting" | "active" | "draining" | "complete" | "failed"
+      cleanupStartedAt?: string | null
+      cleanupCompletedAt?: string | null
+      cleanupSummary?: Record<string, unknown>
       providerBackoff?: Record<string, unknown> | null
       ignoredPresence?: Record<string, unknown>
       activeWorkerCount?: number

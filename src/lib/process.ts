@@ -237,6 +237,62 @@ function appendTail(existing: Buffer, chunk: Buffer, limit: number) {
   return combined.subarray(combined.byteLength - limit)
 }
 
+const REDACTED = "[REDACTED]"
+
+export function redactSecrets(value: string, secrets: string[]) {
+  return secrets
+    .filter((secret) => secret.length >= 4)
+    .sort((left, right) => right.length - left.length)
+    .reduce((text, secret) => text.split(secret).join(REDACTED), value)
+}
+
+export class StreamingSecretRedactor {
+  private pending = ""
+  private readonly secrets: string[]
+  private readonly maxSecretLength: number
+
+  constructor(secrets: string[]) {
+    this.secrets = [
+      ...new Set(secrets.filter((secret) => secret.length >= 4)),
+    ].sort((left, right) => right.length - left.length)
+    this.maxSecretLength = Math.max(
+      1,
+      ...this.secrets.map((secret) => secret.length)
+    )
+  }
+
+  push(text: string) {
+    if (this.secrets.length === 0) return text
+    this.pending += text
+    const safeStartLimit = Math.max(
+      0,
+      this.pending.length - this.maxSecretLength + 1
+    )
+    let cursor = 0
+    let output = ""
+    while (cursor < safeStartLimit) {
+      const secret = this.secrets.find((candidate) =>
+        this.pending.startsWith(candidate, cursor)
+      )
+      if (secret) {
+        output += REDACTED
+        cursor += secret.length
+      } else {
+        output += this.pending[cursor]
+        cursor += 1
+      }
+    }
+    this.pending = this.pending.slice(cursor)
+    return output
+  }
+
+  flush() {
+    const output = redactSecrets(this.pending, this.secrets)
+    this.pending = ""
+    return output
+  }
+}
+
 export function runProcess(
   command: string,
   args: string[],
@@ -293,6 +349,8 @@ export async function runStreamingProcess(
     startupTimeoutMs?: number
     killGraceMs?: number
     outputTailBytes?: number
+    logLimitBytes?: number
+    redactValues?: string[]
     logPath: string
     activityLogPath?: string
     logHeader?: string
@@ -322,18 +380,57 @@ export async function runStreamingProcess(
 
   return new Promise((resolveProcess, reject) => {
     const useProcessGroup = process.platform !== "win32"
-    const log = createWriteStream(options.logPath, { flags: "a" })
+    let log = createWriteStream(options.logPath, { flags: "w" })
+    let logRotated = false
     const activityLog = options.activityLogPath
       ? createWriteStream(options.activityLogPath, { flags: "a" })
       : null
     const startedAt = new Date().toISOString()
-    log.write(
+    const redactionValues = options.redactValues ?? []
+    const stdoutRedactor = new StreamingSecretRedactor(redactionValues)
+    const stderrRedactor = new StreamingSecretRedactor(redactionValues)
+    const redact = (value: string) => redactSecrets(value, redactionValues)
+    let logBytes = 0
+    const logLimitBytes = options.logLimitBytes ?? 25 * 1024 * 1024
+    const logSegmentLimit = Math.max(1, Math.ceil(logLimitBytes / 2))
+    let logCapped = false
+    const writeRawLog = (value: string | Buffer) => {
+      if (logCapped) return
+      const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value)
+      let offset = 0
+      while (offset < buffer.byteLength && logBytes < logLimitBytes) {
+        const segmentOffset = logRotated
+          ? logBytes - logSegmentLimit
+          : logBytes
+        const segmentRemaining = Math.max(0, logSegmentLimit - segmentOffset)
+        if (segmentRemaining === 0 && !logRotated) {
+          log.end()
+          log = createWriteStream(`${options.logPath}.1`, { flags: "w" })
+          logRotated = true
+          continue
+        }
+        const totalRemaining = logLimitBytes - logBytes
+        const length = Math.min(
+          buffer.byteLength - offset,
+          segmentRemaining,
+          totalRemaining
+        )
+        if (length <= 0) break
+        log.write(buffer.subarray(offset, offset + length))
+        offset += length
+        logBytes += length
+      }
+      if (offset < buffer.byteLength) {
+        logCapped = true
+      }
+    }
+    writeRawLog(
       [
         "",
         `# onyx worker process started ${startedAt}`,
-        `# command: ${command} ${args.join(" ")}`,
-        options.cwd ? `# cwd: ${options.cwd}` : null,
-        options.logHeader ?? null,
+        `# command: ${redact(`${command} ${args.join(" ")}`)}`,
+        options.cwd ? `# cwd: ${redact(options.cwd)}` : null,
+        options.logHeader ? redact(options.logHeader) : null,
         "",
       ]
         .filter(Boolean)
@@ -342,8 +439,8 @@ export async function runStreamingProcess(
     activityLog?.write(
       [
         `# onyx worker activity started ${startedAt}`,
-        `# command: ${command} ${args.join(" ")}`,
-        options.logHeader ?? null,
+        `# command: ${redact(`${command} ${args.join(" ")}`)}`,
+        options.logHeader ? redact(options.logHeader) : null,
         "",
       ]
         .filter(Boolean)
@@ -473,17 +570,19 @@ export async function runStreamingProcess(
 
     const recordOutput = (stream: "stdout" | "stderr", chunk: Buffer) => {
       const at = new Date().toISOString()
-      const text = chunk.toString("utf8")
+      const redactor = stream === "stdout" ? stdoutRedactor : stderrRedactor
+      const text = redactor.push(chunk.toString("utf8"))
       lastOutputAt = at
       if (stream === "stdout") {
         stdoutBytes += chunk.byteLength
-        stdout = appendTail(stdout, chunk, outputTailBytes)
+        stdout = appendTail(stdout, Buffer.from(text), outputTailBytes)
       } else {
         stderrBytes += chunk.byteLength
-        stderr = appendTail(stderr, chunk, outputTailBytes)
+        stderr = appendTail(stderr, Buffer.from(text), outputTailBytes)
       }
-      log.write(`\n[${stream} ${at}]\n`)
-      log.write(chunk)
+      if (!text) return
+      writeRawLog(`\n[${stream} ${at}]\n`)
+      writeRawLog(text)
       for (const line of activityLinesForOutput(stream, text)) {
         activityLog?.write(`[${at}] ${line}\n`)
       }
@@ -505,7 +604,8 @@ export async function runStreamingProcess(
       if (forceKill) clearTimeout(forceKill)
       if (cancelPoll) clearInterval(cancelPoll)
       removeSignalHandlers()
-      log.end(`\n# onyx worker process failed to start: ${error.message}\n`)
+      writeRawLog(`\n# onyx worker process failed to start: ${error.message}\n`)
+      log.end()
       activityLog?.end(
         `# onyx worker activity failed to start: ${error.message}\n`
       )
@@ -519,9 +619,25 @@ export async function runStreamingProcess(
       if (forceKill) clearTimeout(forceKill)
       if (cancelPoll) clearInterval(cancelPoll)
       removeSignalHandlers()
+      for (const [stream, redactor] of [
+        ["stdout", stdoutRedactor],
+        ["stderr", stderrRedactor],
+      ] as const) {
+        const text = redactor.flush()
+        if (!text) continue
+        if (stream === "stdout")
+          stdout = appendTail(stdout, Buffer.from(text), outputTailBytes)
+        else stderr = appendTail(stderr, Buffer.from(text), outputTailBytes)
+        const at = new Date().toISOString()
+        writeRawLog(`\n[${stream} ${at}]\n`)
+        writeRawLog(text)
+        for (const line of activityLinesForOutput(stream, text)) {
+          activityLog?.write(`[${at}] ${line}\n`)
+        }
+      }
       await Promise.all([
         new Promise<void>((resolve) => {
-          log.end(
+          writeRawLog(
             [
               "",
               `# onyx worker process exited ${new Date().toISOString()}`,
@@ -531,9 +647,9 @@ export async function runStreamingProcess(
               `# startupTimedOut: ${startupTimedOut}`,
               `# cancelled: ${cancelled}`,
               "",
-            ].join("\n"),
-            resolve
+            ].join("\n")
           )
+          log.end(resolve)
         }),
         activityLog
           ? new Promise<void>((resolve) => {

@@ -65,7 +65,9 @@ export function configDir() {
     : join(homedir(), ".config", "onyx")
 }
 
-function inferWorkerBinPath(checkout: Pick<DeveloperCheckout, "root" | "binPath">) {
+function inferWorkerBinPath(
+  checkout: Pick<DeveloperCheckout, "root" | "binPath">
+) {
   if (checkout.binPath.endsWith("/bin/onyx.js")) {
     return checkout.binPath.replace(/\/bin\/onyx\.js$/, "/bin/onyx-worker.js")
   }
@@ -107,7 +109,9 @@ function normalizeDeveloperConfig(value: unknown): DeveloperConfig {
   return { mode }
 }
 
-export function isBuiltInWorkerAgent(value: unknown): value is BuiltInWorkerAgent {
+export function isBuiltInWorkerAgent(
+  value: unknown
+): value is BuiltInWorkerAgent {
   return (
     typeof value === "string" &&
     (BUILT_IN_WORKER_AGENTS as readonly string[]).includes(value)
@@ -159,7 +163,9 @@ function normalizeCliProfile(value: unknown): CliProfile | null {
   const worker = normalizeWorkerProfileConfig(candidate.worker)
   return {
     apiUrl: candidate.apiUrl,
-    ...(typeof candidate.apiKey === "string" ? { apiKey: candidate.apiKey } : {}),
+    ...(typeof candidate.apiKey === "string"
+      ? { apiKey: candidate.apiKey }
+      : {}),
     ...(typeof candidate.apiKeyId === "string"
       ? { apiKeyId: candidate.apiKeyId }
       : {}),

@@ -29,4 +29,3 @@ export async function commandToolsRun(args: Args) {
     process.exitCode = result.code ?? 1
   }
 }
-

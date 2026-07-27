@@ -154,7 +154,8 @@ export async function collectLocalResearchStopReasons({
       campaignStatus: brief.campaign.status,
       status: brief.session.status,
       runtimeState: brief.session.runtimeState,
-      finalizationStatus: brief.session.finalizationStatus,
+      outcome: brief.session.outcome,
+      cleanup: brief.session.cleanup,
       canceledAssignmentIds: [],
       progress: brief.progress,
       launch: {
@@ -163,11 +164,6 @@ export async function collectLocalResearchStopReasons({
         openWorkerSlotCount: 0,
         activeHypothesisCount: brief.peerHypothesisCount,
         acceptingExperiments: brief.session.status === "running",
-      },
-      finalization: {
-        status: brief.session.finalizationStatus,
-        reasons: [],
-        terminalReason: brief.session.endReason,
       },
       updatedAt: brief.updatedAt,
     }

@@ -34,12 +34,12 @@ let previousFetch: typeof fetch | null = null
 type ApiCall = { method: string; path: string; body: unknown }
 
 const FAKE_WORKER_COMMAND = [
-  'onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto',
+  '"$ONYX_WORKER_BIN" exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto',
   "printf 'result\\n' > src/result.txt",
   "git add src/result.txt",
   "git commit -m 'fake worker result'",
-  "onyx-worker exp run --resume --auto",
-  "onyx-worker exp log",
+  '"$ONYX_WORKER_BIN" exp run --resume --auto',
+  '"$ONYX_WORKER_BIN" exp log',
 ].join(" && ")
 
 function nowIso() {
@@ -56,16 +56,17 @@ function requireExperimentReport(calls: ApiCall[]) {
   const report = calls.find(
     (call) =>
       call.method === "POST" &&
-      call.path === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+      call.path === "/api/v1/research/worker/experiments"
   )
   if (report) return report
-  const diagnostics = calls.filter((call) => call.path.includes("/heartbeat"))
+  const diagnostics = calls.filter((call) => call.path.includes("heartbeat"))
   throw new Error(
     `Expected an experiment report. Worker diagnostics: ${JSON.stringify(diagnostics)}`
   )
 }
 
 async function withMutedConsole<T>(fn: () => Promise<T>) {
+  if (process.env.ONYX_TEST_DEBUG === "1") return fn()
   const originalLog = console.log
   const originalWarn = console.warn
   const originalError = console.error
@@ -260,7 +261,17 @@ function session({
     deadlineAt: null,
     terminalReason: status === "completed" ? "experiment_target_reached" : null,
     schedulerSiteId: SITE_ID,
-    finalizationStatus: status === "completed" ? "complete" : "running",
+    outcome: {
+      status,
+      endedAt: status === "completed" ? nowIso() : null,
+      endReason: status === "completed" ? "experiment_target_reached" : null,
+    },
+    cleanup: {
+      status: status === "completed" ? "complete" : "running",
+      startedAt: status === "completed" ? nowIso() : null,
+      completedAt: status === "completed" ? nowIso() : null,
+      summary: {},
+    },
     metadata: {},
     startedAt: nowIso(),
     completedAt: status === "completed" ? nowIso() : null,
@@ -354,6 +365,7 @@ function installSupervisorApi({
   let terminal = false
   let workerSequence = 0
   const leasedWorkers: string[] = []
+  const workerIdsByCredential = new Map<string, string>()
   const currentCampaign = campaign(baseCommitSha)
   const currentHypothesis = hypothesis(baseCommitSha)
   const currentAssignment = {
@@ -429,7 +441,7 @@ function installSupervisorApi({
         campaignStatus: "active",
         runtimeState: terminal ? "ended" : "active",
         status: runningSession.status,
-        finalizationStatus: runningSession.finalizationStatus,
+        outcome: runningSession.outcome,
         progress: {
           experimentTarget: 1,
           acceptedExperimentCount,
@@ -447,16 +459,13 @@ function installSupervisorApi({
             runningSession.status === "running" && acceptedExperimentCount < 1,
         },
         canceledAssignmentIds: [],
-        finalization: {
-          status: runningSession.finalizationStatus,
-          reasons: [],
-          terminalReason: runningSession.terminalReason,
-        },
+        cleanup: runningSession.cleanup,
         updatedAt: nowIso(),
       }
     } else if (
       method === "POST" &&
-      url.pathname === `/api/v1/research/sessions/${SESSION_ID}/settle`
+      url.pathname ===
+        `/api/v1/research/sessions/${SESSION_ID}/settlement-tick`
     ) {
       if (receivedExperimentCount > 0) {
         acceptedExperimentCount = 1
@@ -467,7 +476,11 @@ function installSupervisorApi({
         campaignStatus: "active",
         runtimeState: terminal ? "ended" : "active",
         status: terminal ? "completed" : "running",
-        finalizationStatus: runningSession.finalizationStatus,
+        outcome: {
+          status: terminal ? "completed" : "running",
+          endedAt: terminal ? nowIso() : null,
+          endReason: terminal ? "experiment_target_reached" : null,
+        },
         progress: {
           experimentTarget: 1,
           acceptedExperimentCount,
@@ -483,11 +496,7 @@ function installSupervisorApi({
           activeHypothesisCount: 1,
           acceptingExperiments: !terminal && acceptedExperimentCount < 1,
         },
-        finalization: {
-          status: runningSession.finalizationStatus,
-          reasons: [],
-          terminalReason: terminal ? "experiment_target_reached" : null,
-        },
+        cleanup: runningSession.cleanup,
         updatedAt: nowIso(),
       }
     } else if (
@@ -530,10 +539,15 @@ function installSupervisorApi({
         }
       } else {
         const grants = (body?.workers ?? []).map(
-          (requested: { workerRef: string; workerName: string }) => {
+          (requested: {
+            workerRef: string
+            workerName: string
+            leaseCredential: string
+          }) => {
             workerSequence += 1
             const workerId = `60000000-0000-4000-8000-${String(workerSequence).padStart(12, "0")}`
             leasedWorkers.push(workerId)
+            workerIdsByCredential.set(requested.leaseCredential, workerId)
             return {
               workerRef: requested.workerRef,
               worker: {
@@ -541,7 +555,6 @@ function installSupervisorApi({
                 workerName: requested.workerName,
                 workerRef: requested.workerRef,
               },
-              leaseToken: `lease-token-${workerSequence}`.padEnd(16, "x"),
               leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
               assignment: currentAssignment,
               hypothesis: currentHypothesis,
@@ -598,9 +611,9 @@ function installSupervisorApi({
       workerSequence += 1
       const workerId = `60000000-0000-4000-8000-${String(workerSequence).padStart(12, "0")}`
       leasedWorkers.push(workerId)
+      workerIdsByCredential.set(body.leaseCredential, workerId)
       data = {
         worker: worker(workerId, "registered"),
-        leaseToken: `lease-token-${workerSequence}`.padEnd(16, "x"),
         leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
         assignment: currentAssignment,
         hypothesis: currentHypothesis,
@@ -617,9 +630,13 @@ function installSupervisorApi({
       }
     } else if (
       method === "POST" &&
-      /^\/api\/v1\/research\/workers\/[^/]+\/heartbeat$/.test(url.pathname)
+      url.pathname === "/api/v1/research/worker/heartbeat"
     ) {
-      const workerId = url.pathname.split("/").at(-2)!
+      const headers = new Headers(init?.headers)
+      const credential = headers.get("authorization")?.replace(/^Bearer /, "")
+      const workerId =
+        (credential && workerIdsByCredential.get(credential)) ??
+        leasedWorkers[0]!
       if (
         body?.status === "completed" ||
         body?.status === "failed" ||
@@ -703,7 +720,7 @@ function installSupervisorApi({
       }
     } else if (
       method === "POST" &&
-      url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+      url.pathname === "/api/v1/research/worker/experiments"
     ) {
       if (reportFailure) {
         return new Response(
@@ -856,7 +873,7 @@ function installSupervisorApi({
           deadlineAt: null,
           terminalReason: "experiment_target_reached",
         },
-        finalization: {
+        cleanup: {
           status: "complete",
           reasons: [],
           terminalReason: "experiment_target_reached",
@@ -996,7 +1013,8 @@ describe("remote-first research supervisor smoke", () => {
           (call) =>
             call.path ===
               `/api/v1/research/sessions/${SESSION_ID}/control-state` ||
-            call.path === `/api/v1/research/sessions/${SESSION_ID}/settle`
+            call.path ===
+              `/api/v1/research/sessions/${SESSION_ID}/settlement-tick`
         )
         expect(controlCalls.length).toBeLessThan(12)
         expect(
@@ -1035,52 +1053,57 @@ describe("remote-first research supervisor smoke", () => {
     }, 60_000)
   }
 
-  test("renders a bounded summary status without full campaign detail", async () => {
-    const { root, origin, baseCommitSha } = await createSmokeRepo()
-    installSupervisorApi({ baseCommitSha, workerTarget: 1 })
-    try {
-      await withMutedConsole(() =>
-        commandResearchRun({
-          positional: ["research", "run"],
-          options: {
-            cwd: root,
-            campaign: "smoke",
-            workers: "1",
-            experiments: "1",
-            foreground: "true",
-            quiet: "true",
-            "worker-command": FAKE_WORKER_COMMAND,
-            "presence-interval": "0.1",
-            "launch-interval-seconds": "0.01",
-            "startup-timeout": "5",
-            "heartbeat-sample-interval": "0",
-            "first-attempt-warning-seconds": "0",
-          },
-        })
-      )
-      const output = await captureConsole(() =>
-        commandResearchStatus({
-          positional: ["research", "status"],
-          options: {
-            cwd: root,
-            campaign: "smoke",
-            summary: "true",
-            json: "true",
-          },
-        })
-      )
-      const summary = JSON.parse(output) as Record<string, unknown>
-      expect(summary).toHaveProperty("campaign")
-      expect(summary).toHaveProperty("session")
-      expect(summary).toHaveProperty("campaign.status", "active")
-      expect(summary).toHaveProperty("session.finalizationStatus")
-      expect(summary).not.toHaveProperty("hypotheses")
-      expect(summary).not.toHaveProperty("workers")
-    } finally {
-      await rm(root, { recursive: true, force: true })
-      await rm(origin, { recursive: true, force: true })
-    }
-  })
+  test(
+    "renders a bounded summary status without full campaign detail",
+    async () => {
+      const { root, origin, baseCommitSha } = await createSmokeRepo()
+      installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+      try {
+        await withMutedConsole(() =>
+          commandResearchRun({
+            positional: ["research", "run"],
+            options: {
+              cwd: root,
+              campaign: "smoke",
+              workers: "1",
+              experiments: "1",
+              foreground: "true",
+              quiet: "true",
+              "worker-command": FAKE_WORKER_COMMAND,
+              "presence-interval": "0.1",
+              "launch-interval-seconds": "0.01",
+              "startup-timeout": "5",
+              "heartbeat-sample-interval": "0",
+              "first-attempt-warning-seconds": "0",
+            },
+          })
+        )
+        const output = await captureConsole(() =>
+          commandResearchStatus({
+            positional: ["research", "status"],
+            options: {
+              cwd: root,
+              campaign: "smoke",
+              summary: "true",
+              json: "true",
+            },
+          })
+        )
+        const summary = JSON.parse(output) as Record<string, unknown>
+        expect(summary).toHaveProperty("campaign")
+        expect(summary).toHaveProperty("session")
+        expect(summary).toHaveProperty("campaign.status", "active")
+        expect(summary).toHaveProperty("session.outcome")
+        expect(summary).toHaveProperty("session.cleanup")
+        expect(summary).not.toHaveProperty("hypotheses")
+        expect(summary).not.toHaveProperty("workers")
+      } finally {
+        await rm(root, { recursive: true, force: true })
+        await rm(origin, { recursive: true, force: true })
+      }
+    },
+    60_000
+  )
 
   test("treats settled discarded experiment reports as clean logged outcomes", async () => {
     const { root, origin, baseCommitSha } = await createSmokeRepo()
@@ -1114,7 +1137,7 @@ describe("remote-first research supervisor smoke", () => {
       const manifestFiles = calls.filter(
         (call) =>
           call.method === "POST" &&
-          call.path === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+          call.path === "/api/v1/research/worker/experiments"
       )
       expect(manifestFiles).toHaveLength(1)
       const workerLogRoot = join(
@@ -1187,7 +1210,7 @@ describe("remote-first research supervisor smoke", () => {
           (call) =>
             call.method === "POST" &&
             call.path ===
-              `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+              "/api/v1/research/worker/experiments"
         )
       ).toBe(false)
       expect(await pathExists(join(root, ".git", "onyx", "research.db"))).toBe(
@@ -1291,7 +1314,7 @@ describe("remote-first research supervisor smoke", () => {
       const reportCall = calls.find(
         (call) =>
           call.method === "POST" &&
-          call.path === `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+          call.path === "/api/v1/research/worker/experiments"
       )
       expect(reportCall).toBeDefined()
       expect(reportCall?.body).toMatchObject({
@@ -1339,7 +1362,7 @@ describe("remote-first research supervisor smoke", () => {
           (call) =>
             call.method === "POST" &&
             call.path ===
-              `/api/v1/research/campaigns/${CAMPAIGN_ID}/experiments`
+              "/api/v1/research/worker/experiments"
         )
       ).toBe(true)
       const refs = await git(

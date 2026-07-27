@@ -13,9 +13,14 @@ import { describe, expect, test } from "bun:test"
 
 import { writeConfig } from "./lib/config"
 import { currentCommit, pushRefs } from "./lib/git"
-import { runProcess, runStreamingProcess } from "./lib/process"
+import {
+  runProcess,
+  runStreamingProcess,
+  StreamingSecretRedactor,
+} from "./lib/process"
 import {
   buildWorkerInvocation,
+  preflightProviderModel,
   preflightWorkerInvocation,
   workerRuntimeEnvironment,
   workerRuntimePaths,
@@ -61,6 +66,14 @@ async function writeFakeOnyx(path: string) {
       '  echo "onyx fake 1.0"',
       "  exit 0",
       "fi",
+      'if [[ "${1:-}" == "diagnostics" && "${2:-}" == "handshake" ]]; then',
+      '  echo "{\\"protocolVersion\\":5,\\"workerContextSchemas\\":[5],\\"capabilities\\":[]}"',
+      "  exit 0",
+      "fi",
+      'if [[ "${1:-}" == "research" && "${2:-}" == "session-state-brief" ]]; then',
+      '  echo "{\\"schemaVersion\\":1,\\"worker\\":{\\"id\\":null,\\"sessionId\\":null,\\"assignment\\":{\\"id\\":null}}}"',
+      "  exit 0",
+      "fi",
       'if [[ "${1:-}" == "developer" && "${2:-}" == "status" ]]; then',
       '  echo "{\\"mode\\":\\"dev\\",\\"apiTarget\\":\\"http://localhost:3000\\"}"',
       "  exit 0",
@@ -95,6 +108,37 @@ async function writeFakeOnyx(path: string) {
 }
 
 describe("worker launchers", () => {
+  test("redacts secrets split across provider output chunks", async () => {
+    const secret = "owx_worker_v1_abcdefghijklmnopqrstuvwxyz123456"
+    const redactor = new StreamingSecretRedactor([secret])
+    const direct =
+      redactor.push("before owx_worker_v1_abcdefgh") +
+      redactor.push("ijklmnopqrstuvwxyz123456 after") +
+      redactor.flush()
+    expect(direct).not.toContain(secret)
+    expect(direct).toContain("[REDACTED]")
+
+    const root = await mkdtemp(join(tmpdir(), "onyx-redaction-"))
+    const logPath = join(root, "worker.log")
+    const activityLogPath = join(root, "worker.activity.log")
+    const result = await runStreamingProcess(
+      "sh",
+      [
+        "-c",
+        'printf "before owx_worker_v1_abcdefgh"; sleep 0.05; printf "ijklmnopqrstuvwxyz123456 after\\n"; printf "owx_worker_v1_abcdefgh" >&2; sleep 0.05; printf "ijklmnopqrstuvwxyz123456\\n" >&2',
+      ],
+      { logPath, activityLogPath, redactValues: [secret] }
+    )
+    const retained = [
+      result.stdout,
+      result.stderr,
+      await readFile(logPath, "utf8"),
+      await readFile(activityLogPath, "utf8"),
+    ].join("\n")
+    expect(retained).not.toContain(secret)
+    expect(retained).toContain("[REDACTED]")
+  })
+
   test("builds direct Codex, Claude, and OpenCode invocations", () => {
     const prompt = "SECRET_PROMPT"
     const addedWritableRoots = ["/tmp/worktree/.git", "/tmp/repo/.git"]
@@ -123,13 +167,18 @@ describe("worker launchers", () => {
     expect(codex.command).toBe("codex")
     expect(codex.args).toEqual([
       "--search",
-      "--sandbox",
-      "workspace-write",
       "--ask-for-approval",
       "never",
+      "exec",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--strict-config",
+      "--config",
+      "sandbox_workspace_write.network_access=true",
+      "--sandbox",
+      "workspace-write",
       "--model",
       "gpt-5-codex",
-      "exec",
       "--cd",
       "/tmp/worktree",
       "--add-dir",
@@ -191,6 +240,50 @@ describe("worker launchers", () => {
     expect(JSON.stringify(opencode.args)).not.toContain(prompt)
   })
 
+  test("model preflight invokes the resolved executable despite a hostile PATH", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-exact-provider-"))
+    const hostileBin = join(root, "hostile")
+    const trustedBin = join(root, "trusted")
+    await mkdir(hostileBin)
+    await mkdir(trustedBin)
+    const hostileMarker = join(root, "hostile-ran")
+    await writeFile(
+      join(hostileBin, "codex"),
+      `#!/bin/sh\n/usr/bin/touch ${JSON.stringify(hostileMarker)}\nexit 19\n`,
+      "utf8"
+    )
+    await chmod(join(hostileBin, "codex"), 0o755)
+    const trusted = join(trustedBin, "codex")
+    await writeFile(
+      trusted,
+      [
+        "#!/bin/sh",
+        'if [ "${1:-}" = "--version" ]; then echo "codex trusted 1.0"; exit 0; fi',
+        "prompt=$(/bin/cat)",
+        "marker=${prompt##*: }",
+        `printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\\n' "$marker"`,
+        "",
+      ].join("\n"),
+      "utf8"
+    )
+    await chmod(trusted, 0o755)
+    const invocation = buildWorkerInvocation({
+      agentKind: "codex",
+      providerExecutable: trusted,
+      worktree: root,
+      prompt: "worker prompt",
+    })
+    const result = await preflightProviderModel({
+      invocation,
+      cwd: root,
+      env: { ...process.env, PATH: hostileBin },
+    })
+
+    expect(result.skipped).toBe(false)
+    expect(result.version).toContain("codex trusted 1.0")
+    await expect(readFile(hostileMarker, "utf8")).rejects.toThrow()
+  })
+
   test("preflights and streams built-in worker stdin to logs", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-launcher-"))
     const bin = join(root, "bin")
@@ -219,6 +312,7 @@ describe("worker launchers", () => {
     const preflight = await preflightWorkerInvocation(invocation, {
       cwd: worktree,
       env,
+      onyxWorkerPath: join(bin, "onyx-worker"),
     })
     expect(preflight.version).toContain("codex fake 1.0")
 
@@ -345,6 +439,29 @@ describe("worker launchers", () => {
     expect(log).toContain("0123456789abcdef")
   })
 
+  test("rotates raw provider logs within the per-worker byte cap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-log-cap-"))
+    const logPath = join(root, "worker.log")
+    const result = await runStreamingProcess(
+      "sh",
+      ["-c", "printf '%01000d' 0"],
+      {
+        logPath,
+        timeoutMs: 5000,
+        startupTimeoutMs: 1000,
+        killGraceMs: 100,
+        logLimitBytes: 512,
+      }
+    )
+
+    expect(result.code).toBe(0)
+    const first = await readFile(logPath)
+    const second = await readFile(`${logPath}.1`)
+    expect(first.byteLength).toBeLessThanOrEqual(256)
+    expect(second.byteLength).toBeLessThanOrEqual(256)
+    expect(first.byteLength + second.byteLength).toBe(512)
+  })
+
   test("preflights Claude with its direct print-mode launcher", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-claude-launcher-"))
     const bin = join(root, "bin")
@@ -370,6 +487,7 @@ describe("worker launchers", () => {
     const preflight = await preflightWorkerInvocation(invocation, {
       cwd: worktree,
       env,
+      onyxWorkerPath: join(bin, "onyx-worker"),
     })
 
     expect(preflight.version).toContain("claude fake 2.0")
@@ -407,6 +525,7 @@ describe("worker launchers", () => {
           ...process.env,
           PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
         },
+        onyxWorkerPath: join(bin, "onyx-worker"),
       })
     ).rejects.toThrow(
       "Install or authenticate OpenCode before using `--agent opencode`."
@@ -435,6 +554,7 @@ describe("worker launchers", () => {
         PATH: `${bin}:${process.env.PATH ?? ""}`,
       },
       campaignName: "smoke",
+      onyxWorkerPath: join(bin, "onyx-worker"),
     })
 
     expect(preflight.checks.map((item) => item.name)).not.toContain(
@@ -497,7 +617,7 @@ describe("worker launchers", () => {
     await writeWorkerRuntimeContext({
       paths,
       context: {
-        schemaVersion: 4,
+        schemaVersion: 5,
         campaignId: "campaign-id",
         campaignName: "campaign",
         sessionId: "session/one",
@@ -529,7 +649,7 @@ describe("worker launchers", () => {
           lastWorkedAt: null,
         },
         workerId: "worker/one",
-        workerLeaseToken: "lease-token",
+        workerCredential: "owx_worker_v1_test-credential-0000000000000000",
         worktreeRoot: join(root, "worktree"),
         projectPath: "",
         projectRoot: join(root, "worktree"),
@@ -546,7 +666,11 @@ describe("worker launchers", () => {
       target: join(root, "bin", "onyx-worker.js"),
     }
     const env = workerRuntimeEnvironment({
-      baseEnv: { PATH: "/usr/bin" },
+      baseEnv: {
+        PATH: "/usr/bin",
+        ONYX_API_KEY: "must-not-be-inherited",
+        UNRELATED_SECRET: "must-not-be-inherited",
+      },
       wrapper,
       paths,
     })
@@ -558,6 +682,8 @@ describe("worker launchers", () => {
     expect(env.ONYX_WORKER_CONTEXT).toBe(paths.contextPath)
     expect(env.ONYX_HOME).toBe(paths.homeDir)
     expect(env.TMPDIR).toBe(paths.tempDir)
+    expect(env).not.toHaveProperty("ONYX_API_KEY")
+    expect(env).not.toHaveProperty("UNRELATED_SECRET")
   })
 
   test("dev-mode worker wrapper dispatches through linked checkout with bypass", async () => {

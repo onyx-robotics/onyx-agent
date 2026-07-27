@@ -3,8 +3,10 @@ import {
   mkdir,
   readdir,
   readFile,
+  rm,
   rename,
   writeFile,
+  realpath,
 } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { delimiter } from "node:path"
@@ -14,7 +16,7 @@ import { fileURLToPath } from "node:url"
 import { onyxStateDir } from "./runtime-state"
 import { readConfig, type BuiltInWorkerAgent } from "./config"
 import { gitCommonDir, gitDir } from "./git"
-import { pathExists, runProcess } from "./process"
+import { activityLinesForOutput, pathExists, runProcess } from "./process"
 import type { WorkerRuntimeContext } from "./worker-context"
 
 const ONYX_LAUNCHER_BYPASS = "ONYX_LAUNCHER_BYPASS"
@@ -32,6 +34,33 @@ export type WorkerInvocation = {
   workerModel?: string | null
 }
 
+type WorkerInvocationOptions = {
+  worktree: string
+  prompt: string
+  addedWritableRoots: string[]
+  workerModel: string | null
+  workerTitle?: string
+  providerExecutable?: string
+}
+
+export type ProviderFailureClass =
+  | "auth"
+  | "quota"
+  | "rate_limit"
+  | "overloaded"
+  | "unavailable"
+  | "model_unsupported"
+  | "other"
+
+/** One deterministic boundary for every built-in provider CLI. */
+export interface ProviderAdapter {
+  readonly kind: BuiltInWorkerAgent
+  readonly executable: string
+  buildInvocation(options: WorkerInvocationOptions): WorkerInvocation
+  parseStructuredEvents(output: string): string[]
+  classifyFailure(output: string): ProviderFailureClass
+}
+
 export type WorkerPreflightCheck = {
   name: string
   status: "passed" | "failed"
@@ -42,6 +71,113 @@ export type WorkerPreflightResult = {
   version: string | null
   onyxVersion: string | null
   checks: WorkerPreflightCheck[]
+}
+
+export async function resolveProviderExecutable(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env
+) {
+  if (command.includes("/")) return realpath(command)
+  const result = await runProcess("which", [command], {
+    env,
+    timeoutMs: 5_000,
+  })
+  const resolved = result.stdout.trim().split("\n")[0]
+  if (result.code !== 0 || result.timedOut || !resolved) {
+    throw new Error(`Provider executable ${command} was not found on PATH.`)
+  }
+  return realpath(resolved)
+}
+
+export async function preflightProviderModel({
+  invocation,
+  cwd,
+  env,
+  timeoutMs = 90_000,
+}: {
+  invocation: WorkerInvocation
+  cwd: string
+  env?: NodeJS.ProcessEnv
+  timeoutMs?: number
+}) {
+  if (invocation.agentKind === "custom") {
+    return { skipped: true, version: null, marker: null }
+  }
+  const marker = `ONYX_PREFLIGHT_READY_${randomUUID()}`
+  const probe = buildWorkerInvocation({
+    agentKind: invocation.agentKind,
+    worktree: cwd,
+    prompt: `This is a capability probe. Do not use tools. Respond with exactly: ${marker}`,
+    workerModel: invocation.workerModel ?? null,
+    providerExecutable: invocation.command,
+  })
+  const [versionResult, probeResult] = await Promise.all([
+    runProcess(invocation.command, ["--version"], {
+      cwd,
+      env,
+      timeoutMs: 10_000,
+    }),
+    runProcess(probe.command, probe.args, {
+      cwd,
+      env,
+      stdin: probe.stdin,
+      timeoutMs,
+    }),
+  ])
+  const output = `${probeResult.stdout}\n${probeResult.stderr}`
+  if (
+    versionResult.code !== 0 ||
+    versionResult.timedOut ||
+    probeResult.code !== 0 ||
+    probeResult.timedOut ||
+    !providerAdapter(invocation.agentKind)
+      .parseStructuredEvents(probeResult.stdout)
+      .some((line) => line.includes(marker))
+  ) {
+    throw new Error(
+      `Provider/model preflight failed before session creation: ${compactPreflightOutput(output || versionResult.stderr || versionResult.stdout)}`
+    )
+  }
+  return {
+    skipped: false,
+    version: `${versionResult.stdout}\n${versionResult.stderr}`.trim() || null,
+    marker,
+  }
+}
+
+export async function preflightWorkerProtocol({ root }: { root: string }) {
+  const preflightId = `preflight-${randomUUID()}`
+  const paths = await workerRuntimePaths({
+    root,
+    sessionId: "preflight",
+    workerId: preflightId,
+  })
+  try {
+    const wrapper = await writeWorkerCliWrapper({ paths })
+    const result = await runProcess(
+      wrapper.workerPath,
+      ["diagnostics", "handshake", "--json"],
+      { cwd: root, timeoutMs: 10_000 }
+    )
+    if (result.code !== 0 || result.timedOut) {
+      throw new Error(result.stderr || result.stdout || "handshake failed")
+    }
+    const payload = JSON.parse(result.stdout) as {
+      protocolVersion?: number
+      workerContextSchemas?: number[]
+    }
+    if (
+      payload.protocolVersion !== 5 ||
+      !payload.workerContextSchemas?.includes(5)
+    ) {
+      throw new Error(
+        `expected protocol 5/context 5, received ${compactPreflightOutput(result.stdout)}`
+      )
+    }
+    return { ...payload, workerPath: wrapper.workerPath, mode: wrapper.mode }
+  } finally {
+    await rm(paths.dir, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 export type WorkerCliWrapper = {
@@ -273,9 +409,14 @@ export async function writeWorkerRuntimeContext({
   context: WorkerRuntimeContext
 }) {
   await Promise.all([
-    mkdir(paths.dir, { recursive: true }),
-    mkdir(paths.homeDir, { recursive: true }),
-    mkdir(paths.tempDir, { recursive: true }),
+    mkdir(paths.dir, { recursive: true, mode: 0o700 }),
+    mkdir(paths.homeDir, { recursive: true, mode: 0o700 }),
+    mkdir(paths.tempDir, { recursive: true, mode: 0o700 }),
+  ])
+  await Promise.all([
+    chmod(paths.dir, 0o700),
+    chmod(paths.homeDir, 0o700),
+    chmod(paths.tempDir, 0o700),
   ])
   await writeFile(paths.contextPath, `${JSON.stringify(context, null, 2)}\n`, {
     encoding: "utf8",
@@ -351,6 +492,51 @@ export async function writeWorkerCliWrapper({
   return { binDir: paths.binDir, workerPath, mode, target }
 }
 
+const PROVIDER_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "COLORTERM",
+  "SSH_AUTH_SOCK",
+  "SSH_AGENT_PID",
+  "GIT_ASKPASS",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_TERMINAL_PROMPT",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
+  "OPENCODE_CONFIG_DIR",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+] as const
+
+export function providerRuntimeEnvironment(
+  baseEnv: NodeJS.ProcessEnv = process.env
+) {
+  return Object.fromEntries(
+    PROVIDER_ENV_ALLOWLIST.flatMap((name) =>
+      baseEnv[name] === undefined ? [] : [[name, baseEnv[name]]]
+    )
+  )
+}
+
 export function workerRuntimeEnvironment({
   baseEnv,
   wrapper,
@@ -361,7 +547,7 @@ export function workerRuntimeEnvironment({
   paths: WorkerRuntimePaths
 }) {
   return {
-    ...baseEnv,
+    ...providerRuntimeEnvironment(baseEnv),
     PATH: [wrapper.binDir, baseEnv.PATH ?? ""].filter(Boolean).join(delimiter),
     ONYX_WORKER_CONTEXT: paths.contextPath,
     ONYX_HOME: paths.homeDir,
@@ -379,6 +565,7 @@ export function buildWorkerInvocation({
   addedWritableRoots = [],
   workerModel = null,
   workerTitle,
+  providerExecutable,
 }: {
   agentKind: string
   workerCommand?: string
@@ -387,6 +574,7 @@ export function buildWorkerInvocation({
   addedWritableRoots?: string[]
   workerModel?: string | null
   workerTitle?: string
+  providerExecutable?: string
 }): WorkerInvocation {
   if (workerCommand) {
     return {
@@ -399,101 +587,194 @@ export function buildWorkerInvocation({
     }
   }
 
-  if (agentKind === "codex") {
-    const modelArgs = workerModel ? ["--model", workerModel] : []
-    const writableArgs = addedWritableRoots.flatMap((root) => [
-      "--add-dir",
-      root,
-    ])
-    const args = [
-      "--search",
-      "--sandbox",
-      "workspace-write",
-      "--ask-for-approval",
-      "never",
-      ...modelArgs,
-      "exec",
-      "--cd",
-      worktree,
-      ...writableArgs,
-      "--json",
-      "--color",
-      "never",
-      "--ephemeral",
-      "-",
-    ]
-    return {
-      agentKind,
-      command: "codex",
-      args,
-      redactedArgs: args,
-      preflightArgs: args.slice(0, -1).concat("--help"),
-      stdin: prompt,
-      addedWritableRoots,
-      workerModel,
-    }
-  }
+  return providerAdapter(agentKind).buildInvocation({
+    worktree,
+    prompt,
+    addedWritableRoots,
+    workerModel,
+    workerTitle,
+    providerExecutable,
+  })
+}
 
-  if (agentKind === "claude") {
-    const modelArgs = workerModel ? ["--model", workerModel] : []
-    const writableArgs = unique([worktree, ...addedWritableRoots]).flatMap(
-      (root) => ["--add-dir", root]
+export function classifyProviderFailure(output: string): ProviderFailureClass {
+  if (/unsupported model|model .*not found|unknown model/i.test(output)) {
+    return "model_unsupported"
+  }
+  if (
+    /authentication|unauthorized|invalid api key|login required|not logged in|\b401\b|\b403\b/i.test(
+      output
     )
-    const args = [
-      "--verbose",
-      "--print",
-      ...modelArgs,
-      "--input-format",
-      "text",
-      "--output-format",
-      "stream-json",
-      "--include-partial-messages",
-      "--permission-mode",
-      "auto",
-      ...writableArgs,
-      "--no-session-persistence",
-    ]
-    return {
-      agentKind,
-      command: "claude",
-      args,
-      redactedArgs: args,
-      preflightArgs: args.concat("--help"),
-      stdin: prompt,
+  ) {
+    return "auth"
+  }
+  if (
+    /session limit|usage limit|out[_ -]?of[_ -]?credits|credit balance|insufficient credits|overage|spending limit|billing limit|quota exceeded/i.test(
+      output
+    )
+  ) {
+    return "quota"
+  }
+  if (/rate limit|too many requests|\b429\b|throttl/i.test(output)) {
+    return "rate_limit"
+  }
+  if (/overloaded|capacity|server busy|\b529\b/i.test(output)) {
+    return "overloaded"
+  }
+  if (/service unavailable|upstream|gateway|\b50[0234]\b/i.test(output)) {
+    return "unavailable"
+  }
+  return "other"
+}
+
+function structuredActivity(output: string) {
+  return activityLinesForOutput("stdout", output)
+}
+
+const providerAdapters: Record<BuiltInWorkerAgent, ProviderAdapter> = {
+  codex: {
+    kind: "codex",
+    executable: "codex",
+    parseStructuredEvents: structuredActivity,
+    classifyFailure: classifyProviderFailure,
+    buildInvocation({
+      worktree,
+      prompt,
       addedWritableRoots,
       workerModel,
-    }
-  }
-
-  if (agentKind === "opencode") {
-    const modelArgs = workerModel ? ["--model", workerModel] : []
-    const args = [
-      "run",
-      "--pure",
-      "--dir",
+      providerExecutable,
+    }) {
+      const modelArgs = workerModel ? ["--model", workerModel] : []
+      const writableArgs = addedWritableRoots.flatMap((root) => [
+        "--add-dir",
+        root,
+      ])
+      const args = [
+        "--search",
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "--config",
+        "sandbox_workspace_write.network_access=true",
+        "--sandbox",
+        "workspace-write",
+        ...modelArgs,
+        "--cd",
+        worktree,
+        ...writableArgs,
+        "--json",
+        "--color",
+        "never",
+        "--ephemeral",
+        "-",
+      ]
+      return {
+        agentKind: "codex",
+        command: providerExecutable ?? "codex",
+        args,
+        redactedArgs: args,
+        preflightArgs: args.slice(0, -1).concat("--help"),
+        stdin: prompt,
+        addedWritableRoots,
+        workerModel,
+      }
+    },
+  },
+  claude: {
+    kind: "claude",
+    executable: "claude",
+    parseStructuredEvents: structuredActivity,
+    classifyFailure: classifyProviderFailure,
+    buildInvocation({
       worktree,
-      "--format",
-      "json",
-      "--title",
-      workerTitle ?? "onyx-worker",
-      ...modelArgs,
-      "--print-logs",
-      "--log-level",
-      "ERROR",
-      "--dangerously-skip-permissions",
-    ]
-    return {
-      agentKind,
-      command: "opencode",
-      args,
-      redactedArgs: args,
-      preflightArgs: ["run", "--help"],
-      stdin: prompt,
-      addedWritableRoots: [],
+      prompt,
+      addedWritableRoots,
       workerModel,
-    }
-  }
+      providerExecutable,
+    }) {
+      const modelArgs = workerModel ? ["--model", workerModel] : []
+      const writableArgs = unique([worktree, ...addedWritableRoots]).flatMap(
+        (root) => ["--add-dir", root]
+      )
+      const args = [
+        "--verbose",
+        "--print",
+        ...modelArgs,
+        "--input-format",
+        "text",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--permission-mode",
+        "auto",
+        ...writableArgs,
+        "--no-session-persistence",
+      ]
+      return {
+        agentKind: "claude",
+        command: providerExecutable ?? "claude",
+        args,
+        redactedArgs: args,
+        preflightArgs: args.concat("--help"),
+        stdin: prompt,
+        addedWritableRoots,
+        workerModel,
+      }
+    },
+  },
+  opencode: {
+    kind: "opencode",
+    executable: "opencode",
+    parseStructuredEvents: structuredActivity,
+    classifyFailure: classifyProviderFailure,
+    buildInvocation({
+      worktree,
+      prompt,
+      workerModel,
+      workerTitle,
+      providerExecutable,
+    }) {
+      const modelArgs = workerModel ? ["--model", workerModel] : []
+      const args = [
+        "run",
+        "--pure",
+        "--dir",
+        worktree,
+        "--format",
+        "json",
+        "--title",
+        workerTitle ?? "onyx-worker",
+        ...modelArgs,
+        "--print-logs",
+        "--log-level",
+        "ERROR",
+        "--dangerously-skip-permissions",
+      ]
+      return {
+        agentKind: "opencode",
+        command: providerExecutable ?? "opencode",
+        args,
+        redactedArgs: args,
+        preflightArgs: ["run", "--help"],
+        stdin: prompt,
+        addedWritableRoots: [],
+        workerModel,
+      }
+    },
+  },
+}
 
+export function providerAdapter(agentKind: string): ProviderAdapter {
+  if (
+    agentKind === "codex" ||
+    agentKind === "claude" ||
+    agentKind === "opencode"
+  ) {
+    return providerAdapters[agentKind]
+  }
   throw new Error(
     `Unknown --agent ${agentKind}. Use codex, claude, opencode, or pass --worker-command.`
   )
@@ -507,44 +788,49 @@ export async function preflightWorkerInvocation(
     timeoutMs?: number
     campaignName?: string
     sessionId?: string
+    assignmentId?: string
+    workerId?: string
+    onyxWorkerPath: string
   }
 ): Promise<WorkerPreflightResult> {
-  if (invocation.agentKind === "custom") {
-    return { version: null, onyxVersion: null, checks: [] }
-  }
-
   let version: string | null = null
-  try {
-    const versionResult = await runProcess(invocation.command, ["--version"], {
-      cwd: options.cwd,
-      env: options.env,
-      timeoutMs: options.timeoutMs ?? 10_000,
-    })
-    if (versionResult.code !== 0 || versionResult.timedOut) {
+  if (invocation.agentKind !== "custom") {
+    try {
+      const versionResult = await runProcess(
+        invocation.command,
+        ["--version"],
+        {
+          cwd: options.cwd,
+          env: options.env,
+          timeoutMs: options.timeoutMs ?? 10_000,
+        }
+      )
+      if (versionResult.code !== 0 || versionResult.timedOut) {
+        throw new Error(
+          versionResult.timedOut
+            ? "version check timed out"
+            : versionResult.stderr.trim() ||
+                versionResult.stdout.trim() ||
+                "version check failed"
+        )
+      }
+      version =
+        [versionResult.stdout.trim(), versionResult.stderr.trim()]
+          .filter(Boolean)
+          .join("\n") || null
+    } catch (error) {
+      const install =
+        invocation.agentKind === "codex"
+          ? "Install or authenticate the Codex CLI before using `--agent codex`."
+          : invocation.agentKind === "claude"
+            ? "Install or authenticate Claude Code before using `--agent claude`."
+            : "Install or authenticate OpenCode before using `--agent opencode`."
       throw new Error(
-        versionResult.timedOut
-          ? "version check timed out"
-          : versionResult.stderr.trim() ||
-              versionResult.stdout.trim() ||
-              "version check failed"
+        `${invocation.command} preflight failed. ${install} ${
+          error instanceof Error ? error.message : String(error)
+        }`
       )
     }
-    version =
-      [versionResult.stdout.trim(), versionResult.stderr.trim()]
-        .filter(Boolean)
-        .join("\n") || null
-  } catch (error) {
-    const install =
-      invocation.agentKind === "codex"
-        ? "Install or authenticate the Codex CLI before using `--agent codex`."
-        : invocation.agentKind === "claude"
-          ? "Install or authenticate Claude Code before using `--agent claude`."
-          : "Install or authenticate OpenCode before using `--agent opencode`."
-    throw new Error(
-      `${invocation.command} preflight failed. ${install} ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
   }
 
   const checks: WorkerPreflightCheck[] = []
@@ -639,29 +925,25 @@ export async function preflightWorkerInvocation(
     return result
   }
 
-  for (const probe of [
-    {
-      name: "onyx-worker exp run help",
-      args: ["exp", "run", "--help"],
-    },
-    {
-      name: "onyx-worker research brief help",
-      args: ["research", "brief", "--help"],
-    },
-    {
-      name: "onyx-worker research session-state-brief help",
-      args: ["research", "session-state-brief", "--help"],
-    },
-    {
-      name: "onyx-worker knowledge add help",
-      args: ["knowledge", "add", "--help"],
-    },
-    {
-      name: "onyx-worker tools run help",
-      args: ["tools", "run", "--help"],
-    },
-  ]) {
-    await runCheck(probe.name, "onyx-worker", probe.args)
+  const handshake = await runCheck(
+    "onyx-worker protocol handshake",
+    options.onyxWorkerPath,
+    ["diagnostics", "handshake", "--json"]
+  )
+  let handshakePayload: Record<string, unknown>
+  try {
+    handshakePayload = JSON.parse(handshake.stdout) as Record<string, unknown>
+  } catch {
+    throw new Error("Worker protocol handshake did not return JSON")
+  }
+  if (
+    handshakePayload.protocolVersion !== 5 ||
+    !Array.isArray(handshakePayload.workerContextSchemas) ||
+    !handshakePayload.workerContextSchemas.includes(5)
+  ) {
+    throw new Error(
+      `Worker protocol mismatch: expected protocol 5/context 5, received ${compactPreflightOutput(handshake.stdout)}`
+    )
   }
   checks.push({
     name: "onyx-worker capability surface",
@@ -669,13 +951,44 @@ export async function preflightWorkerInvocation(
     output: null,
   })
 
-  const versionResult = await runCheck("onyx-worker version", "onyx-worker", [
-    "--version",
-  ])
+  const versionResult = await runCheck(
+    "onyx-worker version",
+    options.onyxWorkerPath,
+    ["--version", "--json"]
+  )
   onyxVersion =
     [versionResult.stdout.trim(), versionResult.stderr.trim()]
       .filter(Boolean)
       .join("\n") || null
+
+  const contextResult = await runCheck(
+    "onyx-worker real context",
+    options.onyxWorkerPath,
+    ["research", "session-state-brief", "--json"]
+  )
+  try {
+    const context = JSON.parse(contextResult.stdout) as {
+      schemaVersion?: number
+      worker?: {
+        id?: string
+        sessionId?: string
+        assignment?: { id?: string }
+      }
+    }
+    if (
+      context.schemaVersion !== 1 ||
+      (options.workerId && context.worker?.id !== options.workerId) ||
+      (options.sessionId && context.worker?.sessionId !== options.sessionId) ||
+      (options.assignmentId &&
+        context.worker?.assignment?.id !== options.assignmentId)
+    ) {
+      throw new Error("identity mismatch")
+    }
+  } catch (error) {
+    throw new Error(
+      `Worker real-context handshake failed: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
 
   await runCheck("git metadata write", "git", [
     "update-index",

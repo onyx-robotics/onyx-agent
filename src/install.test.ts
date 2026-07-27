@@ -193,9 +193,9 @@ describe("install script", () => {
       expect(result.stdout).toContain(
         `Installed onyx-worker to ${fixture.home}/.local/bin/onyx-worker`
       )
-      expect(await readFile(`${fixture.home}/.local/bin/onyx`, "utf8")).toContain(
-        "fake login complete"
-      )
+      expect(
+        await readFile(`${fixture.home}/.local/bin/onyx`, "utf8")
+      ).toContain("fake login complete")
       expect(
         await readFile(`${fixture.home}/.local/bin/onyx-worker`, "utf8")
       ).toContain("fake login complete")
@@ -220,7 +220,9 @@ describe("install script", () => {
       expect(result.stdout).toContain(
         `|     Add ${fixture.home}/.local/bin to your shell PATH?`
       )
-      expect(result.stdout).toContain(`Added ${fixture.home}/.local/bin to PATH`)
+      expect(result.stdout).toContain(
+        `Added ${fixture.home}/.local/bin to PATH`
+      )
       expect(await readFile(`${fixture.home}/.bashrc`, "utf8")).toContain(
         'export PATH="$HOME/.local/bin:$PATH"'
       )
@@ -237,7 +239,9 @@ describe("install script", () => {
       expect(result.code).toBe(0)
       expect(result.stdout).toContain("Add Onyx to your PATH:")
       expect(result.stdout).toContain('export PATH="$HOME/.local/bin:$PATH"')
-      await expect(readFile(`${fixture.home}/.bashrc`, "utf8")).rejects.toThrow()
+      await expect(
+        readFile(`${fixture.home}/.bashrc`, "utf8")
+      ).rejects.toThrow()
     })
   })
 
@@ -252,7 +256,9 @@ describe("install script", () => {
       expect(result.stdout).toContain('export ONYX_API_KEY="onyx_..."')
       expect(result.stdout).not.toContain(">  Make onyx available")
       expect(result.stdout).not.toContain(">  Authenticate")
-      await expect(readFile(`${fixture.home}/.bashrc`, "utf8")).rejects.toThrow()
+      await expect(
+        readFile(`${fixture.home}/.bashrc`, "utf8")
+      ).rejects.toThrow()
       const log = await readFile(fixture.logPath, "utf8")
       expect(log).not.toContain("login")
     })

@@ -21,11 +21,7 @@ import {
   runLauncher,
   skillInstallTarget,
 } from "./onyx"
-import {
-  readConfig,
-  writeConfig,
-  type DeveloperCheckout,
-} from "./lib/config"
+import { readConfig, writeConfig, type DeveloperCheckout } from "./lib/config"
 
 let configHome: string | null = null
 let previousConfigHome: string | undefined
@@ -76,9 +72,7 @@ describe("developer mode", () => {
   beforeEach(async () => {
     previousConfigHome = process.env.XDG_CONFIG_HOME
     previousLauncherBypass = process.env[ONYX_LAUNCHER_BYPASS]
-    configHome = await mkdtemp(
-      join(tmpdir(), "onyx-developer-config-test-")
-    )
+    configHome = await mkdtemp(join(tmpdir(), "onyx-developer-config-test-"))
     process.env.XDG_CONFIG_HOME = configHome
     delete process.env[ONYX_LAUNCHER_BYPASS]
   })
@@ -319,9 +313,9 @@ describe("developer mode", () => {
 
       const config = await readConfig()
       expect(config.developer).toEqual({ mode: "release" })
-      expect((await lstat(skillInstallTarget(skillRoot))).isSymbolicLink()).toBe(
-        false
-      )
+      expect(
+        (await lstat(skillInstallTarget(skillRoot))).isSymbolicLink()
+      ).toBe(false)
     } finally {
       await rm(checkoutRoot, { recursive: true, force: true })
       await rm(skillRoot, { recursive: true, force: true })
@@ -414,7 +408,7 @@ describe("developer mode", () => {
       })
     )
 
-    expect(output).toBe("0.1.10")
+    expect(output).toContain("onyx 0.1.10 (protocol 5, source")
   })
 
   test("launcher reports missing linked dev files", async () => {

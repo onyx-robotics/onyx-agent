@@ -526,41 +526,68 @@ async function buildValidation({
     )
   }
 
-  const ids = [
-    ...Object.keys(setup.tools),
+  const declaredCapabilityText = [
+    setup.goal,
+    ...Object.entries(setup.resources).flatMap(([id, resource]) => [
+      id,
+      resource.description ?? "",
+    ]),
+    ...Object.entries(setup.tools).flatMap(([id, tool]) => [
+      id,
+      tool.description ?? "",
+    ]),
     ...setup.workflow.map((step) => step.id),
   ]
-  const hasSafety = ids.some((id) => id.includes("safety"))
-  const hasReadiness = ids.some(
-    (id) => id.includes("readiness") || id.includes("reset")
+    .join(" ")
+    .toLowerCase()
+  const hasSafety = /\b(safety|safe|interlock|hazard)\b/.test(
+    declaredCapabilityText
   )
-  const hasReliability = ids.some(
-    (id) => id.includes("reliability") || id.includes("check")
+  const safetyApplicable =
+    Object.keys(setup.resources).length > 0 &&
+    /\b(hardware|robot|device|motor|physical|real[- ]world|service)\b/.test(
+      declaredCapabilityText
+    )
+  const hasReadiness = /\b(readiness|ready|reset|cleanup|restore)\b/.test(
+    declaredCapabilityText
   )
-  if (!hasSafety) {
+  const hasGuardrail = setup.workflow.some((step) => step.guardrail)
+  const unmarkedCheckSteps = setup.workflow.filter(
+    (step) =>
+      step.run &&
+      !step.metric &&
+      !step.guardrail &&
+      /\b(check|test|validate|verify|lint)\b/.test(
+        `${step.id} ${setup.tools[step.run]?.description ?? ""}`.toLowerCase()
+      )
+  )
+  if (safetyApplicable && !hasSafety) {
     checks.push(
       check(
         "safety_warning",
         "warning",
-        "Recommendation: add a safety-style workflow or tool step for long-running or real-world research."
+        `Declared physical/service resources (${Object.keys(setup.resources).join(", ")}) have no named safety or interlock capability. Add a safety tool/step or document why those resources are intrinsically safe.`,
+        { resources: Object.keys(setup.resources) }
       )
     )
   }
-  if (!hasReadiness) {
+  if (Object.keys(setup.resources).length > 0 && !hasReadiness) {
     checks.push(
       check(
         "readiness_warning",
         "warning",
-        "Recommendation: add a readiness/reset-style workflow or tool step when experiments need environment cleanup."
+        `Setup declares shared resources (${Object.keys(setup.resources).join(", ")}) but no reset, cleanup, restore, or readiness capability. Add the appropriate tool when resource state can persist between experiments.`,
+        { resources: Object.keys(setup.resources) }
       )
     )
   }
-  if (!hasReliability) {
+  if (!hasGuardrail && unmarkedCheckSteps.length > 0) {
     checks.push(
       check(
         "reliability_warning",
         "warning",
-        "Recommendation: add a reliability/check-style workflow or tool step when metric wins need extra guardrails."
+        `Workflow check step${unmarkedCheckSteps.length === 1 ? "" : "s"} ${unmarkedCheckSteps.map((step) => step.id).join(", ")} are not marked as guardrails. Set guardrail=true when failure must reject a metric win.`,
+        { workflowStepIds: unmarkedCheckSteps.map((step) => step.id) }
       )
     )
   }

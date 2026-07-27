@@ -35,7 +35,13 @@ function snapshot(fetchedAt: string): SupervisorControlStateSnapshot {
       campaignStatus: "active",
       runtimeState: "active",
       status: "running",
-      finalizationStatus: "running",
+      outcome: { status: "running", endedAt: null, endReason: null },
+      cleanup: {
+        status: "running",
+        startedAt: null,
+        completedAt: null,
+        summary: {},
+      },
       progress: {
         experimentTarget: 50,
         acceptedExperimentCount: 10,
@@ -54,11 +60,6 @@ function snapshot(fetchedAt: string): SupervisorControlStateSnapshot {
         acceptingExperiments: true,
       },
       canceledAssignmentIds: ["55000000-0000-4000-8000-000000000001"],
-      finalization: {
-        status: "running",
-        reasons: [],
-        terminalReason: null,
-      },
       updatedAt: fetchedAt,
     },
   }
@@ -85,8 +86,7 @@ describe("supervisor control state snapshots", () => {
         ...control,
         progress: {
           ...control.progress,
-          acceptedExperimentCount:
-            control.progress.acceptedExperimentCount + 1,
+          acceptedExperimentCount: control.progress.acceptedExperimentCount + 1,
         },
       })
     ).not.toBe(baseline)

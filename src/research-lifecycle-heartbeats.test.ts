@@ -5,10 +5,7 @@ import { createLifecycleHeartbeatPublisher } from "./commands/research"
 function heartbeat(workerId: string) {
   return {
     workerId,
-    leaseToken: `lease-${workerId}`,
     status: "stopped" as const,
-    sessionId: "30000000-0000-4000-8000-000000000001",
-    hypothesisId: "40000000-0000-4000-8000-000000000001",
     phase: "stopped",
     event: "stop_requested",
   }
@@ -20,7 +17,12 @@ describe("supervisor lifecycle heartbeat publisher", () => {
     async (count) => {
       const batches: string[][] = []
       const publisher = createLifecycleHeartbeatPublisher(
-        { positional: [], options: {} },
+        {
+          args: { positional: [], options: {} },
+          sessionId: "30000000-0000-4000-8000-000000000001",
+          siteId: "50000000-0000-4000-8000-000000000001",
+          supervisorRunId: "test-run",
+        },
         async ({ heartbeats }) => {
           batches.push(heartbeats.map((item) => item.workerId))
           return {
@@ -47,7 +49,12 @@ describe("supervisor lifecycle heartbeat publisher", () => {
 
   test("attributes partial batch failures to the affected worker", async () => {
     const publisher = createLifecycleHeartbeatPublisher(
-      { positional: [], options: {} },
+      {
+        args: { positional: [], options: {} },
+        sessionId: "30000000-0000-4000-8000-000000000001",
+        siteId: "50000000-0000-4000-8000-000000000001",
+        supervisorRunId: "test-run",
+      },
       async ({ heartbeats }) => ({
         results: heartbeats.map((item, index) =>
           index === 0
