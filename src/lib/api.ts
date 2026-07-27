@@ -790,6 +790,7 @@ export async function callApi(
 
 export class ApiError extends Error {
   status: number
+  payload: unknown
 
   constructor(method: string, path: string, status: number, payload: unknown) {
     super(
@@ -799,6 +800,7 @@ export class ApiError extends Error {
     )
     this.name = "ApiError"
     this.status = status
+    this.payload = payload
   }
 }
 

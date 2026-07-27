@@ -77,7 +77,7 @@ Usage:
   onyx research scale --workers <n> [--session <id>]
   onyx research clean [--dry-run]
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
-  onyx research status [--campaign <name>] [--all-sessions] [--json] [--reconcile]
+  onyx research status [--campaign <name>] [--all-sessions] [--summary] [--json] [--reconcile]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--require-online]
   onyx knowledge list [--campaign <name>] [--limit <n>] [--json]
   onyx exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]

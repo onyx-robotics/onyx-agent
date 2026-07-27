@@ -1242,6 +1242,39 @@ export async function abandonBlockedWorkflowRunsForSession({
   return runs.map((run) => run.runRef)
 }
 
+export async function abandonNonterminalWorkflowRunsForWorker({
+  root,
+  sessionId,
+  workerId,
+  hypothesisId,
+  reason,
+}: {
+  root: string
+  sessionId: string
+  workerId: string
+  hypothesisId?: string | null
+  reason: string
+}) {
+  const runs = await listWorkflowRuns(root, {
+    sessionId,
+    workerId,
+    ...(hypothesisId ? { hypothesisId } : {}),
+    statuses: ["running", "paused", "blocked"],
+  })
+  for (const run of runs) {
+    await upsertWorkflowRun({
+      root,
+      run: {
+        ...run,
+        status: "abandoned",
+        blockReason: run.blockReason ? `${run.blockReason}; ${reason}` : reason,
+        completedAt: run.completedAt ?? nowIso(),
+      },
+    })
+  }
+  return runs.map((run) => run.runRef)
+}
+
 export async function upsertWorkflowStep({
   root,
   step,

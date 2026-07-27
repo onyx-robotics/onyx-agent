@@ -6,8 +6,10 @@ import {
   minimumUsefulLaunchMs,
   providerBackoffDelayMs,
   providerBackoffReasonForResult,
+  sessionCommitVisibilityGuidance,
   waitForStartupSessionReady,
 } from "./commands/research"
+import { ApiError } from "./lib/api"
 
 describe("research supervisor launch gates", () => {
   test("requires five useful minutes for built-in agents", () => {
@@ -171,5 +173,26 @@ describe("research supervisor launch gates", () => {
       if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
       else process.env.ONYX_API_KEY = previousApiKey
     }
+  })
+
+  test("renders actionable guidance for invisible session commits", () => {
+    const error = new ApiError("POST", "/sessions", 409, {
+      error: {
+        code: "conflict",
+        message: "Commit is not visible",
+        details: {
+          reason: "assignment_commit_not_visible",
+          commitSha: "a".repeat(40),
+          hypothesisId: "40000000-0000-4000-8000-000000000001",
+        },
+      },
+    })
+
+    expect(sessionCommitVisibilityGuidance(error)).toContain(
+      "Push that exact commit"
+    )
+    expect(sessionCommitVisibilityGuidance(error)).toContain(
+      "No research session was created"
+    )
   })
 })

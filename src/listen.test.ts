@@ -337,7 +337,9 @@ describe("onyx listen", () => {
 
     const text = await captureSnapshot(root)
     // One summary line, no per-slot rows.
-    expect(text).toContain("session completed · 1 workers · 1 delivered")
+    expect(text).toContain(
+      "session completed · 1 workers · 1 stopped · 1 attempt delivered"
+    )
     expect(text).not.toContain("worker-cache ·")
   })
 

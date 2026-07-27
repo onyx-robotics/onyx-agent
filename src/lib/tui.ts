@@ -432,19 +432,28 @@ function renderWorkerPanel(
   // Terminal sessions collapse to one summary line — the per-worker rows are
   // history, and the experiment table gets the vertical space back.
   if (sessionIsTerminal(model.sessionStatus)) {
-    const finalizationCounts = new Map<string, number>()
+    const lifecycleCounts = new Map<string, number>()
+    const deliveryCounts = new Map<string, number>()
     for (const worker of workers) {
-      const key =
-        worker.attemptDelivery && worker.attemptDelivery !== "none"
-          ? worker.attemptDelivery
-          : worker.status
-      finalizationCounts.set(key, (finalizationCounts.get(key) ?? 0) + 1)
+      lifecycleCounts.set(
+        worker.status,
+        (lifecycleCounts.get(worker.status) ?? 0) + 1
+      )
+      if (worker.attemptDelivery && worker.attemptDelivery !== "none") {
+        deliveryCounts.set(
+          worker.attemptDelivery,
+          (deliveryCounts.get(worker.attemptDelivery) ?? 0) + 1
+        )
+      }
     }
     const summary = [
       `session ${model.sessionStatus}`,
       `${workers.length} workers`,
-      ...[...finalizationCounts.entries()].map(
+      ...[...lifecycleCounts.entries()].map(
         ([status, count]) => `${count} ${status}`
+      ),
+      ...[...deliveryCounts.entries()].map(
+        ([status, count]) => `${count} attempt ${status}`
       ),
       ...(workers.some((worker) => worker.worktreeCleanup === "failed")
         ? [

@@ -100,6 +100,11 @@ import {
   type SessionStateBriefSnapshot,
   type WorkerSessionStopGuidance,
 } from "../lib/session-state-brief"
+import {
+  readSupervisorControlStateSnapshot,
+  supervisorControlStateIsFresh,
+  writeSupervisorControlStateSnapshot,
+} from "../lib/supervisor-control-state"
 import { readWorkerRuntimeContext } from "../lib/worker-context"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
@@ -111,6 +116,7 @@ import {
 import { resolveOpenCodeModelId } from "../lib/opencode-models"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
 import {
+  abandonNonterminalWorkflowRunsForWorker,
   clearLocalAttempt,
   cacheLocalCampaign,
   cacheResearchSessionState,
@@ -1803,6 +1809,18 @@ export async function teardownHypothesisAttempt({
   try {
     const warnings = await recordWorkerHarnessWarnings(activityManifest)
     if (warnings.length > 0) manifest.warnings = warnings
+    await abandonNonterminalWorkflowRunsForWorker({
+      root,
+      sessionId,
+      workerId,
+      hypothesisId: hypothesis.id,
+      reason: `Worker teardown: ${reasonCode}`,
+    }).catch((error) => {
+      manifest.warnings = [
+        ...(manifest.warnings ?? []),
+        `Could not abandon nonterminal workflow runs: ${boundedText(errorMessage(error), 500)}`,
+      ]
+    })
     const attempts = await listLocalAttempts(root, {
       sessionId,
       workerId,
@@ -2103,6 +2121,8 @@ export function createResearchSessionStopChecker({
   settleBeforeCheck = false,
   settlementNudgeIntervalMs = 1_000,
   controlPollIntervalMs = 1_000,
+  preferLocalSupervisorControl = false,
+  onRemoteControlState,
 }: {
   root: string
   sessionId: string
@@ -2111,6 +2131,8 @@ export function createResearchSessionStopChecker({
   settleBeforeCheck?: boolean
   settlementNudgeIntervalMs?: number
   controlPollIntervalMs?: number
+  preferLocalSupervisorControl?: boolean
+  onRemoteControlState?: (control: ApiSessionControlState) => Promise<void>
 }) {
   let nextSettlementNudgeMs = 0
   let nextControlPollMs = 0
@@ -2123,9 +2145,30 @@ export function createResearchSessionStopChecker({
         controlPollIntervalMs +
         Math.floor(Math.random() * Math.max(1, controlPollIntervalMs * 0.25))
       try {
+        if (preferLocalSupervisorControl) {
+          const local = await collectResearchStopReasons({
+            root,
+            sessionId,
+            nowMs,
+          })
+          if (local.shouldStop) {
+            cachedResult = local
+            return cachedResult
+          }
+        }
         const shouldNudge = settleBeforeCheck && nowMs >= nextSettlementNudgeMs
         let control: Awaited<ReturnType<typeof getResearchSessionControlState>>
-        if (shouldNudge) {
+        const localSnapshot = preferLocalSupervisorControl
+          ? await readSupervisorControlStateSnapshot({ root, sessionId }).catch(
+              () => null
+            )
+          : null
+        if (
+          localSnapshot &&
+          supervisorControlStateIsFresh(localSnapshot, nowMs)
+        ) {
+          control = localSnapshot.control
+        } else if (shouldNudge) {
           nextSettlementNudgeMs =
             nowMs +
             settlementNudgeIntervalMs +
@@ -2137,6 +2180,9 @@ export function createResearchSessionStopChecker({
           )
         } else {
           control = await getResearchSessionControlState(sessionId, args)
+        }
+        if (!localSnapshot || control !== localSnapshot.control) {
+          await onRemoteControlState?.(control).catch(() => {})
         }
         const reasons: string[] = []
         const reasonCodes = new Set<ResearchStopReasonCode>()
@@ -2947,6 +2993,7 @@ async function runHypothesisOnce({
       sessionId,
       assignmentId: lease.assignment.id,
       args,
+      preferLocalSupervisorControl: true,
     })
     const workerResult = await withWorkerHeartbeat({
       root,
@@ -3687,8 +3734,177 @@ export async function commandResearchBrief(args: Args) {
   console.log(renderSessionBrief(brief))
 }
 
+function supervisorTelemetryForStatus(
+  supervisor: SupervisorRuntimeTelemetry | undefined
+) {
+  if (!supervisor) return null
+  if (supervisor.status && supervisor.status !== "running") return supervisor
+  return freshSupervisorTelemetry(supervisor)
+}
+
+function uniqueWorkerWarnings(manifest: WorkerLaunchManifest) {
+  return [
+    ...new Set([
+      ...(manifest.warnings ?? []),
+      ...(manifest.teardown?.warnings ?? []),
+    ]),
+  ]
+}
+
+async function commandResearchStatusSummary({
+  root,
+  args,
+}: {
+  root: string
+  args: Args
+}) {
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const campaignName = args.options.campaign ?? state.activeCampaign
+  if (!campaignName) {
+    throw new Error("No active campaign. Pass --campaign <name>.")
+  }
+  const cachedCampaign =
+    state.campaigns?.[campaignStateKey(projectPath, campaignName)] ?? null
+  let campaignId = cachedCampaign?.campaignId ?? null
+  let sessionId = cachedCampaign?.sessionId ?? null
+  let fallbackCampaign: ApiCampaign | null = null
+  if (!sessionId && campaignId) {
+    sessionId =
+      Object.entries(state.sessions ?? {}).find(
+        ([, session]) =>
+          session.campaignId === campaignId &&
+          ["running", "stop_requested"].includes(session.status ?? "")
+      )?.[0] ?? null
+  }
+  if (!campaignId || !sessionId) {
+    const campaignInfo = await campaignForName(root, args)
+    fallbackCampaign = campaignInfo.campaign
+    campaignId = campaignInfo.campaign.id
+    sessionId =
+      sessionId ??
+      campaignInfo.overview.sessions.find((session) =>
+        ["running", "stop_requested"].includes(session.status)
+      )?.id ??
+      null
+  }
+
+  const runtime = sessionId ? state.sessions?.[sessionId] : null
+  const [control, manifests] = sessionId
+    ? await Promise.all([
+        getResearchSessionControlState(sessionId, args).catch(() => null),
+        readWorkerLaunchManifests(root, sessionId).catch(() => []),
+      ])
+    : [null, []]
+  const supervisor = supervisorTelemetryForStatus(runtime?.supervisor)
+  const failures = manifests
+    .filter((manifest) => manifest.status === "failed")
+    .slice(-10)
+    .map((manifest) => ({
+      workerId: manifest.workerId,
+      workerName: manifest.workerName,
+      reasonCode: manifest.teardown?.reasonCode ?? null,
+      errorSummary: manifest.error
+        ? compactProviderErrorSummary(manifest.error)
+        : manifest.teardown?.providerError
+          ? compactProviderErrorSummary(manifest.teardown.providerError)
+          : null,
+      logPath: manifest.logPath,
+    }))
+  const teardownFailureCount = manifests.filter(
+    (manifest) =>
+      manifest.teardown?.attemptDelivery === "failed" ||
+      manifest.teardown?.worktreeCleanup === "failed" ||
+      (!manifest.teardown && manifestIsTerminal(manifest))
+  ).length
+  const warningCount = manifests.reduce(
+    (total, manifest) => total + uniqueWorkerWarnings(manifest).length,
+    0
+  )
+  const activeProcesses = supervisor?.activeProcessCount ?? 0
+  const summary = {
+    campaign: {
+      id: campaignId,
+      name: fallbackCampaign?.name ?? campaignName,
+      status: fallbackCampaign?.status ?? null,
+    },
+    session: sessionId
+      ? {
+          id: sessionId,
+          status: control?.status ?? runtime?.status ?? null,
+          runtimeState: control?.runtimeState ?? null,
+          finalizationStatus:
+            control?.finalizationStatus ?? runtime?.finalizationStatus ?? null,
+          workerTarget: control?.launch.workerTarget ?? null,
+          activeWorkers: control?.launch.activeWorkerCount ?? activeProcesses,
+          openSlots: control?.launch.openWorkerSlotCount ?? null,
+          activeProcessCount: activeProcesses,
+          progress: control?.progress ?? null,
+          supervisor: supervisor
+            ? {
+                pid: supervisor.pid ?? null,
+                logPath: supervisor.logPath ?? null,
+                updatedAt: supervisor.updatedAt ?? null,
+              }
+            : null,
+        }
+      : null,
+    providerBackoff:
+      supervisor?.providerBackoff ?? runtime?.providerBackoff ?? null,
+    recentFailedLaunches:
+      supervisor?.recentFailedLaunches ??
+      runtime?.providerBackoff?.recentFailures ??
+      [],
+    noProgressBreaker: supervisor?.noProgressBreaker ?? null,
+    failures,
+    localTeardownFailures: { count: teardownFailureCount },
+    workerWarnings: { count: warningCount },
+  }
+
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(summary, null, 2))
+    return
+  }
+  console.log(`campaign: ${summary.campaign.name}`)
+  if (!summary.session) {
+    console.log("session: none")
+    return
+  }
+  console.log(
+    `session: ${summary.session.id} ${summary.session.status ?? ""}`.trim()
+  )
+  const progress = summary.session.progress
+  if (progress) {
+    console.log(
+      `experiments: accepted=${progress.acceptedExperimentCount}${
+        progress.experimentTarget === null
+          ? ""
+          : `/${progress.experimentTarget}`
+      } remaining=${progress.remainingExperimentCount ?? "-"}`
+    )
+  }
+  console.log(
+    `workers: active=${summary.session.activeWorkers}/${summary.session.workerTarget ?? "?"} processes=${summary.session.activeProcessCount}`
+  )
+  if (summary.providerBackoff) {
+    console.log(`provider backoff: ${JSON.stringify(summary.providerBackoff)}`)
+  }
+  if (summary.failures.length > 0) {
+    console.log(`worker failures: ${summary.failures.length}`)
+  }
+  if (summary.localTeardownFailures.count > 0) {
+    console.log(
+      `local teardown failures: ${summary.localTeardownFailures.count}`
+    )
+  }
+}
+
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot(args.options.cwd)
+  if (args.options.summary === "true") {
+    await commandResearchStatusSummary({ root, args })
+    return
+  }
   const shouldReconcile = args.options.reconcile === "true"
   const campaignInfo = await campaignForName(root, args, {
     persistState: shouldReconcile,
@@ -3896,7 +4112,7 @@ export async function commandResearchStatus(args: Args) {
   const sessionRuntimeState = activeSessionId
     ? state.sessions?.[activeSessionId]
     : undefined
-  const supervisorTelemetry = freshSupervisorTelemetry(
+  const supervisorTelemetry = supervisorTelemetryForStatus(
     sessionRuntimeState?.supervisor
   )
   const ignoredPresence = sessionRuntimeState?.ignoredPresence ?? null
@@ -3955,22 +4171,13 @@ export async function commandResearchStatus(args: Args) {
       manifestPath: manifest.manifestPath,
     }))
   const workerWarnings = manifests
-    .filter(
-      (manifest) =>
-        (manifest.warnings?.length ?? 0) +
-          (manifest.teardown?.warnings?.length ?? 0) >
-        0
-    )
-    .map((manifest) => ({
+    .map((manifest) => ({ manifest, warnings: uniqueWorkerWarnings(manifest) }))
+    .filter(({ warnings }) => warnings.length > 0)
+    .map(({ manifest, warnings }) => ({
       workerId: manifest.workerId,
       workerName: manifest.workerName,
-      warnings: [
-        ...(manifest.warnings ?? []),
-        ...(manifest.teardown?.warnings ?? []),
-      ].slice(0, 10),
-      warningCount:
-        (manifest.warnings?.length ?? 0) +
-        (manifest.teardown?.warnings?.length ?? 0),
+      warnings: warnings.slice(0, 10),
+      warningCount: warnings.length,
       manifestPath: manifest.manifestPath,
     }))
   const progress = live?.progress ?? sessionState?.session ?? null
@@ -4177,9 +4384,7 @@ export async function commandResearchStatus(args: Args) {
     const manifestError = manifest?.error
       ? compactProviderErrorSummary(manifest.error).slice(0, 160)
       : null
-    const warningCount =
-      (manifest?.warnings?.length ?? 0) +
-      (manifest?.teardown?.warnings?.length ?? 0)
+    const warningCount = manifest ? uniqueWorkerWarnings(manifest).length : 0
     console.log(
       [
         `  ${worker.workerName}: ${worker.status}`,
@@ -4770,6 +4975,33 @@ function supervisorWorkerTarget(args: Args, fallback: number) {
   return target
 }
 
+export function sessionCommitVisibilityGuidance(error: unknown) {
+  if (!(error instanceof ApiError) || error.status !== 409) return null
+  const payload = error.payload
+  if (!payload || typeof payload !== "object" || !("error" in payload)) {
+    return null
+  }
+  const envelope = payload as {
+    error?: { details?: Record<string, unknown> }
+  }
+  const details = envelope.error?.details
+  if (!details) return null
+  const reason = details?.reason
+  if (
+    reason !== "base_commit_not_visible" &&
+    reason !== "assignment_commit_not_visible"
+  ) {
+    return null
+  }
+  const commitSha =
+    typeof details.commitSha === "string" ? details.commitSha : "the commit"
+  const hypothesis =
+    typeof details.hypothesisId === "string"
+      ? ` for hypothesis ${details.hypothesisId}`
+      : ""
+  return `Research cannot start because ${commitSha}${hypothesis} is not visible to GitHub. Push that exact commit to the repository remote, then rerun \`onyx research run\`. No research session was created.`
+}
+
 async function resolveCommitRef(root: string, ref: string) {
   return (await git(["rev-parse", "--verify", `${ref}^{commit}`], root)).trim()
 }
@@ -5338,7 +5570,7 @@ async function supervisorLogPath(root: string, sessionId: string) {
 }
 
 function statusCommand(campaignName: string) {
-  return `onyx research status --campaign ${campaignName} --json`
+  return `onyx research status --campaign ${campaignName} --summary --json`
 }
 
 function listenCommand() {
@@ -5777,12 +6009,18 @@ export async function commandResearchRun(args: Args) {
       evaluationFingerprint: snapshot.fingerprint,
     })
   }
-  const result = internalSession
-    ? {
-        session: internalSession.session,
-        hypotheses: internalSession.hypotheses,
-      }
-    : await createCampaignSession(
+  let result: {
+    session: ApiSession
+    hypotheses: ApiHypothesis[]
+  }
+  if (internalSession) {
+    result = {
+      session: internalSession.session,
+      hypotheses: internalSession.hypotheses,
+    }
+  } else {
+    try {
+      result = await createCampaignSession(
         campaign.id,
         {
           name: args.options.name ?? `research-${new Date().toISOString()}`,
@@ -5809,6 +6047,12 @@ export async function commandResearchRun(args: Args) {
         },
         args
       )
+    } catch (error) {
+      const guidance = sessionCommitVisibilityGuidance(error)
+      if (guidance) throw new Error(guidance)
+      throw error
+    }
+  }
   const sessionId = result.session.id
   await cacheResearchSessionState({
     root,
@@ -5953,11 +6197,25 @@ export async function commandResearchRun(args: Args) {
   let stopLogged = false
   // Clear stale worktree bookkeeping left by crashed runs before launching.
   await git(["worktree", "prune"], root).catch(() => {})
+  let controlSnapshotSequence = 0
   const sessionStopChecker = createResearchSessionStopChecker({
     root,
     sessionId,
     args,
     settleBeforeCheck: true,
+    onRemoteControlState: async (control) => {
+      controlSnapshotSequence += 1
+      await writeSupervisorControlStateSnapshot({
+        root,
+        sessionId,
+        snapshot: {
+          schemaVersion: 1,
+          sequence: controlSnapshotSequence,
+          fetchedAt: new Date().toISOString(),
+          control,
+        },
+      })
+    },
   })
   const currentProviderBackoff = () => {
     if (!providerBackoffReason || Date.now() >= providerBackoffUntil) {
@@ -6672,9 +6930,15 @@ export async function commandResearchRun(args: Args) {
       finalizationReasons: finalization.reasons,
     },
   }).catch(() => {})
-  await verifyResearchCampaignGit(campaign.id, args, {
-    gitVerifyLimit: 100,
-  }).catch(() => null)
+  const finalGitVerificationStartedAt = Date.now()
+  const finalGitVerification = await verifyResearchCampaignGit(
+    campaign.id,
+    args,
+    { gitVerifyLimit: 100 }
+  ).catch(() => null)
+  console.log(
+    `Final Git verification: durationMs=${Date.now() - finalGitVerificationStartedAt} checked=${finalGitVerification?.checkedCount ?? 0} updated=${finalGitVerification?.updatedCount ?? 0} remaining=${finalGitVerification?.remainingCount ?? "unknown"}`
+  )
   const reportedFinalizationStatus = finalization.status
   const completionLive = await getResearchSessionLive(sessionId, args).catch(
     () => null

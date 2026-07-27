@@ -13,7 +13,7 @@ import { join } from "node:path"
 
 import { afterEach, describe, expect, test } from "bun:test"
 
-import { commandResearchRun } from "./commands/research"
+import { commandResearchRun, commandResearchStatus } from "./commands/research"
 import { setupHash, type ResearchSetupFile } from "./lib/contract"
 import { currentCommit, git } from "./lib/git"
 import { writeState } from "./lib/runtime-state"
@@ -79,6 +79,18 @@ async function withMutedConsole<T>(fn: () => Promise<T>) {
     console.warn = originalWarn
     console.error = originalError
   }
+}
+
+async function captureConsole(fn: () => Promise<void>) {
+  const lines: string[] = []
+  const originalLog = console.log
+  console.log = (...values: unknown[]) => lines.push(values.join(" "))
+  try {
+    await fn()
+  } finally {
+    console.log = originalLog
+  }
+  return lines.join("\n")
 }
 
 function setupFile(): ResearchSetupFile {
@@ -965,6 +977,25 @@ describe("remote-first research supervisor smoke", () => {
           expect(call.body).not.toHaveProperty("pushQueueDepth")
         }
         requireExperimentReport(calls)
+        const controlCalls = calls.filter(
+          (call) =>
+            call.path ===
+              `/api/v1/research/sessions/${SESSION_ID}/control-state` ||
+            call.path === `/api/v1/research/sessions/${SESSION_ID}/settle`
+        )
+        expect(controlCalls.length).toBeLessThan(12)
+        expect(
+          await pathExists(
+            join(
+              root,
+              ".git",
+              "onyx",
+              "worker-runtime",
+              SESSION_ID,
+              "supervisor-control-state.json"
+            )
+          )
+        ).toBe(true)
         expect(
           (
             await git(
@@ -988,6 +1019,51 @@ describe("remote-first research supervisor smoke", () => {
       }
     }, 60_000)
   }
+
+  test("renders a bounded summary status without full campaign detail", async () => {
+    const { root, origin, baseCommitSha } = await createSmokeRepo()
+    installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "worker-command": FAKE_WORKER_COMMAND,
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "5",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+          },
+        })
+      )
+      const output = await captureConsole(() =>
+        commandResearchStatus({
+          positional: ["research", "status"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            summary: "true",
+            json: "true",
+          },
+        })
+      )
+      const summary = JSON.parse(output) as Record<string, unknown>
+      expect(summary).toHaveProperty("campaign")
+      expect(summary).toHaveProperty("session")
+      expect(summary).not.toHaveProperty("hypotheses")
+      expect(summary).not.toHaveProperty("workers")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(origin, { recursive: true, force: true })
+    }
+  })
 
   test("treats settled discarded experiment reports as clean logged outcomes", async () => {
     const { root, origin, baseCommitSha } = await createSmokeRepo()

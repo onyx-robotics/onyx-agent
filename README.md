@@ -91,7 +91,8 @@ The CLI writes research product state directly to `/api/v1`. Supabase/API owns
 campaigns, sessions, hypotheses, worker leases, experiments,
 knowledge, stop state, report settlement, and accepted experiment ordering.
 Local `.git/onyx/` files are runtime artifacts: logs, manifests, workflow
-runs, attempts, session-state briefs, resource locks, and a small `state.json`
+runs, transient pending-report outbox entries, session/control snapshots,
+resource locks, and a small `state.json`
 convenience cache.
 Transient diagnostics use `onyx tools run <tool-id>`, which executes declared
 setup tools without creating workflow or measured-attempt state.
@@ -134,6 +135,11 @@ until the GitHub App is connected for private code/diff viewing and
 verification. After pushing missing refs or connecting GitHub, use the web
 campaign page or `onyx research status --reconcile` to refresh Git verification
 state.
+
+For `github_public` and `github_app` projects, the exact session and assignment
+base commits must also be visible to GitHub. Push them before starting Research;
+the CLI reports the invisible commit without creating a session when preflight
+validation fails.
 
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
@@ -196,8 +202,10 @@ isolated `ONYX_HOME` plus `ONYX_WORKER_CONTEXT` under
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-server lease acquisition, session-state brief refreshes, adaptive coalesced
-presence updates, batch heartbeats, stop handling, and local child cleanup. `onyx research status --json` reports fresh
+server lease acquisition, session-state brief refreshes, supervisor-owned
+control polling, adaptive coalesced presence updates, batch heartbeats, stop
+handling, and local child cleanup. `onyx research status --summary --json`
+provides bounded orchestrator telemetry; detailed `onyx research status --json` reports fresh
 supervisor telemetry when available, including active process count, launch
 rate, provider backoff, the no-progress breaker, recent launch failures, PID,
 and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
