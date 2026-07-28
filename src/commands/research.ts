@@ -113,6 +113,7 @@ import {
   readWorkerFinishMarker,
   type WorkerFinishMarker,
 } from "../lib/worker-finish"
+import { readWorkerReportMarker } from "../lib/worker-reports"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
   pathExists,
@@ -2221,14 +2222,19 @@ export function createResearchSessionStopChecker({
   let nextControlPollMs = 0
   let cachedResult: ResearchStopCheck | null = null
   return {
-    async check({ nowMs = Date.now() }: { nowMs?: number } = {}) {
-      if (cachedResult && nowMs < nextControlPollMs) return cachedResult
+    async check({
+      nowMs = Date.now(),
+      force = false,
+    }: { nowMs?: number; force?: boolean } = {}) {
+      if (!force && cachedResult && nowMs < nextControlPollMs) {
+        return cachedResult
+      }
       nextControlPollMs =
         nowMs +
         controlPollIntervalMs +
         Math.floor(Math.random() * Math.max(1, controlPollIntervalMs * 0.25))
       try {
-        if (preferLocalSupervisorControl) {
+        if (preferLocalSupervisorControl && !force) {
           const local = await collectResearchStopReasons({
             root,
             sessionId,
@@ -2244,7 +2250,7 @@ export function createResearchSessionStopChecker({
           nowMs >= nextSettlementNudgeMs &&
           Boolean(cachedResult?.controlState?.progress.receivedExperimentCount)
         let control: Awaited<ReturnType<typeof getResearchSessionControlState>>
-        const localSnapshot = preferLocalSupervisorControl
+        const localSnapshot = preferLocalSupervisorControl && !force
           ? await readSupervisorControlStateSnapshot({ root, sessionId }).catch(
               () => null
             )
@@ -2761,7 +2767,7 @@ export function classifyDurableWorkerTerminalReason({
   stopReasonCodes,
   cleanupFailed,
   attemptDeliveryFailed,
-  attemptDelivered,
+  reportedExperimentCount,
   explicitFinishReason,
   timedOut,
   protocolViolation,
@@ -2773,7 +2779,7 @@ export function classifyDurableWorkerTerminalReason({
   stopReasonCodes?: ResearchStopReasonCode[]
   cleanupFailed: boolean
   attemptDeliveryFailed: boolean
-  attemptDelivered: boolean
+  reportedExperimentCount: number
   explicitFinishReason: WorkerFinishMarker["reason"] | null
   timedOut: boolean
   protocolViolation: boolean
@@ -2781,20 +2787,17 @@ export function classifyDurableWorkerTerminalReason({
   providerFailureClass: ProviderFailureClass | null
   error: string | null
 }): DurableWorkerTerminalReason {
-  if (stoppedByHarness) {
-    if (stopReasonCodes?.includes("assignment_canceled")) {
-      return "assignment_canceled"
-    }
-    if (
-      stopReasonCodes?.includes("deadline_reached") ||
-      stopReasonCodes?.includes("experiment_target_reached")
-    ) {
-      return "session_cutoff"
-    }
-    return "session_stopped"
+  if (stopReasonCodes?.includes("assignment_canceled")) {
+    return "assignment_canceled"
   }
-  if (cleanupFailed) return "cleanup_failed"
-  if (attemptDeliveryFailed) return "worker_report_delivery_failed"
+  if (
+    stopReasonCodes?.includes("deadline_reached") ||
+    stopReasonCodes?.includes("experiment_target_reached")
+  ) {
+    return "session_cutoff"
+  }
+  if (stoppedByHarness || stopReasonCodes?.length) return "session_stopped"
+  if (reportedExperimentCount > 0) return "completed_with_experiments"
   if (timedOut) return "worker_timeout"
 
   const message = error ?? ""
@@ -2852,8 +2855,9 @@ export function classifyDurableWorkerTerminalReason({
         return "provider_process_failed"
     }
   }
-  if (attemptDelivered) return "completed_with_experiments"
   if (explicitFinishReason) return explicitFinishReason
+  if (attemptDeliveryFailed) return "worker_report_delivery_failed"
+  if (cleanupFailed) return "cleanup_failed"
   return "worker_no_progress"
 }
 
@@ -3464,6 +3468,12 @@ async function runHypothesisOnce({
     explicitFinishMarker = runtimePaths?.contextPath
       ? await readWorkerFinishMarker(runtimePaths.contextPath)
       : null
+    const finalStopCheck = await stopChecker
+      .check({ force: true })
+      .catch(() => null)
+    if (finalStopCheck?.shouldStop) {
+      harnessStopReasonCodes = finalStopCheck.reasonCodes
+    }
     providerExitCode = workerResult.code
     providerSignal = workerResult.signal
     providerTimedOut = workerResult.timedOut
@@ -3711,6 +3721,12 @@ async function runHypothesisOnce({
       const durableAttemptDelivered =
         teardown.attemptDelivery === "delivered" ||
         teardown.attemptDelivery === "duplicate"
+      const reportMarker = runtimePaths?.contextPath
+        ? await readWorkerReportMarker(runtimePaths.contextPath)
+        : null
+      const reportedExperimentCount =
+        (reportMarker?.reportedExperimentCount ?? 0) +
+        (durableAttemptDelivered ? 1 : 0)
       if (teardown.resultCommitSha && durableAttemptDelivered) {
         resultCommitSha = teardown.resultCommitSha
         terminalOutcome.resultCommitSha = teardown.resultCommitSha
@@ -3773,7 +3789,7 @@ async function runHypothesisOnce({
         stopReasonCodes: harnessStopReasonCodes,
         cleanupFailed: teardown.worktreeCleanup === "failed",
         attemptDeliveryFailed: teardown.attemptDelivery === "failed",
-        attemptDelivered: durableAttemptDelivered,
+        reportedExperimentCount,
         explicitFinishReason: explicitFinishMarker?.reason ?? null,
         timedOut: providerTimedOut,
         protocolViolation: teardown.reasonCode === "worker_protocol_violation",
@@ -3866,7 +3882,7 @@ async function runHypothesisOnce({
           providerExitCode,
           providerSignal,
           timedOut: providerTimedOut,
-          reportedExperimentCount: durableAttemptDelivered ? 1 : 0,
+          reportedExperimentCount,
           teardownDelivery: durableAttemptDelivered
             ? "delivered"
             : teardown.attemptDelivery === "none"

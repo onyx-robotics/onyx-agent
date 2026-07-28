@@ -112,7 +112,7 @@ describe("research supervisor launch gates", () => {
       stoppedByHarness: false,
       cleanupFailed: false,
       attemptDeliveryFailed: false,
-      attemptDelivered: false,
+      reportedExperimentCount: 0,
       explicitFinishReason: null,
       timedOut: false,
       protocolViolation: false,
@@ -160,6 +160,37 @@ describe("research supervisor launch gates", () => {
         stopReasonCodes: ["assignment_canceled"],
       })
     ).toBe("assignment_canceled")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        processFailed: false,
+        reportedExperimentCount: 3,
+      })
+    ).toBe("completed_with_experiments")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        cleanupFailed: true,
+        attemptDeliveryFailed: true,
+        reportedExperimentCount: 3,
+      })
+    ).toBe("completed_with_experiments")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        processFailed: false,
+        reportedExperimentCount: 3,
+        stopReasonCodes: ["experiment_target_reached"],
+      })
+    ).toBe("session_cutoff")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        processFailed: false,
+        reportedExperimentCount: 3,
+        stopReasonCodes: ["deadline_reached"],
+      })
+    ).toBe("session_cutoff")
     expect(durableWorkerReasonIsSiteFatal("worker_protocol_mismatch")).toBe(
       true
     )

@@ -39,6 +39,7 @@ import {
 import { onyxStateDir, readState, writeState } from "../lib/runtime-state"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { readWorkerRuntimeContext } from "../lib/worker-context"
+import { recordWorkerReportedExperiment } from "../lib/worker-reports"
 import {
   clearLocalAttempt,
   abandonBlockedWorkflowRunsForSession,
@@ -1650,6 +1651,16 @@ async function logExperiment(
       resultRefPushError: resultRefPushError ?? null,
     })
   })
+  const workerContextPath = process.env.ONYX_WORKER_CONTEXT?.trim()
+  if (workerRuntimeContext && workerContextPath) {
+    await recordWorkerReportedExperiment({
+      contextPath: workerContextPath,
+      workerId: workerRuntimeContext.workerId,
+      sessionId: workerRuntimeContext.sessionId,
+      hypothesisId: workerRuntimeContext.hypothesisId,
+      runRef,
+    }).catch(() => {})
+  }
   await clearLocalAttempt(root, { runRef }).catch(() => {})
   await emitEvent(root, {
     type: "exp_logged",
