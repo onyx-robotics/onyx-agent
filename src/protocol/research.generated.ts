@@ -1343,6 +1343,8 @@ export const researchExperimentRowSchema = z.object({
   hypothesisId: z.uuid().nullable(),
   hypothesisName: z.string().min(1).nullable(),
   hypothesisDescription: z.string().nullable(),
+  hypothesisStatus: researchHypothesisStatusSchema.nullable(),
+  campaignStatus: researchCampaignStatusSchema,
   name: z.string().min(1),
   description: z.string().nullable(),
   resultCommitSha: z.string().min(1),
