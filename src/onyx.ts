@@ -137,6 +137,7 @@ export {
 } from "./commands/research"
 export { commandSetupInit, commandSetupValidate } from "./commands/setup"
 export { commandWorkflowStatus } from "./commands/workflow"
+export { commandTelemetry } from "./commands/telemetry"
 export {
   normalizeSetupFile,
   normalizeValidationFile,

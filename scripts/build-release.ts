@@ -60,6 +60,22 @@ async function run(command: string, args: string[]) {
 
 const options = parseArgs(process.argv.slice(2))
 await mkdir(options.outputDirectory, { recursive: true })
+const buildSha =
+  process.env.ONYX_BUILD_SHA?.trim() ||
+  (await run("git", ["rev-parse", "HEAD"])).stdout.trim()
+const posthogProjectToken = process.env.ONYX_POSTHOG_KEY?.trim()
+const posthogHost =
+  process.env.ONYX_POSTHOG_HOST?.trim() || "https://e.onyxresearch.ai"
+if (!posthogProjectToken?.startsWith("phc_")) {
+  throw new Error(
+    "Official onyx releases require ONYX_POSTHOG_KEY with the public production project token"
+  )
+}
+if (posthogHost !== "https://e.onyxresearch.ai") {
+  throw new Error(
+    "Official onyx releases must use the managed production PostHog proxy"
+  )
+}
 
 const outputs: string[] = []
 for (const target of options.targets) {
@@ -72,12 +88,26 @@ for (const target of options.targets) {
       options.current ? prefix : assetName(prefix, target)
     )
     const targetArgs = options.current ? [] : [`--target=${target}`]
+    const releaseDefines = [
+      `--define=process.env.ONYX_DISTRIBUTION="release"`,
+      `--define=process.env.ONYX_BUILD_SHA=${JSON.stringify(buildSha)}`,
+    ]
+    const telemetryDefines =
+      prefix === "onyx"
+        ? [
+            `--define=__ONYX_OFFICIAL_TELEMETRY_BUILD__=true`,
+            `--define=process.env.ONYX_POSTHOG_KEY=${JSON.stringify(posthogProjectToken)}`,
+            `--define=process.env.ONYX_POSTHOG_HOST=${JSON.stringify(posthogHost)}`,
+          ]
+        : []
     await run("bun", [
       "build",
       entry,
       "--compile",
       "--minify",
       ...targetArgs,
+      ...releaseDefines,
+      ...telemetryDefines,
       `--outfile=${output}`,
     ])
     outputs.push(output)

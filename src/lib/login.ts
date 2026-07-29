@@ -25,6 +25,7 @@ export type CliLoginResult = {
   apiUrl?: string
   teamId: string
   teamName: string
+  userId?: string
   profileName?: string
   alreadyConfigured: boolean
 }
@@ -235,6 +236,7 @@ export async function waitForCliLogin({
         apiUrl: url.searchParams.get("api_url") ?? undefined,
         teamId,
         teamName,
+        userId: url.searchParams.get("user_id") ?? undefined,
         profileName: url.searchParams.get("profile_name") ?? undefined,
         alreadyConfigured,
       })

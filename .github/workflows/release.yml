@@ -26,7 +26,11 @@ jobs:
       - run: bun run typecheck
       - run: bun run lint
       - run: bun test
-      - run: bun run build:release
+      - name: Build official release binaries
+        env:
+          ONYX_POSTHOG_KEY: ${{ secrets.ONYX_POSTHOG_KEY }}
+          ONYX_POSTHOG_HOST: https://e.onyxresearch.ai
+        run: bun run build:release
       - name: Upload GitHub release assets
         uses: softprops/action-gh-release@v2
         with:

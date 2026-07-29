@@ -180,6 +180,25 @@ function createWorkerCredential() {
   return `owx_worker_v1_${randomBytes(32).toString("base64url")}`
 }
 
+function markResearchPreflightFailure(error: unknown) {
+  if (
+    !(
+      (typeof error === "object" && error !== null) ||
+      typeof error === "function"
+    )
+  )
+    return
+  try {
+    Object.defineProperty(
+      error,
+      Symbol.for("onyx.telemetry.research_preflight_failure"),
+      { value: true, configurable: true, enumerable: false }
+    )
+  } catch {
+    // Frozen/non-object throws still propagate normally without the optional marker.
+  }
+}
+
 function aggregateChildRssBytes(manifests: WorkerLaunchManifest[]) {
   const pids = manifests
     .filter(
@@ -2250,11 +2269,13 @@ export function createResearchSessionStopChecker({
           nowMs >= nextSettlementNudgeMs &&
           Boolean(cachedResult?.controlState?.progress.receivedExperimentCount)
         let control: Awaited<ReturnType<typeof getResearchSessionControlState>>
-        const localSnapshot = preferLocalSupervisorControl && !force
-          ? await readSupervisorControlStateSnapshot({ root, sessionId }).catch(
-              () => null
-            )
-          : null
+        const localSnapshot =
+          preferLocalSupervisorControl && !force
+            ? await readSupervisorControlStateSnapshot({
+                root,
+                sessionId,
+              }).catch(() => null)
+            : null
         if (
           localSnapshot &&
           supervisorControlStateIsFresh(localSnapshot, nowMs)
@@ -6238,7 +6259,10 @@ async function launchDetachedResearchSupervisor({
   return payload
 }
 
-export async function commandResearchRun(args: Args) {
+async function commandResearchRunImplementation(
+  args: Args,
+  markSessionCreated: () => void
+) {
   const root = await repoRoot(args.options.cwd)
   const internalSessionId =
     process.env.ONYX_LAUNCHER_BYPASS === "1"
@@ -6625,6 +6649,7 @@ export async function commandResearchRun(args: Args) {
       throw error
     }
   }
+  markSessionCreated()
   const sessionId = result.session.id
   await cacheResearchSessionState({
     root,
@@ -7593,6 +7618,18 @@ export async function commandResearchRun(args: Args) {
   )
   const apiTimingSummary = renderApiTimingSummary(args)
   if (apiTimingSummary) console.error(apiTimingSummary)
+}
+
+export async function commandResearchRun(args: Args) {
+  let sessionCreated = false
+  try {
+    return await commandResearchRunImplementation(args, () => {
+      sessionCreated = true
+    })
+  } catch (error) {
+    if (!sessionCreated) markResearchPreflightFailure(error)
+    throw error
+  }
 }
 
 export async function commandWorkerRun(args: Args) {

@@ -51,6 +51,32 @@ hosted app with `onyx profile use <name>`. Developer mode
 (`onyx developer use dev`) changes which CLI source runs, not which app the
 CLI targets.
 
+## CLI analytics
+
+Official Onyx releases collect one structured outcome event per allowlisted
+user command from the first eligible command. Events
+may include the bounded command name, terminal outcome, rounded duration,
+stable failure stage/reason, version, auth state, and internal team ID. They
+never include arguments, environment variables, local paths, repository
+identity, refs or commits, code, diffs, prompts, research content, metric names
+or values, credentials, exception text, worker output, rendering, keys, rows,
+or polling.
+
+No analytics runs in `onyx-worker`, CI, testbed/synthetic-worker environments,
+developer/source builds, or non-production API profiles. A random installation
+ID is used before the next successful login supplies an internal user ID; old
+installation activity is never linked to that user. Delivery is best effort,
+has a 250 ms shutdown budget, creates no outbox, and cannot change a command's
+exit code.
+
+```bash
+onyx telemetry status
+onyx telemetry disable
+onyx telemetry enable
+```
+
+`ONYX_TELEMETRY_DISABLED=1` and `DO_NOT_TRACK=1` always disable collection.
+
 ## Agent Skill
 
 The installer installs the bundled skill automatically for Claude Code, Codex,
@@ -313,8 +339,14 @@ or the bundled agent skill changes, update the public docs in
 Release binaries are built from Bun standalone executables:
 
 ```bash
-bun run build:release
+ONYX_POSTHOG_KEY=phc_production_project_token \
+  ONYX_POSTHOG_HOST=https://e.onyxresearch.ai \
+  bun run build:release
 ```
+
+The release workflow reads the public production project token from the
+`ONYX_POSTHOG_KEY` GitHub Actions secret. Source builds remain telemetry-off,
+and the build keeps the token and all analytics code out of `onyx-worker`.
 
 ## License
 

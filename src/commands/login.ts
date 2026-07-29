@@ -114,6 +114,7 @@ function storedProfileFromLoginResult({
     apiUrl,
     apiKey: result.apiKey,
     ...(result.apiKeyId ? { apiKeyId: result.apiKeyId } : {}),
+    ...(result.userId ? { userId: result.userId } : {}),
     teamId: result.teamId,
     teamName: result.teamName,
     ...(existing?.worker ? { worker: existing.worker } : {}),
@@ -146,6 +147,14 @@ export async function saveLoginProfile({
 
     await writeConfig({
       ...config,
+      profiles: {
+        ...config.profiles,
+        [profileName]: {
+          ...config.profiles[profileName],
+          ...(result.userId ? { userId: result.userId } : {}),
+          updatedAt: new Date().toISOString(),
+        },
+      },
       currentProfile: profileName,
     })
     return { profileName, apiUrl, alreadyConfigured: true }

@@ -12,6 +12,10 @@ import {
   type ResearchSetupValidationCheck,
   type ResearchSetupValidationFile,
 } from "../lib/contract"
+import {
+  recordSetupInitialized,
+  recordSetupValidation,
+} from "../lib/telemetry"
 import { repoRoot } from "../lib/git"
 import { onyxPath, resolveProjectPath } from "../lib/project"
 import { pathExists } from "../lib/process"
@@ -684,6 +688,7 @@ export async function commandSetupInit(args: Args) {
   console.log(
     "next: edit onyx/setup.json, onyx/onyx.md, and onyx/tools/* for this repository, then run `onyx setup validate` to execute the metric tool and prove readiness."
   )
+  await recordSetupInitialized(args)
 }
 
 export async function commandSetupValidate(args: Args) {
@@ -720,4 +725,14 @@ export async function commandSetupValidate(args: Args) {
   console.log(
     "metric readiness: `onyx setup validate` executed the canonical metric tool and recorded readiness evidence in validation.json."
   )
+  await recordSetupValidation({
+    args,
+    passed: validation.status === "passed",
+    failedCheckCount: validation.checks.filter(
+      (item) => item.status === "failed"
+    ).length,
+    warningCheckCount: validation.checks.filter(
+      (item) => item.status === "warning"
+    ).length,
+  })
 }
