@@ -27,7 +27,7 @@ export async function commandTelemetry(args: Args) {
         identity: effective.profile?.userId ? "user" : "installation",
         notice: config.telemetry.noticeShownAt
           ? `shown ${config.telemetry.noticeShownAt}`
-          : "pending (telemetry inactive until shown)",
+          : "pending",
       },
       null,
       2

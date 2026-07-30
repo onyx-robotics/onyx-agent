@@ -13,7 +13,6 @@ import {
   recordCliTui,
   recordSetupInitialized,
   recordSetupValidation,
-  resetNoticeStateForTests,
   setTelemetryClientFactoryForTests,
   telemetryEffectiveState,
   updateTelemetryPreference,
@@ -67,10 +66,8 @@ beforeEach(async () => {
     telemetry: {
       enabled: true,
       anonymousId: "33333333-3333-4333-8333-333333333333",
-      noticeShownAt: "2026-07-01T00:00:00.000Z",
     },
   })
-  resetNoticeStateForTests()
 })
 
 afterEach(async () => {
@@ -206,10 +203,7 @@ describe("CLI telemetry", () => {
       ...config,
       profiles: {},
       currentProfile: "",
-      telemetry: {
-        enabled: true,
-        noticeShownAt: "2026-07-01T00:00:00.000Z",
-      },
+      telemetry: { enabled: true },
     })
     const captures: Array<Record<string, unknown>> = []
     setTelemetryClientFactoryForTests(() => ({
@@ -339,33 +333,7 @@ describe("CLI telemetry", () => {
     expect(shutdowns).toBe(1)
   })
 
-  test("captures nothing and mints no identity before the first-run notice", async () => {
-    const config = await readConfig()
-    await writeConfig({
-      ...config,
-      telemetry: { enabled: true },
-    })
-    const captures: Array<Record<string, unknown>> = []
-    setTelemetryClientFactoryForTests(() => ({
-      capture(message) {
-        captures.push(message as unknown as Record<string, unknown>)
-      },
-      async shutdown() {},
-    }))
-
-    await recordCliCommand({
-      argv: ["status"],
-      args: parseArgs(["status"]),
-      startedAt: Date.now(),
-    })
-
-    expect(captures).toHaveLength(0)
-    const stored = await readConfig()
-    expect(stored.telemetry.anonymousId).toBeUndefined()
-    expect(stored.telemetry.noticeShownAt).toBeUndefined()
-  })
-
-  test("first-run notice suppresses capture for its own run and enables the next", async () => {
+  test("first-run notice shows once and never blocks capture", async () => {
     const config = await readConfig()
     await writeConfig({
       ...config,
@@ -397,18 +365,11 @@ describe("CLI telemetry", () => {
       expect(shown).toBe(true)
       expect(writes.join("")).toContain("onyx telemetry disable")
 
-      await recordCliCommand({
-        argv: ["status"],
-        args: parseArgs(["status"]),
-        startedAt: Date.now(),
-      })
-      expect(captures).toHaveLength(0)
-
       const stored = await readConfig()
       expect(stored.telemetry.noticeShownAt).toBeTruthy()
       expect(stored.telemetry.anonymousId).toBeTruthy()
 
-      resetNoticeStateForTests()
+      // Capture is live on the same run that showed the notice.
       await recordCliCommand({
         argv: ["status"],
         args: parseArgs(["status"]),
