@@ -8,10 +8,12 @@ import { DEFAULT_API_URL, emptyConfig, readConfig, writeConfig } from "./config"
 import {
   cliCommandName,
   markResearchPreflightFailure,
+  maybeShowFirstRunNotice,
   recordCliCommand,
   recordCliTui,
   recordSetupInitialized,
   recordSetupValidation,
+  resetNoticeStateForTests,
   setTelemetryClientFactoryForTests,
   telemetryEffectiveState,
   updateTelemetryPreference,
@@ -65,8 +67,10 @@ beforeEach(async () => {
     telemetry: {
       enabled: true,
       anonymousId: "33333333-3333-4333-8333-333333333333",
+      noticeShownAt: "2026-07-01T00:00:00.000Z",
     },
   })
+  resetNoticeStateForTests()
 })
 
 afterEach(async () => {
@@ -202,7 +206,10 @@ describe("CLI telemetry", () => {
       ...config,
       profiles: {},
       currentProfile: "",
-      telemetry: { enabled: true },
+      telemetry: {
+        enabled: true,
+        noticeShownAt: "2026-07-01T00:00:00.000Z",
+      },
     })
     const captures: Array<Record<string, unknown>> = []
     setTelemetryClientFactoryForTests(() => ({
@@ -330,5 +337,155 @@ describe("CLI telemetry", () => {
     })
     expect(events).toEqual(["cli:command_complete", "cli:tui_end"])
     expect(shutdowns).toBe(1)
+  })
+
+  test("captures nothing and mints no identity before the first-run notice", async () => {
+    const config = await readConfig()
+    await writeConfig({
+      ...config,
+      telemetry: { enabled: true },
+    })
+    const captures: Array<Record<string, unknown>> = []
+    setTelemetryClientFactoryForTests(() => ({
+      capture(message) {
+        captures.push(message as unknown as Record<string, unknown>)
+      },
+      async shutdown() {},
+    }))
+
+    await recordCliCommand({
+      argv: ["status"],
+      args: parseArgs(["status"]),
+      startedAt: Date.now(),
+    })
+
+    expect(captures).toHaveLength(0)
+    const stored = await readConfig()
+    expect(stored.telemetry.anonymousId).toBeUndefined()
+    expect(stored.telemetry.noticeShownAt).toBeUndefined()
+  })
+
+  test("first-run notice suppresses capture for its own run and enables the next", async () => {
+    const config = await readConfig()
+    await writeConfig({
+      ...config,
+      telemetry: { enabled: true },
+    })
+    const captures: Array<Record<string, unknown>> = []
+    setTelemetryClientFactoryForTests(() => ({
+      capture(message) {
+        captures.push(message as unknown as Record<string, unknown>)
+      },
+      async shutdown() {},
+    }))
+    const stderrDescriptor = Object.getOwnPropertyDescriptor(
+      process.stderr,
+      "isTTY"
+    )
+    const writes: string[] = []
+    const originalWrite = process.stderr.write.bind(process.stderr)
+    Object.defineProperty(process.stderr, "isTTY", {
+      value: true,
+      configurable: true,
+    })
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      writes.push(String(chunk))
+      return true
+    }) as typeof process.stderr.write
+    try {
+      const shown = await maybeShowFirstRunNotice(parseArgs(["status"]))
+      expect(shown).toBe(true)
+      expect(writes.join("")).toContain("onyx telemetry disable")
+
+      await recordCliCommand({
+        argv: ["status"],
+        args: parseArgs(["status"]),
+        startedAt: Date.now(),
+      })
+      expect(captures).toHaveLength(0)
+
+      const stored = await readConfig()
+      expect(stored.telemetry.noticeShownAt).toBeTruthy()
+      expect(stored.telemetry.anonymousId).toBeTruthy()
+
+      resetNoticeStateForTests()
+      await recordCliCommand({
+        argv: ["status"],
+        args: parseArgs(["status"]),
+        startedAt: Date.now(),
+      })
+      expect(captures).toHaveLength(1)
+
+      const secondShow = await maybeShowFirstRunNotice(parseArgs(["status"]))
+      expect(secondShow).toBe(false)
+    } finally {
+      process.stderr.write = originalWrite
+      if (stderrDescriptor) {
+        Object.defineProperty(process.stderr, "isTTY", stderrDescriptor)
+      }
+    }
+  })
+
+  test("first-run notice never shows for opted-out, suppressed, json, or non-TTY runs", async () => {
+    const config = await readConfig()
+    await writeConfig({
+      ...config,
+      telemetry: { enabled: true },
+    })
+    const stderrDescriptor = Object.getOwnPropertyDescriptor(
+      process.stderr,
+      "isTTY"
+    )
+    Object.defineProperty(process.stderr, "isTTY", {
+      value: true,
+      configurable: true,
+    })
+    try {
+      process.env.DO_NOT_TRACK = "1"
+      expect(await maybeShowFirstRunNotice(parseArgs(["status"]))).toBe(false)
+      delete process.env.DO_NOT_TRACK
+
+      expect(
+        await maybeShowFirstRunNotice(parseArgs(["status", "--json"]))
+      ).toBe(false)
+
+      Object.defineProperty(process.stderr, "isTTY", {
+        value: false,
+        configurable: true,
+      })
+      expect(await maybeShowFirstRunNotice(parseArgs(["status"]))).toBe(false)
+
+      const stored = await readConfig()
+      expect(stored.telemetry.noticeShownAt).toBeUndefined()
+    } finally {
+      if (stderrDescriptor) {
+        Object.defineProperty(process.stderr, "isTTY", stderrDescriptor)
+      }
+    }
+  })
+
+  test("explicit enable supersedes the first-run notice", async () => {
+    const config = await readConfig()
+    await writeConfig({
+      ...config,
+      telemetry: { enabled: true },
+    })
+    await updateTelemetryPreference(true)
+    const stored = await readConfig()
+    expect(stored.telemetry.noticeShownAt).toBeTruthy()
+    expect(telemetryEffectiveState({ config: stored }).enabled).toBe(true)
+  })
+
+  test("noticeShownAt round-trips through config normalization", async () => {
+    const config = await readConfig()
+    await writeConfig({
+      ...config,
+      telemetry: {
+        ...config.telemetry,
+        noticeShownAt: "2026-07-30T09:00:00.000Z",
+      },
+    })
+    const stored = await readConfig()
+    expect(stored.telemetry.noticeShownAt).toBe("2026-07-30T09:00:00.000Z")
   })
 })

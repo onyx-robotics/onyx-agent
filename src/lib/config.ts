@@ -44,6 +44,7 @@ export type DeveloperConfig = {
 export type TelemetryConfig = {
   enabled?: boolean
   anonymousId?: string
+  noticeShownAt?: string
 }
 
 export type Config = {
@@ -221,6 +222,9 @@ function normalizeTelemetryConfig(value: unknown): TelemetryConfig {
       : {}),
     ...(typeof candidate.anonymousId === "string"
       ? { anonymousId: candidate.anonymousId }
+      : {}),
+    ...(typeof candidate.noticeShownAt === "string"
+      ? { noticeShownAt: candidate.noticeShownAt }
       : {}),
   }
 }

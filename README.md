@@ -54,7 +54,11 @@ CLI targets.
 ## CLI analytics
 
 Official Onyx releases collect one structured outcome event per allowlisted
-user command from the first eligible command. Events
+user command, and nothing is collected until a one-time notice has been shown:
+the first eligible interactive command prints a short telemetry notice to
+stderr and sends nothing; collection starts on the next command. Runs that
+never see the notice (non-interactive, `--json`, or quiet output) are never
+collected. `onyx telemetry enable` counts as the notice. Events
 may include the bounded command name, terminal outcome, rounded duration,
 stable failure stage/reason, version, auth state, and internal team ID. They
 never include arguments, environment variables, local paths, repository

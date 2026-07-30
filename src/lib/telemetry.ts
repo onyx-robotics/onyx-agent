@@ -114,6 +114,14 @@ function targetAllowsCapture(profile: CliProfile | null) {
   return !profile || profile.apiUrl === DEFAULT_API_URL
 }
 
+// True only for the process that just displayed the first-run notice: that
+// command must not capture, so users can opt out before anything is sent.
+let noticeJustShown = false
+
+export function resetNoticeStateForTests() {
+  noticeJustShown = false
+}
+
 export function telemetryEffectiveState({
   config,
   args,
@@ -128,6 +136,8 @@ export function telemetryEffectiveState({
     distributionAllowsCapture(config) &&
     targetAllowsCapture(profile) &&
     config.telemetry.enabled !== false &&
+    Boolean(config.telemetry.noticeShownAt) &&
+    !noticeJustShown &&
     Boolean(internalId(config.telemetry.anonymousId)) &&
     Boolean(apiKey)
   return {
@@ -135,6 +145,44 @@ export function telemetryEffectiveState({
     profile,
     apiKey,
     host: process.env.ONYX_POSTHOG_HOST?.trim() || DEFAULT_POSTHOG_HOST,
+  }
+}
+
+const FIRST_RUN_NOTICE = `Onyx collects anonymous usage telemetry: command name, outcome, and duration — never code, arguments, or research content.
+Nothing has been sent yet; collection starts on your next command.
+Opt out with \`onyx telemetry disable\`, ONYX_TELEMETRY_DISABLED=1, or DO_NOT_TRACK=1. Details: https://onyxresearch.ai/privacy`
+
+export async function maybeShowFirstRunNotice(args: Args) {
+  try {
+    const config = await readConfig()
+    if (config.telemetry.noticeShownAt) return false
+    if (!process.stderr.isTTY) return false
+    if (args.options.json === "true" || args.options.quiet === "true") {
+      return false
+    }
+    // Only show the notice when telemetry would actually capture once noticed.
+    if (
+      executionIsSuppressed() ||
+      !distributionAllowsCapture(config) ||
+      !targetAllowsCapture(selectedProfile(config, args)) ||
+      config.telemetry.enabled === false ||
+      !process.env.ONYX_POSTHOG_KEY?.trim()
+    ) {
+      return false
+    }
+    process.stderr.write(`${FIRST_RUN_NOTICE}\n`)
+    await writeConfig({
+      ...config,
+      telemetry: {
+        ...config.telemetry,
+        noticeShownAt: new Date().toISOString(),
+        anonymousId: config.telemetry.anonymousId ?? randomUUID(),
+      },
+    })
+    noticeJustShown = true
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -146,6 +194,13 @@ export async function updateTelemetryPreference(enabled: boolean) {
       ...config.telemetry,
       enabled,
       anonymousId: config.telemetry.anonymousId ?? randomUUID(),
+      // Explicit consent supersedes the first-run notice.
+      ...(enabled
+        ? {
+            noticeShownAt:
+              config.telemetry.noticeShownAt ?? new Date().toISOString(),
+          }
+        : {}),
     },
   })
   return readConfig()
@@ -289,6 +344,7 @@ async function deliverMany({
     distributionAllowsCapture(config) &&
     targetAllowsCapture(selectedProfile(config, args)) &&
     config.telemetry.enabled !== false &&
+    Boolean(config.telemetry.noticeShownAt) &&
     Boolean(process.env.ONYX_POSTHOG_KEY?.trim())
   ) {
     await writeConfig({

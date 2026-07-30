@@ -34,7 +34,11 @@ import { commandToolsRun } from "./commands/tools"
 import { commandWorkflowStatus } from "./commands/workflow"
 import { removedResearchSyncCommandMessage } from "./lib/removed-commands"
 import { commandTelemetry } from "./commands/telemetry"
-import { recordCliCommand, recordCliTui } from "./lib/telemetry"
+import {
+  maybeShowFirstRunNotice,
+  recordCliCommand,
+  recordCliTui,
+} from "./lib/telemetry"
 
 export const USAGE = `onyx - research workflow CLI
 
@@ -231,6 +235,7 @@ async function runMainCommand(argv: string[]) {
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv)
   const startedAt = Date.now()
+  await maybeShowFirstRunNotice(args)
   const isInteractiveTui =
     argv[0] === "listen" && process.stdin.isTTY && process.stdout.isTTY
   if (isInteractiveTui) await recordCliTui("started", args, startedAt)
