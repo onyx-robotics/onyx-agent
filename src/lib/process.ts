@@ -382,6 +382,9 @@ export async function runStreamingProcess(
     const useProcessGroup = process.platform !== "win32"
     let log = createWriteStream(options.logPath, { flags: "w" })
     let logRotated = false
+    // Rotated-out segments flush asynchronously; resolution must await them
+    // or callers can read a partially flushed first segment.
+    const rotatedLogFlushes: Promise<void>[] = []
     const activityLog = options.activityLogPath
       ? createWriteStream(options.activityLogPath, { flags: "a" })
       : null
@@ -404,7 +407,10 @@ export async function runStreamingProcess(
           : logBytes
         const segmentRemaining = Math.max(0, logSegmentLimit - segmentOffset)
         if (segmentRemaining === 0 && !logRotated) {
-          log.end()
+          const rotatedOut = log
+          rotatedLogFlushes.push(
+            new Promise<void>((resolve) => rotatedOut.end(resolve))
+          )
           log = createWriteStream(`${options.logPath}.1`, { flags: "w" })
           logRotated = true
           continue
@@ -636,6 +642,7 @@ export async function runStreamingProcess(
         }
       }
       await Promise.all([
+        ...rotatedLogFlushes,
         new Promise<void>((resolve) => {
           writeRawLog(
             [
