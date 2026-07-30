@@ -398,17 +398,28 @@ describe("developer mode", () => {
   })
 
   test("launcher bypass runs the local CLI", async () => {
-    const output = await captureLogs(() =>
-      runLauncher({
-        argv: ["--version"],
-        env: { [ONYX_LAUNCHER_BYPASS]: "1" },
-        runDev: async () => {
-          throw new Error("should not dispatch")
-        },
-      })
-    )
+    // Path-based distribution detection only recognizes monorepo checkouts
+    // (paths containing /packages/agent/); pin the override so the assertion
+    // holds in standalone checkouts such as this repo's own CI.
+    const previousDistribution = process.env.ONYX_DISTRIBUTION
+    process.env.ONYX_DISTRIBUTION = "source"
+    try {
+      const output = await captureLogs(() =>
+        runLauncher({
+          argv: ["--version"],
+          env: { [ONYX_LAUNCHER_BYPASS]: "1" },
+          runDev: async () => {
+            throw new Error("should not dispatch")
+          },
+        })
+      )
 
-    expect(output).toContain("onyx 0.1.10 (protocol 5, source")
+      expect(output).toContain("onyx 0.1.10 (protocol 5, source")
+    } finally {
+      if (previousDistribution === undefined)
+        delete process.env.ONYX_DISTRIBUTION
+      else process.env.ONYX_DISTRIBUTION = previousDistribution
+    }
   })
 
   test("launcher reports missing linked dev files", async () => {
