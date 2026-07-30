@@ -414,7 +414,8 @@ describe("developer mode", () => {
         })
       )
 
-      expect(output).toContain("onyx 0.1.10 (protocol 5, source")
+      // Version-agnostic: releases bump package.json without editing tests.
+      expect(output).toMatch(/onyx \d+\.\d+\.\d+ \(protocol \d+, source/)
     } finally {
       if (previousDistribution === undefined)
         delete process.env.ONYX_DISTRIBUTION
