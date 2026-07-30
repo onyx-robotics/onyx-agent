@@ -5,12 +5,12 @@ import { tmpdir } from "node:os"
 import { afterEach, describe, expect, test } from "bun:test"
 
 import {
-  commandResearchFinish,
+  commandKnowledgeList,
   commandResearchStatus,
   commandResearchSessionStateBrief,
 } from "./commands/research"
 import { commandExpList } from "./commands/exp"
-import type { ApiSessionStateBrief } from "./lib/api"
+import type { ApiCampaign, ApiSession, ApiSessionStateBrief } from "./lib/api"
 import { git } from "./lib/git"
 import {
   cacheResearchSessionState,
@@ -27,13 +27,15 @@ import {
   writeWorkerRuntimeContext,
   type WorkerRuntimePaths,
 } from "./lib/worker-launcher"
-import { main } from "./main"
+import { main, USAGE } from "./main"
+import { WORKER_USAGE } from "./worker-main"
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111"
 const MOCK_API_ORIGIN = "https://api.onyx.test"
 
 let previousApiUrl: string | undefined
 let previousApiKey: string | undefined
+let previousWorkerCredential: string | undefined
 let previousFetch: typeof fetch | null = null
 
 async function tempRepo(prefix = "onyx-remote-first-") {
@@ -59,19 +61,47 @@ async function writeTestWorkerContext({
   hypothesisId?: string
   hypothesisName?: string
 }): Promise<WorkerRuntimePaths> {
-  const paths = await workerRuntimePaths({ root, sessionId: SESSION_ID, workerId })
+  const paths = await workerRuntimePaths({
+    root,
+    sessionId: SESSION_ID,
+    workerId,
+  })
   await writeWorkerRuntimeContext({
     paths,
     context: {
-      schemaVersion: 1,
+      schemaVersion: 5,
       campaignId,
       campaignName,
       sessionId: SESSION_ID,
+      assignmentId: "66666666-6666-4666-8666-666666666666",
+      startingCommitSha: "abc123",
       hypothesisId,
       hypothesisName,
+      assignment: {
+        id: "66666666-6666-4666-8666-666666666666",
+        startingCommitSha: "abc123",
+        sourceExperimentId: null,
+      },
+      hypothesis: {
+        id: hypothesisId,
+        name: hypothesisName,
+        description: "Test hypothesis guidance",
+        status: "active",
+        plan: {
+          focus: "Exercise the worker brief",
+          statement: "The worker brief contains complete assigned guidance.",
+          startingPoints: [],
+          avoidList: [],
+          successSignals: [],
+          giveUpSignals: [],
+        },
+        bestMetricValue: null,
+        bestCommitSha: null,
+        experimentCount: 0,
+        lastWorkedAt: null,
+      },
       workerId,
-      workerLeaseToken: "lease-token",
-      workerBranch: "onyx/worker",
+      workerCredential: "owx_worker_v1_test-credential-0000000000000000",
       worktreeRoot: root,
       projectPath: "",
       projectRoot: root,
@@ -89,67 +119,43 @@ function makeSessionStateBrief(): ApiSessionStateBrief {
     generatedAt: now,
     session: {
       id: SESSION_ID,
-      campaignId: "33333333-3333-4333-8333-333333333333",
       name: "scale-run",
+      runtimeState: "active",
       status: "running",
+      outcome: { status: "running", endedAt: null, endReason: null },
+      cleanup: {
+        status: "running",
+        startedAt: null,
+        completedAt: null,
+        summary: {},
+      },
       workerTarget: 100,
-      experimentTarget: 100,
-      acceptedExperimentCount: 7,
-      remainingExperimentCount: 93,
       deadlineAt: null,
-      terminalReason: null,
-      schedulerSiteId: "site-1",
-      finalizationStatus: "running",
-      metadata: {},
-      startedAt: now,
-      completedAt: null,
-      createdAt: now,
-      updatedAt: now,
+      endedAt: null,
+      endReason: null,
     },
     campaign: {
       id: "33333333-3333-4333-8333-333333333333",
-      projectId: "55555555-5555-4555-8555-555555555555",
-      parentCampaignId: null,
       name: "scale-test",
-      description: "Scale test",
-      baseCommitSha: "abc123",
-      baseGitStatus: "verified",
-      baseGitVerifiedAt: now,
-      baseGitStatusReason: null,
       status: "active",
       metricName: "error",
       metricUnit: null,
       metricDirection: "minimize",
-      bestExperimentId: null,
-      bestMetricValue: null,
-      bestCommitSha: null,
-      experimentCount: 7,
-      lastExperimentAt: now,
-      promotionRefName: null,
-      createdAt: now,
-      updatedAt: now,
-    },
-    project: {
-      id: "55555555-5555-4555-8555-555555555555",
-      name: "research-test",
-      repositoryUrl: "https://github.com/example/research-test.git",
-      repositoryAccessMode: "github_app",
-      repositoryFullName: "example/research-test",
-      defaultBranch: "main",
-      projectPath: "",
     },
     progress: {
       experimentTarget: 100,
       acceptedExperimentCount: 7,
+      receivedExperimentCount: 0,
       remainingExperimentCount: 93,
       deadlineAt: null,
+      endedAt: null,
+      endReason: null,
       terminalReason: null,
     },
-    latestExperiments: [],
-    bestExperiment: null,
-    activeHypotheses: [],
-    summaries: [],
-    knowledge: [],
+    peerHypothesisCount: 0,
+    peerHypotheses: [],
+    results: { latest: [], best: null },
+    knowledge: { items: [], hasMore: false },
     updatedAt: now,
   }
 }
@@ -159,9 +165,12 @@ function installMockApi(
 ) {
   previousApiUrl = process.env.ONYX_API_URL
   previousApiKey = process.env.ONYX_API_KEY
+  previousWorkerCredential = process.env.ONYX_WORKER_CREDENTIAL
   previousFetch = globalThis.fetch
   process.env.ONYX_API_URL = MOCK_API_ORIGIN
   process.env.ONYX_API_KEY = "test-key"
+  process.env.ONYX_WORKER_CREDENTIAL =
+    "owx_worker_v1_test-credential-0000000000000000"
   globalThis.fetch = (async (input, init) => {
     const url = new URL(
       typeof input === "string"
@@ -195,6 +204,9 @@ afterEach(() => {
   else process.env.ONYX_API_URL = previousApiUrl
   if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
   else process.env.ONYX_API_KEY = previousApiKey
+  if (previousWorkerCredential === undefined)
+    delete process.env.ONYX_WORKER_CREDENTIAL
+  else process.env.ONYX_WORKER_CREDENTIAL = previousWorkerCredential
 })
 
 describe("remote-first agent architecture", () => {
@@ -229,6 +241,37 @@ describe("remote-first agent architecture", () => {
     }
   })
 
+  test("summary commands and help are removed", async () => {
+    expect(USAGE).not.toContain("research summarize")
+    expect(USAGE).not.toContain("onyx summary")
+    expect(WORKER_USAGE).not.toContain("summary upsert")
+    expect(USAGE).not.toContain("session-state-brief [--compact]")
+    expect(WORKER_USAGE).not.toContain("--compact")
+
+    const originalError = console.error
+    const originalExit = process.exit
+    const errors: string[] = []
+    console.error = (message?: unknown) => {
+      errors.push(String(message))
+    }
+    process.exit = ((code?: number) => {
+      throw new Error(`exit ${code ?? 0}`)
+    }) as typeof process.exit
+    try {
+      for (const argv of [
+        ["research", "summarize"],
+        ["summary", "upsert"],
+        ["summary", "list"],
+      ]) {
+        await expect(main(argv)).rejects.toThrow("exit 1")
+      }
+      expect(errors.join("\n")).toContain("Unknown command")
+    } finally {
+      console.error = originalError
+      process.exit = originalExit
+    }
+  })
+
   test("worker session-state-brief reads the local supervisor file only", async () => {
     const root = await tempRepo()
     const logs: string[] = []
@@ -240,6 +283,44 @@ describe("remote-first agent architecture", () => {
     }
     const paths = await writeTestWorkerContext({ root })
     process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    const completeKnowledgeBody = "K".repeat(4000)
+    const sessionBrief = makeSessionStateBrief()
+    sessionBrief.peerHypotheses = [
+      {
+        id: "44444444-4444-4444-8444-444444444444",
+        name: "Hypothesis",
+        status: "active",
+        bestMetricValue: null,
+        bestCommitSha: null,
+        experimentCount: 0,
+        lastWorkedAt: null,
+      },
+      {
+        id: "55555555-5555-4555-8555-555555555555",
+        name: "Peer hypothesis",
+        status: "active",
+        bestMetricValue: 0.5,
+        bestCommitSha: "def456",
+        experimentCount: 2,
+        lastWorkedAt: "2026-06-29T11:00:00.000Z",
+      },
+    ]
+    sessionBrief.peerHypothesisCount = sessionBrief.peerHypotheses.length
+    sessionBrief.knowledge = {
+      items: [
+        {
+          id: "77777777-7777-4777-8777-777777777777",
+          hypothesisId: null,
+          experimentId: null,
+          kind: "insight",
+          title: "Complete knowledge",
+          body: completeKnowledgeBody,
+          confidence: 0.9,
+          createdAt: "2026-06-29T11:30:00.000Z",
+        },
+      ],
+      hasMore: true,
+    }
     await writeSessionStateBriefSnapshot({
       root,
       sessionId: SESSION_ID,
@@ -250,7 +331,7 @@ describe("remote-first agent architecture", () => {
         generatedAt: "2026-06-29T12:00:00.000Z",
         fetchedAt: "2026-06-29T12:00:01.000Z",
         lastRefreshAttemptAt: "2026-06-29T12:00:01.000Z",
-        brief: makeSessionStateBrief(),
+        brief: sessionBrief,
       },
     })
     installMockApi(({ method, path }) => {
@@ -267,6 +348,27 @@ describe("remote-first agent architecture", () => {
       expect(payload.refreshStatus).toBe("ok")
       expect(payload.progress.acceptedExperimentCount).toBe(7)
       expect(payload.worker.sessionId).toBe(SESSION_ID)
+      expect(payload.currentHypothesis.plan).toEqual({
+        focus: "Exercise the worker brief",
+        statement: "The worker brief contains complete assigned guidance.",
+        startingPoints: [],
+        avoidList: [],
+        successSignals: [],
+        giveUpSignals: [],
+      })
+      expect(
+        payload.peerHypotheses.map((item: { id: string }) => item.id)
+      ).toEqual(["55555555-5555-4555-8555-555555555555"])
+      expect(payload.knowledge.items[0].body).toBe(completeKnowledgeBody)
+      expect(payload.knowledge.moreCommand).toContain("knowledge list")
+      expect(payload.campaign).toEqual({
+        id: "33333333-3333-4333-8333-333333333333",
+        name: "scale-test",
+        status: "active",
+        metricName: "error",
+        metricUnit: null,
+        metricDirection: "minimize",
+      })
       expect(payload.stop).toEqual({
         shouldStopStartingNewWork: false,
         reasonCodes: [],
@@ -298,9 +400,11 @@ describe("remote-first agent architecture", () => {
     process.env.ONYX_WORKER_CONTEXT = paths.contextPath
     const brief = makeSessionStateBrief()
     brief.session.status = "completed"
-    brief.session.acceptedExperimentCount = 100
-    brief.session.remainingExperimentCount = 0
-    brief.session.terminalReason = "experiment_target_reached"
+    brief.session.runtimeState = "ended"
+    brief.session.outcome.status = "completed"
+    brief.session.outcome.endedAt = brief.generatedAt
+    brief.session.cleanup.status = "complete"
+    brief.session.endReason = "experiment_target_reached"
     brief.progress.acceptedExperimentCount = 100
     brief.progress.remainingExperimentCount = 0
     brief.progress.terminalReason = "experiment_target_reached"
@@ -392,9 +496,11 @@ describe("remote-first agent architecture", () => {
     })
     const brief = makeSessionStateBrief()
     brief.session.status = "completed"
-    brief.session.acceptedExperimentCount = 100
-    brief.session.remainingExperimentCount = 0
-    brief.session.terminalReason = "experiment_target_reached"
+    brief.session.runtimeState = "ended"
+    brief.session.outcome.status = "completed"
+    brief.session.outcome.endedAt = brief.generatedAt
+    brief.session.cleanup.status = "complete"
+    brief.session.endReason = "experiment_target_reached"
     brief.progress.acceptedExperimentCount = 100
     brief.progress.remainingExperimentCount = 0
     brief.progress.terminalReason = "experiment_target_reached"
@@ -494,7 +600,8 @@ describe("remote-first agent architecture", () => {
       const payload = JSON.parse(logs.join("\n"))
       expect(payload.refreshStatus).toBe("initializing")
       expect(payload.progress).toBeNull()
-      expect(payload.latestExperiments).toEqual([])
+      expect(payload.results).toEqual({ latest: [], best: null })
+      expect(payload.currentHypothesis.name).toBe("Hypothesis")
       expect(payload.stop.shouldStopStartingNewWork).toBe(false)
       expect(payload.stop.recommendedAction).toBe("continue")
       expect(payload.warnings.join("\n")).toContain(
@@ -530,7 +637,7 @@ describe("remote-first agent architecture", () => {
       ) {
         throw new Error(`unexpected fanout read: ${path}`)
       }
-      if (path === `/api/v1/research/campaigns/${campaignId}/experiments`) {
+      if (path === "/api/v1/research/worker/experiments") {
         return { items: [], page: { nextCursor: null } }
       }
       throw new Error(`unexpected API call: ${method} ${path}`)
@@ -543,9 +650,40 @@ describe("remote-first agent architecture", () => {
       expect(logs.join("\n")).toContain(
         "No experiments recorded in the Onyx API yet."
       )
-      expect(calls).toEqual([
-        `GET /api/v1/research/campaigns/${campaignId}/experiments`,
-      ])
+      expect(calls).toEqual(["GET /api/v1/research/worker/experiments"])
+    } finally {
+      console.log = originalLog
+      if (previousWorkerContext === undefined)
+        delete process.env.ONYX_WORKER_CONTEXT
+      else process.env.ONYX_WORKER_CONTEXT = previousWorkerContext
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker knowledge list uses worker context without campaign fanout", async () => {
+    const root = await tempRepo()
+    const logs: string[] = []
+    const calls: string[] = []
+    const originalLog = console.log
+    const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
+    const campaignId = "33333333-3333-4333-8333-333333333333"
+    console.log = (message?: unknown) => logs.push(String(message))
+    const paths = await writeTestWorkerContext({ root, campaignId })
+    process.env.ONYX_WORKER_CONTEXT = paths.contextPath
+    installMockApi(({ method, path }) => {
+      calls.push(`${method} ${path}`)
+      if (path === "/api/v1/research/worker/knowledge") {
+        return []
+      }
+      throw new Error(`unexpected API call: ${method} ${path}`)
+    })
+    try {
+      await commandKnowledgeList({
+        positional: ["knowledge", "list"],
+        options: { cwd: root, campaign: "scale-test", json: "true" },
+      })
+      expect(JSON.parse(logs.join("\n"))).toEqual([])
+      expect(calls).toEqual(["GET /api/v1/research/worker/knowledge"])
     } finally {
       console.log = originalLog
       if (previousWorkerContext === undefined)
@@ -561,20 +699,50 @@ describe("remote-first agent architecture", () => {
     const calls: string[] = []
     const originalLog = console.log
     const brief = makeSessionStateBrief()
-    const staleCampaign = { ...brief.campaign, experimentCount: 0 }
+    const staleCampaign: ApiCampaign = {
+      ...brief.campaign,
+      projectId: "55555555-5555-4555-8555-555555555555",
+      description: null,
+      createdFromCommitSha: "abc123",
+      currentEvaluationRevisionId: null,
+      currentEvaluationRevision: null,
+      baseCommitSha: "abc123",
+      bestExperimentId: null,
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      promotionRefName: null,
+    }
     const freshCampaign = { ...brief.campaign, experimentCount: 50 }
-    const completedSession = {
+    const completedSession: ApiSession = {
       ...brief.session,
+      cleanupStatus: "complete",
+      campaignId: brief.campaign.id,
+      evaluationRevisionId: "77777777-7777-4777-8777-777777777777",
+      baseCommitSha: "abc123",
+      setupHash: `sha256:${"a".repeat(64)}`,
+      baseGitStatus: "verified",
+      baseGitVerifiedAt: null,
+      baseGitStatusReason: null,
       acceptedExperimentCount: 50,
+      experimentTarget: 50,
       remainingExperimentCount: 0,
       status: "completed" as const,
       terminalReason: "experiment_target_reached" as const,
+      schedulerSiteId: null,
+      assignments: [],
+      metadata: {},
     }
     console.log = (message?: unknown) => {
       logs.push(String(message))
     }
     await git(
-      ["remote", "add", "origin", "https://github.com/example/research-test.git"],
+      [
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/research-test.git",
+      ],
       root
     )
     await cacheResearchSessionState({
@@ -603,7 +771,6 @@ describe("remote-first agent architecture", () => {
           sessions: [completedSession],
           workers: [],
           hypotheses: [],
-          summaries: [],
           knowledge: [],
           counts: {
             experiments: 50,
@@ -623,11 +790,10 @@ describe("remote-first agent architecture", () => {
             deadlineAt: null,
             terminalReason: "experiment_target_reached",
           },
-          finalization: {
+          cleanup: {
             status: "complete",
             reasons: [],
             terminalReason: "experiment_target_reached",
-            unmeasuredSalvageCount: 0,
           },
           livenessCounts: {
             active: 0,
@@ -662,218 +828,6 @@ describe("remote-first agent architecture", () => {
       )
     } finally {
       console.log = originalLog
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("research finish completes the campaign before writing final summary", async () => {
-    const root = await tempRepo()
-    const logs: string[] = []
-    const calls: string[] = []
-    const originalLog = console.log
-    const brief = makeSessionStateBrief()
-    const completedSession = {
-      ...brief.session,
-      status: "completed" as const,
-      acceptedExperimentCount: 50,
-      remainingExperimentCount: 0,
-      terminalReason: "experiment_target_reached" as const,
-      finalizationStatus: "complete" as const,
-    }
-    const completedCampaign = {
-      ...brief.campaign,
-      status: "completed" as const,
-      experimentCount: 50,
-    }
-    console.log = (message?: unknown) => {
-      logs.push(String(message))
-    }
-    await git(
-      ["remote", "add", "origin", "https://github.com/example/research-test.git"],
-      root
-    )
-    await cacheResearchSessionState({
-      root,
-      campaign: brief.campaign,
-      session: completedSession,
-    })
-    await updateState(root, (state) => {
-      state.projectPath = ""
-      state.activeCampaign = brief.campaign.name
-      state.campaigns = state.campaigns ?? {}
-      state.campaigns[brief.campaign.name] = {
-        ...(state.campaigns[brief.campaign.name] ?? {}),
-        campaignId: brief.campaign.id,
-        sessionId: SESSION_ID,
-        projectPath: "",
-      }
-    })
-    installMockApi(({ method, path, body }) => {
-      calls.push(`${method} ${path}`)
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/overview`) {
-        return {
-          campaign: completedCampaign,
-          bestExperiment: null,
-          latestExperiments: [],
-          sessions: [completedSession],
-          workers: [],
-          hypotheses: [],
-          summaries: [],
-          knowledge: [],
-          counts: {
-            experiments: 50,
-            hypothesisCount: 0,
-            activeWorkers: 0,
-          },
-        }
-      }
-      if (path === `/api/v1/research/sessions/${SESSION_ID}/stop`) {
-        expect(body).toMatchObject({
-          campaignId: brief.campaign.id,
-          status: "completed",
-          finalizationStatus: "complete",
-        })
-        return completedSession
-      }
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/complete`) {
-        expect(body).toEqual({ sessionId: SESSION_ID })
-        return { campaign: completedCampaign }
-      }
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/reconcile`) {
-        return {
-          campaign: completedCampaign,
-          hypotheses: [],
-          workers: [],
-          experiments: [],
-          gitVerification: {
-            checkedCount: 0,
-            updatedCount: 0,
-            remainingCount: 0,
-            limit: 100,
-            hasMore: false,
-            base: {
-              checked: true,
-              updated: false,
-              previousStatus: "verified",
-              status: "verified",
-              verifiedAt: null,
-              statusReason: null,
-            },
-            summary: {
-              repositoryAccessMode: "github_app",
-              baseGitStatus: "verified",
-              baseGitVerifiedAt: null,
-              baseGitStatusReason: null,
-              acceptedExperimentGitStatusCounts: {
-                local_reported: 0,
-                pending: 0,
-                verified: 0,
-                missing: 0,
-                mismatch: 0,
-                unreachable: 0,
-              },
-              needsVerificationCount: 0,
-              hardFailureCount: 0,
-              lastVerifiedAt: null,
-              recommendedAction: "none",
-              message: "No accepted experiment refs need Git verification yet.",
-            },
-          },
-        }
-      }
-      if (path === `/api/v1/research/sessions/${SESSION_ID}/live`) {
-        return {
-          session: completedSession,
-          campaign: completedCampaign,
-          progress: {
-            experimentTarget: 100,
-            acceptedExperimentCount: 50,
-            remainingExperimentCount: 0,
-            deadlineAt: null,
-            terminalReason: "experiment_target_reached",
-          },
-          finalization: {
-            status: "complete",
-            reasons: [],
-            terminalReason: "experiment_target_reached",
-            unmeasuredSalvageCount: 0,
-          },
-          livenessCounts: {
-            active: 0,
-            stale: 0,
-            lost: 0,
-            unknown: 0,
-            terminal: 0,
-          },
-          phaseCounts: {},
-          workers: [],
-          sites: [],
-          unmatchedPresenceCount: 0,
-          ignoredPresence: {},
-          providerBackoff: null,
-          recentExperiments: [],
-          recentTerminalWorkers: [],
-          liveWatermark: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        }
-      }
-      if (path === `/api/v1/research/campaigns/${brief.campaign.id}/summaries`) {
-        return {
-          summary: {
-            id: "77777777-7777-4777-8777-777777777777",
-            campaignId: brief.campaign.id,
-            sessionId: SESSION_ID,
-            hypothesisId: null,
-            authoredByWorkerId: null,
-            experimentId: null,
-            summaryKind: "campaign_brief",
-            title: "final results",
-            body: "done",
-            isCurrent: true,
-            metadata: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          },
-        }
-      }
-      throw new Error(`unexpected API call: ${method} ${path}`)
-    })
-    try {
-      await commandResearchFinish({
-        positional: ["research", "finish"],
-        options: { cwd: root, campaign: brief.campaign.name },
-      })
-      expect(logs.join("\n")).toContain(
-        `Finalized campaign ${brief.campaign.name}.`
-      )
-      expect(calls.indexOf(`POST /api/v1/research/campaigns/${brief.campaign.id}/complete`)).toBeGreaterThan(
-        calls.indexOf(`POST /api/v1/research/sessions/${SESSION_ID}/stop`)
-      )
-      expect(calls.indexOf(`POST /api/v1/research/campaigns/${brief.campaign.id}/summaries`)).toBeGreaterThan(
-        calls.indexOf(`POST /api/v1/research/campaigns/${brief.campaign.id}/complete`)
-      )
-    } finally {
-      console.log = originalLog
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("finish rejects removed offline and sync flags", async () => {
-    const root = await tempRepo()
-    try {
-      await expect(
-        commandResearchFinish({
-          positional: ["research", "finish"],
-          options: { cwd: root, offline: "true", campaign: "smoke" },
-        })
-      ).rejects.toThrow("removed")
-      await expect(
-        commandResearchFinish({
-          positional: ["research", "finish"],
-          options: { cwd: root, "final-sync-timeout": "1", campaign: "smoke" },
-        })
-      ).rejects.toThrow("removed")
-    } finally {
       await rm(root, { recursive: true, force: true })
     }
   })

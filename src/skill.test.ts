@@ -46,7 +46,9 @@ async function withManagedSkillHome<T>(fn: (root: string) => Promise<T>) {
 
 describe("managed skill installs", () => {
   test("embedded release skill matches canonical skill markdown", async () => {
-    const source = fileURLToPath(new URL("../skills/onyx/SKILL.md", import.meta.url))
+    const source = fileURLToPath(
+      new URL("../skills/onyx/SKILL.md", import.meta.url)
+    )
     expect(ONYX_SKILL_MARKDOWN).toBe(await readFile(source, "utf8"))
   })
 

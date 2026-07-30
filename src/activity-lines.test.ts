@@ -83,7 +83,11 @@ describe("activity lines", () => {
         },
         // Paragraph-separator parts must vanish instead of rendering as a
         // bare "text" event name.
-        { type: "text", timestamp: 1783204837023, part: { type: "text", text: "\n\n" } },
+        {
+          type: "text",
+          timestamp: 1783204837023,
+          part: { type: "text", text: "\n\n" },
+        },
         { type: "reasoning", part: { type: "reasoning", text: "IO-bound." } },
       ])
     ).toEqual([

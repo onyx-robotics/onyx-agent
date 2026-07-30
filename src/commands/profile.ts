@@ -19,7 +19,7 @@ const PROFILE_USAGE =
 function assertProfileMutationAllowed() {
   if (process.env.ONYX_WORKER_ID) {
     throw new Error(
-      "Worker agents cannot mutate Onyx CLI profiles. The worker API target is fixed by the supervisor; use the provided ONYX_API_URL/ONYX_API_KEY environment."
+      "Worker agents cannot mutate Onyx CLI profiles. The worker API target and scoped credential are fixed by the supervisor."
     )
   }
 }

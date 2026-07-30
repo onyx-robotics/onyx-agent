@@ -22,6 +22,7 @@ export type CliProfile = {
   apiKeyEnv?: string
   teamId: string
   teamName: string
+  userId?: string
   updatedAt: string
   worker?: WorkerProfileConfig
 }
@@ -40,14 +41,22 @@ export type DeveloperConfig = {
   checkout?: DeveloperCheckout
 }
 
+export type TelemetryConfig = {
+  enabled?: boolean
+  anonymousId?: string
+  noticeShownAt?: string
+}
+
 export type Config = {
   profiles: Record<string, CliProfile>
   currentProfile: string
   developer: DeveloperConfig
+  telemetry: TelemetryConfig
 }
 
-export type ConfigInput = Omit<Config, "developer"> & {
+export type ConfigInput = Omit<Config, "developer" | "telemetry"> & {
   developer?: DeveloperConfig
+  telemetry?: TelemetryConfig
 }
 
 export function emptyConfig(): Config {
@@ -55,6 +64,7 @@ export function emptyConfig(): Config {
     profiles: {},
     currentProfile: "",
     developer: { mode: "release" },
+    telemetry: {},
   }
 }
 
@@ -65,7 +75,9 @@ export function configDir() {
     : join(homedir(), ".config", "onyx")
 }
 
-function inferWorkerBinPath(checkout: Pick<DeveloperCheckout, "root" | "binPath">) {
+function inferWorkerBinPath(
+  checkout: Pick<DeveloperCheckout, "root" | "binPath">
+) {
   if (checkout.binPath.endsWith("/bin/onyx.js")) {
     return checkout.binPath.replace(/\/bin\/onyx\.js$/, "/bin/onyx-worker.js")
   }
@@ -107,7 +119,9 @@ function normalizeDeveloperConfig(value: unknown): DeveloperConfig {
   return { mode }
 }
 
-export function isBuiltInWorkerAgent(value: unknown): value is BuiltInWorkerAgent {
+export function isBuiltInWorkerAgent(
+  value: unknown
+): value is BuiltInWorkerAgent {
   return (
     typeof value === "string" &&
     (BUILT_IN_WORKER_AGENTS as readonly string[]).includes(value)
@@ -159,7 +173,9 @@ function normalizeCliProfile(value: unknown): CliProfile | null {
   const worker = normalizeWorkerProfileConfig(candidate.worker)
   return {
     apiUrl: candidate.apiUrl,
-    ...(typeof candidate.apiKey === "string" ? { apiKey: candidate.apiKey } : {}),
+    ...(typeof candidate.apiKey === "string"
+      ? { apiKey: candidate.apiKey }
+      : {}),
     ...(typeof candidate.apiKeyId === "string"
       ? { apiKeyId: candidate.apiKeyId }
       : {}),
@@ -168,6 +184,9 @@ function normalizeCliProfile(value: unknown): CliProfile | null {
       : {}),
     teamId: candidate.teamId,
     teamName: candidate.teamName,
+    ...(typeof candidate.userId === "string"
+      ? { userId: candidate.userId }
+      : {}),
     updatedAt: candidate.updatedAt,
     ...(worker ? { worker } : {}),
   }
@@ -191,6 +210,33 @@ async function readExistingDeveloperConfig() {
     return normalizeDeveloperConfig(parsed.developer)
   } catch {
     return { mode: "release" as const }
+  }
+}
+
+function normalizeTelemetryConfig(value: unknown): TelemetryConfig {
+  if (!value || typeof value !== "object") return {}
+  const candidate = value as Partial<TelemetryConfig>
+  return {
+    ...(typeof candidate.enabled === "boolean"
+      ? { enabled: candidate.enabled }
+      : {}),
+    ...(typeof candidate.anonymousId === "string"
+      ? { anonymousId: candidate.anonymousId }
+      : {}),
+    ...(typeof candidate.noticeShownAt === "string"
+      ? { noticeShownAt: candidate.noticeShownAt }
+      : {}),
+  }
+}
+
+async function readExistingTelemetryConfig() {
+  try {
+    const parsed = JSON.parse(
+      await readFile(configPath(), "utf8")
+    ) as Partial<Config>
+    return normalizeTelemetryConfig(parsed.telemetry)
+  } catch {
+    return {}
   }
 }
 
@@ -224,6 +270,7 @@ export async function readConfig(): Promise<Config> {
       profiles: normalizeProfiles(parsed.profiles),
       currentProfile: parsed.currentProfile ?? "",
       developer: normalizeDeveloperConfig(parsed.developer),
+      telemetry: normalizeTelemetryConfig(parsed.telemetry),
     }
     configCache = { mtimeMs, config }
     return config
@@ -238,12 +285,17 @@ export async function writeConfig(config: ConfigInput) {
     config.developer === undefined
       ? await readExistingDeveloperConfig()
       : normalizeDeveloperConfig(config.developer)
+  const telemetry =
+    config.telemetry === undefined
+      ? await readExistingTelemetryConfig()
+      : normalizeTelemetryConfig(config.telemetry)
   await writeFile(
     configPath(),
     `${JSON.stringify(
       {
         ...config,
         developer,
+        telemetry,
       },
       null,
       2

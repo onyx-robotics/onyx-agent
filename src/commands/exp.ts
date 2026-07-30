@@ -12,7 +12,10 @@ import {
   listCampaignExperiments,
   listProjectCampaigns,
   reportCampaignExperiment,
+  reportWorkerExperiment,
+  listWorkerExperiments,
   resolveProject,
+  type ApiCampaign,
 } from "../lib/api"
 import { descriptionOption, optionalFlag, type Args } from "../lib/args"
 import {
@@ -36,6 +39,7 @@ import {
 import { onyxStateDir, readState, writeState } from "../lib/runtime-state"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { readWorkerRuntimeContext } from "../lib/worker-context"
+import { recordWorkerReportedExperiment } from "../lib/worker-reports"
 import {
   clearLocalAttempt,
   abandonBlockedWorkflowRunsForSession,
@@ -269,7 +273,7 @@ async function ensureCampaignMetadata({
     ...state.campaigns[key],
     campaignId: campaign.id,
     projectPath,
-    baseCommitSha: campaign.baseCommitSha,
+    baseCommitSha: campaign.createdFromCommitSha ?? (await currentCommit(root)),
     description: campaign.description,
     metricName: campaign.metricName,
     metricUnit: campaign.metricUnit,
@@ -282,7 +286,7 @@ async function ensureCampaignMetadata({
     campaignId: campaign.id,
     hypothesisId: state.campaigns[key]?.hypothesisId,
     metricName: campaign.metricName,
-    baseCommitSha: campaign.baseCommitSha,
+    baseCommitSha: campaign.createdFromCommitSha ?? (await currentCommit(root)),
   }
 }
 
@@ -1326,24 +1330,76 @@ export async function commandExpRun(args: Args) {
   return executeWorkflow({ root, projectPath, setup, run, args, mode })
 }
 
-export async function commandExpLog(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  const projectPath = await resolveProjectPath(root, args)
-  const campaignName = await resolveCampaignName(root, args)
-  const campaign = await ensureCampaignMetadata({
-    root,
-    args,
-    projectPath,
-    campaignName,
-  })
-  const setup = await readSetupFile(root, projectPath)
+export type FrozenExperimentDeliveryContext = {
+  root: string
+  projectPath: string
+  campaign: ApiCampaign
+  setup: ResearchSetupFile
+  runRef: string
+  sessionId: string
+  assignmentId: string
+  hypothesisId: string
+  workerId: string
+  workerCredential: string
+}
+
+export class ExperimentDeliveryError extends Error {
+  readonly resultRefPushStatus: "pushed" | "failed"
+  readonly resultRefPushError: string | null
+
+  constructor({
+    message,
+    resultRefPushStatus,
+    resultRefPushError,
+  }: {
+    message: string
+    resultRefPushStatus: "pushed" | "failed"
+    resultRefPushError: string | null
+  }) {
+    super(message)
+    this.name = "ExperimentDeliveryError"
+    this.resultRefPushStatus = resultRefPushStatus
+    this.resultRefPushError = resultRefPushError
+  }
+}
+
+async function logExperiment(
+  args: Args,
+  frozen?: FrozenExperimentDeliveryContext
+) {
+  const root = frozen?.root ?? (await repoRoot(args.options.cwd))
+  const projectPath =
+    frozen?.projectPath ?? (await resolveProjectPath(root, args))
+  const campaignName =
+    frozen?.campaign.name ?? (await resolveCampaignName(root, args))
+  const campaign = frozen
+    ? {
+        campaignId: frozen.campaign.id,
+        hypothesisId: frozen.hypothesisId,
+        metricName: frozen.campaign.metricName,
+        baseCommitSha: frozen.campaign.baseCommitSha,
+      }
+    : await ensureCampaignMetadata({
+        root,
+        args,
+        projectPath,
+        campaignName,
+      })
+  const setup = frozen?.setup ?? (await readSetupFile(root, projectPath))
+  const workerRuntimeContext = frozen ? null : await readWorkerRuntimeContext()
   if (setup.projectPath !== projectPath) {
     throw new Error(
       `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
     )
   }
-  const context = resolveWorkerWorkflowContext(args)
-  const explicitRunRef = args.options["run-ref"]
+  const context: WorkerWorkflowContext = frozen
+    ? {
+        sessionId: frozen.sessionId,
+        workerId: frozen.workerId,
+        hypothesisId: frozen.hypothesisId,
+      }
+    : resolveWorkerWorkflowContext(args)
+  const explicitRunRef = frozen?.runRef ?? args.options["run-ref"]
   const allowUnmeasuredFailure =
     !explicitRunRef &&
     optionalFlag(args, "allow-unmeasured") &&
@@ -1373,28 +1429,32 @@ export async function commandExpLog(args: Args) {
   }
   if (explicitRunRef && !usableAttempt) {
     throw new Error(
-      `No measured run found for --run-ref ${explicitRunRef}. Rerun the workflow or leave unlogged salvage to the worker harness.`
+      `No measured run found for --run-ref ${explicitRunRef}. Rerun the workflow to create a terminal measured attempt.`
     )
   }
   const resultCommitSha =
-    args.options.commit ??
+    (frozen ? undefined : args.options.commit) ??
     usableAttempt?.resultCommitSha ??
     (await currentCommit(root))
   const baseCommitSha =
-    args.options.base ?? usableAttempt?.baseCommitSha ?? campaign.baseCommitSha
+    (frozen ? undefined : args.options.base) ??
+    usableAttempt?.baseCommitSha ??
+    campaign.baseCommitSha
   const metricName =
-    args.options["metric-name"] ??
+    (frozen ? undefined : args.options["metric-name"]) ??
     usableAttempt?.primaryMetricName ??
     campaign.metricName
   const metricValue =
-    args.options.metric === undefined
+    frozen || args.options.metric === undefined
       ? (usableAttempt?.primaryMetricValue ?? null)
       : Number(args.options.metric)
   if (metricValue !== null && !Number.isFinite(metricValue)) {
     throw new Error("--metric must be a finite number")
   }
   const status = validateStatus(
-    args.options.status ?? usableAttempt?.status ?? "succeeded"
+    (frozen ? undefined : args.options.status) ??
+      usableAttempt?.status ??
+      "succeeded"
   )
   if (
     !usableAttempt &&
@@ -1402,7 +1462,7 @@ export async function commandExpLog(args: Args) {
     !optionalFlag(args, "allow-unmeasured")
   ) {
     throw new Error(
-      "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for failed unmeasured attempts. Rerun the workflow or leave unlogged salvage to the worker harness."
+      "Measured attempts must be created by `onyx exp run` before `onyx exp log`. Use --status failed --allow-unmeasured only for an explicitly requested failed attempt. Rerun the workflow to create a terminal measured attempt."
     )
   }
   if (status === "succeeded" && metricValue === null) {
@@ -1411,38 +1471,48 @@ export async function commandExpLog(args: Args) {
     )
   }
   const checks = usableAttempt?.checks ?? null
-  if (
-    checks &&
-    checks.status !== "passed" &&
-    status === "succeeded"
-  ) {
+  if (checks && checks.status !== "passed" && status === "succeeded") {
     throw new Error(
       `Cannot record ${status}: checks ${checks.status}. Use --status checks_failed.`
     )
   }
   const completedAt = new Date().toISOString()
   const metrics =
-    args.options.metric === undefined
+    frozen || args.options.metric === undefined
       ? (usableAttempt?.metrics ?? {})
       : metricValue === null
         ? {}
         : { ...(usableAttempt?.metrics ?? {}), [metricName]: metricValue }
   const runRef = usableAttempt?.runRef ?? clientRunRef(campaignName)
   const resultRef =
-    args.options["result-ref"] ??
+    (frozen ? undefined : args.options["result-ref"]) ??
     usableAttempt?.resultRef ??
     `refs/onyx/experiments/${campaign.campaignId}/${safeRefSegment(runRef)}`
   const hypothesisId =
+    frozen?.hypothesisId ??
     args.options.hypothesis ??
     usableAttempt?.hypothesisId ??
     process.env.ONYX_HYPOTHESIS_ID ??
     campaign.hypothesisId
   const sessionId =
+    frozen?.sessionId ??
     args.options.session ??
     usableAttempt?.sessionId ??
     process.env.ONYX_SESSION_ID
   const workerId =
-    args.options.worker ?? usableAttempt?.workerId ?? process.env.ONYX_WORKER_ID
+    frozen?.workerId ??
+    args.options.worker ??
+    usableAttempt?.workerId ??
+    process.env.ONYX_WORKER_ID
+  const assignmentId =
+    frozen?.assignmentId ??
+    args.options.assignment ??
+    workerRuntimeContext?.assignmentId
+  if (!sessionId || !hypothesisId || !assignmentId) {
+    throw new Error(
+      "Experiment reports require a session, hypothesis, and session assignment. Run inside a supervised worker or pass --session, --hypothesis, and --assignment."
+    )
+  }
   const loggedCompliance =
     usableAttempt?.setupCompliance ??
     setupCompliance({
@@ -1463,8 +1533,10 @@ export async function commandExpLog(args: Args) {
     createdAt: completedAt,
     runRef,
     campaignName,
-    name: args.options.name ?? `experiment-${resultCommitSha.slice(0, 7)}`,
-    description: descriptionOption(args),
+    name:
+      (frozen ? undefined : args.options.name) ??
+      `experiment-${resultCommitSha.slice(0, 7)}`,
+    description: frozen ? null : descriptionOption(args),
     projectPath,
     baseCommitSha,
     resultCommitSha,
@@ -1474,7 +1546,9 @@ export async function commandExpLog(args: Args) {
     primaryMetricName: metricName,
     primaryMetricValue: metricValue,
     metrics,
-    agentNotes: parseAgentNotes(args.options["agent-notes"]),
+    agentNotes: frozen
+      ? (usableAttempt?.agentNotes ?? {})
+      : parseAgentNotes(args.options["agent-notes"]),
     checks,
     durationMs: usableAttempt?.durationMs ?? null,
     startedAt: usableAttempt?.startedAt ?? null,
@@ -1502,60 +1576,91 @@ export async function commandExpLog(args: Args) {
     metadata: { pid: process.pid, runRef },
   }).catch(() => null)
   try {
-    await git(["push", "origin", `${resultCommitSha}:${resultRef}`], root)
-    resultRefPushedAt = new Date().toISOString()
+    let lastPushError: unknown = null
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await git(["push", "origin", `${resultCommitSha}:${resultRef}`], root)
+        resultRefPushedAt = new Date().toISOString()
+        lastPushError = null
+        break
+      } catch (error) {
+        lastPushError = error
+        if (attempt < 3) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, 150 * attempt + Math.floor(Math.random() * 150))
+          )
+        }
+      }
+    }
+    if (lastPushError) throw lastPushError
   } catch (error) {
     resultRefPushStatus = "failed"
     resultRefPushError = errorMessage(error)
     console.warn(
-      `Warning: failed to push experiment ref ${resultRef}. Onyx will record the result as local-reported; push later with \`git push origin ${resultCommitSha}:${resultRef}\` to make code and diffs visible after GitHub is connected. ${resultRefPushError}`
+      `Warning: failed to push experiment ref ${resultRef} after three attempts. Onyx will record the result as local-reported. ${resultRefPushError}`
     )
   } finally {
     await releasePushSlot?.()
   }
-  const report = await reportCampaignExperiment(
-    campaign.campaignId,
-    {
-      sessionId,
-      hypothesisId,
-      workerId,
-      name: record.name,
-      ...(record.description ? { description: record.description } : {}),
-      runRef,
-      baseCommitSha,
-      resultCommitSha,
-      resultRef,
-      resultRefPushStatus,
-      ...(resultRefPushedAt ? { resultRefPushedAt } : {}),
-      ...(resultRefPushError ? { resultRefPushError } : {}),
-      status: loggedStatus,
-      setupCompliance: loggedCompliance,
-      primaryMetricName: metricName,
-      ...(metricValue === null ? {} : { primaryMetricValue: metricValue }),
-      secondaryMetrics: metrics,
-      artifactRefs: {},
-      agentNotes: record.agentNotes,
-      ...(checks
-        ? {
-            checks: {
-              status: checks.status,
-              durationMs: checks.durationMs ?? null,
-              outputSummary: checks.outputSummary ?? null,
-            },
-          }
-        : {}),
-      ...(record.durationMs === null ? {} : { durationMs: record.durationMs }),
-      ...(record.outputSummary ? { outputSummary: record.outputSummary } : {}),
-      ...(record.startedAt ? { startedAt: record.startedAt } : {}),
-      completedAt: record.completedAt ?? completedAt,
-      provenance: [],
-    },
-    args
+  const reportBody = {
+    sessionId,
+    assignmentId,
+    hypothesisId,
+    workerId,
+    name: record.name,
+    ...(record.description ? { description: record.description } : {}),
+    runRef,
+    baseCommitSha,
+    resultCommitSha,
+    resultRef,
+    resultRefPushStatus,
+    ...(resultRefPushedAt ? { resultRefPushedAt } : {}),
+    ...(resultRefPushError ? { resultRefPushError } : {}),
+    status: loggedStatus,
+    setupCompliance: loggedCompliance,
+    primaryMetricName: metricName,
+    ...(metricValue === null ? {} : { primaryMetricValue: metricValue }),
+    secondaryMetrics: metrics,
+    artifactRefs: {},
+    agentNotes: record.agentNotes,
+    ...(checks
+      ? {
+          checks: {
+            status: checks.status,
+            durationMs: checks.durationMs ?? null,
+            outputSummary: checks.outputSummary ?? null,
+          },
+        }
+      : {}),
+    ...(record.durationMs === null ? {} : { durationMs: record.durationMs }),
+    ...(record.outputSummary ? { outputSummary: record.outputSummary } : {}),
+    ...(record.startedAt ? { startedAt: record.startedAt } : {}),
+    completedAt: record.completedAt ?? completedAt,
+    provenance: [],
+  }
+  const scopedWorkerCredential =
+    frozen?.workerCredential ?? workerRuntimeContext?.workerCredential
+  const report = await (
+    scopedWorkerCredential
+      ? reportWorkerExperiment(reportBody, args, scopedWorkerCredential)
+      : reportCampaignExperiment(campaign.campaignId, reportBody, args)
   ).catch((error) => {
-    throw new Error(
-      `API reporting failed after local measurement${resultRefPushStatus === "pushed" ? " and ref push" : ""}. Retry \`onyx exp log --campaign ${campaignName} --run-ref ${runRef}\` after checking the Onyx API. ${errorMessage(error)}`
-    )
+    throw new ExperimentDeliveryError({
+      message: `API reporting failed after local measurement${resultRefPushStatus === "pushed" ? " and ref push" : ""}. ${errorMessage(error)}`,
+      resultRefPushStatus,
+      resultRefPushError: resultRefPushError ?? null,
+    })
   })
+  const workerContextPath = process.env.ONYX_WORKER_CONTEXT?.trim()
+  if (workerRuntimeContext && workerContextPath) {
+    await recordWorkerReportedExperiment({
+      contextPath: workerContextPath,
+      workerId: workerRuntimeContext.workerId,
+      sessionId: workerRuntimeContext.sessionId,
+      hypothesisId: workerRuntimeContext.hypothesisId,
+      runRef,
+    }).catch(() => {})
+  }
   await clearLocalAttempt(root, { runRef }).catch(() => {})
   await emitEvent(root, {
     type: "exp_logged",
@@ -1567,9 +1672,7 @@ export async function commandExpLog(args: Args) {
     message: `${record.name} (${loggedStatus})`,
   })
   const gitNote =
-    report.experiment.gitStatus === "local_reported"
-      ? " [local-reported]"
-      : ""
+    report.experiment.gitStatus === "local_reported" ? " [local-reported]" : ""
   const pushNote =
     resultRefPushStatus === "failed" ? " (experiment ref push failed)" : ""
   console.log(
@@ -1579,7 +1682,32 @@ export async function commandExpLog(args: Args) {
         : ""
     }${gitNote}${pushNote}`
   )
-  return report.experiment
+  return {
+    ...report.experiment,
+    deliveryOutcome: report.outcome,
+    deliveryResultRefPushStatus: resultRefPushStatus,
+    deliveryResultRefPushError: resultRefPushError ?? null,
+  }
+}
+
+/**
+ * Delivers one already-terminal measured attempt using the immutable worker
+ * context captured by the supervisor. This intentionally bypasses mutable
+ * profile/campaign discovery while sharing the exact push/report primitive
+ * used by the public `exp log` command.
+ */
+export async function deliverTerminalExperimentAttempt({
+  args,
+  context,
+}: {
+  args: Args
+  context: FrozenExperimentDeliveryContext
+}) {
+  return logExperiment(args, context)
+}
+
+export async function commandExpLog(args: Args) {
+  return logExperiment(args)
 }
 
 export async function commandExpList(args: Args) {
@@ -1641,10 +1769,25 @@ export async function commandExpList(args: Args) {
   for (const { campaign } of resolvedCampaigns) {
     let cursor: string | null = null
     do {
-      const page = await listCampaignExperiments(campaign.id, args, {
-        limit: Math.min(100, Math.max(limit, 1)),
-        cursor: cursor ?? undefined,
-      })
+      const disposition =
+        (args.options.disposition as
+          | "all"
+          | "received"
+          | "accepted"
+          | "discarded"
+          | undefined) ?? "all"
+      const page: Awaited<ReturnType<typeof listCampaignExperiments>> =
+        workerContext
+          ? await listWorkerExperiments(args, {
+              limit: Math.min(100, Math.max(limit, 1)),
+              cursor: cursor ?? undefined,
+              disposition,
+            })
+          : await listCampaignExperiments(campaign.id, args, {
+              limit: Math.min(100, Math.max(limit, 1)),
+              cursor: cursor ?? undefined,
+              disposition,
+            })
       for (const experiment of page.items) {
         const row = apiExperimentToHistory(campaign, experiment)
         if (row) rows.push(row)

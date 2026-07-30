@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 
 import {
   ONYX_LAUNCHER_BYPASS,
@@ -21,11 +21,11 @@ import {
   runLauncher,
   skillInstallTarget,
 } from "./onyx"
-import {
-  readConfig,
-  writeConfig,
-  type DeveloperCheckout,
-} from "./lib/config"
+import { readConfig, writeConfig, type DeveloperCheckout } from "./lib/config"
+
+let configHome: string | null = null
+let previousConfigHome: string | undefined
+let previousLauncherBypass: string | undefined
 
 async function captureLogs<T>(fn: () => Promise<T>) {
   const previous = console.log
@@ -70,10 +70,23 @@ async function writeProductCheckout(root: string) {
 
 describe("developer mode", () => {
   beforeEach(async () => {
-    process.env.XDG_CONFIG_HOME = await mkdtemp(
-      join(tmpdir(), "onyx-developer-config-test-")
-    )
+    previousConfigHome = process.env.XDG_CONFIG_HOME
+    previousLauncherBypass = process.env[ONYX_LAUNCHER_BYPASS]
+    configHome = await mkdtemp(join(tmpdir(), "onyx-developer-config-test-"))
+    process.env.XDG_CONFIG_HOME = configHome
     delete process.env[ONYX_LAUNCHER_BYPASS]
+  })
+
+  afterEach(async () => {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = previousConfigHome
+    if (previousLauncherBypass === undefined) {
+      delete process.env[ONYX_LAUNCHER_BYPASS]
+    } else {
+      process.env[ONYX_LAUNCHER_BYPASS] = previousLauncherBypass
+    }
+    if (configHome) await rm(configHome, { recursive: true, force: true })
+    configHome = null
   })
 
   test("detects standalone and product checkouts", async () => {
@@ -300,9 +313,9 @@ describe("developer mode", () => {
 
       const config = await readConfig()
       expect(config.developer).toEqual({ mode: "release" })
-      expect((await lstat(skillInstallTarget(skillRoot))).isSymbolicLink()).toBe(
-        false
-      )
+      expect(
+        (await lstat(skillInstallTarget(skillRoot))).isSymbolicLink()
+      ).toBe(false)
     } finally {
       await rm(checkoutRoot, { recursive: true, force: true })
       await rm(skillRoot, { recursive: true, force: true })
@@ -385,17 +398,28 @@ describe("developer mode", () => {
   })
 
   test("launcher bypass runs the local CLI", async () => {
-    const output = await captureLogs(() =>
-      runLauncher({
-        argv: ["--version"],
-        env: { [ONYX_LAUNCHER_BYPASS]: "1" },
-        runDev: async () => {
-          throw new Error("should not dispatch")
-        },
-      })
-    )
+    // Path-based distribution detection only recognizes monorepo checkouts
+    // (paths containing /packages/agent/); pin the override so the assertion
+    // holds in standalone checkouts such as this repo's own CI.
+    const previousDistribution = process.env.ONYX_DISTRIBUTION
+    process.env.ONYX_DISTRIBUTION = "source"
+    try {
+      const output = await captureLogs(() =>
+        runLauncher({
+          argv: ["--version"],
+          env: { [ONYX_LAUNCHER_BYPASS]: "1" },
+          runDev: async () => {
+            throw new Error("should not dispatch")
+          },
+        })
+      )
 
-    expect(output).toBe("0.1.10")
+      expect(output).toContain("onyx 0.1.10 (protocol 5, source")
+    } finally {
+      if (previousDistribution === undefined)
+        delete process.env.ONYX_DISTRIBUTION
+      else process.env.ONYX_DISTRIBUTION = previousDistribution
+    }
   })
 
   test("launcher reports missing linked dev files", async () => {

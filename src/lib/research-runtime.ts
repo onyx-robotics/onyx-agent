@@ -22,7 +22,6 @@ import type {
   ApiKnowledge,
   ApiSession,
   ApiSessionState,
-  ApiSummary,
   ApiWorker,
 } from "./api"
 import {
@@ -116,7 +115,6 @@ export type LocalWorkflowStep = {
   updatedAt: string
 }
 
-type LocalSummaryKind = ApiSummary["summaryKind"]
 type LocalKnowledgeKind = ApiKnowledge["kind"]
 
 export type LocalDiscardedAttempt = {
@@ -155,7 +153,6 @@ type LocalSessionRecord = {
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
   experiments: ApiCampaignExperiment[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
 }
 
@@ -275,6 +272,9 @@ function campaignFromInput({
     name,
     description,
     parentCampaignId: null,
+    createdFromCommitSha: baseCommitSha,
+    currentEvaluationRevisionId: null,
+    currentEvaluationRevision: null,
     projectPath,
     baseCommitSha,
     setup,
@@ -319,15 +319,25 @@ function defaultSession({
     campaignId,
     name,
     status: "running",
-    workerTarget,
+    evaluationRevisionId: "local",
+    baseCommitSha: "",
+    setupHash: "",
+    baseGitStatus: "local_reported",
+    baseGitVerifiedAt: null,
+    baseGitStatusReason: null,
+    runtimeState: "starting",
+    workerTarget: workerTarget ?? 1,
     experimentTarget,
     acceptedExperimentCount: 0,
     remainingExperimentCount:
       experimentTarget === null ? null : Math.max(0, experimentTarget),
     deadlineAt,
+    endedAt: null,
+    endReason: null,
     terminalReason: null,
     schedulerSiteId,
-    finalizationStatus: "running",
+    assignments: [],
+    cleanupStatus: "running",
     metadata,
     startedAt: at,
     completedAt: null,
@@ -364,8 +374,11 @@ function defaultHypothesis({
     description: description ?? plan.statement,
     status: "active",
     baseCommitSha: baseCommitSha ?? "",
+    summaryEvaluationRevisionId: null,
     bestExperimentId: null,
     bestMetricValue: null,
+    bestCommitSha: null,
+    experimentCount: 0,
     lastWorkedAt: null,
     plan,
     metadata,
@@ -697,7 +710,6 @@ export async function createLocalSession({
     hypotheses: createdHypotheses,
     workers: [],
     experiments: [],
-    summaries: [],
     knowledge: [],
   }
   await writeSessionRecord(root, record)
@@ -709,8 +721,6 @@ export async function createLocalSession({
       campaignId,
       status: session.status,
       experimentTarget,
-      acceptedExperimentCount: 0,
-      remainingExperimentCount: session.remainingExperimentCount,
       deadlineAt,
       schedulerSiteId,
     }
@@ -734,7 +744,6 @@ export async function cacheResearchSessionState({
   hypotheses = [],
   workers = [],
   experiments = [],
-  summaries = [],
   knowledge = [],
 }: {
   root: string
@@ -743,7 +752,6 @@ export async function cacheResearchSessionState({
   hypotheses?: ApiHypothesis[]
   workers?: ApiWorker[]
   experiments?: ApiCampaignExperiment[]
-  summaries?: ApiSummary[]
   knowledge?: ApiKnowledge[]
 }) {
   const existing = await readSessionRecord(root, session.id).catch(() => null)
@@ -755,7 +763,6 @@ export async function cacheResearchSessionState({
     workers: workers.length > 0 ? workers : (existing?.workers ?? []),
     experiments:
       experiments.length > 0 ? experiments : (existing?.experiments ?? []),
-    summaries: summaries.length > 0 ? summaries : (existing?.summaries ?? []),
     knowledge: knowledge.length > 0 ? knowledge : (existing?.knowledge ?? []),
   }
   await writeSessionRecord(root, record)
@@ -767,8 +774,6 @@ export async function cacheResearchSessionState({
       campaignId: campaign.id,
       status: session.status,
       experimentTarget: session.experimentTarget,
-      acceptedExperimentCount: session.acceptedExperimentCount,
-      remainingExperimentCount: session.remainingExperimentCount,
       deadlineAt: session.deadlineAt,
       schedulerSiteId: session.schedulerSiteId,
     }
@@ -857,7 +862,8 @@ export async function registerLocalWorker({
   const worker: ApiWorker = {
     id: workerId ?? randomUUID(),
     campaignId,
-    sessionId: sessionId ?? null,
+    sessionId: sessionId ?? "local",
+    assignmentId: undefined,
     hypothesisId,
     workerName,
     agentKind,
@@ -951,14 +957,14 @@ export async function stopLocalSession({
   root,
   sessionId,
   status,
-  finalizationStatus,
+  cleanupStatus,
   terminalReason,
   metadata,
 }: {
   root: string
   sessionId: string
   status: ApiSession["status"]
-  finalizationStatus?: ApiSession["finalizationStatus"] | null
+  cleanupStatus?: ApiSession["cleanupStatus"] | null
   terminalReason?: ApiSession["terminalReason"] | null
   reason?: string | null
   metadata?: Record<string, unknown>
@@ -967,13 +973,10 @@ export async function stopLocalSession({
   record.session = {
     ...record.session,
     status,
-    finalizationStatus: finalizationStatus ?? record.session.finalizationStatus,
+    cleanupStatus: cleanupStatus ?? record.session.cleanupStatus,
     terminalReason: terminalReason ?? record.session.terminalReason,
     metadata: { ...record.session.metadata, ...(metadata ?? {}) },
-    completedAt:
-      status === "running" || status === "stop_requested"
-        ? record.session.completedAt
-        : nowIso(),
+    completedAt: status === "running" ? record.session.completedAt : nowIso(),
     updatedAt: nowIso(),
   }
   await writeSessionRecord(root, record)
@@ -993,8 +996,10 @@ export async function acceptOrDiscardLocalExperiment({
   const experiment: ApiCampaignExperiment = {
     id: randomUUID(),
     campaignId: "",
-    sessionId: record.sessionId ?? null,
-    hypothesisId: record.hypothesisId ?? null,
+    sessionId: record.sessionId ?? "local",
+    evaluationRevisionId: "local",
+    assignmentId: "local",
+    hypothesisId: record.hypothesisId ?? "local",
     workerId: record.workerId ?? null,
     acceptedIndex: null,
     runRef: record.runRef,
@@ -1067,7 +1072,6 @@ export async function applyRemoteProjectionDeltas(_input: {
     hypotheses: ApiHypothesis[]
     workers: ApiWorker[]
     experiments: ApiCampaignExperiment[]
-    summaries: ApiSummary[]
     knowledge: ApiKnowledge[]
   }
 }) {
@@ -1238,6 +1242,39 @@ export async function abandonBlockedWorkflowRunsForSession({
   return runs.map((run) => run.runRef)
 }
 
+export async function abandonNonterminalWorkflowRunsForWorker({
+  root,
+  sessionId,
+  workerId,
+  hypothesisId,
+  reason,
+}: {
+  root: string
+  sessionId: string
+  workerId: string
+  hypothesisId?: string | null
+  reason: string
+}) {
+  const runs = await listWorkflowRuns(root, {
+    sessionId,
+    workerId,
+    ...(hypothesisId ? { hypothesisId } : {}),
+    statuses: ["running", "paused", "blocked"],
+  })
+  for (const run of runs) {
+    await upsertWorkflowRun({
+      root,
+      run: {
+        ...run,
+        status: "abandoned",
+        blockReason: run.blockReason ? `${run.blockReason}; ${reason}` : reason,
+        completedAt: run.completedAt ?? nowIso(),
+      },
+    })
+  }
+  return runs.map((run) => run.runRef)
+}
+
 export async function upsertWorkflowStep({
   root,
   step,
@@ -1255,44 +1292,6 @@ export async function upsertWorkflowStep({
 
 export async function listWorkflowSteps(root: string, runId: string) {
   return jsonFile<LocalWorkflowStep[]>(await workflowStepsPath(root, runId), [])
-}
-
-export async function upsertLocalSummary(input: {
-  root: string
-  campaignId: string
-  sessionId?: string
-  hypothesisId?: string
-  authoredByWorkerId?: string
-  summaryKind: LocalSummaryKind
-  title: string
-  body: string
-  isCurrent?: boolean
-  metadata?: Record<string, unknown>
-}) {
-  const at = nowIso()
-  return {
-    id: randomUUID(),
-    campaignId: input.campaignId,
-    sessionId: input.sessionId ?? null,
-    hypothesisId: input.hypothesisId ?? null,
-    authoredByWorkerId: input.authoredByWorkerId ?? null,
-    summaryKind: input.summaryKind,
-    title: input.title,
-    body: input.body,
-    isCurrent: input.isCurrent ?? true,
-    metadata: input.metadata ?? {},
-    createdAt: at,
-    updatedAt: at,
-  } satisfies ApiSummary
-}
-
-export async function listLocalSummaries(
-  _root: string,
-  _campaignId: string
-): Promise<ApiSummary[]> {
-  void _root
-  void _campaignId
-  return []
 }
 
 export async function createLocalKnowledge(input: {
@@ -1357,7 +1356,6 @@ export async function upsertWorkerLaunch(_input: {
     workerId: string
     status: string
     worktree?: string | null
-    branchName?: string | null
     promptPath?: string | null
     logPath?: string | null
     activityLogPath?: string | null
@@ -1367,7 +1365,6 @@ export async function upsertWorkerLaunch(_input: {
     timedOut?: boolean
     startupTimedOut?: boolean
     lastOutputAt?: string | null
-    finalizationStatus?: string | null
     error?: string | null
     metadata?: Record<string, unknown>
     startedAt?: string | null
@@ -1418,7 +1415,6 @@ export type LocalResearchBrief = {
   session: ApiSession | null
   hypothesis: ApiHypothesis | null
   latestExperiments: ApiCampaignExperiment[]
-  summaries: ApiSummary[]
   knowledge: ApiKnowledge[]
 }
 
@@ -1430,7 +1426,6 @@ export async function localResearchBrief(): Promise<LocalResearchBrief> {
     session: null,
     hypothesis: null,
     latestExperiments: [],
-    summaries: [],
     knowledge: [],
   }
 }

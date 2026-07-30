@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { gitCommonDir } from "./git"
 
 export type CliState = {
+  schemaVersion?: 2
   projectId?: string
   projectCache?: {
     id: string
@@ -35,7 +36,6 @@ export type CliState = {
       sessionId?: string
       hypothesisId?: string
       hypothesisName?: string
-      workerBranch?: string
       workers?: Record<
         string,
         {
@@ -53,17 +53,17 @@ export type CliState = {
       campaignId?: string
       deadlineAt?: string | null
       experimentTarget?: number | null
-      acceptedExperimentCount?: number
-      remainingExperimentCount?: number | null
       schedulerSiteId?: string | null
       stopRequested?: boolean
+      stopPendingRemote?: boolean
       status?: string
       terminalReason?: string | null
-      finalizationStatus?:
+      cleanupStatus?:
         | "not_started"
         | "running"
         | "complete"
-        | "incomplete"
+        | "draining"
+        | "abandoned"
         | "failed"
       ignoredPresence?: {
         total: number
@@ -93,6 +93,8 @@ export type CliState = {
       supervisor?: {
         pid?: number | null
         supervisorRunId?: string | null
+        processStartedAt?: string | null
+        commandIdentity?: string | null
         logPath?: string | null
         activeProcessCount?: number
         launchRate?: {
@@ -121,6 +123,18 @@ export type CliState = {
           error?: string | null
           errorSummary?: string | null
         }>
+        noProgressBreaker?: {
+          tripped: boolean
+          threshold: number
+          count: number
+          recentFailures: Array<{
+            at: string
+            workerId: string | null
+            hypothesisId: string
+            status: string
+            errorSummary: string | null
+          }>
+        } | null
         status?: string
         updatedAt?: string
       }
@@ -206,7 +220,19 @@ export async function readState(root: string): Promise<CliState> {
     const parsed = JSON.parse(
       await readFile(await statePath(root), "utf8")
     ) as Partial<CliState>
+    if (parsed.schemaVersion !== 2) {
+      return {
+        schemaVersion: 2,
+        projectId: parsed.projectId,
+        projectCache: parsed.projectCache,
+        projectPath: parsed.projectPath,
+        activeCampaign: parsed.activeCampaign,
+        campaigns: {},
+        sessions: {},
+      }
+    }
     return {
+      schemaVersion: 2,
       projectId: parsed.projectId,
       projectCache: parsed.projectCache,
       projectPath: parsed.projectPath,
@@ -215,7 +241,7 @@ export async function readState(root: string): Promise<CliState> {
       sessions: parsed.sessions ?? {},
     }
   } catch {
-    return { campaigns: {}, sessions: {} }
+    return { schemaVersion: 2, campaigns: {}, sessions: {} }
   }
 }
 
@@ -228,7 +254,11 @@ export async function writeState(root: string, state: CliState) {
 async function writeStateUnlocked(root: string, state: CliState) {
   const path = await statePath(root)
   const tmp = uniqueTempPath(path)
-  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8")
+  await writeFile(
+    tmp,
+    `${JSON.stringify({ ...state, schemaVersion: 2 }, null, 2)}\n`,
+    "utf8"
+  )
   await rename(tmp, path)
 }
 

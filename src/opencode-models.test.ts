@@ -58,10 +58,9 @@ describe("OpenCode model resolution", () => {
 
   test("rejects ambiguous human model names with exact ids", async () => {
     const command = await writeFakeOpenCode(
-      [
-        "opencode/deepseek-v4-flash",
-        "opencode/deepseek-v4-flash-free",
-      ].join("\n")
+      ["opencode/deepseek-v4-flash", "opencode/deepseek-v4-flash-free"].join(
+        "\n"
+      )
     )
 
     await expect(

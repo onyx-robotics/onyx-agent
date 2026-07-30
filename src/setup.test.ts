@@ -62,6 +62,7 @@ describe("setup validation", () => {
               timeoutSeconds: 30,
               leaseTimeoutSeconds: 30,
               outputLimitBytes: 4000,
+              fingerprintPaths: ["onyx/tools/evaluation"],
             },
           },
           workflow: [
@@ -101,9 +102,12 @@ describe("setup validation", () => {
     const evalPath = join(root, "onyx", "tools", "evaluation", "run.sh")
     await writeFile(
       evalPath,
-      ["#!/usr/bin/env bash", "set -euo pipefail", "echo 'METRIC score=1'", ""].join(
-        "\n"
-      ),
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "echo 'METRIC score=1'",
+        "",
+      ].join("\n"),
       "utf8"
     )
     await chmod(evalPath, 0o755)
@@ -112,7 +116,10 @@ describe("setup validation", () => {
     process.chdir(root)
     try {
       await withMutedConsole(() => commandSetupValidate(args()))
-      const first = await readFile(join(root, "onyx", "validation.json"), "utf8")
+      const first = await readFile(
+        join(root, "onyx", "validation.json"),
+        "utf8"
+      )
       await withMutedConsole(() => commandSetupValidate(args()))
       const second = await readFile(
         join(root, "onyx", "validation.json"),

@@ -122,25 +122,22 @@ export { commandStatus } from "./commands/status"
 export { commandToolsRun } from "./commands/tools"
 export {
   commandResearchBrief,
-  commandResearchFinish,
   commandResearchHypothesisAdd,
   commandResearchHypotheses,
   commandResearchSessionStateBrief,
   commandResearchRun,
-  commandResearchStart,
   commandResearchStatus,
   commandResearchStop,
   commandKnowledgeAdd,
   commandKnowledgeList,
-  commandSummaryList,
-  commandSummaryUpsert,
-  finalizationStatusLabel,
-  finalizeHypothesisAttempt,
+  teardownStatusLabel,
+  teardownHypothesisAttempt,
   summarizeWorkerOutput,
   commandWorkerRun,
 } from "./commands/research"
 export { commandSetupInit, commandSetupValidate } from "./commands/setup"
 export { commandWorkflowStatus } from "./commands/workflow"
+export { commandTelemetry } from "./commands/telemetry"
 export {
   normalizeSetupFile,
   normalizeValidationFile,

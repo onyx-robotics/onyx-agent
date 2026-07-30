@@ -31,6 +31,7 @@
   ],
   "scripts": {
     "build:release": "bun scripts/build-release.ts",
+    "verify:release-analytics": "bun scripts/verify-release-analytics.ts",
     "ci": "bun run lint && bun run typecheck && bun run test",
     "generate:skill-content": "bun scripts/generate-skill-content.ts",
     "lint": "eslint .",
@@ -38,6 +39,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "posthog-node": "^5.46.1",
     "zod": "^4.1.13"
   },
   "devDependencies": {

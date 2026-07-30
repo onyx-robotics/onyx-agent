@@ -27,6 +27,7 @@ export type WorkerSessionStateBrief = {
     campaignName: string
     hypothesisId: string
     hypothesisName: string
+    assignment: WorkerRuntimeContext["assignment"]
   }
   sequence: number
   refreshStatus: SessionStateBriefSnapshot["refreshStatus"]
@@ -37,17 +38,18 @@ export type WorkerSessionStateBrief = {
   message: string | null
   warnings: string[]
   session: ApiSessionStateBrief["session"] | null
-  campaign: ApiSessionStateBrief["campaign"] | {
-    id: string
-    name: string
-  }
-  project: ApiSessionStateBrief["project"] | null
+  campaign:
+    | ApiSessionStateBrief["campaign"]
+    | {
+        id: string
+        name: string
+      }
   progress: ApiSessionStateBrief["progress"] | null
-  activeHypotheses: ApiSessionStateBrief["activeHypotheses"]
-  latestExperiments: ApiSessionStateBrief["latestExperiments"]
-  bestExperiment: ApiSessionStateBrief["bestExperiment"]
-  summaries: ApiSessionStateBrief["summaries"]
-  knowledge: ApiSessionStateBrief["knowledge"]
+  currentHypothesis: WorkerRuntimeContext["hypothesis"]
+  peerHypothesisCount: number
+  peerHypotheses: ApiSessionStateBrief["peerHypotheses"]
+  results: ApiSessionStateBrief["results"]
+  knowledge: ApiSessionStateBrief["knowledge"] & { moreCommand: string | null }
   updatedAt: string | null
   stop: WorkerSessionStopGuidance
 }
@@ -116,7 +118,9 @@ export async function readSessionStateBriefSnapshot({
       record.refreshStatus !== "failed") ||
     typeof record.generatedAt !== "string"
   ) {
-    throw new Error(`Invalid session state brief at ${path}: unsupported schema`)
+    throw new Error(
+      `Invalid session state brief at ${path}: unsupported schema`
+    )
   }
   return record as SessionStateBriefSnapshot
 }
@@ -163,7 +167,9 @@ export function workerSessionStateBriefFromSnapshot({
       snapshot.message ?? "Supervisor session state brief is initializing."
     )
   } else if (snapshot.refreshStatus === "failed" && snapshot.lastError) {
-    outputWarnings.push(`Supervisor session state brief refresh failed: ${snapshot.lastError}`)
+    outputWarnings.push(
+      `Supervisor session state brief refresh failed: ${snapshot.lastError}`
+    )
   }
   return {
     schemaVersion: 1,
@@ -174,6 +180,7 @@ export function workerSessionStateBriefFromSnapshot({
       campaignName: context.campaignName,
       hypothesisId: context.hypothesisId,
       hypothesisName: context.hypothesisName,
+      assignment: context.assignment,
     },
     sequence: snapshot?.sequence ?? 0,
     refreshStatus: snapshot?.refreshStatus ?? "initializing",
@@ -183,20 +190,30 @@ export function workerSessionStateBriefFromSnapshot({
     lastError: snapshot?.lastError ?? null,
     message:
       snapshot?.message ??
-      (snapshot ? null : "Supervisor session state brief is not available yet."),
+      (snapshot
+        ? null
+        : "Supervisor session state brief is not available yet."),
     warnings: outputWarnings,
     session: brief?.session ?? null,
     campaign: brief?.campaign ?? {
       id: context.campaignId,
       name: context.campaignName,
     },
-    project: brief?.project ?? null,
     progress: brief?.progress ?? null,
-    activeHypotheses: brief?.activeHypotheses ?? [],
-    latestExperiments: brief?.latestExperiments ?? [],
-    bestExperiment: brief?.bestExperiment ?? null,
-    summaries: brief?.summaries ?? [],
-    knowledge: brief?.knowledge ?? [],
+    currentHypothesis: context.hypothesis,
+    peerHypothesisCount: brief?.peerHypothesisCount ?? 0,
+    peerHypotheses:
+      brief?.peerHypotheses.filter(
+        (hypothesis) => hypothesis.id !== context.hypothesisId
+      ) ?? [],
+    results: brief?.results ?? { latest: [], best: null },
+    knowledge: {
+      items: brief?.knowledge.items ?? [],
+      hasMore: brief?.knowledge.hasMore ?? false,
+      moreCommand: brief?.knowledge.hasMore
+        ? `"$ONYX_WORKER_BIN" knowledge list --campaign ${JSON.stringify(context.campaignName)} --limit 50`
+        : null,
+    },
     updatedAt: brief?.updatedAt ?? null,
     stop:
       stop ??

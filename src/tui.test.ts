@@ -26,7 +26,11 @@ function workerRow(overrides: Partial<ListenWorkerRow>): ListenWorkerRow {
     lastOutputAt: null,
     startedAt: "2026-07-04T11:59:00.000Z",
     completedAt: null,
-    finalizationStatus: null,
+    attemptDelivery: null,
+    resultRefPushStatus: null,
+    terminalReasonCode: null,
+    worktreeCleanup: null,
+    terminalError: null,
     activityLogPath: "/tmp/activity.log",
     logPath: "/tmp/raw.log",
     ...overrides,
@@ -52,7 +56,11 @@ function model(overrides: Partial<ListenModel>): ListenModel {
   }
 }
 
-const size = { columns: 100, rows: 30, nowMs: Date.parse("2026-07-04T12:00:30.000Z") }
+const size = {
+  columns: 100,
+  rows: 30,
+  nowMs: Date.parse("2026-07-04T12:00:30.000Z"),
+}
 
 describe("slot rows", () => {
   test("lowestFreeSlot fills gaps before extending", () => {
@@ -135,10 +143,11 @@ describe("frame height", () => {
     }
 
     // Tall terminals still cap the table at MAX_TABLE_ROWS.
-    const tall = renderFrame(
-      model({ rows: experiments }),
-      { ...size, rows: 60, color: false }
-    ).map(stripAnsi)
+    const tall = renderFrame(model({ rows: experiments }), {
+      ...size,
+      rows: 60,
+      color: false,
+    }).map(stripAnsi)
     expect(tall.filter((line) => line.includes("exp-")).length).toBe(12)
   })
 })

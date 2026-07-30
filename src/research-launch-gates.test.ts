@@ -2,12 +2,16 @@ import { describe, expect, test } from "bun:test"
 
 import {
   canLaunchWorkerBeforeDeadline,
+  classifyDurableWorkerTerminalReason,
   compactProviderErrorSummary,
+  durableWorkerReasonIsSiteFatal,
   minimumUsefulLaunchMs,
   providerBackoffDelayMs,
   providerBackoffReasonForResult,
+  sessionCommitVisibilityGuidance,
   waitForStartupSessionReady,
 } from "./commands/research"
+import { ApiError } from "./lib/api"
 
 describe("research supervisor launch gates", () => {
   test("requires five useful minutes for built-in agents", () => {
@@ -63,14 +67,14 @@ describe("research supervisor launch gates", () => {
         status: "failed",
         startupTimedOut: true,
       })
-    ).toBe("startup_timeout")
+    ).toBeNull()
     expect(
       providerBackoffReasonForResult({
         status: "failed",
         error:
           "Claude session limit reached: out_of_credits billing overage rejected",
       })
-    ).toBe("quota_exhausted")
+    ).toBeNull()
     expect(
       providerBackoffReasonForResult({
         status: "failed",
@@ -88,7 +92,7 @@ describe("research supervisor launch gates", () => {
         status: "failed",
         error: "401 unauthorized: invalid api key",
       })
-    ).toBe("auth_error")
+    ).toBeNull()
     expect(
       providerBackoffReasonForResult({
         status: "failed",
@@ -101,6 +105,97 @@ describe("research supervisor launch gates", () => {
         error: "429",
       })
     ).toBeNull()
+  })
+
+  test("keeps terminal reasons distinct and isolates site-fatal failures", () => {
+    const base = {
+      stoppedByHarness: false,
+      cleanupFailed: false,
+      attemptDeliveryFailed: false,
+      reportedExperimentCount: 0,
+      explicitFinishReason: null,
+      timedOut: false,
+      protocolViolation: false,
+      processFailed: true,
+      providerFailureClass: "other" as const,
+      error: null,
+    }
+
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        providerFailureClass: "auth",
+      })
+    ).toBe("provider_auth")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        providerFailureClass: "rate_limit",
+      })
+    ).toBe("provider_rate_limited")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        error: "operation not permitted by sandbox",
+      })
+    ).toBe("worker_sandbox_failed")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        error: "git checkout failed",
+      })
+    ).toBe("worker_git_failed")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        processFailed: false,
+        attemptDeliveryFailed: true,
+      })
+    ).toBe("worker_report_delivery_failed")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        stoppedByHarness: true,
+        processFailed: false,
+        stopReasonCodes: ["assignment_canceled"],
+      })
+    ).toBe("assignment_canceled")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        processFailed: false,
+        reportedExperimentCount: 3,
+      })
+    ).toBe("completed_with_experiments")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        cleanupFailed: true,
+        attemptDeliveryFailed: true,
+        reportedExperimentCount: 3,
+      })
+    ).toBe("completed_with_experiments")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        processFailed: false,
+        reportedExperimentCount: 3,
+        stopReasonCodes: ["experiment_target_reached"],
+      })
+    ).toBe("session_cutoff")
+    expect(
+      classifyDurableWorkerTerminalReason({
+        ...base,
+        processFailed: false,
+        reportedExperimentCount: 3,
+        stopReasonCodes: ["deadline_reached"],
+      })
+    ).toBe("session_cutoff")
+    expect(durableWorkerReasonIsSiteFatal("worker_protocol_mismatch")).toBe(
+      true
+    )
+    expect(durableWorkerReasonIsSiteFatal("provider_rate_limited")).toBe(false)
+    expect(durableWorkerReasonIsSiteFatal("worker_git_failed")).toBe(false)
   })
 
   test("computes exponential provider backoff with deterministic jitter", () => {
@@ -117,14 +212,14 @@ describe("research supervisor launch gates", () => {
         attempt: 3,
         random: () => 0.5,
       })
-    ).toBe(135_000)
+    ).toBe(120_000)
     expect(
       providerBackoffDelayMs({
         baseMs: 600_000,
         attempt: 6,
         random: () => 1,
       })
-    ).toBe(600_000)
+    ).toBe(120_000)
   })
 
   test("sanitizes provider error summaries for status output", () => {
@@ -171,5 +266,26 @@ describe("research supervisor launch gates", () => {
       if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
       else process.env.ONYX_API_KEY = previousApiKey
     }
+  })
+
+  test("renders actionable guidance for invisible session commits", () => {
+    const error = new ApiError("POST", "/sessions", 409, {
+      error: {
+        code: "conflict",
+        message: "Commit is not visible",
+        details: {
+          reason: "assignment_commit_not_visible",
+          commitSha: "a".repeat(40),
+          hypothesisId: "40000000-0000-4000-8000-000000000001",
+        },
+      },
+    })
+
+    expect(sessionCommitVisibilityGuidance(error)).toContain(
+      "Push that exact commit"
+    )
+    expect(sessionCommitVisibilityGuidance(error)).toContain(
+      "No research session was created"
+    )
   })
 })

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import { closeSync, openSync } from "node:fs"
 import {
   appendFile,
@@ -8,66 +8,77 @@ import {
   rmdir,
   writeFile,
 } from "node:fs/promises"
-import { spawn } from "node:child_process"
-import { join } from "node:path"
+import { spawn, spawnSync } from "node:child_process"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { freemem } from "node:os"
 
 import {
   researchHypothesisPlanSchema,
   type ResearchHypothesisPlan,
 } from "../protocol"
 import { optionValues, type Args } from "../lib/args"
-import { commandExpLog, commandExpRun } from "./exp"
+import {
+  deliverTerminalExperimentAttempt,
+  ExperimentDeliveryError,
+} from "./exp"
 import {
   ApiError,
-  completeCampaign,
+  closeCampaignHypothesis,
   getCampaignOverview,
   acquireResearchWorkerLease,
   acquireResearchWorkerLeasesBatch,
   createCampaignHypothesis,
   createCampaignSession,
   createCampaignKnowledge,
+  createWorkerKnowledge,
   getResearchSessionControlState,
   getResearchSessionBrief,
+  getWorkerResearchBrief,
   getResearchSessionStateBrief,
   getResearchSessionLive,
   getResearchSessionState,
   heartbeatWorkersBatch,
   heartbeatWorker,
   listCampaignExperiments,
+  listCampaignHypotheses,
   listCampaignKnowledge,
+  listWorkerKnowledge,
   listProjectCampaigns,
   reconcileCampaign,
+  reopenCampaignHypothesis,
   renderApiTimingSummary,
   resetApiTimingSummary,
   settleResearchSession,
+  scaleCampaignSession,
   stopCampaignSession,
-  upsertCampaignSummary,
   upsertResearchPresence,
   verifyResearchCampaignGit,
   resolveProject,
   type ApiCampaign,
+  type ApiCampaignExperiment,
   type ApiHypothesis,
   type ApiResearchPresenceResponse,
   type ApiSession,
   type ApiSessionBrief,
   type ApiSessionControlState,
   type ApiSessionLive,
-  type ApiSummary,
   type ApiWorker,
   type ApiWorkerLease,
 } from "../lib/api"
 import {
+  normalizeSetupFile,
   readSetupFile,
   readValidationFile,
   setupPath,
+  setupHash,
   validationMatchesSetup,
   validationPath,
   type ResearchSetupFile,
 } from "../lib/contract"
+import { evaluationFingerprint } from "../lib/evaluation-fingerprint"
 import {
   apiBaseUrl,
-  apiKey,
   normalizeWorkerModel,
   profileNameFromArgs,
   readConfig,
@@ -75,7 +86,7 @@ import {
   type BuiltInWorkerAgent,
 } from "../lib/config"
 import { emitEvent } from "../lib/events"
-import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
+import { currentCommit, git, repoRoot } from "../lib/git"
 import {
   onyxStateDir,
   readState,
@@ -92,7 +103,17 @@ import {
   type SessionStateBriefSnapshot,
   type WorkerSessionStopGuidance,
 } from "../lib/session-state-brief"
+import {
+  readSupervisorControlStateSnapshot,
+  supervisorControlStateIsFresh,
+  writeSupervisorControlStateSnapshot,
+} from "../lib/supervisor-control-state"
 import { readWorkerRuntimeContext } from "../lib/worker-context"
+import {
+  readWorkerFinishMarker,
+  type WorkerFinishMarker,
+} from "../lib/worker-finish"
+import { readWorkerReportMarker } from "../lib/worker-reports"
 import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
 import {
   pathExists,
@@ -103,12 +124,11 @@ import {
 import { resolveOpenCodeModelId } from "../lib/opencode-models"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
 import {
-  abandonBlockedWorkflowRunsForSession,
-  assertLocalSessionSchedulerSite,
+  abandonNonterminalWorkflowRunsForWorker,
+  clearLocalAttempt,
   cacheLocalCampaign,
   cacheResearchSessionState,
   applyRemoteProjectionDeltas,
-  completeLocalCampaign,
   getLocalSessionState,
   listLocalAttempts,
   listWorkflowRuns,
@@ -129,8 +149,14 @@ import {
 } from "../lib/worker-activity"
 import {
   buildWorkerInvocation,
+  classifyProviderFailure,
   lowestFreeSlot,
+  manifestIsTerminal,
   preflightWorkerInvocation,
+  preflightProviderModel,
+  preflightWorkerProtocol,
+  providerRuntimeEnvironment,
+  resolveProviderExecutable,
   readWorkerLaunchManifests,
   workerRuntimeEnvironment,
   workerRuntimePaths,
@@ -139,15 +165,58 @@ import {
   writeWorkerCliWrapper,
   writeWorkerLaunchManifest,
   writeWorkerRuntimeContext,
-  type WorkerFinalizationManifest,
-  type WorkerFinalizationStatus,
+  type WorkerTeardownManifest,
   type WorkerInvocation,
   type WorkerLaunchManifest,
   type WorkerAgentKind,
   type WorkerCliWrapper,
   type WorkerRuntimePaths,
+  type WorkerTerminalReasonCode,
+  type ProviderFailureClass,
 } from "../lib/worker-launcher"
 import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
+
+function createWorkerCredential() {
+  return `owx_worker_v1_${randomBytes(32).toString("base64url")}`
+}
+
+function markResearchPreflightFailure(error: unknown) {
+  if (
+    !(
+      (typeof error === "object" && error !== null) ||
+      typeof error === "function"
+    )
+  )
+    return
+  try {
+    Object.defineProperty(
+      error,
+      Symbol.for("onyx.telemetry.research_preflight_failure"),
+      { value: true, configurable: true, enumerable: false }
+    )
+  } catch {
+    // Frozen/non-object throws still propagate normally without the optional marker.
+  }
+}
+
+function aggregateChildRssBytes(manifests: WorkerLaunchManifest[]) {
+  const pids = manifests
+    .filter(
+      (manifest) =>
+        manifest.status === "starting" || manifest.status === "running"
+    )
+    .map((manifest) => manifest.pid)
+    .filter((pid): pid is number => typeof pid === "number" && pid > 0)
+  if (pids.length === 0) return 0
+  const result = spawnSync("ps", ["-o", "rss=", "-p", pids.join(",")], {
+    encoding: "utf8",
+  })
+  if (result.status !== 0) return 0
+  return result.stdout
+    .split(/\s+/)
+    .filter(Boolean)
+    .reduce((total, value) => total + (Number(value) || 0) * 1024, 0)
+}
 
 const MAX_WORKER_SHUTDOWN_CUSHION_MS = 90_000
 const MIN_WORKER_SHUTDOWN_CUSHION_MS = 15_000
@@ -156,11 +225,9 @@ const BUILTIN_AGENT_MIN_USEFUL_LAUNCH_MS = 5 * 60_000
 const CUSTOM_WORKER_MIN_USEFUL_LAUNCH_MS = 30_000
 const DEFAULT_FIRST_ATTEMPT_WARNING_MS = 180_000
 const MAX_LOCAL_SUPERVISOR_WORKERS = 250
-const DEFAULT_REF_PUSH_QUEUE_CONCURRENCY = 4
 // Server-side verification is push-webhook-first; the supervisor sweep is a
 // backstop for lost webhooks, not the primary heal path.
 const GIT_VERIFICATION_BACKSTOP_INTERVAL_MS = 10 * 60_000
-const MAX_REF_PUSH_QUEUE_DEPTH = 500
 const SUPERVISOR_TELEMETRY_STALE_MS = 45_000
 const SUPERVISOR_LOG_DIR = "supervisor-logs"
 
@@ -187,27 +254,31 @@ async function frozenWorkerApiEnv(args: Args) {
   } catch {
     // Leave API URL unset only for low-level local debugging.
   }
-  try {
-    env.ONYX_API_KEY = await apiKey(args)
-  } catch {
-    // Leave auth unset when the caller is intentionally offline.
-  }
   return env
 }
 
-type SessionFinalizationStatus = ApiSession["finalizationStatus"]
+type SessionCleanupStatus = ApiSession["cleanupStatus"]
 type SessionTerminalReason =
   | "experiment_target_reached"
   | "deadline_reached"
-  | "stop_requested"
+  | "user_stopped"
   | "provider_capacity_exhausted"
-  | "no_active_hypotheses"
+  | "all_hypotheses_closed"
+  | "supervisor_failed"
+  | "abandoned"
   | "failed"
 type ProviderLaunchFailure = {
   at: string
   reason: string
   workerId: string | null
   hypothesisId: string
+  errorSummary: string | null
+}
+type NoProgressWorkerExit = {
+  at: string
+  workerId: string | null
+  hypothesisId: string
+  status: HypothesisRunResult["status"]
   errorSummary: string | null
 }
 type SupervisorRuntimeTelemetry = NonNullable<
@@ -220,23 +291,6 @@ type WorkerActivityEvent = {
   summary?: string
   metadata?: Record<string, unknown>
 }
-
-type RefPushQueueJob = {
-  reason: string
-  cwd: string
-  sourceRef: string
-  targetRef: string
-  manifest?: WorkerLaunchManifest | null
-  resolve: (result: ProcessResult) => void
-}
-
-type WorkerBranchPusher = (input: {
-  cwd: string
-  sourceRef: string
-  targetRef: string
-  reason: string
-  manifest?: WorkerLaunchManifest | null
-}) => Promise<ProcessResult>
 
 async function appendWorkerActivityEvent(
   manifest: WorkerLaunchManifest,
@@ -254,11 +308,21 @@ async function appendWorkerActivityEvent(
     ...(event.summary ? { summary: event.summary } : {}),
     ...(event.metadata ? { metadata: event.metadata } : {}),
   }
-  await appendFile(
-    manifest.activityJsonlPath,
-    `${JSON.stringify(record)}\n`,
-    "utf8"
-  ).catch(() => {})
+  let serialized = JSON.stringify(record)
+  const originalBytes = Buffer.byteLength(serialized)
+  if (originalBytes > 8 * 1024) {
+    serialized = JSON.stringify({
+      ...record,
+      ...(event.summary ? { summary: event.summary.slice(0, 4000) } : {}),
+      metadata: {
+        truncated: true,
+        originalBytes,
+      },
+    })
+  }
+  await appendFile(manifest.activityJsonlPath, `${serialized}\n`, "utf8").catch(
+    () => {}
+  )
 }
 
 const PIPED_ONYX_MUTATION_COMMAND =
@@ -461,25 +525,6 @@ export function canLaunchWorkerBeforeDeadline({
   return usefulMs >= minimumUsefulLaunchMs(agentKind)
 }
 
-async function hypothesisPlansOption(args: Args) {
-  const json = args.options["hypotheses"]
-  if (!json) return undefined
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(json)
-  } catch (error) {
-    throw new Error(
-      `--hypotheses must be an inline JSON array, for example --hypotheses '[{"focus":"...","statement":"..."}]'. ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-  }
-  if (!Array.isArray(parsed)) {
-    throw new Error("--hypotheses must be an inline JSON array")
-  }
-  return parsed.map((plan) => researchHypothesisPlanSchema.parse(plan))
-}
-
 const INLINE_HYPOTHESIS_PLAN_OPTIONS = [
   "focus",
   "hypothesis",
@@ -523,7 +568,7 @@ function setupAwareHypothesisDefaults({
     scope,
     protectedPaths,
     startingPoints: uniqueStrings([
-      "Review recent experiments, hypothesis summaries, and shared knowledge before editing.",
+      "Review recent experiments, experiment notes, and shared knowledge before editing.",
       ...scope,
     ]),
     successSignals: [
@@ -690,10 +735,6 @@ async function resolveWorkerSettings({
   return { agentKind, workerModel }
 }
 
-function workerOptions({ agentKind, workerModel }: WorkerSettings) {
-  return ` --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}`
-}
-
 function workerModelMetadata(workerModel: string | null) {
   return workerModel ? { workerModel } : {}
 }
@@ -754,16 +795,6 @@ export function summarizeWorkerOutput(result: StreamingProcessResult) {
   return raw ? raw.slice(-1200) : null
 }
 
-const SUMMARY_KINDS = [
-  "campaign_brief",
-  "session_brief",
-  "hypothesis_summary",
-  "transfer_brief",
-  "setup_notes",
-] as const
-
-type SummaryKind = ApiSummary["summaryKind"]
-
 type ResearchLaunchSuggestion =
   | {
       kind: "launch_worker"
@@ -779,18 +810,6 @@ type ResearchLaunchSuggestion =
       sessionId: string
       reason: string
     }
-
-function summaryKindOption(args: Args, fallback: SummaryKind): SummaryKind {
-  const kind = args.options.kind ?? fallback
-  if (!SUMMARY_KINDS.includes(kind as SummaryKind)) {
-    const hint =
-      kind === "hypothesis" ? " Did you mean hypothesis_summary?" : ""
-    throw new Error(
-      `--kind must be campaign_brief, session_brief, hypothesis_summary, transfer_brief, or setup_notes.${hint}`
-    )
-  }
-  return kind as SummaryKind
-}
 
 function workerIsActive(worker: Pick<ApiWorker, "status">) {
   return ["registered", "running"].includes(worker.status)
@@ -817,6 +836,16 @@ function workerStatusFromManifest(
   return manifest.status === "starting" ? "registered" : "running"
 }
 
+function durableTeardownResultCommit(
+  teardown: WorkerTeardownManifest | null | undefined
+) {
+  return teardown &&
+    (teardown.attemptDelivery === "delivered" ||
+      teardown.attemptDelivery === "duplicate")
+    ? teardown.resultCommitSha
+    : null
+}
+
 function apiWorkerFromManifest({
   manifest,
   campaignId,
@@ -840,7 +869,7 @@ function apiWorkerFromManifest({
     currentExperimentId: null,
     phase: manifest.status,
     progressMessage: null,
-    gitLabel: manifest.finalization?.commitSha ?? null,
+    gitLabel: durableTeardownResultCommit(manifest.teardown),
     lastSeenAt:
       manifest.lastOutputAt ??
       manifest.completedAt ??
@@ -890,12 +919,11 @@ async function reconcileTerminalWorkerManifests({
       event: "manifest_reconciled",
       progressMessage: `Worker manifest shows ${status}`,
       gitLabel:
-        manifest.finalization?.commitSha ??
-        manifest.finalization?.measurementBaseCommitSha ??
-        worker.gitLabel,
+        durableTeardownResultCommit(manifest.teardown) ?? worker.gitLabel,
       metadata: {
         manifestPath: manifest.manifestPath,
         reconciledFrom: "worker-manifest",
+        ...(manifest.teardown ? { terminal: manifest.teardown } : {}),
       },
     })
     repaired += 1
@@ -980,170 +1008,22 @@ function launchSuggestionsForSession({
   return []
 }
 
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-
-function optionalUuid(value: string | undefined, label: string) {
-  if (value === undefined) return undefined
-  if (!UUID_PATTERN.test(value)) {
-    throw new Error(`${label} must be a UUID, not "${value}".`)
-  }
-  return value
-}
-
-function createRefPushQueue({ args }: { args: Args }) {
-  const maxConcurrency = positiveIntegerOption(
-    args,
-    "ref-push-concurrency",
-    DEFAULT_REF_PUSH_QUEUE_CONCURRENCY
-  )
-  const queue: RefPushQueueJob[] = []
-  const idleWaiters = new Set<() => void>()
-  let active = 0
-  let stopped = false
-
-  const depth = () => queue.length + active
-  const notifyIdle = () => {
-    if (depth() > 0) return
-    for (const resolve of idleWaiters) resolve()
-    idleWaiters.clear()
-  }
-  const emitJobEvent = async (
-    job: RefPushQueueJob,
-    summary: string,
-    metadata: Record<string, unknown>
-  ) => {
-    if (!job.manifest) return
-    await appendWorkerActivityEvent(job.manifest, {
-      type: "push_result",
-      phase: "pushing",
-      summary,
-      metadata: {
-        reason: job.reason,
-        ...metadata,
-      },
-    })
-  }
-  const failedProcessResult = (message: string): ProcessResult => ({
-    code: 1,
-    stdout: "",
-    stderr: message,
-    timedOut: false,
-  })
-  const runPushRefJob = async (job: RefPushQueueJob) => {
-    try {
-      const result = await gitResult(
-        ["push", "origin", `${job.sourceRef}:${job.targetRef}`],
-        job.cwd
-      )
-      if (result.code === 0 && !result.timedOut) {
-        await emitJobEvent(job, "Git ref pushed", {
-          ref: job.targetRef,
-        })
-      } else {
-        await emitJobEvent(job, "Git ref push failed", {
-          ref: job.targetRef,
-          error: result.stderr.trim() || result.stdout.trim(),
-        })
-      }
-      job.resolve(result)
-    } catch (error) {
-      await emitJobEvent(job, "Git ref push failed", {
-        ref: job.targetRef,
-        error: errorMessage(error),
-      })
-      job.resolve(failedProcessResult(errorMessage(error)))
-    }
-  }
-  const runJob = async (job: RefPushQueueJob) => {
-    await runPushRefJob(job).finally(() => {
-      active -= 1
-      pump()
-      notifyIdle()
-    })
-  }
-  const pump = () => {
-    while (active < maxConcurrency && queue.length > 0) {
-      const job = queue.shift()!
-      active += 1
-      void runJob(job)
-    }
-  }
-  const enqueue = (job: RefPushQueueJob) => {
-    if (stopped) return null
-    if (depth() >= MAX_REF_PUSH_QUEUE_DEPTH) return null
-    queue.push(job)
-    pump()
-    return depth()
-  }
-  const waitForIdle = async (timeoutMs: number) => {
-    const deadline = Date.now() + timeoutMs
-    while (depth() > 0 && Date.now() < deadline) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, Math.max(1, deadline - Date.now()))
-        idleWaiters.add(() => {
-          clearTimeout(timer)
-          resolve()
-        })
-      })
-    }
-    return depth()
-  }
-
-  return {
-    pushRef({
-      cwd,
-      sourceRef,
-      targetRef,
-      reason,
-      manifest,
-    }: {
-      cwd: string
-      sourceRef: string
-      targetRef: string
-      reason: string
-      manifest?: WorkerLaunchManifest | null
-    }) {
-      return new Promise<ProcessResult>((resolve) => {
-        const accepted = enqueue({
-          reason,
-          cwd,
-          sourceRef,
-          targetRef,
-          manifest,
-          resolve,
-        })
-        if (accepted === null) {
-          resolve(failedProcessResult("ref push queue rejected job"))
-        }
-      })
-    },
-    depth,
-    waitForIdle,
-    async drain(timeoutMs: number) {
-      stopped = true
-      return waitForIdle(timeoutMs)
-    },
-    stop() {
-      stopped = true
-    },
-  }
-}
-
 function createPresenceSupervisor({
   root,
   args,
   sessionId,
   supervisorRunId,
   intervalMs,
-  leaseTokensByWorkerId,
+  maxConcurrency,
+  workerCredentialsByWorkerId,
 }: {
   root: string
   args: Args
   sessionId: string
   supervisorRunId: string
   intervalMs: number
-  leaseTokensByWorkerId: Map<string, string>
+  maxConcurrency: number
+  workerCredentialsByWorkerId: Map<string, string>
 }) {
   const lastSent = new Map<string, string>()
   let sequence = 0
@@ -1151,12 +1031,16 @@ function createPresenceSupervisor({
   let lastLeaseRenewalAt = 0
   let running: Promise<void> | null = null
   let stopped = false
+  let memoryWarningEmitted = false
   let timer: ReturnType<typeof setInterval> | null = null
 
   type PresenceSnapshotOptions = {
     forceFull?: boolean
     terminal?: boolean
+    runtimeStatus?: "starting" | "active" | "draining" | "complete" | "failed"
   }
+
+  let cleanupStartedAt: string | null = null
 
   const normalizeSnapshotOptions = (
     options: boolean | PresenceSnapshotOptions = {}
@@ -1196,6 +1080,11 @@ function createPresenceSupervisor({
     const options = normalizeSnapshotOptions(rawOptions)
     const forceFull = options.forceFull ?? false
     const terminal = options.terminal ?? false
+    const runtimeStatus =
+      options.runtimeStatus ?? (terminal ? "complete" : "active")
+    if (runtimeStatus === "draining" && !cleanupStartedAt) {
+      cleanupStartedAt = new Date().toISOString()
+    }
     if (args.options.offline === "true") return
     const state = await getLocalSessionState(root, sessionId)
     const cliState = await readState(root).catch(() => null)
@@ -1212,6 +1101,26 @@ function createPresenceSupervisor({
       )
     )
     const observedAt = new Date().toISOString()
+    const supervisorRssBytes = process.memoryUsage().rss
+    const childRssBytes = aggregateChildRssBytes(manifests)
+    const availableHostMemoryBytes = freemem()
+    const activeChildCount = manifests.filter(
+      (manifest) =>
+        manifest.status === "starting" || manifest.status === "running"
+    ).length
+    const averageChildRssBytes =
+      activeChildCount > 0 ? childRssBytes / activeChildCount : 0
+    const projectedMemoryBytes =
+      supervisorRssBytes + averageChildRssBytes * maxConcurrency
+    if (
+      !memoryWarningEmitted &&
+      projectedMemoryBytes > availableHostMemoryBytes * 0.7
+    ) {
+      memoryWarningEmitted = true
+      console.warn(
+        `Research processes are using more than 70% of currently available host memory. Reduce --max-concurrency if the host becomes unstable.`
+      )
+    }
     const sessionRuntimeState = cliState?.sessions?.[sessionId]
     const supervisorTelemetry = freshSupervisorTelemetry(
       sessionRuntimeState?.supervisor
@@ -1252,13 +1161,6 @@ function createPresenceSupervisor({
             status: snapshotStatus({ worker, manifest, latest }),
           })
         }).length
-    const unmeasuredSalvageCount = manifests.filter(
-      (manifest) =>
-        manifest.finalization?.salvaged &&
-        manifest.finalization.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        )
-    ).length
     const workerSnapshots = workersForPresence.map((worker) => {
       const manifest = manifestByWorker.get(worker.id)
       const latest = manifest ? latestByWorker.get(worker.id) : null
@@ -1273,8 +1175,7 @@ function createPresenceSupervisor({
             manifestPath: manifest.manifestPath,
             latestObservedAt: latest?.at ?? null,
             warnings: manifest.warnings ?? [],
-            finalizationStatus:
-              manifest.finalization?.finalizationStatus ?? null,
+            teardown: manifest.teardown,
           }
         : {}
       const status = snapshotStatus({ worker, manifest, latest })
@@ -1283,7 +1184,10 @@ function createPresenceSupervisor({
         status,
         phase: latest?.phase ?? manifest?.status ?? worker.phase,
         progressMessage: latest?.progressMessage ?? worker.progressMessage,
-        gitLabel: worker.gitLabel ?? manifest?.finalization?.commitSha ?? null,
+        gitLabel:
+          worker.gitLabel ??
+          durableTeardownResultCommit(manifest?.teardown) ??
+          null,
         lastOutputAt: manifest?.lastOutputAt ?? null,
         activitySummary: manifest
           ? activitySummaryForManifest(manifest, latest)
@@ -1326,13 +1230,21 @@ function createPresenceSupervisor({
           sequence,
           sessionId,
           site: {
+            runtimeStatus,
+            cleanupStartedAt:
+              runtimeStatus === "draining" || terminal
+                ? (cleanupStartedAt ?? observedAt)
+                : null,
+            cleanupCompletedAt: terminal ? observedAt : null,
+            cleanupSummary: terminal
+              ? { activeProcessCount: 0, workerCount: workerSnapshots.length }
+              : {},
             activeWorkerCount,
             launchedWorkerCount: workerSnapshots.length,
             failedLaunchCount,
             uploadedWorkerCount: selectedWorkers.length,
             unchangedWorkerCount,
             droppedOrDeferredWorkerCount,
-            unmeasuredSalvageCount,
             providerBackoff: terminal ? null : providerBackoff,
             ignoredPresence:
               cliState?.sessions?.[sessionId]?.ignoredPresence ?? {},
@@ -1341,6 +1253,11 @@ function createPresenceSupervisor({
               splitIndex: index + 1,
               splitCount,
               terminal,
+              supervisorRssBytes,
+              childRssBytes,
+              availableHostMemoryBytes,
+              projectedMemoryBytes,
+              noProgressBreaker: supervisorTelemetry?.noProgressBreaker ?? null,
             },
           },
           workers: chunk.map((worker) => worker.snapshot),
@@ -1416,7 +1333,7 @@ function createPresenceSupervisor({
     if (shouldRenewLeases) {
       const heartbeats = workerSnapshots
         .flatMap((worker) => {
-          const token = leaseTokensByWorkerId.get(worker.snapshot.id)
+          const token = workerCredentialsByWorkerId.get(worker.snapshot.id)
           const durable = workerById.get(worker.snapshot.id)
           if (
             !token ||
@@ -1428,10 +1345,7 @@ function createPresenceSupervisor({
           return [
             {
               workerId: worker.snapshot.id,
-              leaseToken: token,
               status: "running" as const,
-              sessionId,
-              hypothesisId: durable.hypothesisId,
               phase: worker.snapshot.phase ?? "running",
               event: "supervisor_batch_heartbeat",
               progressMessage: worker.snapshot.progressMessage ?? null,
@@ -1446,7 +1360,10 @@ function createPresenceSupervisor({
         .slice(0, 500)
       if (heartbeats.length > 0) {
         lastLeaseRenewalAt = Date.now()
-        const response = await heartbeatWorkersBatch({ heartbeats }, args)
+        const response = await heartbeatWorkersBatch(
+          { sessionId, siteId, supervisorRunId, heartbeats },
+          args
+        )
         const failures = response.results.filter((result) => !result.ok)
         if (failures.length > 0) {
           console.warn(
@@ -1477,9 +1394,11 @@ function createPresenceSupervisor({
     return running
   }
 
+  const jitteredIntervalMs =
+    intervalMs + Math.floor(Math.random() * Math.max(1, intervalMs * 0.2))
   timer = setInterval(() => {
     if (!stopped) void run()
-  }, intervalMs)
+  }, jitteredIntervalMs)
 
   return {
     request() {
@@ -1488,10 +1407,10 @@ function createPresenceSupervisor({
     async flush(options: PresenceSnapshotOptions = {}) {
       await run({ ...options, forceFull: true }).catch(() => {})
     },
-    async stop() {
+    async stop(options: PresenceSnapshotOptions = {}) {
       stopped = true
       if (timer) clearInterval(timer)
-      await run(true).catch(() => {})
+      await run({ ...options, forceFull: true }).catch(() => {})
     },
   }
 }
@@ -1522,21 +1441,20 @@ export async function waitForStartupSessionReady({
   )
 }
 
-type SessionFinalizationComputation = {
-  status: SessionFinalizationStatus
+type SessionCleanupComputation = {
+  status: SessionCleanupStatus
   reasons: string[]
   live: ApiSessionLive | null
 }
 
-async function computeSessionFinalizationStatus({
+async function computeSessionCleanupStatus({
   root,
   sessionId,
 }: {
   root: string
   sessionId: string
-}): Promise<SessionFinalizationComputation> {
-  const failedReasons: string[] = []
-  const incompleteReasons: string[] = []
+}): Promise<SessionCleanupComputation> {
+  const cleanupFailures: string[] = []
   const [manifests] = await Promise.all([
     readWorkerLaunchManifests(root, sessionId).catch(() => []),
   ])
@@ -1545,52 +1463,33 @@ async function computeSessionFinalizationStatus({
     const batch = manifests.slice(index, index + 25)
     if (manifests.length > 25) {
       console.log(
-        `finalization check: workers ${index + 1}-${index + batch.length}/${manifests.length}`
+        `cleanup check: workers ${index + 1}-${index + batch.length}/${manifests.length}`
       )
     }
     for (const manifest of batch) {
       if (manifest.status === "starting" || manifest.status === "running") {
-        incompleteReasons.push(
+        cleanupFailures.push(
           `worker ${manifest.workerId} still ${manifest.status}`
         )
       }
-      const finalization = manifest.finalization
-      if (!finalization) {
+      const teardown = manifest.teardown
+      if (!teardown) {
         if (
           manifest.status === "completed" ||
           manifest.status === "failed" ||
           manifest.status === "stopped"
         ) {
-          incompleteReasons.push(
-            `worker ${manifest.workerId} has no finalization result`
+          cleanupFailures.push(
+            `worker ${manifest.workerId} has no teardown result`
           )
         }
         continue
       }
-      if (finalization.finalizationStatus === "failed") {
-        failedReasons.push(
-          `worker ${manifest.workerId} finalization failed${
-            finalization.error ? `: ${finalization.error}` : ""
+      if (teardown.worktreeCleanup === "failed") {
+        cleanupFailures.push(
+          `worker ${manifest.workerId} worktree cleanup failed${
+            teardown.error ? `: ${teardown.error}` : ""
           }`
-        )
-        continue
-      }
-      const cleanFinalizationStatus =
-        finalization.finalizationStatus === "measured_and_logged" ||
-        finalization.finalizationStatus === "already_logged" ||
-        finalization.finalizationStatus === "none" ||
-        finalization.finalizationStatus === "discarded_after_completion"
-      const hasUnresolvedSalvage =
-        finalization.finalizationStatus.startsWith("salvaged_unmeasured") ||
-        (!cleanFinalizationStatus && finalization.unloggedCommitCount > 0)
-      if (hasUnresolvedSalvage) {
-        incompleteReasons.push(
-          `worker ${manifest.workerId} has unlogged or salvaged work`
-        )
-      }
-      if (finalization.rootDriftStatus === "dirty") {
-        incompleteReasons.push(
-          `worker ${manifest.workerId} detected root drift`
         )
       }
     }
@@ -1598,33 +1497,30 @@ async function computeSessionFinalizationStatus({
 
   const live: ApiSessionLive | null = null
 
-  const reasons = failedReasons.length > 0 ? failedReasons : incompleteReasons
+  const reasons = cleanupFailures
   return {
-    status:
-      failedReasons.length > 0
-        ? "failed"
-        : incompleteReasons.length > 0
-          ? "incomplete"
-          : "complete",
+    status: cleanupFailures.length > 0 ? "failed" : "complete",
     reasons,
     live,
   }
 }
 
-async function writeRemoteSessionFinalization({
+async function writeRemoteSessionCleanup({
   sessionId,
   campaignId,
   status,
-  finalization,
+  cleanup,
   terminalReason,
+  metadata,
   args,
   requireOnline = false,
 }: {
   sessionId: string
   campaignId: string
   status: "completed" | "failed" | "stopped"
-  finalization: SessionFinalizationComputation
+  cleanup: SessionCleanupComputation
   terminalReason?: SessionTerminalReason | null
+  metadata?: Record<string, unknown>
   args: Args
   requireOnline?: boolean
 }) {
@@ -1633,15 +1529,20 @@ async function writeRemoteSessionFinalization({
       sessionId,
       {
         campaignId,
-        status,
-        finalizationStatus: finalization.status,
+        endReason:
+          terminalReason === "provider_capacity_exhausted"
+            ? "provider_capacity_exhausted"
+            : status === "failed"
+              ? "failed"
+              : "user_stopped",
         reason:
-          finalization.reasons.length > 0
-            ? finalization.reasons.slice(0, 5).join("; ")
+          cleanup.reasons.length > 0
+            ? cleanup.reasons.slice(0, 5).join("; ")
             : "research session finalized",
         metadata: {
           ...(terminalReason ? { terminalReason } : {}),
-          finalizationReasons: finalization.reasons,
+          cleanupReasons: cleanup.reasons,
+          ...metadata,
         },
       },
       args
@@ -1649,7 +1550,7 @@ async function writeRemoteSessionFinalization({
   } catch (error) {
     if (requireOnline) throw error
     console.warn(
-      `Remote session finalization was not written: ${errorMessage(error)}`
+      `Remote session cleanup was not written: ${errorMessage(error)}`
     )
     return null
   }
@@ -1770,7 +1671,7 @@ async function assertLocalSetupReady(root: string, projectPath: string) {
       [
         "Setup validation has blocking failure(s):",
         ...failing.map((check) => `- ${check.id}: ${check.message}`),
-        "Run `onyx setup validate`, fix the listed setup files/tools, and commit the setup surface before `onyx research start`.",
+        "Run `onyx setup validate`, fix the listed setup files/tools, and commit the setup surface before `onyx research run`.",
       ].join("\n")
     )
   }
@@ -1825,16 +1726,15 @@ async function recheckCheapSetupReadiness({
 
 async function ensureWorktree({
   root,
-  hypothesis,
+  startingCommitSha,
   sessionId,
   workerId,
 }: {
   root: string
-  hypothesis: ApiHypothesis
+  startingCommitSha: string
   sessionId: string
   workerId: string
 }) {
-  const branch = workerBranchName({ sessionId, workerId })
   const dir = join(await onyxStateDir(root), "worktrees", sessionId, workerId)
   if (!(await pathExists(dir))) {
     await withOnyxLock(root, "git-worktree", async () => {
@@ -1842,20 +1742,15 @@ async function ensureWorktree({
       await mkdir(join(await onyxStateDir(root), "worktrees", sessionId), {
         recursive: true,
       })
-      await git(
-        ["worktree", "add", "-B", branch, dir, hypothesis.baseCommitSha],
-        root
-      )
+      await git(["worktree", "add", "--detach", dir, startingCommitSha], root)
     })
   }
-  return { dir, branch }
+  return { dir }
 }
 
 /**
- * Removes a finished worker's worktree so a 100-worker session does not
- * leave 100 working trees on disk. The worker branch and any pushed refs
- * survive removal, so salvage/recovery evidence is unaffected. Set
- * ONYX_KEEP_WORKTREES=1 to keep worktrees for debugging.
+ * Removes a finished worker's disposable worktree. Experiment refs are the
+ * only durable Git output; incomplete workspace state is intentionally lost.
  */
 async function removeWorkerWorktree({
   root,
@@ -1866,72 +1761,16 @@ async function removeWorkerWorktree({
   sessionId: string
   workerId: string
 }) {
-  if (process.env.ONYX_KEEP_WORKTREES === "1") return
   const sessionDir = join(await onyxStateDir(root), "worktrees", sessionId)
   const dir = join(sessionDir, workerId)
   if (!(await pathExists(dir))) return
   await withOnyxLock(root, "git-worktree", async () => {
-    try {
-      await git(["worktree", "remove", "--force", dir], root)
-    } catch {
-      // Leave the directory for the next prune rather than failing the
-      // worker lifecycle over cleanup.
-      await git(["worktree", "prune"], root).catch(() => {})
-    }
+    await git(["worktree", "remove", "--force", dir], root)
+    await git(["worktree", "prune"], root).catch(() => {})
     // Last worker out removes the session directory; rmdir refuses to
     // delete a non-empty directory, so earlier workers no-op here.
     await rmdir(sessionDir).catch(() => {})
   })
-}
-
-function workerBranchName({
-  sessionId,
-  workerId,
-}: {
-  sessionId: string
-  workerId: string
-}) {
-  return [
-    "onyx",
-    safeBranchSegment(sessionId),
-    safeBranchSegment(workerId),
-  ].join("/")
-}
-
-async function commitIfNeeded(worktree: string, hypothesis: ApiHypothesis) {
-  const status = await git(["status", "--porcelain"], worktree)
-  if (!status.trim()) {
-    return { commitSha: await currentCommit(worktree), changed: false }
-  }
-  await git(["add", "-A"], worktree)
-  await git(
-    ["commit", "-m", `onyx: ${hypothesis.name} research attempt`],
-    worktree
-  )
-  return { commitSha: await currentCommit(worktree), changed: true }
-}
-
-async function localExperimentCommitSetFor({
-  root,
-  campaignName,
-  hypothesisId,
-}: {
-  root: string
-  campaignName: string
-  hypothesisId: string
-}) {
-  const attempts = await listLocalAttempts(root).catch(() => [])
-  const commits = new Set<string>()
-  for (const record of attempts) {
-    if (
-      record.campaignName === campaignName &&
-      record.hypothesisId === hypothesisId &&
-      record.resultCommitSha
-    ) {
-      commits.add(record.resultCommitSha)
-    }
-  }
-  return commits
 }
 
 async function hasWorkerLoggedAttempt({
@@ -1945,129 +1784,6 @@ async function hasWorkerLoggedAttempt({
   return attempts.some((record) => record.workerId === workerId)
 }
 
-async function findRemoteWorkerExperimentForCommit({
-  campaignId,
-  sessionId,
-  workerId,
-  resultCommitSha,
-  args,
-}: {
-  campaignId: string
-  sessionId: string
-  workerId: string
-  resultCommitSha: string
-  args: Args
-}) {
-  const page = await listCampaignExperiments(campaignId, args, {
-    limit: 5,
-    sessionId,
-    workerId,
-    resultCommitSha,
-  })
-  return (
-    page.items.find(
-      (experiment) =>
-        experiment.sessionId === sessionId &&
-        experiment.workerId === workerId &&
-        experiment.resultCommitSha === resultCommitSha
-    ) ?? null
-  )
-}
-
-type FinalizationCommitAnalysis =
-  | {
-      kind: "already_logged"
-      unloggedCommits: string[]
-      measurementBaseCommitSha: null
-      reason: null
-    }
-  | {
-      kind: "single_unlogged_head"
-      unloggedCommits: string[]
-      measurementBaseCommitSha: string
-      reason: null
-    }
-  | {
-      kind: "salvage_only"
-      unloggedCommits: string[]
-      measurementBaseCommitSha: null
-      reason: string
-    }
-
-async function analyzeFinalizationCommits({
-  worktree,
-  baseCommitSha,
-  headCommitSha,
-  loggedCommits,
-}: {
-  worktree: string
-  baseCommitSha: string
-  headCommitSha: string
-  loggedCommits: Set<string>
-}): Promise<FinalizationCommitAnalysis> {
-  if (loggedCommits.has(headCommitSha)) {
-    return {
-      kind: "already_logged",
-      unloggedCommits: [],
-      measurementBaseCommitSha: null,
-      reason: null,
-    }
-  }
-
-  let commits: string[]
-  try {
-    commits = (
-      await git(
-        ["rev-list", "--reverse", `${baseCommitSha}..${headCommitSha}`],
-        worktree
-      )
-    )
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-  } catch (error) {
-    return {
-      kind: "salvage_only",
-      unloggedCommits: [headCommitSha],
-      measurementBaseCommitSha: null,
-      reason: `Unable to inspect commits between hypothesis base and worker HEAD: ${errorMessage(error)}`,
-    }
-  }
-
-  const unloggedCommits = commits.filter((commit) => !loggedCommits.has(commit))
-  if (unloggedCommits.length === 1 && unloggedCommits[0] === headCommitSha) {
-    const parentLine = await git(
-      ["rev-list", "--parents", "-n", "1", headCommitSha],
-      worktree
-    )
-    const [, parentCommitSha] = parentLine.trim().split(/\s+/)
-    if (!parentCommitSha) {
-      return {
-        kind: "salvage_only",
-        unloggedCommits,
-        measurementBaseCommitSha: null,
-        reason: "Unable to find a parent commit for the unlogged worker HEAD.",
-      }
-    }
-    return {
-      kind: "single_unlogged_head",
-      unloggedCommits,
-      measurementBaseCommitSha: parentCommitSha,
-      reason: null,
-    }
-  }
-
-  return {
-    kind: "salvage_only",
-    unloggedCommits,
-    measurementBaseCommitSha: null,
-    reason:
-      unloggedCommits.length === 0
-        ? "Worker HEAD was not locally logged, but no unlogged commit range could be measured safely."
-        : `Worker HEAD contains ${unloggedCommits.length} unlogged commits; finalization only measures exactly one unlogged HEAD commit.`,
-  }
-}
-
 async function withoutProcessExitCode<T>(fn: () => Promise<T>) {
   const previous = process.exitCode
   process.exitCode = undefined
@@ -2078,317 +1794,244 @@ async function withoutProcessExitCode<T>(fn: () => Promise<T>) {
   }
 }
 
-export async function finalizeHypothesisAttempt({
+function boundedText(value: string, limit: number) {
+  return value.length <= limit ? value : `${value.slice(0, limit - 3)}...`
+}
+
+async function workspaceDiagnostics({
+  worktree,
+  startingCommitSha,
+}: {
+  worktree: string
+  startingCommitSha: string
+}) {
+  const headCommitSha = await currentCommit(worktree).catch(() => null)
+  const commitsAhead = headCommitSha
+    ? Number(
+        await git(
+          ["rev-list", "--count", `${startingCommitSha}..${headCommitSha}`],
+          worktree
+        ).catch(() => "0")
+      ) || 0
+    : 0
+  const status = await git(["status", "--porcelain"], worktree).catch(() => "")
+  const changedPaths = status
+    .split("\n")
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean)
+    .slice(0, 50)
+  const committedDiff = headCommitSha
+    ? await git(
+        ["diff", "--stat", startingCommitSha, headCommitSha],
+        worktree
+      ).catch(() => "")
+    : ""
+  const dirtyDiff = await git(["diff", "--stat", "HEAD"], worktree).catch(
+    () => ""
+  )
+  const diffStat = boundedText(
+    [committedDiff.trim(), dirtyDiff.trim()].filter(Boolean).join("\n"),
+    4096
+  )
+  return {
+    headCommitSha,
+    commitsAhead,
+    dirty: Boolean(status.trim()),
+    changedPaths,
+    diffStat: diffStat || null,
+  }
+}
+
+export async function teardownHypothesisAttempt({
   root,
   worktree,
+  projectPath,
   campaign,
+  setup,
   hypothesis,
+  startingCommitSha,
   sessionId,
+  assignmentId,
   workerId,
-  workerBranch,
+  workerCredential,
   activityManifest,
   args,
-  workerFailed,
-  pushWorkerBranch,
+  providerExitCode,
+  providerSignal,
+  timedOut,
+  startupTimedOut,
+  phase,
+  providerError,
+  reasonCode,
 }: {
   root: string
   worktree: string
+  projectPath: string
   campaign: ApiCampaign
+  setup: ResearchSetupFile
   hypothesis: ApiHypothesis
+  startingCommitSha: string
   sessionId: string
+  assignmentId: string
   workerId: string
-  workerBranch: string
+  workerCredential: string
   activityManifest?: WorkerLaunchManifest | null
   args: Args
-  workerFailed: boolean
-  pushWorkerBranch: WorkerBranchPusher
-}): Promise<WorkerFinalizationManifest> {
-  const manifest: WorkerFinalizationManifest = {
-    attempted: false,
-    salvaged: workerFailed,
-    finalizationStatus: "none",
-    commitSha: null,
-    measurementBaseCommitSha: null,
-    unloggedCommitCount: 0,
-    workerBranchPushStatus: "not_attempted",
-    rootDriftStatus: "not_checked",
+  providerExitCode: number | null
+  providerSignal: string | null
+  timedOut: boolean
+  startupTimedOut: boolean
+  phase: "completed" | "failed" | "stopped"
+  providerError: string | null
+  reasonCode: WorkerTerminalReasonCode
+}): Promise<WorkerTeardownManifest> {
+  const diagnostics = await workspaceDiagnostics({
+    worktree,
+    startingCommitSha,
+  })
+  const manifest: WorkerTeardownManifest = {
+    attemptDelivery: "none",
+    runRef: null,
+    resultCommitSha: null,
+    resultRefPushStatus: "not_attempted",
+    resultRefPushError: null,
+    ...diagnostics,
+    worktreeCleanup: "pending",
+    providerExitCode,
+    providerSignal,
+    timedOut,
+    startupTimedOut,
+    phase,
+    providerError: providerError ? boundedText(providerError, 1000) : null,
+    reasonCode,
     error: null,
   }
 
   try {
     const warnings = await recordWorkerHarnessWarnings(activityManifest)
     if (warnings.length > 0) manifest.warnings = warnings
-    const headBefore = await currentCommit(worktree)
-    const dirty = (await git(["status", "--porcelain"], worktree)).trim()
-    const hasResult =
-      (Boolean(dirty) && dirty.length > 0) ||
-      headBefore !== hypothesis.baseCommitSha
-    if (!hasResult) {
-      const rootStatus = await mainWorktreeStatus(root)
-      manifest.rootDriftStatus = rootStatus ? "dirty" : "clean"
-      if (rootStatus) {
-        manifest.error = `main checkout changed during worker run:\n${rootStatus}`
-      }
-      return manifest
-    }
-
-    manifest.attempted = true
-    const commit = await commitIfNeeded(worktree, hypothesis)
-    manifest.commitSha = commit.commitSha
-
-    const remoteHeadExperiment = await findRemoteWorkerExperimentForCommit({
-      campaignId: campaign.id,
+    await abandonNonterminalWorkflowRunsForWorker({
+      root,
       sessionId,
       workerId,
-      resultCommitSha: commit.commitSha,
-      args,
-    }).catch(() => null)
-    if (remoteHeadExperiment) {
-      manifest.unloggedCommitCount = 0
-      manifest.measurementBaseCommitSha = null
-      manifest.finalizationStatus = "already_logged"
-      manifest.salvaged = false
-    }
-
-    if (manifest.finalizationStatus === "none") {
-      const loggedCommits = await localExperimentCommitSetFor({
-        root,
-        campaignName: campaign.name,
-        hypothesisId: hypothesis.id,
-      })
-      const analysis = await analyzeFinalizationCommits({
-        worktree,
-        baseCommitSha: hypothesis.baseCommitSha,
-        headCommitSha: commit.commitSha,
-        loggedCommits,
-      })
-      manifest.unloggedCommitCount = analysis.unloggedCommits.length
-      manifest.measurementBaseCommitSha = analysis.measurementBaseCommitSha
-
-      if (analysis.kind === "already_logged") {
-        manifest.finalizationStatus = "already_logged"
-        manifest.salvaged = false
-        manifest.unloggedCommitCount = 0
-      } else if (analysis.kind === "salvage_only") {
-        const stopCheck = await collectResearchStopReasons({
-          root,
-          sessionId,
-        }).catch(() => null)
-        if (stopCheck?.shouldStop) {
-          manifest.finalizationStatus = "discarded_after_completion"
-          manifest.salvaged = false
-          manifest.error = [
-            "Session stop condition reached before final measurement; discarded unlogged work without creating an experiment.",
-            analysis.reason,
-          ]
-            .filter(Boolean)
-            .join(" ")
-          if (activityManifest) {
-            await appendWorkerActivityEvent(activityManifest, {
-              type: "finalization",
-              phase: "discarded",
-              summary: "Session completed before final measurement",
-              metadata: {
-                finalizationStatus: manifest.finalizationStatus,
-                unloggedCommitCount: analysis.unloggedCommits.length,
-                stopReasons: stopCheck.reasons,
-                salvageReason: analysis.reason,
-              },
-            })
-          }
-        } else {
-          manifest.finalizationStatus = "salvaged_unmeasured"
-          manifest.salvaged = true
-          manifest.error = analysis.reason
-        }
-      } else {
-        const measurementBaseCommitSha = analysis.measurementBaseCommitSha
-        const stopCheck = await collectResearchStopReasons({
-          root,
-          sessionId,
-        }).catch(() => null)
-        if (stopCheck?.shouldStop) {
-          manifest.finalizationStatus = "discarded_after_completion"
-          manifest.salvaged = false
-          manifest.error =
-            "Session stop condition reached before final measurement; discarded unlogged work without creating an experiment."
-          if (activityManifest) {
-            await appendWorkerActivityEvent(activityManifest, {
-              type: "finalization",
-              phase: "discarded",
-              summary: "Session completed before final measurement",
-              metadata: {
-                finalizationStatus: manifest.finalizationStatus,
-                measurementBaseCommitSha,
-                unloggedCommitCount: analysis.unloggedCommits.length,
-                stopReasons: stopCheck.reasons,
-              },
-            })
-          }
-        } else {
-          let measurementError: string | null = null
-          let measuredRunRef: string | null = null
-          await withoutProcessExitCode(() =>
-            commandExpRun({
-              positional: ["exp", "run"],
-              options: {
-                ...args.options,
-                cwd: worktree,
-                campaign: campaign.name,
-                base: measurementBaseCommitSha,
-                hypothesis: hypothesis.id,
-                session: sessionId,
-                worker: workerId,
-                timeout: "120",
-                "checks-timeout": "120",
-              },
-            })
-          )
-            .then((result) => {
-              measuredRunRef = result?.runRef ?? null
-            })
-            .catch((error) => {
-              measurementError = errorMessage(error)
-              manifest.error = measurementError
-            })
-          await withoutProcessExitCode(() =>
-            commandExpLog({
-              positional: ["exp", "log"],
-              options: {
-                ...args.options,
-                cwd: worktree,
-                campaign: campaign.name,
-                base: measurementBaseCommitSha,
-                hypothesis: hypothesis.id,
-                session: sessionId,
-                worker: workerId,
-                ...(measuredRunRef ? { "run-ref": measuredRunRef } : {}),
-                ...(measurementError
-                  ? { status: "failed", "allow-unmeasured": "true" }
-                  : {}),
-                name: `${hypothesis.name}-final-${commit.commitSha.slice(0, 7)}`,
-                description: workerFailed
-                  ? `Best-effort salvage from ${hypothesis.name} after worker process failure.`
-                  : `Final ${hypothesis.name} worker result.`,
-                "agent-notes": JSON.stringify({
-                  finalizedBy: "onyx worker harness",
-                  workerFailed,
-                  measurementError,
-                  hypothesis: hypothesis.name,
-                  measurementBaseCommitSha,
-                  unloggedCommitCount: analysis.unloggedCommits.length,
-                }),
-              },
-            })
-          )
-            .then(async (record) => {
-              manifest.finalizationStatus = "measured_and_logged"
-              if (record && activityManifest) {
-                await appendWorkerActivityEvent(activityManifest, {
-                  type: "metrics",
-                  phase: "measured",
-                  summary: `${record.primaryMetricName}=${record.primaryMetricValue ?? "null"}`,
-                  metadata: {
-                    runRef: record.runRef,
-                    status: record.status,
-                    primaryMetricName: record.primaryMetricName,
-                    primaryMetricValue: record.primaryMetricValue,
-                    metrics:
-                      "metrics" in record
-                        ? record.metrics
-                        : record.secondaryMetrics,
-                    resultCommitSha: record.resultCommitSha,
-                    resultRef: record.resultRef,
-                  },
-                })
-              }
-            })
-            .catch((error) => {
-              manifest.finalizationStatus = "failed"
-              manifest.error = [
-                manifest.error,
-                `experiment log failed: ${errorMessage(error)}`,
-              ]
-                .filter(Boolean)
-                .join("; ")
-            })
-        }
-      }
-    }
-
-    if (
-      manifest.finalizationStatus.startsWith("salvaged_unmeasured") ||
-      manifest.finalizationStatus === "discarded_after_completion"
-    ) {
-      await abandonBlockedWorkflowRunsForSession({
-        root,
-        sessionId,
-        workerId,
-        hypothesisId: hypothesis.id,
-        reason: `Worker finalization ${manifest.finalizationStatus}; workflow no longer represents a loggable attempt.`,
-      }).catch(() => [])
-    }
-
-    const workerBranchPush = await pushWorkerBranch({
-      cwd: worktree,
-      sourceRef: "HEAD",
-      targetRef: `refs/heads/${workerBranch}`,
-      reason: "worker-branch-finalization",
-      manifest: activityManifest,
-    })
-    if (workerBranchPush.code === 0 && !workerBranchPush.timedOut) {
-      manifest.workerBranchPushStatus = "pushed"
-      if (activityManifest) {
-        await appendWorkerActivityEvent(activityManifest, {
-          type: "push_result",
-          phase: "pushing",
-          summary: "Worker branch pushed",
-          metadata: {
-            ref: `refs/heads/${workerBranch}`,
-            commitSha: manifest.commitSha,
-          },
-        })
-      }
-    } else {
-      manifest.workerBranchPushStatus = "failed"
-      const workerBranchPushError =
-        workerBranchPush.stderr.trim() ||
-        workerBranchPush.stdout.trim() ||
-        "worker branch push failed"
-      manifest.error = [manifest.error, workerBranchPushError]
-        .filter(Boolean)
-        .join("; ")
-      if (activityManifest) {
-        await appendWorkerActivityEvent(activityManifest, {
-          type: "push_result",
-          phase: "pushing",
-          summary: "Worker branch push failed",
-          metadata: {
-            ref: `refs/heads/${workerBranch}`,
-            commitSha: manifest.commitSha,
-            error: manifest.error,
-          },
-        })
-      }
-    }
-
-    const rootStatus = await mainWorktreeStatus(root)
-    manifest.rootDriftStatus = rootStatus ? "dirty" : "clean"
-    if (rootStatus) {
-      manifest.error = [
-        manifest.error,
-        `main checkout changed during worker run:\n${rootStatus}`,
+      hypothesisId: hypothesis.id,
+      reason: `Worker teardown: ${reasonCode}`,
+    }).catch((error) => {
+      manifest.warnings = [
+        ...(manifest.warnings ?? []),
+        `Could not abandon nonterminal workflow runs: ${boundedText(errorMessage(error), 500)}`,
       ]
-        .filter(Boolean)
-        .join("; ")
+    })
+    const attempts = await listLocalAttempts(root, {
+      sessionId,
+      workerId,
+      hypothesisId: hypothesis.id,
+    })
+    if (attempts.length > 1) {
+      manifest.attemptDelivery = "ambiguous_discarded"
+      manifest.reasonCode = "worker_protocol_violation"
+      manifest.error = `Worker produced ${attempts.length} terminal attempt manifests; none were delivered.`
+      await Promise.all(
+        attempts.map((attempt) =>
+          clearLocalAttempt(root, { runRef: attempt.runRef })
+        )
+      )
+      return manifest
     }
+    const attempt = attempts[0]
+    if (!attempt) return manifest
 
+    manifest.runRef = attempt.runRef
+    manifest.resultCommitSha = attempt.resultCommitSha
+    const record = await withoutProcessExitCode(() =>
+      deliverTerminalExperimentAttempt({
+        args,
+        context: {
+          root: worktree,
+          projectPath,
+          campaign,
+          setup,
+          runRef: attempt.runRef,
+          sessionId,
+          assignmentId,
+          hypothesisId: hypothesis.id,
+          workerId,
+          workerCredential,
+        },
+      })
+    )
+    manifest.attemptDelivery =
+      record.deliveryOutcome === "duplicate" ? "duplicate" : "delivered"
+    manifest.resultRefPushStatus =
+      record.deliveryResultRefPushStatus === "failed" ? "failed" : "pushed"
+    manifest.resultRefPushError = record.deliveryResultRefPushError
+      ? boundedText(record.deliveryResultRefPushError, 1000)
+      : null
     return manifest
   } catch (error) {
-    manifest.finalizationStatus = "failed"
-    manifest.error = errorMessage(error)
+    manifest.attemptDelivery = "failed"
+    manifest.reasonCode = "terminal_attempt_delivery_failed"
+    manifest.error = boundedText(errorMessage(error), 1000)
+    if (error instanceof ExperimentDeliveryError) {
+      manifest.resultRefPushStatus = error.resultRefPushStatus
+      manifest.resultRefPushError = error.resultRefPushError
+        ? boundedText(error.resultRefPushError, 1000)
+        : null
+    }
+    if (manifest.runRef) {
+      await clearLocalAttempt(root, { runRef: manifest.runRef }).catch(() => {})
+    }
     return manifest
   }
+}
+
+function emptyWorkerTeardown({
+  phase,
+  reasonCode,
+  providerExitCode,
+  providerSignal,
+  timedOut,
+  startupTimedOut,
+  providerError,
+  error = null,
+}: {
+  phase: "completed" | "failed" | "stopped"
+  reasonCode: WorkerTerminalReasonCode
+  providerExitCode: number | null
+  providerSignal: string | null
+  timedOut: boolean
+  startupTimedOut: boolean
+  providerError: string | null
+  error?: string | null
+}): WorkerTeardownManifest {
+  return {
+    attemptDelivery: "none",
+    runRef: null,
+    resultCommitSha: null,
+    resultRefPushStatus: "not_attempted",
+    resultRefPushError: null,
+    headCommitSha: null,
+    commitsAhead: 0,
+    dirty: false,
+    changedPaths: [],
+    diffStat: null,
+    worktreeCleanup: "pending",
+    providerExitCode,
+    providerSignal,
+    timedOut,
+    startupTimedOut,
+    phase,
+    providerError: providerError ? boundedText(providerError, 1000) : null,
+    reasonCode,
+    error: error ? boundedText(error, 1000) : null,
+  }
+}
+
+function appendBoundedTeardownError(current: string | null, next: unknown) {
+  return boundedText(
+    [current, errorMessage(next)].filter(Boolean).join("; "),
+    1000
+  )
 }
 
 async function writeWorkerPrompt({
@@ -2400,7 +2043,6 @@ async function writeWorkerPrompt({
   sessionId,
   hypothesis,
   workerId,
-  workerBranch,
   endTimeMs,
 }: {
   root: string
@@ -2411,7 +2053,6 @@ async function writeWorkerPrompt({
   sessionId: string
   hypothesis: ApiHypothesis
   workerId: string
-  workerBranch: string
   endTimeMs: number
 }) {
   const dir = join(await onyxStateDir(root), "worker-prompts", sessionId)
@@ -2445,7 +2086,6 @@ async function writeWorkerPrompt({
     researchSpecPath: onyxPath(worktree, projectPath, "onyx.md"),
     sessionId,
     worktreeRoot: worktree,
-    workerBranch,
   })
 
   await writeFile(path, `${markdown}\n`, "utf8")
@@ -2509,6 +2149,7 @@ export function compactProviderErrorSummary(input: string | null | undefined) {
 export type ResearchStopReasonCode =
   | "stop_requested"
   | "session_terminal"
+  | "assignment_canceled"
   | "deadline_reached"
   | "experiment_target_reached"
 
@@ -2534,7 +2175,7 @@ function terminalReasonForStopCheck(
   stopCheck: ResearchStopCheck
 ): SessionTerminalReason | null {
   if (stopCheck.reasonCodes.includes("stop_requested")) {
-    return "stop_requested"
+    return "user_stopped"
   }
   if (stopCheck.reasonCodes.includes("experiment_target_reached")) {
     return "experiment_target_reached"
@@ -2569,38 +2210,92 @@ export async function collectResearchStopReasons({
     sessionId,
     reasonCodes: [...reasonCodes],
     reasons,
-    ...(localCheck.controlState ? { controlState: localCheck.controlState } : {}),
+    ...(localCheck.controlState
+      ? { controlState: localCheck.controlState }
+      : {}),
   }
 }
 
 export function createResearchSessionStopChecker({
   root,
   sessionId,
+  assignmentId,
   args,
   settleBeforeCheck = false,
   settlementNudgeIntervalMs = 5_000,
+  controlPollIntervalMs = 1_000,
+  preferLocalSupervisorControl = false,
+  onRemoteControlState,
 }: {
   root: string
   sessionId: string
+  assignmentId?: string
   args: Args
   settleBeforeCheck?: boolean
   settlementNudgeIntervalMs?: number
+  controlPollIntervalMs?: number
+  preferLocalSupervisorControl?: boolean
+  onRemoteControlState?: (control: ApiSessionControlState) => Promise<void>
 }) {
-  let lastSettlementNudgeMs = 0
+  let nextSettlementNudgeMs = 0
+  let nextControlPollMs = 0
+  let cachedResult: ResearchStopCheck | null = null
   return {
-    async check({ nowMs = Date.now() }: { nowMs?: number } = {}) {
+    async check({
+      nowMs = Date.now(),
+      force = false,
+    }: { nowMs?: number; force?: boolean } = {}) {
+      if (!force && cachedResult && nowMs < nextControlPollMs) {
+        return cachedResult
+      }
+      nextControlPollMs =
+        nowMs +
+        controlPollIntervalMs +
+        Math.floor(Math.random() * Math.max(1, controlPollIntervalMs * 0.25))
       try {
+        if (preferLocalSupervisorControl && !force) {
+          const local = await collectResearchStopReasons({
+            root,
+            sessionId,
+            nowMs,
+          })
+          if (local.shouldStop) {
+            cachedResult = local
+            return cachedResult
+          }
+        }
         const shouldNudge =
           settleBeforeCheck &&
-          nowMs - lastSettlementNudgeMs >= settlementNudgeIntervalMs
+          nowMs >= nextSettlementNudgeMs &&
+          Boolean(cachedResult?.controlState?.progress.receivedExperimentCount)
         let control: Awaited<ReturnType<typeof getResearchSessionControlState>>
-        if (shouldNudge) {
-          lastSettlementNudgeMs = nowMs
-          control = await settleResearchSession(sessionId, args, {
-            mode: "try",
-          }).catch(() => getResearchSessionControlState(sessionId, args))
+        const localSnapshot =
+          preferLocalSupervisorControl && !force
+            ? await readSupervisorControlStateSnapshot({
+                root,
+                sessionId,
+              }).catch(() => null)
+            : null
+        if (
+          localSnapshot &&
+          supervisorControlStateIsFresh(localSnapshot, nowMs)
+        ) {
+          control = localSnapshot.control
+        } else if (shouldNudge) {
+          nextSettlementNudgeMs =
+            nowMs +
+            settlementNudgeIntervalMs +
+            Math.floor(
+              Math.random() * Math.max(1, settlementNudgeIntervalMs * 0.25)
+            )
+          control = await settleResearchSession(sessionId, args).catch(() =>
+            getResearchSessionControlState(sessionId, args)
+          )
         } else {
           control = await getResearchSessionControlState(sessionId, args)
+        }
+        if (!localSnapshot || control !== localSnapshot.control) {
+          await onRemoteControlState?.(control).catch(() => {})
         }
         const reasons: string[] = []
         const reasonCodes = new Set<ResearchStopReasonCode>()
@@ -2608,11 +2303,13 @@ export function createResearchSessionStopChecker({
           addResearchStopReason(reasonCodes, reasons, code, reason)
         if (control.status !== "running") {
           add(
-            control.progress.terminalReason === "experiment_target_reached" ||
-              control.progress.terminalReason === "deadline_reached" ||
-              control.progress.terminalReason === "stop_requested"
-              ? control.progress.terminalReason
-              : "session_terminal",
+            control.progress.terminalReason === "user_stopped"
+              ? "stop_requested"
+              : control.progress.terminalReason ===
+                    "experiment_target_reached" ||
+                  control.progress.terminalReason === "deadline_reached"
+                ? control.progress.terminalReason
+                : "session_terminal",
             `session ${control.status}`
           )
         }
@@ -2625,13 +2322,20 @@ export function createResearchSessionStopChecker({
         if (control.progress.remainingExperimentCount === 0) {
           add("experiment_target_reached", "experiment target reached")
         }
-        return {
+        if (
+          assignmentId &&
+          control.canceledAssignmentIds.includes(assignmentId)
+        ) {
+          add("assignment_canceled", "hypothesis assignment canceled")
+        }
+        cachedResult = {
           shouldStop: reasons.length > 0,
           sessionId,
           reasonCodes: [...reasonCodes],
           reasons,
           controlState: control,
         }
+        return cachedResult
       } catch {
         return collectResearchStopReasons({
           root,
@@ -2647,7 +2351,7 @@ function createSessionStateBriefRefresher({
   root,
   sessionId,
   args,
-  intervalMs = 5_000,
+  intervalMs = 30_000,
 }: {
   root: string
   sessionId: string
@@ -2669,9 +2373,43 @@ function createSessionStateBriefRefresher({
     await write(placeholderSessionStateBrief())
   }
 
-  const refresh = ({ force = false }: { force?: boolean } = {}) => {
+  const patchControlState = async (control: ApiSessionControlState) => {
+    const previous = latestSnapshot
+    if (!previous?.brief) return
+    const now = new Date().toISOString()
+    await write({
+      ...previous,
+      sequence: previous.sequence + 1,
+      generatedAt: now,
+      brief: {
+        ...previous.brief,
+        session: {
+          ...previous.brief.session,
+          runtimeState: control.runtimeState,
+          status: control.status,
+          outcome: control.outcome,
+          cleanup: control.cleanup,
+          deadlineAt: control.progress.deadlineAt,
+          endedAt: control.progress.endedAt,
+          endReason: control.progress.endReason,
+        },
+        campaign: {
+          ...previous.brief.campaign,
+          status: control.campaignStatus,
+        },
+        progress: control.progress,
+        updatedAt: control.updatedAt,
+      },
+    })
+  }
+
+  const refresh = ({
+    force = false,
+  }: { force?: boolean } = {}): Promise<void> => {
     const nowMs = Date.now()
-    if (inFlight) return inFlight
+    if (inFlight) {
+      return force ? inFlight.then(() => refresh({ force: true })) : inFlight
+    }
     if (!force && nowMs - lastRefreshAttemptMs < intervalMs) {
       return Promise.resolve()
     }
@@ -2713,23 +2451,28 @@ function createSessionStateBriefRefresher({
     return inFlight
   }
 
-  return { writePlaceholder, refresh }
+  return { writePlaceholder, refresh, patchControlState }
 }
 
-async function harnessShouldStopSession({
-  checker,
-}: {
-  checker: ReturnType<typeof createResearchSessionStopChecker>
-}) {
-  const result = await checker.check()
-  return result.shouldStop
+export function sessionStateBriefControlSignature(
+  control: ApiSessionControlState
+) {
+  return JSON.stringify({
+    acceptedExperimentCount: control.progress.acceptedExperimentCount,
+    activeHypothesisCount: control.launch.activeHypothesisCount,
+    canceledAssignmentIds: [...control.canceledAssignmentIds].sort(),
+    campaignStatus: control.campaignStatus,
+    sessionStatus: control.status,
+    outcomeStatus: control.outcome.status,
+    cleanupStatus: control.cleanup.status,
+  })
 }
 
 async function withWorkerHeartbeat<T>({
   root,
   args,
   workerId,
-  leaseToken,
+  workerCredential,
   sessionId,
   hypothesisId,
   latestStatePath,
@@ -2744,7 +2487,7 @@ async function withWorkerHeartbeat<T>({
   root: string
   args: Args
   workerId: string
-  leaseToken?: string
+  workerCredential?: string
   sessionId: string
   hypothesisId: string
   latestStatePath?: string | null
@@ -2789,7 +2532,7 @@ async function withWorkerHeartbeat<T>({
       void heartbeatWorker(
         workerId,
         {
-          leaseToken,
+          workerCredential,
           status: "running",
           sessionId,
           hypothesisId,
@@ -2819,6 +2562,95 @@ async function withWorkerHeartbeat<T>({
   }
 }
 
+type LifecycleHeartbeat = Parameters<
+  typeof heartbeatWorkersBatch
+>[0]["heartbeats"][number]
+
+export function createLifecycleHeartbeatPublisher(
+  context: {
+    args: Args
+    sessionId: string
+    siteId: string
+    supervisorRunId: string
+  },
+  send: typeof heartbeatWorkersBatch = heartbeatWorkersBatch
+) {
+  const pending = new Map<
+    string,
+    {
+      heartbeat: LifecycleHeartbeat
+      waiters: Array<{ resolve: () => void; reject: (error: Error) => void }>
+    }
+  >()
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let flushing: Promise<void> | null = null
+
+  const flush = async (): Promise<void> => {
+    if (flushing) return flushing
+    if (timer) clearTimeout(timer)
+    timer = null
+    const entries = [...pending.entries()].slice(0, 500)
+    if (entries.length === 0) return
+    for (const [workerId] of entries) pending.delete(workerId)
+    flushing = (async () => {
+      try {
+        const response = await send(
+          {
+            sessionId: context.sessionId,
+            siteId: context.siteId,
+            supervisorRunId: context.supervisorRunId,
+            heartbeats: entries.map(([, entry]) => entry.heartbeat),
+          },
+          context.args
+        )
+        const resultByWorkerId = new Map(
+          response.results.map((result) => [result.workerId, result])
+        )
+        for (const [workerId, entry] of entries) {
+          const result = resultByWorkerId.get(workerId)
+          if (result?.ok) {
+            for (const waiter of entry.waiters) waiter.resolve()
+            continue
+          }
+          const error = new Error(
+            `Lifecycle heartbeat failed for worker ${workerId}: ${
+              result && !result.ok
+                ? result.error.message
+                : "batch response omitted worker"
+            }`
+          )
+          for (const waiter of entry.waiters) waiter.reject(error)
+        }
+      } catch (error) {
+        const failure = new Error(
+          `Lifecycle heartbeat batch failed: ${errorMessage(error)}`
+        )
+        for (const [, entry] of entries) {
+          for (const waiter of entry.waiters) waiter.reject(failure)
+        }
+      } finally {
+        flushing = null
+      }
+      if (pending.size > 0) await flush()
+    })()
+    return flushing
+  }
+
+  const enqueue = (heartbeat: LifecycleHeartbeat) =>
+    new Promise<void>((resolve, reject) => {
+      const current = pending.get(heartbeat.workerId)
+      pending.set(heartbeat.workerId, {
+        heartbeat,
+        waiters: [...(current?.waiters ?? []), { resolve, reject }],
+      })
+      if (!timer) {
+        timer = setTimeout(() => void flush(), 50)
+      }
+    })
+
+  return { enqueue, flush }
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -2827,20 +2659,20 @@ async function mainWorktreeStatus(root: string) {
   return (await git(["status", "--porcelain"], root)).trim()
 }
 
-export function finalizationStatusLabel(status: WorkerFinalizationStatus) {
+export function teardownStatusLabel(
+  status: WorkerTeardownManifest["attemptDelivery"]
+) {
   switch (status) {
     case "none":
-      return "no result changes"
-    case "already_logged":
-      return "already logged"
-    case "measured_and_logged":
-      return "measured and logged"
-    case "salvaged_unmeasured":
-      return "salvaged without measurement"
-    case "discarded_after_completion":
-      return "discarded after session completion"
+      return "no terminal attempt"
+    case "delivered":
+      return "terminal attempt delivered"
+    case "duplicate":
+      return "terminal attempt already delivered"
+    case "ambiguous_discarded":
+      return "ambiguous terminal attempts discarded"
     case "failed":
-      return "failed"
+      return "terminal attempt delivery failed"
   }
 }
 
@@ -2855,20 +2687,16 @@ async function assertMainWorktreeClean(root: string, label: string) {
 function workerProgress({
   hypothesisName,
   logPath,
-  activityLogPath,
   lastOutputAt,
 }: {
   hypothesisName: string
   logPath: string
-  activityLogPath?: string | null
   lastOutputAt: string | null
 }) {
   const output = lastOutputAt
     ? `last output ${formatAge(lastOutputAt, Date.now())} ago`
     : "no output yet"
-  return `${hypothesisName} worker running; ${output}; log ${logPath}${
-    activityLogPath ? `; activity ${activityLogPath}` : ""
-  }`
+  return `${hypothesisName} phase=running; ${output}; log=${logPath}`
 }
 
 function workerMetadata({
@@ -2898,11 +2726,9 @@ function workerMetadata({
 async function persistWorkerLaunchState({
   root,
   manifest,
-  workerBranch,
 }: {
   root: string
   manifest: WorkerLaunchManifest
-  workerBranch: string
 }) {
   await writeWorkerLaunchManifest(manifest)
   await upsertWorkerLaunch({
@@ -2913,7 +2739,6 @@ async function persistWorkerLaunchState({
       hypothesisId: manifest.hypothesisId,
       status: manifest.status,
       worktree: manifest.cwd,
-      branchName: workerBranch,
       promptPath: manifest.promptPath,
       logPath: manifest.logPath,
       activityLogPath: manifest.activityLogPath,
@@ -2923,8 +2748,7 @@ async function persistWorkerLaunchState({
       timedOut: manifest.timedOut,
       startupTimedOut: manifest.startupTimedOut,
       lastOutputAt: manifest.lastOutputAt,
-      finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
-      error: manifest.error ?? manifest.finalization?.error ?? null,
+      error: manifest.error ?? manifest.teardown?.error ?? null,
       metadata: {
         agentKind: manifest.agentKind,
         command: manifest.command,
@@ -2933,6 +2757,7 @@ async function persistWorkerLaunchState({
         workerContextPath: manifest.workerContextPath,
         latestStatePath: manifest.latestStatePath,
         addedWritableRoots: manifest.addedWritableRoots,
+        teardown: manifest.teardown,
         ...workerModelMetadata(manifest.workerModel ?? null),
       },
       startedAt: manifest.startedAt,
@@ -2949,6 +2774,125 @@ type HypothesisRunResult = {
   error?: string
   leaseUnavailable?: boolean
   startupTimedOut?: boolean
+  terminalReason?: DurableWorkerTerminalReason
+  siteFatal?: boolean
+  providerFailureClass?: ProviderFailureClass | null
+}
+
+type DurableWorkerTerminalReason = NonNullable<
+  ApiWorker["terminalOutcome"]
+>["reason"]
+
+export function classifyDurableWorkerTerminalReason({
+  stoppedByHarness,
+  stopReasonCodes,
+  cleanupFailed,
+  attemptDeliveryFailed,
+  reportedExperimentCount,
+  explicitFinishReason,
+  timedOut,
+  protocolViolation,
+  processFailed,
+  providerFailureClass,
+  error,
+}: {
+  stoppedByHarness: boolean
+  stopReasonCodes?: ResearchStopReasonCode[]
+  cleanupFailed: boolean
+  attemptDeliveryFailed: boolean
+  reportedExperimentCount: number
+  explicitFinishReason: WorkerFinishMarker["reason"] | null
+  timedOut: boolean
+  protocolViolation: boolean
+  processFailed: boolean
+  providerFailureClass: ProviderFailureClass | null
+  error: string | null
+}): DurableWorkerTerminalReason {
+  if (stopReasonCodes?.includes("assignment_canceled")) {
+    return "assignment_canceled"
+  }
+  if (
+    stopReasonCodes?.includes("deadline_reached") ||
+    stopReasonCodes?.includes("experiment_target_reached")
+  ) {
+    return "session_cutoff"
+  }
+  if (stoppedByHarness || stopReasonCodes?.length) return "session_stopped"
+  if (reportedExperimentCount > 0) return "completed_with_experiments"
+  if (timedOut) return "worker_timeout"
+
+  const message = error ?? ""
+  if (
+    protocolViolation ||
+    /protocol mismatch|unsupported (?:worker )?context|worker context .*mismatch|handshake failed/i.test(
+      message
+    )
+  ) {
+    return "worker_protocol_mismatch"
+  }
+  if (
+    /network policy|network access (?:is )?(?:denied|disabled|blocked)|egress (?:denied|blocked)/i.test(
+      message
+    )
+  ) {
+    return "worker_network_policy"
+  }
+  if (
+    /sandbox violation|sandbox denied|outside (?:the )?workspace|read-only file system|operation not permitted by sandbox/i.test(
+      message
+    )
+  ) {
+    return "worker_sandbox_failed"
+  }
+  if (
+    /evaluation failed|metric tool failed|checks_failed|setup_violation|invalid metric output/i.test(
+      message
+    )
+  ) {
+    return "worker_evaluation_failed"
+  }
+  if (
+    /git (?:push|commit|checkout|worktree) failed|failed to (?:push|commit|checkout)|result ref .*failed/i.test(
+      message
+    )
+  ) {
+    return "worker_git_failed"
+  }
+  if (processFailed) {
+    switch (providerFailureClass) {
+      case "auth":
+        return "provider_auth"
+      case "quota":
+        return "provider_quota_exhausted"
+      case "model_unsupported":
+        return "provider_model_unsupported"
+      case "rate_limit":
+        return "provider_rate_limited"
+      case "overloaded":
+        return "provider_overloaded"
+      case "unavailable":
+        return "provider_unavailable"
+      default:
+        return "provider_process_failed"
+    }
+  }
+  if (explicitFinishReason) return explicitFinishReason
+  if (attemptDeliveryFailed) return "worker_report_delivery_failed"
+  if (cleanupFailed) return "cleanup_failed"
+  return "worker_no_progress"
+}
+
+export function durableWorkerReasonIsSiteFatal(
+  reason: DurableWorkerTerminalReason
+) {
+  return (
+    reason === "provider_auth" ||
+    reason === "provider_quota_exhausted" ||
+    reason === "provider_model_unsupported" ||
+    reason === "worker_protocol_mismatch" ||
+    reason === "worker_network_policy" ||
+    reason === "worker_sandbox_failed"
+  )
 }
 
 function isLeaseUnavailableError(error: unknown) {
@@ -2985,10 +2929,11 @@ async function runHypothesisOnce({
   startupTimeoutMs,
   stopGraceMs,
   quiet,
-  refPushQueue,
   preacquiredLease,
   slotIndex = null,
   onRegistered,
+  lifecycleHeartbeats,
+  providerExecutable,
   args,
 }: {
   root: string
@@ -3007,41 +2952,52 @@ async function runHypothesisOnce({
   startupTimeoutMs: number
   stopGraceMs: number
   quiet: boolean
-  refPushQueue: ReturnType<typeof createRefPushQueue>
   preacquiredLease?: ApiWorkerLease | null
   /** Supervisor capacity slot this worker occupies (stable across relaunches). */
   slotIndex?: number | null
   onRegistered?: (worker: {
     workerId: string
     hypothesisId: string
-    leaseToken: string
+    workerCredential: string
   }) => void
+  lifecycleHeartbeats?: ReturnType<typeof createLifecycleHeartbeatPublisher>
+  providerExecutable?: string
   args: Args
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
-  let leaseToken: string | undefined
+  let workerName: string | null = null
+  let workerCredential: string | undefined
   let resultCommitSha: string | undefined
-  let workerBranch = "unknown"
+  let worktree: string | null = null
+  let assignmentId: string | null = null
+  let startingCommitSha: string | null = null
+  let teardown: WorkerTeardownManifest | null = null
   let launchManifest: WorkerLaunchManifest | null = null
+  let launchPaths: Awaited<ReturnType<typeof workerLaunchPaths>> | null = null
+  let terminalPhase: "completed" | "failed" | "stopped" = "failed"
+  let terminalReasonCode: WorkerTerminalReasonCode = "startup_failure"
+  let providerExitCode: number | null = null
+  let providerSignal: string | null = null
+  let providerTimedOut = false
+  let providerStartupTimedOut = false
+  let stoppedByHarness = false
+  let harnessStopReasonCodes: ResearchStopReasonCode[] = []
+  let explicitFinishMarker: WorkerFinishMarker | null = null
+  let providerError: string | null = null
+  let providerFailureClass: ProviderFailureClass | null = null
+  let outcome: HypothesisRunResult | null = null
+  let firstAttemptWarningTimer: ReturnType<typeof setTimeout> | null = null
   let launchPersistQueue: Promise<void> = Promise.resolve()
   const persistLaunchManifest = (manifest: WorkerLaunchManifest) => {
     const snapshot = manifest
     const write = launchPersistQueue
       .catch(() => {})
-      .then(() =>
-        persistWorkerLaunchState({ root, manifest: snapshot, workerBranch })
-      )
+      .then(() => persistWorkerLaunchState({ root, manifest: snapshot }))
     launchPersistQueue = write
     return write
   }
   let workerCliWrapper: WorkerCliWrapper | null = null
   let runtimePaths: WorkerRuntimePaths | null = null
-  const cleanupWorkerRuntimeTempDir = async () => {
-    if (!runtimePaths) return
-    await rm(runtimePaths.tempDir, { recursive: true, force: true }).catch(
-      () => {}
-    )
-  }
 
   try {
     const effectiveAgentKind = workerCommand ? "custom" : agentKind
@@ -3056,6 +3012,7 @@ async function runHypothesisOnce({
           agentKind: effectiveAgentKind,
           runtime: "local",
           leaseSeconds: 180,
+          leaseCredential: createWorkerCredential(),
           metadata: workerModelMetadata(workerModel),
         },
         args
@@ -3074,9 +3031,12 @@ async function runHypothesisOnce({
       }
     }
     const worker = lease.worker
-    leaseToken = lease.leaseToken
+    assignmentId = lease.assignment.id
+    startingCommitSha = lease.assignment.startingCommitSha
+    workerCredential = lease.workerCredential
     hypothesis = lease.hypothesis
     workerId = worker.id
+    workerName = worker.workerName
     await registerLocalWorker({
       root,
       campaignId: campaign.id,
@@ -3091,31 +3051,85 @@ async function runHypothesisOnce({
     onRegistered?.({
       workerId: worker.id,
       hypothesisId: hypothesis.id,
-      leaseToken,
+      workerCredential,
     })
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
-        status: "running",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "starting",
-        event: "hypothesis_started",
-        progressMessage: `Preparing ${hypothesis.name} worker preflight`,
-        metadata: workerModelMetadata(workerModel),
-      },
-      args
-    )
+    if (!lifecycleHeartbeats)
+      await heartbeatWorker(
+        worker.id,
+        {
+          workerCredential,
+          status: "running",
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: "starting",
+          event: "hypothesis_started",
+          progressMessage: `Preparing ${hypothesis.name} worker preflight`,
+          metadata: workerModelMetadata(workerModel),
+        },
+        args
+      )
 
+    worktree = join(await onyxStateDir(root), "worktrees", sessionId, worker.id)
+    const initialLaunchPaths = await workerLaunchPaths({
+      root,
+      sessionId,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+    })
+    launchPaths = initialLaunchPaths
+    const initialAgentKind: WorkerAgentKind = workerCommand
+      ? "custom"
+      : (agentKind as WorkerAgentKind)
+    const initialManifest: WorkerLaunchManifest = {
+      schemaVersion: 2,
+      agentKind: initialAgentKind,
+      workerModel,
+      command: workerCommand ?? agentKind,
+      args: [],
+      onyxWorkerPath: null,
+      workerContextPath: null,
+      addedWritableRoots: [],
+      cwd: worktree,
+      promptPath: "",
+      logPath: initialLaunchPaths.logPath,
+      activityLogPath: initialLaunchPaths.activityLogPath,
+      activityJsonlPath: initialLaunchPaths.activityJsonlPath,
+      latestStatePath: initialLaunchPaths.latestStatePath,
+      manifestPath: initialLaunchPaths.manifestPath,
+      sessionId,
+      startingCommitSha: lease.assignment.startingCommitSha,
+      hypothesisId: hypothesis.id,
+      hypothesisName: hypothesis.name,
+      workerId: worker.id,
+      workerName: worker.workerName,
+      supervisorRunId,
+      pid: null,
+      processStartedAt: null,
+      commandIdentity: null,
+      slotIndex,
+      version: null,
+      startedAt: new Date().toISOString(),
+      lastOutputAt: null,
+      completedAt: null,
+      status: "starting",
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      startupTimedOut: false,
+      error: null,
+      preflight: null,
+      teardown: null,
+    }
+    launchManifest = initialManifest
+    await persistLaunchManifest(initialManifest)
     const worktreeInfo = await ensureWorktree({
       root,
-      hypothesis,
+      startingCommitSha: lease.assignment.startingCommitSha,
       sessionId,
       workerId: worker.id,
     })
-    const worktree = worktreeInfo.dir
-    workerBranch = worktreeInfo.branch
+    worktree = worktreeInfo.dir
     await emitEvent(root, {
       type: "hypothesis_started",
       campaignName: campaign.name,
@@ -3135,7 +3149,6 @@ async function runHypothesisOnce({
       sessionId,
       hypothesis,
       workerId: worker.id,
-      workerBranch,
       endTimeMs,
     })
     runtimePaths = await workerRuntimePaths({
@@ -3147,15 +3160,32 @@ async function runHypothesisOnce({
     await writeWorkerRuntimeContext({
       paths: runtimePaths,
       context: {
-        schemaVersion: 1,
+        schemaVersion: 5,
         campaignId: campaign.id,
         campaignName: campaign.name,
         sessionId,
+        assignmentId: lease.assignment.id,
+        startingCommitSha: lease.assignment.startingCommitSha,
         hypothesisId: hypothesis.id,
         hypothesisName: hypothesis.name,
+        assignment: {
+          id: lease.assignment.id,
+          startingCommitSha: lease.assignment.startingCommitSha,
+          sourceExperimentId: lease.assignment.sourceExperimentId,
+        },
+        hypothesis: {
+          id: hypothesis.id,
+          name: hypothesis.name,
+          description: hypothesis.description,
+          status: hypothesis.status,
+          plan: hypothesis.plan,
+          bestMetricValue: hypothesis.bestMetricValue,
+          bestCommitSha: hypothesis.bestCommitSha,
+          experimentCount: hypothesis.experimentCount,
+          lastWorkedAt: hypothesis.lastWorkedAt,
+        },
         workerId: worker.id,
-        workerLeaseToken: leaseToken,
-        workerBranch,
+        workerCredential: workerCredential,
         worktreeRoot: worktree,
         projectPath,
         projectRoot,
@@ -3179,9 +3209,9 @@ async function runHypothesisOnce({
       ONYX_SESSION_ID: sessionId,
       ONYX_HYPOTHESIS_ID: hypothesis.id,
       ONYX_HYPOTHESIS_NAME: hypothesis.name,
-      ONYX_WORKER_BRANCH: workerBranch,
       ONYX_WORKER_ID: worker.id,
-      ONYX_WORKER_LEASE_TOKEN: leaseToken,
+      ONYX_WORKER_CREDENTIAL: workerCredential,
+      ONYX_WORKER_BIN: workerCliWrapper.workerPath,
       ONYX_WORKER_PROMPT_FILE: prompt.path,
       ONYX_WORKTREE_ROOT: worktree,
       ONYX_PROJECT_ROOT: projectRoot,
@@ -3204,7 +3234,7 @@ async function runHypothesisOnce({
     const addedWritableRoots = workerCommand
       ? []
       : await workerGitWritableRoots(worktree)
-    const invocation = buildWorkerInvocation({
+    const preparedInvocation = buildWorkerInvocation({
       agentKind,
       workerCommand,
       worktree,
@@ -3212,89 +3242,86 @@ async function runHypothesisOnce({
       addedWritableRoots,
       workerModel,
       workerTitle: worker.id,
+      providerExecutable,
     })
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
-        status: "running",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "orienting",
-        event: "context_ready",
-        progressMessage: `Worker context files are ready for ${hypothesis.name}`,
-        metadata: workerModelMetadata(workerModel),
-      },
-      args
-    )
-    const preflight = await preflightWorkerInvocation(invocation, {
-      cwd: worktree,
-      env: workerRunEnv,
-      campaignName: campaign.name,
-      sessionId,
-    })
-    const launchPaths = await workerLaunchPaths({
+    const preparedLaunchPaths = await workerLaunchPaths({
       root,
       sessionId,
       hypothesisId: hypothesis.id,
       hypothesisName: hypothesis.name,
       workerId: worker.id,
     })
-    launchManifest = {
-      schemaVersion: 1,
-      agentKind: invocation.agentKind,
-      workerModel: invocation.workerModel ?? null,
-      command: invocation.command,
-      args: invocation.redactedArgs,
+    launchPaths = preparedLaunchPaths
+    const readyManifest: WorkerLaunchManifest = {
+      ...initialManifest,
+      agentKind: preparedInvocation.agentKind,
+      workerModel: preparedInvocation.workerModel ?? null,
+      command: preparedInvocation.command,
+      args: preparedInvocation.redactedArgs,
       onyxWorkerPath: workerCliWrapper.workerPath,
       workerContextPath: runtimePaths.contextPath,
-      addedWritableRoots: invocation.addedWritableRoots,
+      addedWritableRoots: preparedInvocation.addedWritableRoots,
       cwd: worktree,
       promptPath: prompt.path,
-      logPath: launchPaths.logPath,
-      activityLogPath: launchPaths.activityLogPath,
-      activityJsonlPath: launchPaths.activityJsonlPath,
-      latestStatePath: launchPaths.latestStatePath,
-      manifestPath: launchPaths.manifestPath,
+      logPath: preparedLaunchPaths.logPath,
+      activityLogPath: preparedLaunchPaths.activityLogPath,
+      activityJsonlPath: preparedLaunchPaths.activityJsonlPath,
+      latestStatePath: preparedLaunchPaths.latestStatePath,
+      manifestPath: preparedLaunchPaths.manifestPath,
       sessionId,
+      startingCommitSha: lease.assignment.startingCommitSha,
       hypothesisId: hypothesis.id,
       hypothesisName: hypothesis.name,
       workerId: worker.id,
       workerName: worker.workerName,
-      slotIndex,
-      version: preflight.version,
-      startedAt: new Date().toISOString(),
-      lastOutputAt: null,
-      completedAt: null,
-      status: "starting",
-      exitCode: null,
-      signal: null,
-      timedOut: false,
-      startupTimedOut: false,
-      error: null,
-      preflight,
-      finalization: null,
     }
-    await persistLaunchManifest(launchManifest)
-    console.log(`worker: ${worker.id}`)
-    console.log(`hypothesis: ${hypothesis.id} ${hypothesis.name}`)
-    console.log(`worktree: ${worktree}`)
-    console.log(`manifest: ${launchPaths.manifestPath}`)
-    console.log(`raw log: ${launchPaths.logPath}`)
-    console.log(`activity log: ${launchPaths.activityLogPath}`)
-    console.log(`activity events: ${launchPaths.activityJsonlPath}`)
-    await appendWorkerActivityEvent(launchManifest, {
+    launchManifest = readyManifest
+    await persistLaunchManifest(readyManifest)
+    if (!lifecycleHeartbeats)
+      await heartbeatWorker(
+        worker.id,
+        {
+          workerCredential,
+          status: "running",
+          sessionId,
+          hypothesisId: hypothesis.id,
+          phase: "orienting",
+          event: "context_ready",
+          progressMessage: `Worker context files are ready for ${hypothesis.name}`,
+          metadata: workerModelMetadata(workerModel),
+        },
+        args
+      )
+    const preflight = await preflightWorkerInvocation(preparedInvocation, {
+      cwd: worktree,
+      env: workerRunEnv,
+      campaignName: campaign.name,
+      sessionId,
+      assignmentId: lease.assignment.id,
+      workerId: worker.id,
+      onyxWorkerPath: workerCliWrapper.workerPath,
+    })
+    const preflightManifest: WorkerLaunchManifest = {
+      ...readyManifest,
+      version: preflight.version,
+      preflight,
+    }
+    launchManifest = preflightManifest
+    await persistLaunchManifest(preflightManifest)
+    console.log(
+      `worker=${worker.id} hypothesis=${JSON.stringify(hypothesis.name)} status=started log=${preparedLaunchPaths.logPath}`
+    )
+    await appendWorkerActivityEvent(preflightManifest, {
       type: "process_start",
       phase: "starting",
-      summary: `Starting ${invocation.agentKind} worker for ${hypothesis.name}`,
+      summary: `Starting ${preparedInvocation.agentKind} worker for ${hypothesis.name}`,
       metadata: {
-        command: invocation.command,
-        args: invocation.redactedArgs,
-        workerBranch,
+        command: preparedInvocation.command,
+        args: preparedInvocation.redactedArgs,
         ...workerModelMetadata(workerModel),
       },
     })
-    await appendWorkerActivityEvent(launchManifest, {
+    await appendWorkerActivityEvent(preflightManifest, {
       type: "phase_change",
       phase: "orienting",
       summary: "Worker context files are ready",
@@ -3305,18 +3332,30 @@ async function runHypothesisOnce({
         "first-attempt-warning-seconds",
         DEFAULT_FIRST_ATTEMPT_WARNING_MS / 1000
       ) * 1000
-    let firstAttemptWarningTimer: ReturnType<typeof setTimeout> | null = null
     const heartbeatSampleEveryMs =
       nonnegativeNumberOption(args, "heartbeat-sample-interval", 0) * 1000
     if (firstAttemptWarningMs > 0) {
+      const warningManifest = launchManifest
       firstAttemptWarningTimer = setTimeout(() => {
         void hasWorkerLoggedAttempt({ root, workerId: worker.id })
-          .then((hasAttempt) => {
+          .then(async (hasAttempt) => {
             if (hasAttempt) return
-            return heartbeatWorker(
+            if (lifecycleHeartbeats) {
+              await appendWorkerActivityEvent(warningManifest, {
+                type: "warning",
+                phase: "orienting",
+                summary:
+                  "No logged workflow attempt yet; worker may still be orienting or sweeping.",
+                metadata: {
+                  warningAfterSeconds: Math.round(firstAttemptWarningMs / 1000),
+                },
+              })
+              return
+            }
+            await heartbeatWorker(
               worker.id,
               {
-                leaseToken,
+                workerCredential,
                 status: "running",
                 sessionId,
                 hypothesisId: hypothesis.id,
@@ -3343,83 +3382,126 @@ async function runHypothesisOnce({
     const stopChecker = createResearchSessionStopChecker({
       root,
       sessionId,
+      assignmentId: lease.assignment.id,
       args,
+      preferLocalSupervisorControl: true,
     })
     const workerResult = await withWorkerHeartbeat({
       root,
       args,
       workerId: worker.id,
-      leaseToken,
+      workerCredential,
       sessionId,
       hypothesisId: hypothesis.id,
       latestStatePath:
-        launchManifest?.latestStatePath ?? launchPaths.latestStatePath,
+        launchManifest?.latestStatePath ?? preparedLaunchPaths.latestStatePath,
       phase: "running",
       progressMessage: () =>
         workerProgress({
           hypothesisName: hypothesis.name,
-          logPath: launchManifest?.logPath ?? launchPaths.logPath,
-          activityLogPath:
-            launchManifest?.activityLogPath ?? launchPaths.activityLogPath,
+          logPath: launchManifest?.logPath ?? preparedLaunchPaths.logPath,
           lastOutputAt: launchManifest?.lastOutputAt ?? null,
         }),
       metadata: () =>
         launchManifest
-          ? workerMetadata({ invocation, manifest: launchManifest })
+          ? workerMetadata({
+              invocation: preparedInvocation,
+              manifest: launchManifest,
+            })
           : {},
       run: () =>
-        runStreamingProcess(invocation.command, invocation.args, {
-          cwd: worktree,
-          timeoutMs: Math.max(
-            1,
-            Math.min(workerTimeoutMs, hardEndTimeMs - Date.now())
-          ),
-          startupTimeoutMs,
-          killGraceMs: 5000,
-          logPath: launchPaths.logPath,
-          activityLogPath: launchPaths.activityLogPath,
-          logHeader: [
-            `# agent: ${invocation.agentKind}`,
-            `# prompt: ${prompt.path}`,
-            `# worker: ${worker.id}`,
-            `# hypothesis: ${hypothesis.id}`,
-          ].join("\n"),
-          stdin: invocation.stdin,
-          env: workerRunEnv,
-          cancel: {
-            graceMs: stopGraceMs,
-            pollMs: 5000,
-            shouldCancel: () =>
-              harnessShouldStopSession({ checker: stopChecker }),
-          },
-          onOutput: ({ at }) => {
-            if (!launchManifest) return
-            launchManifest = {
-              ...launchManifest,
-              status: "running",
-              lastOutputAt: at,
-            }
-            void persistLaunchManifest(launchManifest).catch(() => {})
-          },
-          terminateOnOutput:
-            invocation.agentKind === "opencode"
-              ? ({ text }) => shouldTerminateOpenCodeOnOutput(text)
-              : undefined,
-        }),
+        runStreamingProcess(
+          preparedInvocation.command,
+          preparedInvocation.args,
+          {
+            cwd: worktree!,
+            timeoutMs: Math.max(
+              1,
+              Math.min(workerTimeoutMs, hardEndTimeMs - Date.now())
+            ),
+            startupTimeoutMs,
+            killGraceMs: 5000,
+            logPath: preparedLaunchPaths.logPath,
+            activityLogPath: preparedLaunchPaths.activityLogPath,
+            logHeader: [
+              `# agent: ${preparedInvocation.agentKind}`,
+              `# prompt: ${prompt.path}`,
+              `# worker: ${worker.id}`,
+              `# hypothesis: ${hypothesis.id}`,
+            ].join("\n"),
+            stdin: preparedInvocation.stdin,
+            env: workerRunEnv,
+            redactValues: [
+              ...(workerCredential ? [workerCredential] : []),
+              ...Object.entries(workerRunEnv)
+                .filter(([name, value]) =>
+                  Boolean(
+                    value &&
+                    /(?:KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD)$/i.test(name)
+                  )
+                )
+                .map(([, value]) => value as string),
+            ],
+            onSpawn: (pid) => {
+              if (!launchManifest) return
+              const identity = inspectProcessIdentity(pid)
+              launchManifest = {
+                ...launchManifest,
+                pid,
+                supervisorRunId,
+                processStartedAt: identity?.startedAt ?? null,
+                commandIdentity: identity?.command ?? null,
+              }
+              void persistLaunchManifest(launchManifest).catch(() => {})
+            },
+            cancel: {
+              graceMs: stopGraceMs,
+              pollMs: 5000 + Math.floor(Math.random() * 1250),
+              shouldCancel: async () => {
+                const check = await stopChecker.check()
+                if (check.shouldStop) {
+                  harnessStopReasonCodes = check.reasonCodes
+                }
+                return check.shouldStop
+              },
+            },
+            onOutput: ({ at }) => {
+              if (!launchManifest) return
+              launchManifest = {
+                ...launchManifest,
+                status: "running",
+                lastOutputAt: at,
+              }
+              void persistLaunchManifest(launchManifest).catch(() => {})
+            },
+            terminateOnOutput:
+              preparedInvocation.agentKind === "opencode"
+                ? ({ text }) => shouldTerminateOpenCodeOnOutput(text)
+                : undefined,
+          }
+        ),
       quiet,
-      heartbeatSampleEveryMs,
+      consoleEveryMs: 60_000,
+      heartbeatSampleEveryMs: lifecycleHeartbeats ? 0 : heartbeatSampleEveryMs,
     })
     if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
-    const stoppedByHarness = workerResult.cancelled
+    stoppedByHarness = workerResult.cancelled
+    explicitFinishMarker = runtimePaths?.contextPath
+      ? await readWorkerFinishMarker(runtimePaths.contextPath)
+      : null
+    const finalStopCheck = await stopChecker
+      .check({ force: true })
+      .catch(() => null)
+    if (finalStopCheck?.shouldStop) {
+      harnessStopReasonCodes = finalStopCheck.reasonCodes
+    }
+    providerExitCode = workerResult.code
+    providerSignal = workerResult.signal
+    providerTimedOut = workerResult.timedOut
+    providerStartupTimedOut = workerResult.startupTimedOut
     if (launchManifest) {
       launchManifest = {
         ...launchManifest,
-        completedAt: new Date().toISOString(),
-        status: stoppedByHarness
-          ? "stopped"
-          : workerResult.code === 0
-            ? "completed"
-            : "failed",
         exitCode: workerResult.code,
         signal: workerResult.signal,
         timedOut: workerResult.timedOut,
@@ -3429,8 +3511,12 @@ async function runHypothesisOnce({
       await persistLaunchManifest(launchManifest)
       await appendWorkerActivityEvent(launchManifest, {
         type: "process_exit",
-        phase: launchManifest.status,
-        summary: `${invocation.agentKind} exited with code ${workerResult.code ?? "null"}`,
+        phase: stoppedByHarness
+          ? "stopped"
+          : workerResult.code === 0
+            ? "completed"
+            : "failed",
+        summary: `${preparedInvocation.agentKind} exited with code ${workerResult.code ?? "null"}`,
         metadata: {
           exitCode: workerResult.code,
           signal: workerResult.signal,
@@ -3444,421 +3530,459 @@ async function runHypothesisOnce({
       workerResult,
       `Worker process for ${hypothesis.name}`
     )
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
-        status: "running",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "finalizing",
-        event: "finalization_started",
-        progressMessage: `Finalizing ${hypothesis.name} worker output`,
-        gitLabel: resultCommitSha ?? null,
-      },
-      args
-    )
-    if (launchManifest) {
-      await appendWorkerActivityEvent(launchManifest, {
-        type: "phase_change",
-        phase: "finalizing",
-        summary: "Finalizing worker output",
-      })
-    }
-    const finalization = await finalizeHypothesisAttempt({
-      root,
-      worktree,
-      campaign,
-      hypothesis,
-      sessionId,
-      workerId: worker.id,
-      workerBranch,
-      activityManifest: launchManifest,
-      args,
-      workerFailed: Boolean(workerFailure) || stoppedByHarness,
-      pushWorkerBranch: refPushQueue.pushRef,
-    })
-    if (finalization.commitSha) resultCommitSha = finalization.commitSha
-    if (launchManifest) {
-      launchManifest = {
-        ...launchManifest,
-        finalization,
-      }
-      await persistLaunchManifest(launchManifest)
-      await appendWorkerActivityEvent(launchManifest, {
-        type: "finalization_result",
-        phase: "finalizing",
-        summary: finalizationStatusLabel(finalization.finalizationStatus),
-        metadata: {
-          finalizationStatus: finalization.finalizationStatus,
-          commitSha: finalization.commitSha,
-          unloggedCommitCount: finalization.unloggedCommitCount,
-          workerBranchPushStatus: finalization.workerBranchPushStatus,
-          rootDriftStatus: finalization.rootDriftStatus,
-          error: finalization.error,
-        },
-      })
-    }
-    if (finalization.rootDriftStatus === "dirty") {
-      // Keep the worktree for inspection when the main checkout drifted.
-      throw new Error(
-        finalization.error ??
-          "Main checkout changed during worker run; see worker manifest."
-      )
-    }
-    await removeWorkerWorktree({
-      root,
-      sessionId,
-      workerId: worker.id,
-    }).catch(() => {})
-
+    terminalReasonCode = stoppedByHarness
+      ? "stopped"
+      : workerResult.startupTimedOut
+        ? "startup_failure"
+        : workerResult.timedOut
+          ? "timeout"
+          : workerFailure
+            ? "provider_failure"
+            : "completed"
     if (stoppedByHarness) {
-      if (launchManifest) {
-        await appendWorkerActivityEvent(launchManifest, {
-          type: "stop",
-          phase: "stopped",
-          summary: "Worker stopped after session stop request",
-        })
-      }
-      await heartbeatWorker(
-        worker.id,
-        {
-          leaseToken,
-          status: "stopped",
-          sessionId,
-          hypothesisId: hypothesis.id,
-          phase: "stopped",
-          event: "stop_requested",
-          progressMessage: `${hypothesis.name} stopped after session stop request`,
-          gitLabel: resultCommitSha,
-        },
-        args
-      )
-      await upsertCampaignSummary(
-        campaign.id,
-        {
-          sessionId,
-          hypothesisId: hypothesis.id,
-          authoredByWorkerId: worker.id,
-          summaryKind: "hypothesis_summary",
-          title: `${hypothesis.name} worker stopped`,
-          body: [
-            `Outcome: stopped`,
-            `Latest commit: ${resultCommitSha ?? "n/a"}`,
-            `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
-            finalization.workerBranchPushStatus === "failed"
-              ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-              : `Worker branch push: ${finalization.workerBranchPushStatus}`,
-            finalization.error
-              ? `Finalization note: ${finalization.error}`
-              : "",
-            `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
-            `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
-            `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          isCurrent: false,
-          metadata: {
-            authoredBy: "worker-harness",
-            outcome: "stopped",
-            resultCommitSha: resultCommitSha ?? null,
-            finalization,
-          },
-        },
-        args
-      )
-      await cleanupWorkerRuntimeTempDir()
-      return {
+      terminalPhase = "stopped"
+      outcome = {
         hypothesis,
         workerId: worker.id,
         resultCommitSha,
         status: "stopped",
         startupTimedOut: workerResult.startupTimedOut,
       }
-    }
-
-    if (workerFailure) {
-      throw new Error(
-        `${workerFailure}. ${
-          finalization.attempted
-            ? `Best-effort finalization ${finalizationStatusLabel(finalization.finalizationStatus)} for ${finalization.commitSha ?? "unknown commit"}. `
-            : ""
-        }`
-      )
-    }
-
-    await heartbeatWorker(
-      worker.id,
-      {
-        leaseToken,
+    } else if (workerFailure) {
+      terminalPhase = "failed"
+      providerError = compactProviderErrorSummary(workerFailure)
+      providerFailureClass = classifyProviderFailure(workerFailure)
+      outcome = {
+        hypothesis,
+        workerId: worker.id,
+        resultCommitSha,
+        status: "failed",
+        error: providerError,
+        startupTimedOut: workerResult.startupTimedOut,
+      }
+    } else {
+      terminalPhase = "completed"
+      outcome = {
+        hypothesis,
+        workerId: worker.id,
+        resultCommitSha,
         status: "completed",
-        sessionId,
-        hypothesisId: hypothesis.id,
-        phase: "completed",
-        event: "hypothesis_completed",
-        progressMessage: `${hypothesis.name} completed`,
-        gitLabel: resultCommitSha,
-      },
-      args
-    )
-    await upsertCampaignSummary(
-      campaign.id,
-      {
-        sessionId,
-        hypothesisId: hypothesis.id,
-        authoredByWorkerId: worker.id,
-        summaryKind: "hypothesis_summary",
-        title: `${hypothesis.name} worker finalization`,
-        body: [
-          `Outcome: completed`,
-          `Latest commit: ${resultCommitSha ?? "n/a"}`,
-          `Finalization: ${finalizationStatusLabel(finalization.finalizationStatus)}`,
-          finalization.workerBranchPushStatus === "failed"
-            ? `Worker branch push failed: ${finalization.error ?? "unknown error"}`
-            : `Worker branch push: ${finalization.workerBranchPushStatus}`,
-          finalization.error ? `Finalization note: ${finalization.error}` : "",
-          `Worker manifest: ${launchManifest?.manifestPath ?? "n/a"}`,
-          `Worker activity log: ${launchManifest?.activityLogPath ?? "n/a"}`,
-          `Worker raw log: ${launchManifest?.logPath ?? "n/a"}`,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        isCurrent: false,
-        metadata: {
-          authoredBy: "worker-harness",
-          outcome: "completed",
-          resultCommitSha: resultCommitSha ?? null,
-          finalization,
-        },
-      },
-      args
-    )
-    await cleanupWorkerRuntimeTempDir()
-    return {
-      hypothesis,
-      workerId: worker.id,
-      resultCommitSha,
-      status: "completed",
-      startupTimedOut: workerResult.startupTimedOut,
+        startupTimedOut: workerResult.startupTimedOut,
+      }
     }
   } catch (error) {
     const message = compactProviderErrorSummary(errorMessage(error))
-    if (launchManifest) {
-      launchManifest = {
-        ...launchManifest,
-        completedAt: new Date().toISOString(),
-        status: "failed",
-        error: message,
-      }
-      await persistLaunchManifest(launchManifest).catch(() => {})
-    }
-    if (workerId) {
-      const metadata = launchManifest
-        ? {
-            workerLogPath: launchManifest.logPath,
-            workerActivityLogPath: launchManifest.activityLogPath,
-            workerPromptPath: launchManifest.promptPath,
-            lastOutputAt: launchManifest.lastOutputAt,
-            launcher: launchManifest.agentKind,
-          }
-        : undefined
-      await heartbeatWorker(
-        workerId,
-        {
-          leaseToken,
-          status: "failed",
-          sessionId,
-          hypothesisId: hypothesis.id,
-          phase: "failed",
-          event: "worker_failed",
-          progressMessage: message.slice(0, 1000),
-          gitLabel: resultCommitSha ?? null,
-          metadata,
-        },
-        args
-      ).catch(() => {})
-    }
-    if (workerId) {
-      await upsertCampaignSummary(
-        campaign.id,
-        {
-          sessionId,
-          hypothesisId: hypothesis.id,
-          authoredByWorkerId: workerId,
-          summaryKind: "hypothesis_summary",
-          title: `${hypothesis.name} worker finalization failed`,
-          body: [
-            `Outcome: failed`,
-            `Error: ${message}`,
-            resultCommitSha ? `Latest commit: ${resultCommitSha}` : "",
-            launchManifest?.manifestPath
-              ? `Worker manifest: ${launchManifest.manifestPath}`
-              : "",
-            launchManifest?.activityLogPath
-              ? `Worker activity log: ${launchManifest.activityLogPath}`
-              : "",
-            launchManifest?.logPath
-              ? `Worker raw log: ${launchManifest.logPath}`
-              : "",
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          isCurrent: false,
-          metadata: {
-            authoredBy: "worker-harness",
-            outcome: "failed",
-            resultCommitSha: resultCommitSha ?? null,
-          },
-        },
-        args
-      ).catch(() => {})
-    }
-    await cleanupWorkerRuntimeTempDir()
-    return {
+    providerError = message
+    providerFailureClass = classifyProviderFailure(message)
+    terminalPhase = "failed"
+    terminalReasonCode = providerStartupTimedOut
+      ? "startup_failure"
+      : providerTimedOut
+        ? "timeout"
+        : providerExitCode === null
+          ? "startup_failure"
+          : "provider_failure"
+    outcome = {
       hypothesis,
       workerId,
       resultCommitSha,
       status: "failed",
       error: message,
-      startupTimedOut: launchManifest?.startupTimedOut,
+      startupTimedOut: providerStartupTimedOut,
+    }
+  } finally {
+    if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
+    if (workerId) {
+      const terminalOutcome =
+        outcome ??
+        ({
+          hypothesis,
+          workerId,
+          resultCommitSha,
+          status: "failed",
+          error: providerError ?? "Worker did not produce a terminal outcome",
+          startupTimedOut: providerStartupTimedOut,
+        } satisfies HypothesisRunResult)
+      outcome = terminalOutcome
+      const worktreeCandidate =
+        worktree ??
+        join(await onyxStateDir(root), "worktrees", sessionId, workerId)
+      const hasWorktree = await pathExists(worktreeCandidate)
+
+      if (!launchManifest) {
+        const fallbackPaths =
+          launchPaths ??
+          (await workerLaunchPaths({
+            root,
+            sessionId,
+            hypothesisId: hypothesis.id,
+            hypothesisName: hypothesis.name,
+            workerId,
+          }).catch(() => null))
+        if (fallbackPaths) {
+          const fallbackAgentKind: WorkerAgentKind = workerCommand
+            ? "custom"
+            : (agentKind as WorkerAgentKind)
+          launchManifest = {
+            schemaVersion: 2,
+            agentKind: fallbackAgentKind,
+            workerModel,
+            command: workerCommand ?? agentKind,
+            args: [],
+            onyxWorkerPath: workerCliWrapper?.workerPath ?? null,
+            workerContextPath: runtimePaths?.contextPath ?? null,
+            addedWritableRoots: [],
+            cwd: worktreeCandidate,
+            promptPath: "",
+            logPath: fallbackPaths.logPath,
+            activityLogPath: fallbackPaths.activityLogPath,
+            activityJsonlPath: fallbackPaths.activityJsonlPath,
+            latestStatePath: fallbackPaths.latestStatePath,
+            manifestPath: fallbackPaths.manifestPath,
+            sessionId,
+            startingCommitSha: startingCommitSha ?? "",
+            hypothesisId: hypothesis.id,
+            hypothesisName: hypothesis.name,
+            workerId,
+            workerName: workerName ?? hypothesis.name,
+            supervisorRunId,
+            pid: null,
+            processStartedAt: null,
+            commandIdentity: null,
+            slotIndex,
+            version: null,
+            startedAt: new Date().toISOString(),
+            lastOutputAt: null,
+            completedAt: null,
+            status: "starting",
+            exitCode: providerExitCode,
+            signal: providerSignal,
+            timedOut: providerTimedOut,
+            startupTimedOut: providerStartupTimedOut,
+            error: providerError,
+            preflight: null,
+            teardown: null,
+          }
+        }
+      }
+
+      if (!lifecycleHeartbeats)
+        await heartbeatWorker(
+          workerId,
+          {
+            workerCredential,
+            status: "running",
+            sessionId,
+            hypothesisId: hypothesis.id,
+            phase: "teardown",
+            event: "teardown_started",
+            progressMessage: `Delivering terminal attempt and tearing down ${hypothesis.name}`,
+            gitLabel: null,
+          },
+          args
+        ).catch(() => {})
+      if (launchManifest) {
+        await appendWorkerActivityEvent(launchManifest, {
+          type: "phase_change",
+          phase: "teardown",
+          summary: "Delivering terminal attempt before workspace disposal",
+        }).catch(() => {})
+      }
+
+      if (
+        hasWorktree &&
+        assignmentId &&
+        startingCommitSha &&
+        workerCredential
+      ) {
+        teardown = await teardownHypothesisAttempt({
+          root,
+          worktree: worktreeCandidate,
+          projectPath,
+          campaign,
+          setup,
+          hypothesis,
+          startingCommitSha,
+          sessionId,
+          assignmentId,
+          workerId,
+          workerCredential,
+          activityManifest: launchManifest,
+          args,
+          providerExitCode,
+          providerSignal,
+          timedOut: providerTimedOut,
+          startupTimedOut: providerStartupTimedOut,
+          phase: terminalPhase,
+          providerError,
+          reasonCode: terminalReasonCode,
+        }).catch((teardownError) =>
+          emptyWorkerTeardown({
+            phase: "failed",
+            reasonCode: "terminal_attempt_delivery_failed",
+            providerExitCode,
+            providerSignal,
+            timedOut: providerTimedOut,
+            startupTimedOut: providerStartupTimedOut,
+            providerError,
+            error: errorMessage(teardownError),
+          })
+        )
+      } else {
+        teardown = emptyWorkerTeardown({
+          phase: terminalPhase,
+          reasonCode: terminalReasonCode,
+          providerExitCode,
+          providerSignal,
+          timedOut: providerTimedOut,
+          startupTimedOut: providerStartupTimedOut,
+          providerError,
+        })
+      }
+      const durableAttemptDelivered =
+        teardown.attemptDelivery === "delivered" ||
+        teardown.attemptDelivery === "duplicate"
+      const reportMarker = runtimePaths?.contextPath
+        ? await readWorkerReportMarker(runtimePaths.contextPath)
+        : null
+      const reportedExperimentCount =
+        (reportMarker?.reportedExperimentCount ?? 0) +
+        (durableAttemptDelivered ? 1 : 0)
+      if (teardown.resultCommitSha && durableAttemptDelivered) {
+        resultCommitSha = teardown.resultCommitSha
+        terminalOutcome.resultCommitSha = teardown.resultCommitSha
+      } else {
+        resultCommitSha = undefined
+        terminalOutcome.resultCommitSha = undefined
+      }
+
+      try {
+        await removeWorkerWorktree({ root, sessionId, workerId })
+        teardown.worktreeCleanup = "removed"
+      } catch (cleanupError) {
+        teardown.worktreeCleanup = "failed"
+        teardown.phase = "failed"
+        teardown.reasonCode = "cleanup_failure"
+        teardown.error = appendBoundedTeardownError(
+          teardown.error,
+          cleanupError
+        )
+        terminalPhase = "failed"
+        terminalOutcome.status = "failed"
+        terminalOutcome.error = appendBoundedTeardownError(
+          terminalOutcome.error ?? null,
+          cleanupError
+        )
+      }
+      if (teardown.attemptDelivery === "failed") {
+        terminalPhase = "failed"
+        teardown.phase = "failed"
+        terminalOutcome.status = "failed"
+        terminalOutcome.error = appendBoundedTeardownError(
+          terminalOutcome.error ?? null,
+          teardown.error ?? "Terminal attempt delivery failed"
+        )
+      }
+
+      let runtimeCleanup: "removed" | "failed" = "removed"
+      if (runtimePaths) {
+        try {
+          await rm(runtimePaths.dir, { recursive: true, force: true })
+        } catch (runtimeCleanupError) {
+          runtimeCleanup = "failed"
+          teardown.worktreeCleanup = "failed"
+          teardown.phase = "failed"
+          teardown.reasonCode = "cleanup_failure"
+          teardown.error = appendBoundedTeardownError(
+            teardown.error,
+            runtimeCleanupError
+          )
+          terminalOutcome.status = "failed"
+          terminalOutcome.error = appendBoundedTeardownError(
+            terminalOutcome.error ?? null,
+            runtimeCleanupError
+          )
+        }
+      }
+
+      const durableReason = classifyDurableWorkerTerminalReason({
+        stoppedByHarness,
+        stopReasonCodes: harnessStopReasonCodes,
+        cleanupFailed: teardown.worktreeCleanup === "failed",
+        attemptDeliveryFailed: teardown.attemptDelivery === "failed",
+        reportedExperimentCount,
+        explicitFinishReason: explicitFinishMarker?.reason ?? null,
+        timedOut: providerTimedOut,
+        protocolViolation: teardown.reasonCode === "worker_protocol_violation",
+        processFailed: terminalOutcome.status === "failed",
+        providerFailureClass,
+        error: terminalOutcome.error ?? providerError,
+      })
+      if (
+        durableReason === "completed_with_experiments" ||
+        durableReason === "hypothesis_exhausted" ||
+        durableReason === "goal_satisfied" ||
+        durableReason === "no_viable_change"
+      ) {
+        terminalOutcome.status = "completed"
+        terminalOutcome.error = undefined
+      } else if (
+        durableReason === "session_stopped" ||
+        durableReason === "session_cutoff" ||
+        durableReason === "assignment_canceled"
+      ) {
+        terminalOutcome.status = "stopped"
+      } else {
+        terminalOutcome.status = "failed"
+        if (durableReason === "worker_no_progress") {
+          terminalOutcome.error =
+            terminalOutcome.error ??
+            "Provider exited successfully without a delivered experiment or an explicit finish marker."
+        }
+      }
+      terminalOutcome.terminalReason = durableReason
+      terminalOutcome.siteFatal = durableWorkerReasonIsSiteFatal(durableReason)
+      terminalOutcome.providerFailureClass = providerFailureClass
+
+      if (launchManifest) {
+        launchManifest = {
+          ...launchManifest,
+          completedAt: new Date().toISOString(),
+          status: terminalOutcome.status,
+          exitCode: providerExitCode,
+          signal: providerSignal,
+          timedOut: providerTimedOut,
+          startupTimedOut: providerStartupTimedOut,
+          error: terminalOutcome.error ?? providerError,
+          teardown,
+        }
+        await persistLaunchManifest(launchManifest).catch(() => {})
+        await appendWorkerActivityEvent(launchManifest, {
+          type: "teardown_result",
+          phase: terminalPhase,
+          summary: teardownStatusLabel(teardown.attemptDelivery),
+          metadata: { ...teardown },
+        }).catch(() => {})
+        if (terminalOutcome.status === "stopped") {
+          await appendWorkerActivityEvent(launchManifest, {
+            type: "stop",
+            phase: "stopped",
+            summary: "Worker stopped after session stop request",
+          }).catch(() => {})
+        }
+      }
+
+      const terminalEvent =
+        terminalOutcome.status === "stopped"
+          ? "stop_requested"
+          : terminalOutcome.status === "completed"
+            ? "hypothesis_completed"
+            : "worker_failed"
+      const terminalProgress =
+        terminalOutcome.status === "stopped"
+          ? `${hypothesis.name} stopped after session stop request`
+          : terminalOutcome.status === "completed"
+            ? `${hypothesis.name} completed`
+            : (terminalOutcome.error ?? `${hypothesis.name} failed`).slice(
+                0,
+                1000
+              )
+      const terminalMetadata = {
+        ...(launchManifest
+          ? {
+              workerLogPath: launchManifest.logPath,
+              workerActivityLogPath: launchManifest.activityLogPath,
+              workerPromptPath: launchManifest.promptPath,
+              lastOutputAt: launchManifest.lastOutputAt,
+              launcher: launchManifest.agentKind,
+            }
+          : {}),
+        terminal: teardown,
+        terminalOutcome: {
+          reason: durableReason,
+          providerExitCode,
+          providerSignal,
+          timedOut: providerTimedOut,
+          reportedExperimentCount,
+          teardownDelivery: durableAttemptDelivered
+            ? "delivered"
+            : teardown.attemptDelivery === "none"
+              ? "none"
+              : "failed",
+          resultRefPush:
+            teardown.resultRefPushStatus === "pushed"
+              ? "pushed"
+              : teardown.resultRefPushStatus === "failed"
+                ? "failed"
+                : "none",
+          cleanup:
+            teardown.worktreeCleanup === "removed" &&
+            runtimeCleanup === "removed"
+              ? "complete"
+              : "failed",
+          errorSummary: terminalOutcome.error
+            ? compactProviderErrorSummary(terminalOutcome.error).slice(0, 2000)
+            : null,
+          completedAt: new Date().toISOString(),
+        },
+      }
+      const terminalHeartbeat = {
+        workerId,
+        status: terminalOutcome.status,
+        phase: terminalOutcome.status,
+        event: terminalEvent,
+        progressMessage: terminalProgress,
+        gitLabel: terminalOutcome.resultCommitSha ?? null,
+        metadata: terminalMetadata,
+      } satisfies LifecycleHeartbeat
+      await (
+        lifecycleHeartbeats
+          ? lifecycleHeartbeats.enqueue(terminalHeartbeat)
+          : heartbeatWorker(
+              workerId,
+              {
+                workerCredential,
+                status: terminalOutcome.status,
+                sessionId,
+                hypothesisId: hypothesis.id,
+                phase: terminalOutcome.status,
+                event: terminalEvent,
+                progressMessage: terminalProgress,
+                gitLabel: terminalOutcome.resultCommitSha ?? null,
+                metadata: terminalMetadata,
+              },
+              args
+            )
+      ).catch((error) => {
+        console.warn(errorMessage(error))
+      })
     }
   }
-}
 
-export async function commandResearchStart(args: Args) {
-  const root = await repoRoot()
-  const { campaign, projectPath } = await campaignForName(root, args)
-  await assertLocalSetupReady(root, projectPath)
-  await assertSetupCommitted({
-    root,
-    projectPath,
-    baseCommitSha: campaign.baseCommitSha,
-    requireBaseMatchesHead: true,
-  })
-
-  const workerTargetOption = args.options.workers ?? args.options.agents
-  if (args.options["max-experiments"] !== undefined) {
-    throw new Error("--max-experiments was removed. Use --experiments.")
-  }
-  if (args.options["max-worker-iterations"] !== undefined) {
-    throw new Error(
-      "--max-worker-iterations is no longer a research session option."
-    )
-  }
-  const experimentTarget = optionalPositiveIntegerOption(args, "experiments")
-  const maxMinutes =
-    args.options["max-minutes"] === undefined
-      ? null
-      : positiveNumberOption(args, "max-minutes", 120)
-  if (experimentTarget === null && maxMinutes === null) {
-    throw new Error("Pass --experiments <n> or --max-minutes <n>.")
-  }
-  const hypotheses = await hypothesisPlansOption(args)
-  const workerTarget =
-    workerTargetOption === undefined && hypotheses
-      ? hypotheses.length
-      : positiveIntegerOption(args, "workers", Number(workerTargetOption ?? 1))
-  const workerSettings = await resolveWorkerSettings({ args, cwd: root })
-  const deadlineAt =
-    maxMinutes === null
-      ? null
-      : new Date(Date.now() + maxMinutes * 60_000).toISOString()
-  const schedulerSiteId = await getResearchSiteId(root)
-  const result = await createCampaignSession(
-    campaign.id,
-    {
-      name: args.options.name ?? `research-${new Date().toISOString()}`,
-      workerTarget,
-      hypotheses,
-      ...(experimentTarget === null ? {} : { experimentTarget }),
-      ...(deadlineAt === null ? {} : { deadlineAt }),
-      ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
-      metadata: {
-        startedBy: "onyx-research",
-        experimentTarget,
-        maxMinutes,
-        agentKind: workerSettings.agentKind,
-        ...workerModelMetadata(workerSettings.workerModel),
-      },
-    },
-    args
+  return (
+    outcome ?? {
+      hypothesis,
+      workerId,
+      resultCommitSha,
+      status: "failed",
+      error: providerError ?? "Worker did not produce a terminal outcome",
+      startupTimedOut: providerStartupTimedOut,
+    }
   )
-  await cacheResearchSessionState({
-    root,
-    campaign,
-    session: result.session,
-    hypotheses: result.hypotheses,
-  }).catch(() => {})
-  const state = await readState(root)
-  const key = campaignStateKey(projectPath, campaign.name)
-  state.campaigns = state.campaigns ?? {}
-  state.campaigns[key] = {
-    ...state.campaigns[key],
-    campaignId: campaign.id,
-    sessionId: result.session.id,
-  }
-  state.sessions = state.sessions ?? {}
-  state.sessions[result.session.id] = {
-    campaignName: campaign.name,
-    campaignId: campaign.id,
-    deadlineAt,
-    experimentTarget,
-    acceptedExperimentCount: 0,
-    remainingExperimentCount: experimentTarget,
-    schedulerSiteId,
-    status: "running",
-  }
-  await writeState(root, state)
-  await emitEvent(root, {
-    type: "research_started",
-    campaignName: campaign.name,
-    campaignId: campaign.id,
-    sessionId: result.session.id,
-    message: `${workerTarget} worker slot(s), ${result.hypotheses.length} hypothesis(s)`,
-  })
-  console.log(`Research session: ${result.session.id}`)
-  console.log(`Campaign: ${campaign.name}`)
-  console.log(`Workers: 0/${workerTarget}`)
-  console.log(`Hypotheses: ${result.hypotheses.length}`)
-  console.log(`Experiment target: ${experimentTarget ?? "deadline only"}`)
-  console.log(`Deadline: ${deadlineAt ?? "none"}`)
-  const agentOption = workerOptions(workerSettings)
-  const budgetOptions =
-    maxMinutes === null ? "" : workerBudgetOptions({ maxMinutes })
-  if (result.hypotheses.length === 0) {
-    console.log(
-      "No hypotheses were created. Add one with `onyx research hypothesis add --session " +
-        `${result.session.id} --focus <focus> --hypothesis <statement>` +
-        "` before launching workers."
-    )
-  } else {
-    for (let index = 0; index < workerTarget; index += 1) {
-      const hypothesis = result.hypotheses[index % result.hypotheses.length]
-      if (!hypothesis) continue
-      console.log(
-        `- worker ${index + 1}: ${hypothesis.name}: ${hypothesis.plan.focus}\n  onyx worker run --session ${result.session.id} --hypothesis ${hypothesis.id}${agentOption}${budgetOptions}`
-      )
-    }
-  }
-  console.log("Use `onyx listen` or `onyx research status` to supervise.")
 }
 
 export async function commandResearchHypothesisAdd(args: Args) {
   const root = await repoRoot(args.options.cwd)
   const projectPath = await resolveProjectPath(root, args)
   const state = await readState(root)
-  const sessionId =
-    args.options.session ??
-    activeSessionIdFromState({
-      state,
-      projectPath,
-      campaignName: args.options.campaign,
-    })
-  if (!sessionId && !args.options.campaign) {
+  if (args.options.session) {
     throw new Error(
-      "Pass --session <id> or --campaign <name>, or start a research session first."
+      "--session is not valid when adding a hypothesis; session membership is immutable. Pass --campaign <name>."
     )
+  }
+  const sessionId: string | undefined = undefined
+  if (!args.options.campaign) {
+    throw new Error("Pass --campaign <name>.")
   }
 
   const setupForPlan = await readSetupFile(root, projectPath).catch(() => null)
@@ -3907,7 +4031,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
       plan,
       name: args.options.name,
       description: args.options.description ?? undefined,
-      baseCommitSha: args.options.base,
       metadata: {
         createdBy: "onyx-research",
         ...(sessionId ? { createdBySessionId: sessionId } : {}),
@@ -3929,7 +4052,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
       ],
       workers: before.workers,
       experiments: before.latestExperiments,
-      summaries: before.summaries,
       knowledge: before.knowledge,
     }).catch(() => {})
   }
@@ -3952,14 +4074,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
       experimentTarget:
         before?.session.experimentTarget ??
         state.sessions[sessionId]?.experimentTarget ??
-        null,
-      acceptedExperimentCount:
-        before?.session.acceptedExperimentCount ??
-        state.sessions[sessionId]?.acceptedExperimentCount ??
-        0,
-      remainingExperimentCount:
-        before?.session.remainingExperimentCount ??
-        state.sessions[sessionId]?.remainingExperimentCount ??
         null,
       schedulerSiteId:
         before?.session.schedulerSiteId ??
@@ -3989,11 +4103,136 @@ export async function commandResearchHypothesisAdd(args: Args) {
       `onyx worker run --session ${sessionId} --hypothesis ${hypothesis.id} --agent ${agentKind}${workerModel ? ` --model ${workerModel}` : ""}${budgetOptions}`
     )
   } else {
-    console.log("Start or choose a research session before launching a worker.")
+    console.log("This hypothesis is available to the next research session.")
   }
 }
 
+export async function commandResearchHypothesisList(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign } = await campaignForName(root, args)
+  const hypotheses = await listCampaignHypotheses(campaign.id, args)
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(hypotheses, null, 2))
+    return
+  }
+  if (hypotheses.length === 0) {
+    console.log(`No hypotheses in ${campaign.name}.`)
+    return
+  }
+  for (const hypothesis of hypotheses) {
+    console.log(
+      `${hypothesis.id}  ${hypothesis.status.padEnd(6)}  ${hypothesis.name}`
+    )
+  }
+}
+
+async function resolveCampaignHypothesis(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const { campaign } = await campaignForName(root, args)
+  const selector = args.options.hypothesis ?? args.options.name
+  if (!selector) throw new Error("Pass --hypothesis <name-or-id>.")
+  const hypotheses = await listCampaignHypotheses(campaign.id, args)
+  const hypothesis = hypotheses.find(
+    (candidate) => candidate.id === selector || candidate.name === selector
+  )
+  if (!hypothesis) {
+    throw new Error(`Hypothesis ${JSON.stringify(selector)} was not found.`)
+  }
+  return { campaign, hypothesis }
+}
+
+export async function commandResearchHypothesisClose(args: Args) {
+  const { campaign, hypothesis } = await resolveCampaignHypothesis(args)
+  const result = await closeCampaignHypothesis(
+    hypothesis.id,
+    { reason: args.options.reason },
+    args
+  )
+  console.log(
+    `Closed ${hypothesis.name} in ${campaign.name}; canceled ${result.canceledAssignmentIds.length} assignment(s) and stopped ${result.stoppedWorkerIds.length} worker(s).`
+  )
+}
+
+export async function commandResearchHypothesisReopen(args: Args) {
+  const { campaign, hypothesis } = await resolveCampaignHypothesis(args)
+  await reopenCampaignHypothesis(hypothesis.id, args)
+  console.log(
+    `Reopened ${hypothesis.name} in ${campaign.name}; it is eligible for future sessions.`
+  )
+}
+
+export async function commandResearchScale(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const sessionId =
+    args.options.session ??
+    selectLocalOpenSessionId({
+      state,
+      projectPath,
+      campaignName: args.options.campaign,
+      operation: "scale",
+    })
+  if (!sessionId) throw new Error("Pass --session <id>.")
+  const campaignId =
+    state.sessions?.[sessionId]?.campaignId ??
+    (await getResearchSessionState(sessionId, args)).campaign.id
+  const workerTarget = positiveIntegerOption(args, "workers", Number.NaN)
+  if (
+    !Number.isInteger(workerTarget) ||
+    workerTarget < 1 ||
+    workerTarget > 500
+  ) {
+    throw new Error("--workers must be an integer from 1 to 500.")
+  }
+  const { session } = await scaleCampaignSession(
+    sessionId,
+    {
+      campaignId,
+      workerTarget,
+      siteId: await getResearchSiteId(root),
+      supervisorRunId:
+        state.sessions?.[sessionId]?.supervisor?.supervisorRunId ?? undefined,
+      metadata: { source: "onyx-research-scale" },
+    },
+    args
+  )
+  console.log(
+    `Session ${session.id} worker target is now ${session.workerTarget}. Existing workers drain naturally when scaling down.`
+  )
+}
+
+export async function commandResearchClean(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const stateDir = await onyxStateDir(root)
+  const targets = [
+    join(stateDir, "worker-runtime"),
+    join(stateDir, "worker-logs"),
+    join(stateDir, "workflow-runs"),
+    join(stateDir, "attempts"),
+    join(stateDir, "worktrees"),
+    join(stateDir, SUPERVISOR_LOG_DIR),
+  ]
+  if (args.options["dry-run"] === "true") {
+    console.log(targets.join("\n"))
+    return
+  }
+  for (const target of targets) {
+    await rm(target, { recursive: true, force: true })
+  }
+  await updateState(root, (state) => {
+    state.sessions = {}
+    for (const campaign of Object.values(state.campaigns ?? {})) {
+      delete campaign.sessionId
+    }
+  })
+  console.log(
+    "Removed local Onyx research runtime, attempt, worktree, and log artifacts."
+  )
+}
+
 export async function commandResearchBrief(args: Args) {
+  const workerContext = await readWorkerRuntimeContext().catch(() => null)
   let sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
   if (!sessionId) {
     const root = await repoRoot(args.options.cwd)
@@ -4017,7 +4256,9 @@ export async function commandResearchBrief(args: Args) {
   }
   const hypothesisId =
     args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID ?? undefined
-  const brief = await getResearchSessionBrief(sessionId, args, { hypothesisId })
+  const brief = workerContext
+    ? await getWorkerResearchBrief(args)
+    : await getResearchSessionBrief(sessionId, args, { hypothesisId })
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(brief, null, 2))
@@ -4026,8 +4267,190 @@ export async function commandResearchBrief(args: Args) {
   console.log(renderSessionBrief(brief))
 }
 
+function supervisorTelemetryForStatus(
+  supervisor: SupervisorRuntimeTelemetry | undefined
+) {
+  if (!supervisor) return null
+  if (supervisor.status && supervisor.status !== "running") return supervisor
+  return freshSupervisorTelemetry(supervisor)
+}
+
+export function uniqueWorkerWarnings(manifest: WorkerLaunchManifest) {
+  const warnings = [
+    ...new Set([
+      ...(manifest.warnings ?? []),
+      ...(manifest.teardown?.warnings ?? []),
+    ]),
+  ]
+  const expectedHarnessStop =
+    (manifest.status === "stopped" ||
+      manifest.teardown?.reasonCode === "stopped" ||
+      manifest.teardown?.phase === "stopped") &&
+    (manifest.signal === "SIGTERM" ||
+      manifest.signal === "SIGKILL" ||
+      manifest.teardown?.providerSignal === "SIGTERM" ||
+      manifest.teardown?.providerSignal === "SIGKILL")
+  return expectedHarnessStop
+    ? warnings.filter(
+        (warning) => !warning.startsWith("provider stream/API error detected:")
+      )
+    : warnings
+}
+
+async function commandResearchStatusSummary({
+  root,
+  args,
+}: {
+  root: string
+  args: Args
+}) {
+  const projectPath = await resolveProjectPath(root, args)
+  const state = await readState(root)
+  const campaignName = args.options.campaign ?? state.activeCampaign
+  if (!campaignName) {
+    throw new Error("No active campaign. Pass --campaign <name>.")
+  }
+  const cachedCampaign =
+    state.campaigns?.[campaignStateKey(projectPath, campaignName)] ?? null
+  let campaignId = cachedCampaign?.campaignId ?? null
+  let sessionId = cachedCampaign?.sessionId ?? null
+  let fallbackCampaign: ApiCampaign | null = null
+  if (!sessionId && campaignId) {
+    sessionId =
+      Object.entries(state.sessions ?? {}).find(
+        ([, session]) =>
+          session.campaignId === campaignId &&
+          ["running", "stop_requested"].includes(session.status ?? "")
+      )?.[0] ?? null
+  }
+  if (!campaignId || !sessionId) {
+    const campaignInfo = await campaignForName(root, args)
+    fallbackCampaign = campaignInfo.campaign
+    campaignId = campaignInfo.campaign.id
+    sessionId =
+      sessionId ??
+      campaignInfo.overview.sessions.find((session) =>
+        ["running", "stop_requested"].includes(session.status)
+      )?.id ??
+      null
+  }
+
+  const runtime = sessionId ? state.sessions?.[sessionId] : null
+  const [control, manifests] = sessionId
+    ? await Promise.all([
+        getResearchSessionControlState(sessionId, args).catch(() => null),
+        readWorkerLaunchManifests(root, sessionId).catch(() => []),
+      ])
+    : [null, []]
+  const supervisor = supervisorTelemetryForStatus(runtime?.supervisor)
+  const failures = manifests
+    .filter((manifest) => manifest.status === "failed")
+    .slice(-10)
+    .map((manifest) => ({
+      workerId: manifest.workerId,
+      workerName: manifest.workerName,
+      reasonCode: manifest.teardown?.reasonCode ?? null,
+      errorSummary: manifest.error
+        ? compactProviderErrorSummary(manifest.error)
+        : manifest.teardown?.providerError
+          ? compactProviderErrorSummary(manifest.teardown.providerError)
+          : null,
+      logPath: manifest.logPath,
+    }))
+  const teardownFailureCount = manifests.filter(
+    (manifest) =>
+      manifest.teardown?.attemptDelivery === "failed" ||
+      manifest.teardown?.worktreeCleanup === "failed" ||
+      (!manifest.teardown && manifestIsTerminal(manifest))
+  ).length
+  const warningCount = manifests.reduce(
+    (total, manifest) => total + uniqueWorkerWarnings(manifest).length,
+    0
+  )
+  const activeProcesses = supervisor?.activeProcessCount ?? 0
+  const summary = {
+    campaign: {
+      id: campaignId,
+      name: fallbackCampaign?.name ?? campaignName,
+      status: control?.campaignStatus ?? fallbackCampaign?.status ?? null,
+    },
+    session: sessionId
+      ? {
+          id: sessionId,
+          status: control?.status ?? runtime?.status ?? null,
+          runtimeState: control?.runtimeState ?? null,
+          outcome: control?.outcome ?? null,
+          cleanup: control?.cleanup ?? null,
+          workerTarget: control?.launch.workerTarget ?? null,
+          activeWorkers: control?.launch.activeWorkerCount ?? activeProcesses,
+          openSlots: control?.launch.openWorkerSlotCount ?? null,
+          activeProcessCount: activeProcesses,
+          progress: control?.progress ?? null,
+          supervisor: supervisor
+            ? {
+                pid: supervisor.pid ?? null,
+                logPath: supervisor.logPath ?? null,
+                updatedAt: supervisor.updatedAt ?? null,
+              }
+            : null,
+        }
+      : null,
+    providerBackoff:
+      supervisor?.providerBackoff ?? runtime?.providerBackoff ?? null,
+    recentFailedLaunches:
+      supervisor?.recentFailedLaunches ??
+      runtime?.providerBackoff?.recentFailures ??
+      [],
+    noProgressBreaker: supervisor?.noProgressBreaker ?? null,
+    failures,
+    localTeardownFailures: { count: teardownFailureCount },
+    workerWarnings: { count: warningCount },
+  }
+
+  if (args.options.json === "true") {
+    console.log(JSON.stringify(summary, null, 2))
+    return
+  }
+  console.log(`campaign: ${summary.campaign.name}`)
+  if (!summary.session) {
+    console.log("session: none")
+    return
+  }
+  console.log(
+    `session: ${summary.session.id} ${summary.session.status ?? ""}`.trim()
+  )
+  const progress = summary.session.progress
+  if (progress) {
+    console.log(
+      `experiments: accepted=${progress.acceptedExperimentCount}${
+        progress.experimentTarget === null
+          ? ""
+          : `/${progress.experimentTarget}`
+      } remaining=${progress.remainingExperimentCount ?? "-"}`
+    )
+  }
+  console.log(
+    `workers: active=${summary.session.activeWorkers}/${summary.session.workerTarget ?? "?"} processes=${summary.session.activeProcessCount}`
+  )
+  if (summary.providerBackoff) {
+    console.log(`provider backoff: ${JSON.stringify(summary.providerBackoff)}`)
+  }
+  if (summary.failures.length > 0) {
+    console.log(`worker failures: ${summary.failures.length}`)
+  }
+  if (summary.localTeardownFailures.count > 0) {
+    console.log(
+      `local teardown failures: ${summary.localTeardownFailures.count}`
+    )
+  }
+}
+
 export async function commandResearchStatus(args: Args) {
   const root = await repoRoot(args.options.cwd)
+  if (args.options.summary === "true") {
+    await commandResearchStatusSummary({ root, args })
+    return
+  }
   const shouldReconcile = args.options.reconcile === "true"
   const campaignInfo = await campaignForName(root, args, {
     persistState: shouldReconcile,
@@ -4047,6 +4470,33 @@ export async function commandResearchStatus(args: Args) {
     )
   }
   const state = await readState(root)
+  const remoteSessionsById = new Map(
+    freshOverview.sessions.map((session) => [session.id, session])
+  )
+  const locallyOwnedOpenSessions = Object.entries(state.sessions ?? {})
+    .filter(
+      ([, session]) =>
+        session.campaignId === campaign.id &&
+        (session.status === "running" ||
+          session.status === "stop_requested" ||
+          session.stopPendingRemote === true)
+    )
+    .map(([id, session]) => {
+      const remote = remoteSessionsById.get(id)
+      return {
+        id,
+        campaignName: session.campaignName,
+        campaignId: session.campaignId,
+        status: remote?.status ?? session.status,
+        experimentTarget: remote?.experimentTarget ?? session.experimentTarget,
+        acceptedExperimentCount: remote?.acceptedExperimentCount ?? null,
+        remainingExperimentCount: remote?.remainingExperimentCount ?? null,
+        deadlineAt: remote?.deadlineAt ?? session.deadlineAt,
+        schedulerSiteId: remote?.schedulerSiteId ?? session.schedulerSiteId,
+        providerBackoff: session.providerBackoff ?? null,
+        supervisor: session.supervisor ?? null,
+      }
+    })
   const activeSessionId =
     state.campaigns?.[campaignStateKey(projectPath, campaign.name)]?.sessionId
   const scopeAll = args.options["all-sessions"] === "true"
@@ -4070,16 +4520,9 @@ export async function commandResearchStatus(args: Args) {
       ).catch(() => localSessionState)
     }
   }
-  const overview = localSessionState
-    ? {
-        campaign: freshOverview.campaign,
-        gitVerification: freshOverview.gitVerification,
-        hypotheses: localSessionState.hypotheses,
-        workers: localSessionState.workers,
-        summaries: localSessionState.summaries,
-        knowledge: localSessionState.knowledge,
-      }
-    : freshOverview
+  // Supabase/API is authoritative for durable workers, including terminal
+  // outcomes that can arrive after the local runtime snapshot was written.
+  const overview = freshOverview
   const hypotheses = overview.hypotheses
   const workers =
     activeSessionId && !scopeAll
@@ -4179,7 +4622,7 @@ export async function commandResearchStatus(args: Args) {
           gitLabel:
             liveWorker.gitLabel ??
             worker.gitLabel ??
-            manifest?.finalization?.commitSha ??
+            durableTeardownResultCommit(manifest?.teardown) ??
             null,
           currentExperimentId:
             liveWorker.currentExperimentId ?? worker.currentExperimentId,
@@ -4190,7 +4633,9 @@ export async function commandResearchStatus(args: Args) {
           status: manifestStatus,
           phase: manifest?.status ?? worker.phase,
           gitLabel:
-            worker.gitLabel ?? manifest?.finalization?.commitSha ?? null,
+            worker.gitLabel ??
+            durableTeardownResultCommit(manifest?.teardown) ??
+            null,
         }
   })
   const activeWorkers = workersForStatus.filter(workerIsActive).length
@@ -4207,7 +4652,7 @@ export async function commandResearchStatus(args: Args) {
   const sessionRuntimeState = activeSessionId
     ? state.sessions?.[activeSessionId]
     : undefined
-  const supervisorTelemetry = freshSupervisorTelemetry(
+  const supervisorTelemetry = supervisorTelemetryForStatus(
     sessionRuntimeState?.supervisor
   )
   const ignoredPresence = sessionRuntimeState?.ignoredPresence ?? null
@@ -4215,7 +4660,7 @@ export async function commandResearchStatus(args: Args) {
     supervisorTelemetry?.providerBackoff ??
     sessionRuntimeState?.providerBackoff ??
     null
-  const sessionMetadata = sessionState?.session.metadata ?? {}
+  const sessionMetadata: Record<string, unknown> = {}
   const launchRate = supervisorTelemetry?.launchRate ?? {
     batchSize:
       typeof sessionMetadata.launchBatchSize === "number"
@@ -4248,33 +4693,12 @@ export async function commandResearchStatus(args: Args) {
         logPath: manifest?.logPath ?? null,
       }
     })
-  const localDiscardedAfterCompletion = manifests
+  const localTeardownFailures = manifests
     .filter(
       (manifest) =>
-        manifest.finalization?.finalizationStatus ===
-        "discarded_after_completion"
-    )
-    .slice(0, 25)
-    .map((manifest) => ({
-      workerId: manifest.workerId,
-      workerName: manifest.workerName,
-      status: manifest.status,
-      unloggedCommitCount: manifest.finalization?.unloggedCommitCount ?? null,
-      workerBranchPushStatus:
-        manifest.finalization?.workerBranchPushStatus ?? null,
-      logPath: manifest.logPath,
-      manifestPath: manifest.manifestPath,
-    }))
-  const localUnloggedAttempts = manifests
-    .filter(
-      (manifest) =>
-        manifest.finalization?.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        ) ||
-        ((manifest.finalization?.unloggedCommitCount ?? 0) > 0 &&
-          manifest.finalization?.finalizationStatus !==
-            "discarded_after_completion") ||
-        (!manifest.finalization &&
+        manifest.teardown?.attemptDelivery === "failed" ||
+        manifest.teardown?.worktreeCleanup === "failed" ||
+        (!manifest.teardown &&
           ["completed", "failed", "stopped"].includes(manifest.status))
     )
     .slice(0, 25)
@@ -4282,28 +4706,18 @@ export async function commandResearchStatus(args: Args) {
       workerId: manifest.workerId,
       workerName: manifest.workerName,
       status: manifest.status,
-      finalizationStatus: manifest.finalization?.finalizationStatus ?? null,
-      unloggedCommitCount: manifest.finalization?.unloggedCommitCount ?? null,
+      teardown: manifest.teardown,
       logPath: manifest.logPath,
       manifestPath: manifest.manifestPath,
     }))
   const workerWarnings = manifests
-    .filter(
-      (manifest) =>
-        (manifest.warnings?.length ?? 0) +
-          (manifest.finalization?.warnings?.length ?? 0) >
-        0
-    )
-    .map((manifest) => ({
+    .map((manifest) => ({ manifest, warnings: uniqueWorkerWarnings(manifest) }))
+    .filter(({ warnings }) => warnings.length > 0)
+    .map(({ manifest, warnings }) => ({
       workerId: manifest.workerId,
       workerName: manifest.workerName,
-      warnings: [
-        ...(manifest.warnings ?? []),
-        ...(manifest.finalization?.warnings ?? []),
-      ].slice(0, 10),
-      warningCount:
-        (manifest.warnings?.length ?? 0) +
-        (manifest.finalization?.warnings?.length ?? 0),
+      warnings: warnings.slice(0, 10),
+      warningCount: warnings.length,
       manifestPath: manifest.manifestPath,
     }))
   const progress = live?.progress ?? sessionState?.session ?? null
@@ -4334,6 +4748,8 @@ export async function commandResearchStatus(args: Args) {
       JSON.stringify(
         {
           campaign: statusCampaign,
+          sessions: freshOverview.sessions,
+          locallyOwnedOpenSessions,
           session: activeSessionId
             ? {
                 id: activeSessionId,
@@ -4366,16 +4782,13 @@ export async function commandResearchStatus(args: Args) {
           bestExperiment,
           providerBackoff,
           recentFailedLaunches,
+          noProgressBreaker: supervisorTelemetry?.noProgressBreaker ?? null,
           failures: failureSummary,
           sites: live?.sites ?? [],
-          finalization: live?.finalization ?? null,
-          localUnloggedAttempts: {
-            count: localUnloggedAttempts.length,
-            workers: localUnloggedAttempts,
-          },
-          localDiscardedAfterCompletion: {
-            count: localDiscardedAfterCompletion.length,
-            workers: localDiscardedAfterCompletion,
+          cleanupSite: live?.sites?.[0] ?? null,
+          localTeardownFailures: {
+            count: localTeardownFailures.length,
+            workers: localTeardownFailures,
           },
           workerWarnings,
           launchSuggestions,
@@ -4389,6 +4802,14 @@ export async function commandResearchStatus(args: Args) {
 
   console.log(`campaign: ${campaign.name}`)
   console.log(`setup: local onyx/setup.json`)
+  console.log(
+    `sessions: ${freshOverview.sessions.length} recent remote, ${locallyOwnedOpenSessions.length} locally owned open`
+  )
+  for (const session of freshOverview.sessions) {
+    console.log(
+      `  ${session.id}: ${session.runtimeState} workers=${session.workerTarget} accepted=${session.acceptedExperimentCount}${session.endedAt ? ` ended=${session.endReason ?? "ended"}` : ""}`
+    )
+  }
   if (shouldReconcile && freshOverview.gitVerification) {
     const summary = freshOverview.gitVerification
     const suffix =
@@ -4406,18 +4827,16 @@ export async function commandResearchStatus(args: Args) {
   if (providerBackoff) {
     console.log(`provider backoff: ${JSON.stringify(providerBackoff)}`)
   }
-  if (live?.finalization) {
-    console.log(
-      `finalization: ${live.finalization.status} terminalReason=${live.finalization.terminalReason ?? "-"}`
-    )
+  if (live?.sites?.[0]?.runtimeStatus) {
+    console.log(`cleanup: ${live.sites[0].runtimeStatus}`)
   }
-  if (localUnloggedAttempts.length > 0) {
-    console.log(`local unlogged attempts: ${localUnloggedAttempts.length}`)
-  }
-  if (localDiscardedAfterCompletion.length > 0) {
-    console.log(
-      `local discarded late work: ${localDiscardedAfterCompletion.length}`
-    )
+  if (localTeardownFailures.length > 0) {
+    console.log(`local teardown failures: ${localTeardownFailures.length}`)
+    for (const failure of localTeardownFailures.slice(0, 5)) {
+      console.log(
+        `  ${failure.workerName}: reason=${failure.teardown?.reasonCode ?? "missing_teardown"} delivery=${failure.teardown?.attemptDelivery ?? "unknown"} cleanup=${failure.teardown?.worktreeCleanup ?? "unknown"}${failure.teardown?.error ? ` error="${compactProviderErrorSummary(failure.teardown.error).slice(0, 160)}"` : ""}`
+      )
+    }
   }
   if (workerWarnings.length > 0) {
     console.log(
@@ -4431,6 +4850,11 @@ export async function commandResearchStatus(args: Args) {
     const latestFailure = recentFailedLaunches[recentFailedLaunches.length - 1]
     console.log(
       `recent launch failures: ${recentFailedLaunches.length} latest=${latestFailure?.reason ?? "unknown"}`
+    )
+  }
+  if (supervisorTelemetry?.noProgressBreaker?.tripped) {
+    console.log(
+      `no-progress breaker: tripped ${supervisorTelemetry.noProgressBreaker.count}/${supervisorTelemetry.noProgressBreaker.threshold}`
     )
   }
   if (ignoredPresence && ignoredPresence.total > 0) {
@@ -4498,9 +4922,7 @@ export async function commandResearchStatus(args: Args) {
     const manifestError = manifest?.error
       ? compactProviderErrorSummary(manifest.error).slice(0, 160)
       : null
-    const warningCount =
-      (manifest?.warnings?.length ?? 0) +
-      (manifest?.finalization?.warnings?.length ?? 0)
+    const warningCount = manifest ? uniqueWorkerWarnings(manifest).length : 0
     console.log(
       [
         `  ${worker.workerName}: ${worker.status}`,
@@ -4509,6 +4931,16 @@ export async function commandResearchStatus(args: Args) {
         `seen=${lastSeen}`,
         `lastOutput=${lastOutput}`,
         manifest?.timedOut ? "timeout=true" : null,
+        manifest?.teardown ? `reason=${manifest.teardown.reasonCode}` : null,
+        manifest?.teardown
+          ? `delivery=${manifest.teardown.attemptDelivery}`
+          : null,
+        manifest?.teardown?.resultRefPushStatus === "failed"
+          ? "refPush=failed"
+          : null,
+        manifest?.teardown
+          ? `cleanup=${manifest.teardown.worktreeCleanup}`
+          : null,
         warningCount > 0 ? `warnings=${warningCount}` : null,
         manifest?.activityLogPath
           ? `activity=${manifest.activityLogPath}`
@@ -4562,7 +4994,7 @@ export async function commandResearchHypotheses(args: Args) {
       statement:
         "A focused follow-up based on previous hypothesis results can test a different mechanism or exploit a promising partial result.",
       startingPoints: [
-        "Review hypothesis summaries, experiment notes, and current best metric before choosing edits.",
+        "Review experiment history, shared knowledge, and the current best metric before choosing edits.",
         ...scope,
       ],
       avoidList: protectedPaths,
@@ -4598,6 +5030,52 @@ function activeSessionIdFromState({
   return undefined
 }
 
+function selectLocalOpenSessionId({
+  state,
+  projectPath,
+  campaignName,
+  operation,
+}: {
+  state: Awaited<ReturnType<typeof readState>>
+  projectPath: string
+  campaignName?: string
+  operation: "stop" | "scale"
+}) {
+  const selectedCampaignName = campaignName ?? state.activeCampaign
+  const selectedCampaignId = selectedCampaignName
+    ? state.campaigns?.[campaignStateKey(projectPath, selectedCampaignName)]
+        ?.campaignId
+    : undefined
+  const openSessionIds = Object.entries(state.sessions ?? {})
+    .filter(([, session]) => {
+      if (selectedCampaignId && session.campaignId !== selectedCampaignId) {
+        return false
+      }
+      if (
+        !selectedCampaignId &&
+        selectedCampaignName &&
+        session.campaignName !== selectedCampaignName
+      ) {
+        return false
+      }
+      return (
+        session.stopPendingRemote === true ||
+        session.status === "running" ||
+        session.status === "stop_requested"
+      )
+    })
+    .map(([sessionId]) => sessionId)
+  if (openSessionIds.length > 1) {
+    throw new Error(
+      `Multiple local research sessions are open (${openSessionIds.join(", ")}). Pass --session <id> to ${operation} one.`
+    )
+  }
+  return (
+    openSessionIds[0] ??
+    activeSessionIdFromState({ state, projectPath, campaignName })
+  )
+}
+
 function renderSessionBrief(brief: ApiSessionBrief) {
   const lines: string[] = [
     `# ${brief.campaign.name}`,
@@ -4631,14 +5109,6 @@ function renderSessionBrief(brief: ApiSessionBrief) {
       )
     }
   }
-  if (brief.summaries.length > 0) {
-    lines.push("", "## Summaries")
-    for (const summary of brief.summaries.slice(0, 8)) {
-      lines.push(`- ${summary.summaryKind}: ${summary.title}`)
-      const preview = summary.body.replace(/\s+/g, " ").trim().slice(0, 240)
-      if (preview) lines.push(`  ${preview}`)
-    }
-  }
   if (brief.knowledge.length > 0) {
     lines.push("", "## Knowledge")
     for (const item of brief.knowledge.slice(0, 12)) {
@@ -4653,33 +5123,6 @@ function renderSessionBrief(brief: ApiSessionBrief) {
 
 function sessionStatusIsTerminal(status: string | null | undefined) {
   return status === "completed" || status === "failed" || status === "stopped"
-}
-
-async function readRunSessionState({
-  root,
-  sessionId,
-  args,
-}: {
-  root: string
-  sessionId: string
-  args: Args
-}) {
-  try {
-    const remote = await getResearchSessionState(sessionId, args)
-    await cacheResearchSessionState({
-      root,
-      campaign: remote.campaign,
-      session: remote.session,
-      hypotheses: remote.hypotheses,
-      workers: remote.workers,
-      experiments: remote.latestExperiments,
-      summaries: remote.summaries,
-      knowledge: remote.knowledge,
-    }).catch(() => {})
-    return remote
-  } catch {
-    return getLocalSessionState(root, sessionId)
-  }
 }
 
 async function reconcileCampaignIntoLocalState({
@@ -4710,7 +5153,6 @@ async function reconcileCampaignIntoLocalState({
       hypotheses: response.hypotheses,
       workers: response.workers,
       experiments: response.experiments,
-      summaries: [],
       knowledge: [],
     },
   }).catch(() => {})
@@ -4780,6 +5222,11 @@ async function workerSessionStopGuidance({
 }
 
 export async function commandResearchSessionStateBrief(args: Args) {
+  if (args.options.compact !== undefined) {
+    throw new Error(
+      "`--compact` was removed; session-state-brief now returns the single bounded worker context."
+    )
+  }
   const context = await readWorkerRuntimeContext()
   if (!context) {
     throw new Error(
@@ -4849,10 +5296,11 @@ export async function commandResearchStop(args: Args) {
   const state = await readState(root)
   const sessionId =
     args.options.session ??
-    activeSessionIdFromState({
+    selectLocalOpenSessionId({
       state,
       projectPath,
       campaignName: args.options.campaign,
+      operation: "stop",
     })
   if (!sessionId) {
     throw new Error("Pass --session <id> or start a research session first.")
@@ -4875,18 +5323,82 @@ export async function commandResearchStop(args: Args) {
     stopRequested: true,
     status: "stop_requested",
   }
+  const stopMarkerDir = join(
+    await onyxStateDir(root),
+    "worker-runtime",
+    sessionId
+  )
+  await mkdir(stopMarkerDir, { recursive: true })
+  await writeFile(
+    join(stopMarkerDir, "stop-marker.json"),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        sessionId,
+        supervisorRunId:
+          state.sessions[sessionId]?.supervisor?.supervisorRunId ?? null,
+        requestedAt: new Date().toISOString(),
+        reason: args.options.reason ?? "user requested stop",
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  )
   await writeState(root, state)
 
+  const supervisor = state.sessions[sessionId]?.supervisor
+  if (supervisor?.pid) {
+    const currentIdentity = inspectProcessIdentity(supervisor.pid)
+    const processManifest = await readSupervisorProcessManifest(root, sessionId)
+    const identityMatches = supervisorProcessIdentityMatches({
+      runtime: supervisor,
+      manifest: processManifest,
+      identity: currentIdentity,
+    })
+    if (identityMatches) {
+      try {
+        process.kill(-supervisor.pid, "SIGTERM")
+      } catch {
+        process.kill(supervisor.pid, "SIGTERM")
+      }
+    } else {
+      console.warn(
+        `Supervisor ${supervisor.pid} identity could not be verified; no local signal was sent. The remote stop cutoff will still apply.`
+      )
+    }
+  }
+
   if (campaignId) {
-    await stopCampaignSession(
-      sessionId,
-      {
-        campaignId,
-        status: "stop_requested",
-        reason: args.options.reason ?? "stop requested",
-      },
-      args
-    )
+    try {
+      await stopCampaignSession(
+        sessionId,
+        {
+          campaignId,
+          endReason: "user_stopped",
+          reason: args.options.reason ?? "stop requested",
+        },
+        args
+      )
+      await updateState(root, (next) => {
+        if (next.sessions?.[sessionId]) {
+          next.sessions[sessionId]!.stopPendingRemote = false
+        }
+      })
+    } catch (error) {
+      await updateState(root, (next) => {
+        next.sessions = next.sessions ?? {}
+        next.sessions[sessionId] = {
+          ...(next.sessions[sessionId] ?? {}),
+          campaignId,
+          stopRequested: true,
+          stopPendingRemote: true,
+        }
+      })
+      throw new Error(
+        `Local stop was applied, but the remote cutoff is pending: ${errorMessage(error)}\nRetry exactly: onyx research stop --session ${sessionId}`
+      )
+    }
   } else {
     const control = await getResearchSessionControlState(sessionId, args)
     throw new Error(
@@ -4902,316 +5414,18 @@ export async function commandResearchStop(args: Args) {
   console.log(`Stop requested for research session ${sessionId}`)
 }
 
-function safeBranchSegment(value: string) {
-  return value.replace(/[^A-Za-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
-}
-
-export async function commandResearchFinish(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  if (
-    args.options.offline === "true" ||
-    args.options["sync-interval"] !== undefined ||
-    args.options["sync-concurrency"] !== undefined ||
-    args.options["sync-drain-batches"] !== undefined ||
-    args.options["sync-batch-size"] !== undefined ||
-    args.options["final-sync-timeout"] !== undefined
-  ) {
-    throw new Error(
-      "Offline and sync finalization flags were removed. Research finish reads and writes directly through the Onyx API."
-    )
-  }
-  const campaignInfo = await campaignForName(root, args)
-  const { campaign } = campaignInfo
-  const state = await readState(root)
-  const projectPath = await resolveProjectPath(root, args)
-  const sessionId =
-    args.options.session ??
-    activeSessionIdFromState({
-      state,
-      projectPath,
-      campaignName: campaign.name,
-    })
-  const finishFinalization = sessionId
-    ? await computeSessionFinalizationStatus({ root, sessionId })
-    : null
-
-  await completeLocalCampaign({
-    root,
-    campaignId: campaign.id,
-  }).catch(() => {})
-  if (sessionId) {
-    state.sessions = state.sessions ?? {}
-    state.sessions[sessionId] = {
-      ...(state.sessions[sessionId] ?? {}),
-      campaignId: campaign.id,
-      campaignName: campaign.name,
-      status: "completed",
-      stopRequested: false,
-      providerBackoff: null,
-    }
-    await writeState(root, state)
-    await abandonBlockedWorkflowRunsForSession({
-      root,
-      sessionId,
-      reason:
-        "Campaign finalized; blocked worker workflow is no longer active.",
-    }).catch(() => [])
-    await stopLocalSession({
-      root,
-      sessionId,
-      status: "completed",
-      reason: "finalized",
-    }).catch(() => {})
-    const sessionState = await getLocalSessionState(root, sessionId).catch(
-      () => null
-    )
-    for (const worker of sessionState?.workers ?? []) {
-      if (["registered", "running"].includes(worker.status)) {
-        await recordLocalWorkerHeartbeat({
-          root,
-          workerId: worker.id,
-          status: "stopped",
-          sessionId,
-          hypothesisId: worker.hypothesisId,
-          phase: "stopped",
-          event: "campaign_finalized",
-          progressMessage: "Campaign finalized",
-          gitLabel: worker.gitLabel ?? null,
-        }).catch(() => {})
-      }
-    }
-    await writeRemoteSessionFinalization({
-      sessionId,
-      campaignId: campaign.id,
-      status: finishFinalization?.status === "failed" ? "failed" : "completed",
-      finalization:
-        finishFinalization ??
-        ({
-          status: "complete",
-          reasons: [],
-          live: null,
-        } satisfies SessionFinalizationComputation),
-      args,
-      requireOnline: args.options["require-online"] === "true",
-    })
-  }
-
-  await completeCampaign(
-    campaign.id,
-    sessionId ? { sessionId } : {},
-    args
-  ).catch((error) => {
-    if (args.options["require-online"] === "true") throw error
-    console.warn(
-      `Campaign completion skipped: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
-    return null
-  })
-
-  const overview = await reconcileCampaignIntoLocalState({
-    root,
-    campaignId: campaign.id,
-    projectPath: campaignInfo.projectPath,
-    args,
-  })
-    .then(() => getCampaignOverview(campaign.id, args))
-    .catch((error) => {
-      if (args.options["require-online"] === "true") throw error
-      return campaignInfo.overview
-    })
-
-  const branches: string[] = []
-  const campaignSegment = safeBranchSegment(campaign.name)
-  if (overview.campaign.bestCommitSha) {
-    const bestBranch = `onyx/${campaignSegment}/best`
-    await git(
-      ["branch", "-f", bestBranch, overview.campaign.bestCommitSha],
-      root
-    )
-    branches.push(`${bestBranch} -> ${overview.campaign.bestCommitSha}`)
-  }
-  const finishLive = sessionId
-    ? await getResearchSessionLive(sessionId, args).catch(() => null)
-    : null
-  const finishLocal = sessionId
-    ? await getLocalSessionState(root, sessionId).catch(() => null)
-    : null
-  const finishManifests = sessionId
-    ? await readWorkerLaunchManifests(root, sessionId).catch(() => [])
-    : []
-  const finishUnmeasuredSalvage =
-    finishLive?.finalization?.unmeasuredSalvageCount ??
-    finishManifests.filter(
-      (manifest) =>
-        manifest.finalization?.salvaged &&
-        manifest.finalization.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        )
-    ).length
-  const finishDiscardedAfterCompletion = finishManifests.filter(
-    (manifest) =>
-      manifest.finalization?.finalizationStatus ===
-      "discarded_after_completion"
-  ).length
-  const finishAccepted =
-    finishLive?.session.acceptedExperimentCount ??
-    finishLocal?.session.acceptedExperimentCount ??
-    overview.campaign.experimentCount ??
-    0
-  const finishTarget =
-    finishLive?.session.experimentTarget ??
-    finishLocal?.session.experimentTarget ??
-    null
-
-  const body = [
-    finishFinalization?.status === "failed"
-      ? `Finalized campaign ${campaign.name} with failed worker finalization.`
-      : finishFinalization?.status === "incomplete"
-        ? `Finalized campaign ${campaign.name} with incomplete worker finalization.`
-        : finishDiscardedAfterCompletion > 0
-          ? `Finalized campaign ${campaign.name} with late discarded worker work.`
-          : `Finalized campaign ${campaign.name}.`,
-    `Best metric: ${overview.campaign.bestMetricValue ?? "n/a"}`,
-    `Best commit: ${overview.campaign.bestCommitSha ?? "n/a"}`,
-    `Experiment counts: accepted=${finishAccepted}${finishTarget === null ? "" : `/${finishTarget}`} unmeasuredSalvage=${finishUnmeasuredSalvage} discardedAfterCompletion=${finishDiscardedAfterCompletion}`,
-    finishFinalization?.reasons.length
-      ? `Finalization notes: ${finishFinalization.reasons.slice(0, 5).join("; ")}`
-      : "",
-    "Hypothesis refs are not promoted from mutable hypothesis heads; use verified experiment best projections for curated outputs.",
-    "",
-    "Local branches:",
-    ...(branches.length > 0
-      ? branches.map((branch) => `- ${branch}`)
-      : ["- none"]),
-  ].join("\n")
-  await upsertCampaignSummary(
-    campaign.id,
-    {
-      sessionId,
-      summaryKind: "campaign_brief",
-      title: `${campaign.name} final results`,
-      body,
-      isCurrent: true,
-      metadata: { authoredBy: "onyx-research-finish" },
-    },
-    args
-  )
-  console.log(body)
-}
-
-export async function commandSummaryUpsert(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  const kind = summaryKindOption(args, "hypothesis_summary")
-  const { campaign } = await campaignForName(root, args)
-  const title = args.options.title ?? `${kind} ${new Date().toISOString()}`
-  const body = args.options.body
-  if (!body) throw new Error("Pass --body <text>.")
-  const sessionId = optionalUuid(
-    args.options.session ?? process.env.ONYX_SESSION_ID,
-    "--session"
-  )
-  const hypothesisId = optionalUuid(
-    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
-    "--hypothesis"
-  )
-  const authoredByWorkerId = optionalUuid(
-    args.options.worker ?? process.env.ONYX_WORKER_ID,
-    "--worker"
-  )
-  if (args.options.sync === "true" || args.options.offline === "true") {
-    throw new Error(
-      "`--sync` and `--offline` were removed. Summaries are written directly to the Onyx API."
-    )
-  }
-  const summary = await upsertCampaignSummary(
-    campaign.id,
-    {
-      sessionId,
-      hypothesisId,
-      authoredByWorkerId,
-      summaryKind: kind,
-      title,
-      body,
-    },
-    args
-  )
-  if (args.options.json === "true") {
-    console.log(JSON.stringify(summary, null, 2))
-    return
-  }
-  console.log(`Updated ${summary.summaryKind} for ${campaign.name}`)
-}
-
-function summaryScope(summary: ApiSummary) {
-  return [
-    summary.sessionId ? `session=${summary.sessionId}` : null,
-    summary.hypothesisId ? `hypothesis=${summary.hypothesisId}` : null,
-    summary.authoredByWorkerId ? `worker=${summary.authoredByWorkerId}` : null,
-  ]
-    .filter(Boolean)
-    .join(" ")
-}
-
-export async function commandSummaryList(args: Args) {
-  const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
-  const kind = args.options.kind
-    ? summaryKindOption(args, "hypothesis_summary")
-    : null
-  const limit = positiveIntegerOption(args, "limit", 20)
-  if (args.options.offline === "true") {
-    throw new Error(
-      "`--offline` was removed. Summaries are read directly from the Onyx API."
-    )
-  }
-  const sourceSummaries = await getCampaignOverview(campaign.id, args).then(
-    (overview) => overview.summaries
-  )
-  const matchingSummaries = sourceSummaries.filter(
-    (summary) => !kind || summary.summaryKind === kind
-  )
-  const summaries = matchingSummaries.slice(0, limit)
-
-  if (args.options.json === "true") {
-    console.log(JSON.stringify(summaries, null, 2))
-    return
-  }
-
-  if (summaries.length === 0) {
-    console.log(
-      kind
-        ? `No ${kind} summaries found for ${campaign.name}.`
-        : `No summaries found for ${campaign.name}.`
-    )
-    return
-  }
-
-  for (const summary of summaries) {
-    const scope = summaryScope(summary)
-    const preview = summary.body.replace(/\s+/g, " ").trim().slice(0, 180)
-    console.log(
-      [
-        `${summary.summaryKind}${summary.isCurrent ? " current" : ""}: ${summary.title}`,
-        scope || null,
-        preview ? `- ${preview}` : null,
-      ]
-        .filter(Boolean)
-        .join(" ")
-    )
-  }
-  if (matchingSummaries.length > summaries.length) {
-    console.log(
-      `... ${matchingSummaries.length - summaries.length} more; raise --limit to see more.`
-    )
-  }
-}
-
 export async function commandKnowledgeAdd(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
-  const kind = args.options.kind ?? "insight"
+  const workerContext = await readWorkerRuntimeContext()
+  const campaign = workerContext
+    ? { id: workerContext.campaignId, name: workerContext.campaignName }
+    : (await campaignForName(root, args)).campaign
+  const kind = (args.options.kind ?? "insight") as
+    | "insight"
+    | "dead_end"
+    | "promising_direction"
+    | "risk"
+    | "transfer_note"
   if (
     kind !== "insight" &&
     kind !== "dead_end" &&
@@ -5233,23 +5447,22 @@ export async function commandKnowledgeAdd(args: Args) {
       "`--sync` and `--offline` were removed. Knowledge is written directly to the Onyx API."
     )
   }
-  const item = await createCampaignKnowledge(
-    campaign.id,
-    {
-      sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-      hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
-      authoredByWorkerId:
-        args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
-      kind,
-      title,
-      body,
-      confidence:
-        args.options.confidence === undefined
-          ? undefined
-          : Number(args.options.confidence),
-    },
-    args
-  )
+  const knowledgeBody = {
+    sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
+    hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
+    authoredByWorkerId:
+      args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+    kind,
+    title,
+    body,
+    confidence:
+      args.options.confidence === undefined
+        ? undefined
+        : Number(args.options.confidence),
+  }
+  const item = workerContext
+    ? await createWorkerKnowledge(knowledgeBody, args)
+    : await createCampaignKnowledge(campaign.id, knowledgeBody, args)
   if (args.options.json === "true") {
     console.log(JSON.stringify(item, null, 2))
     return
@@ -5259,17 +5472,21 @@ export async function commandKnowledgeAdd(args: Args) {
 
 export async function commandKnowledgeList(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const { campaign } = await campaignForName(root, args)
+  const workerContext = await readWorkerRuntimeContext()
+  const campaign = workerContext
+    ? { id: workerContext.campaignId, name: workerContext.campaignName }
+    : (await campaignForName(root, args)).campaign
   const limit = positiveIntegerOption(args, "limit", 50)
   if (args.options.offline === "true") {
     throw new Error(
       "`--offline` was removed. Knowledge is read directly from the Onyx API."
     )
   }
-  const knowledge = (await listCampaignKnowledge(campaign.id, args)).slice(
-    0,
-    limit
-  )
+  const knowledge = (
+    workerContext
+      ? await listWorkerKnowledge(args)
+      : await listCampaignKnowledge(campaign.id, args)
+  ).slice(0, limit)
 
   if (args.options.json === "true") {
     console.log(JSON.stringify(knowledge, null, 2))
@@ -5302,37 +5519,6 @@ export async function commandKnowledgeList(args: Args) {
   }
 }
 
-async function existingRunSession({
-  root,
-  sessionId,
-  args,
-}: {
-  root: string
-  sessionId: string
-  args: Args
-}) {
-  const sessionState = await readRunSessionState({ root, sessionId, args })
-  if (sessionState.session.status !== "running") {
-    throw new Error(
-      `Research session ${sessionId} is ${sessionState.session.status}; cannot supervise new workers.`
-    )
-  }
-  if (
-    args.options.campaign &&
-    sessionState.campaign.name !== args.options.campaign
-  ) {
-    throw new Error(
-      `Session ${sessionId} belongs to ${sessionState.campaign.name}, not ${args.options.campaign}.`
-    )
-  }
-  await assertLocalSessionSchedulerSite({
-    root,
-    sessionId,
-    schedulerSiteId: sessionState.session.schedulerSiteId,
-  })
-  return sessionState
-}
-
 function supervisorWorkerTarget(args: Args, fallback: number) {
   const target = positiveIntegerOption(args, "workers", fallback)
   if (target > MAX_LOCAL_SUPERVISOR_WORKERS) {
@@ -5343,6 +5529,169 @@ function supervisorWorkerTarget(args: Args, fallback: number) {
   return target
 }
 
+export function sessionCommitVisibilityGuidance(error: unknown) {
+  if (!(error instanceof ApiError) || error.status !== 409) return null
+  const payload = error.payload
+  if (!payload || typeof payload !== "object" || !("error" in payload)) {
+    return null
+  }
+  const envelope = payload as {
+    error?: { details?: Record<string, unknown> }
+  }
+  const details = envelope.error?.details
+  if (!details) return null
+  const reason = details?.reason
+  if (
+    reason !== "base_commit_not_visible" &&
+    reason !== "assignment_commit_not_visible"
+  ) {
+    return null
+  }
+  const commitSha =
+    typeof details.commitSha === "string" ? details.commitSha : "the commit"
+  const hypothesis =
+    typeof details.hypothesisId === "string"
+      ? ` for hypothesis ${details.hypothesisId}`
+      : ""
+  return `Research cannot start because ${commitSha}${hypothesis} is not visible to GitHub. Push that exact commit to the repository remote, then rerun \`onyx research run\`. No research session was created.`
+}
+
+async function resolveCommitRef(root: string, ref: string) {
+  return (await git(["rev-parse", "--verify", `${ref}^{commit}`], root)).trim()
+}
+
+async function committedSetupAt({
+  root,
+  projectPath,
+  commitSha,
+}: {
+  root: string
+  projectPath: string
+  commitSha: string
+}) {
+  const path = [projectPath, "onyx", "setup.json"].filter(Boolean).join("/")
+  const raw = await git(["show", `${commitSha}:${path}`], root)
+  const setup = normalizeSetupFile(JSON.parse(raw))
+  const evaluation = await evaluationFingerprint({
+    root,
+    projectPath,
+    commitSha,
+    setup,
+  })
+  return { setup, setupHash: setupHash(setup), ...evaluation }
+}
+
+function selectRunHypotheses(args: Args, hypotheses: ApiHypothesis[]) {
+  const active = hypotheses.filter(
+    (hypothesis) => hypothesis.status === "active"
+  )
+  const selected = optionValues(args, "hypothesis")
+  if (selected.length === 0) return active
+  const resolved = selected.map((selector) => {
+    const hypothesis = active.find(
+      (candidate) => candidate.id === selector || candidate.name === selector
+    )
+    if (!hypothesis) {
+      throw new Error(
+        `Active hypothesis ${JSON.stringify(selector)} was not found. Run \`onyx research hypothesis list --campaign ${args.options.campaign ?? "<name>"}\`.`
+      )
+    }
+    return hypothesis
+  })
+  if (new Set(resolved.map((item) => item.id)).size !== resolved.length) {
+    throw new Error("Each --hypothesis selection must be unique.")
+  }
+  return resolved
+}
+
+export async function resolveHypothesisBaseOverrides({
+  campaignId,
+  hypotheses,
+  args,
+  listExperiments = listCampaignExperiments,
+}: {
+  campaignId: string
+  hypotheses: ApiHypothesis[]
+  args: Args
+  listExperiments?: typeof listCampaignExperiments
+}) {
+  const parsed: Array<{
+    hypothesis: ApiHypothesis
+    rawRef: string
+    experimentId?: string
+  }> = []
+  const experimentIds = new Set<string>()
+  const overrides = new Map<
+    string,
+    { ref: string; sourceExperimentId?: string }
+  >()
+  for (const value of optionValues(args, "hypothesis-base")) {
+    const split = value.indexOf("=")
+    if (split <= 0 || split === value.length - 1) {
+      throw new Error(
+        `Invalid --hypothesis-base ${JSON.stringify(value)}; expected <hypothesis>=<ref|experiment:id>.`
+      )
+    }
+    const selector = value.slice(0, split)
+    const hypothesis = hypotheses.find(
+      (candidate) => candidate.id === selector || candidate.name === selector
+    )
+    if (!hypothesis) {
+      throw new Error(
+        `--hypothesis-base refers to unselected hypothesis ${selector}.`
+      )
+    }
+    const rawRef = value.slice(split + 1)
+    if (rawRef.startsWith("experiment:")) {
+      const experimentId = rawRef.slice("experiment:".length)
+      if (!experimentId) {
+        throw new Error(
+          `Invalid --hypothesis-base ${JSON.stringify(value)}; experiment id is required.`
+        )
+      }
+      experimentIds.add(experimentId)
+      parsed.push({ hypothesis, rawRef, experimentId })
+    } else {
+      parsed.push({ hypothesis, rawRef })
+    }
+  }
+
+  const experimentsById = new Map<string, ApiCampaignExperiment>()
+  if (experimentIds.size > 0) {
+    let cursor: string | undefined
+    do {
+      const page = await listExperiments(campaignId, args, {
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      })
+      for (const experiment of page.items) {
+        if (experimentIds.has(experiment.id)) {
+          experimentsById.set(experiment.id, experiment)
+        }
+      }
+      cursor = page.page.nextCursor ?? undefined
+    } while (experimentsById.size < experimentIds.size && cursor)
+  }
+
+  for (const entry of parsed) {
+    if (!entry.experimentId) {
+      overrides.set(entry.hypothesis.id, { ref: entry.rawRef })
+      continue
+    }
+    const experiment = experimentsById.get(entry.experimentId)
+    if (!experiment) {
+      throw new Error(
+        `Experiment ${entry.experimentId} was not found in this campaign.`
+      )
+    }
+    overrides.set(entry.hypothesis.id, {
+      ref: experiment.resultCommitSha,
+      sourceExperimentId: experiment.id,
+    })
+  }
+  return overrides
+}
+
 function defaultPresenceIntervalSeconds(workerTarget: number) {
   if (workerTarget >= 100) return 15
   if (workerTarget >= 50) return 10
@@ -5350,53 +5699,29 @@ function defaultPresenceIntervalSeconds(workerTarget: number) {
 }
 
 export type ProviderBackoffReason =
-  | "startup_timeout"
-  | "quota_exhausted"
   | "rate_limit"
   | "overloaded"
-  | "auth_error"
   | "provider_degraded"
 
 export function providerBackoffReasonForResult(
-  result: Pick<HypothesisRunResult, "status" | "error" | "startupTimedOut">
+  result: Pick<HypothesisRunResult, "status" | "error" | "startupTimedOut"> & {
+    terminalReason?: string
+  }
 ): ProviderBackoffReason | null {
   if (result.status !== "failed") return null
-  if (result.startupTimedOut) return "startup_timeout"
-  const message = result.error ?? ""
-  if (
-    /session limit|usage limit|out[_ -]?of[_ -]?credits|credit balance|insufficient credits|overage|spending limit|billing limit|quota exceeded/i.test(
-      message
-    )
-  ) {
-    return "quota_exhausted"
-  }
-  if (
-    /rate limit|too many requests|429|throttl|retry[- ]?after/i.test(message)
-  ) {
-    return "rate_limit"
-  }
-  if (
-    /auth|authentication|unauthorized|forbidden|401|403|invalid api key|login required|not logged in|permission denied/i.test(
-      message
-    )
-  ) {
-    return "auth_error"
-  }
-  if (
-    /overloaded|capacity|temporarily unavailable|503|529|server busy/i.test(
-      message
-    )
-  ) {
-    return "overloaded"
-  }
-  if (
-    /degraded|service unavailable|upstream|gateway|5\d\d|timeout connecting|connection timed out|network timeout/i.test(
-      message
-    )
-  ) {
+  if (result.terminalReason === "provider_rate_limited") return "rate_limit"
+  if (result.terminalReason === "provider_overloaded") return "overloaded"
+  if (result.terminalReason === "provider_unavailable") {
     return "provider_degraded"
   }
-  return null
+  const failureClass = classifyProviderFailure(result.error ?? "")
+  return failureClass === "rate_limit"
+    ? "rate_limit"
+    : failureClass === "overloaded"
+      ? "overloaded"
+      : failureClass === "unavailable"
+        ? "provider_degraded"
+        : null
 }
 
 function shouldTerminateOpenCodeOnOutput(text: string) {
@@ -5425,15 +5750,11 @@ export function providerBackoffDelayMs({
   attempt: number
   random?: () => number
 }) {
-  const maxMs = 10 * 60_000
+  const maxMs = 2 * 60_000
   const exponent = Math.max(0, Math.min(5, attempt - 1))
   const floorMs = Math.min(maxMs, Math.max(1, baseMs) * 2 ** exponent)
   const jitterMaxMs = Math.min(maxMs - floorMs, floorMs * 0.25)
   return Math.round(floorMs + jitterMaxMs * random())
-}
-
-function providerBackoffReasonIsTerminal(reason: ProviderBackoffReason) {
-  return reason === "auth_error" || reason === "quota_exhausted"
 }
 
 function sessionStopRequested({
@@ -5457,6 +5778,268 @@ function freshSupervisorTelemetry(
   if (!Number.isFinite(updatedAt)) return null
   if (Date.now() - updatedAt > SUPERVISOR_TELEMETRY_STALE_MS) return null
   return supervisor
+}
+
+function inspectProcessIdentity(pid: number) {
+  const inspect = (field: "lstart" | "command") => {
+    const result = spawnSync("ps", ["-p", String(pid), "-o", `${field}=`], {
+      encoding: "utf8",
+    })
+    return typeof result?.stdout === "string" ? result.stdout.trim() : ""
+  }
+  const startedAt = inspect("lstart")
+  const command = inspect("command")
+  return startedAt && command ? { startedAt, command } : null
+}
+
+type SupervisorProcessManifest = {
+  schemaVersion: 1
+  sessionId: string
+  pid: number
+  supervisorRunId: string
+  processStartedAt: string
+  commandIdentity: string
+  mode: "detached" | "foreground"
+  createdAt: string
+}
+
+async function supervisorProcessManifestPath(root: string, sessionId: string) {
+  return join(
+    await onyxStateDir(root),
+    "worker-runtime",
+    sessionId,
+    "supervisor-process.json"
+  )
+}
+
+async function writeSupervisorProcessManifest({
+  root,
+  manifest,
+}: {
+  root: string
+  manifest: SupervisorProcessManifest
+}) {
+  const path = await supervisorProcessManifestPath(root, manifest.sessionId)
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
+}
+
+async function readSupervisorProcessManifest(
+  root: string,
+  sessionId: string
+): Promise<SupervisorProcessManifest | null> {
+  const path = await supervisorProcessManifestPath(root, sessionId)
+  try {
+    const value = JSON.parse(
+      await readFile(path, "utf8")
+    ) as Partial<SupervisorProcessManifest>
+    if (
+      value.schemaVersion !== 1 ||
+      value.sessionId !== sessionId ||
+      typeof value.pid !== "number" ||
+      typeof value.supervisorRunId !== "string" ||
+      typeof value.processStartedAt !== "string" ||
+      typeof value.commandIdentity !== "string" ||
+      (value.mode !== "detached" && value.mode !== "foreground") ||
+      typeof value.createdAt !== "string"
+    ) {
+      return null
+    }
+    return value as SupervisorProcessManifest
+  } catch {
+    return null
+  }
+}
+
+function supervisorProcessIdentityMatches({
+  runtime,
+  manifest,
+  identity,
+}: {
+  runtime: NonNullable<NonNullable<CliState["sessions"]>[string]["supervisor"]>
+  manifest: SupervisorProcessManifest | null
+  identity: ReturnType<typeof inspectProcessIdentity>
+}) {
+  return Boolean(
+    manifest &&
+    identity &&
+    runtime.pid === manifest.pid &&
+    runtime.supervisorRunId === manifest.supervisorRunId &&
+    runtime.processStartedAt === manifest.processStartedAt &&
+    runtime.commandIdentity === manifest.commandIdentity &&
+    identity.startedAt === manifest.processStartedAt &&
+    identity.command === manifest.commandIdentity &&
+    (manifest.mode === "foreground" ||
+      identity.command.includes(`--supervise-session ${manifest.sessionId}`))
+  )
+}
+
+async function discardOrphanWorkerWorkspace({
+  root,
+  sessionId,
+  manifest,
+  reason,
+}: {
+  root: string
+  sessionId: string
+  manifest: WorkerLaunchManifest
+  reason: string
+}) {
+  const phase = manifest.status === "stopped" ? "stopped" : "failed"
+  let teardown = emptyWorkerTeardown({
+    phase,
+    reasonCode:
+      phase === "stopped"
+        ? "stopped"
+        : manifest.status === "starting"
+          ? "startup_failure"
+          : "provider_failure",
+    providerExitCode: manifest.exitCode,
+    providerSignal: manifest.signal,
+    timedOut: manifest.timedOut,
+    startupTimedOut: manifest.startupTimedOut,
+    providerError: manifest.error ?? reason,
+  })
+  if (await pathExists(manifest.cwd)) {
+    const diagnostics = await workspaceDiagnostics({
+      worktree: manifest.cwd,
+      startingCommitSha: manifest.startingCommitSha,
+    }).catch(() => null)
+    if (diagnostics) teardown = { ...teardown, ...diagnostics }
+  }
+  const attempts = await listLocalAttempts(root, {
+    sessionId,
+    workerId: manifest.workerId,
+    hypothesisId: manifest.hypothesisId,
+  }).catch(() => [])
+  if (attempts.length > 0) {
+    teardown.warnings = [
+      boundedText(
+        `Orphan cleanup discarded ${attempts.length} terminal attempt manifest(s) without delivery.`,
+        500
+      ),
+    ]
+    if (attempts.length > 1) {
+      teardown.attemptDelivery = "ambiguous_discarded"
+      teardown.reasonCode = "worker_protocol_violation"
+    }
+    await Promise.all(
+      attempts.map((attempt) =>
+        clearLocalAttempt(root, { runRef: attempt.runRef }).catch(() => {})
+      )
+    )
+  }
+  try {
+    await removeWorkerWorktree({
+      root,
+      sessionId,
+      workerId: manifest.workerId,
+    })
+    teardown.worktreeCleanup = "removed"
+  } catch (error) {
+    teardown.worktreeCleanup = "failed"
+    teardown.phase = "failed"
+    teardown.reasonCode = "cleanup_failure"
+    teardown.error = appendBoundedTeardownError(teardown.error, error)
+  }
+  await writeWorkerLaunchManifest({
+    ...manifest,
+    completedAt: manifest.completedAt ?? new Date().toISOString(),
+    status: teardown.worktreeCleanup === "failed" ? "failed" : phase,
+    error: boundedText(manifest.error ?? reason, 1000),
+    teardown,
+  }).catch(() => {})
+  return teardown.worktreeCleanup === "removed"
+}
+
+async function cleanupIdentityVerifiedOrphanWorkers({
+  root,
+  sessionId,
+  supervisorRunId,
+}: {
+  root: string
+  sessionId: string
+  supervisorRunId: string | null | undefined
+}) {
+  if (!supervisorRunId) return 0
+  const manifests = await readWorkerLaunchManifests(root, sessionId).catch(
+    () => []
+  )
+  let stopped = 0
+  for (const manifest of manifests) {
+    let identity = manifest.pid ? inspectProcessIdentity(manifest.pid) : null
+    let matchingLiveProcess = Boolean(
+      identity &&
+      manifest.processStartedAt &&
+      manifest.commandIdentity &&
+      identity.startedAt === manifest.processStartedAt &&
+      identity.command === manifest.commandIdentity
+    )
+    if (!matchingLiveProcess) {
+      await discardOrphanWorkerWorkspace({
+        root,
+        sessionId,
+        manifest,
+        reason: "No matching provider process remained during orphan cleanup",
+      })
+    }
+    if (
+      manifestIsTerminal(manifest) ||
+      manifest.supervisorRunId !== supervisorRunId ||
+      !manifest.pid ||
+      !manifest.processStartedAt ||
+      !manifest.commandIdentity
+    ) {
+      continue
+    }
+    if (!matchingLiveProcess) {
+      console.warn(
+        `Worker ${manifest.workerId} process identity could not be verified; no orphan signal was sent.`
+      )
+      continue
+    }
+    try {
+      process.kill(-manifest.pid, "SIGTERM")
+    } catch {
+      try {
+        process.kill(manifest.pid, "SIGTERM")
+      } catch {
+        continue
+      }
+    }
+    stopped += 1
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(250)
+      identity = inspectProcessIdentity(manifest.pid)
+      matchingLiveProcess = Boolean(
+        identity &&
+        identity.startedAt === manifest.processStartedAt &&
+        identity.command === manifest.commandIdentity
+      )
+      if (!matchingLiveProcess) break
+    }
+    if (!matchingLiveProcess) {
+      await discardOrphanWorkerWorkspace({
+        root,
+        sessionId,
+        manifest: {
+          ...manifest,
+          status: "stopped",
+          completedAt: new Date().toISOString(),
+          signal: "SIGTERM",
+          error:
+            "Identity-verified orphan process stopped after supervisor failure",
+        },
+        reason:
+          "Identity-verified orphan process stopped after supervisor failure",
+      })
+    } else {
+      console.warn(
+        `Worker ${manifest.workerId} remained live after orphan stop grace; its worktree was retained.`
+      )
+    }
+  }
+  return stopped
 }
 
 async function persistSupervisorTelemetry({
@@ -5519,7 +6102,7 @@ function researchRunChildArgv({
 }) {
   const options: Record<string, string | undefined> = {
     ...args.options,
-    session: sessionId,
+    "supervise-session": sessionId,
     cwd: root,
     foreground: "true",
     "supervisor-log-path": logPath,
@@ -5543,7 +6126,7 @@ async function supervisorLogPath(root: string, sessionId: string) {
 }
 
 function statusCommand(campaignName: string) {
-  return `onyx research status --campaign ${campaignName} --json`
+  return `onyx research status --campaign ${campaignName} --summary --json`
 }
 
 function listenCommand() {
@@ -5556,12 +6139,14 @@ async function launchDetachedResearchSupervisor({
   sessionId,
   campaign,
   launchRate,
+  supervisorRunId,
 }: {
   root: string
   args: Args
   sessionId: string
   campaign: ApiCampaign
   launchRate: { batchSize: number | null; intervalSeconds: number | null }
+  supervisorRunId: string
 }) {
   const latest = await readState(root).catch(() => null)
   const existing = freshSupervisorTelemetry(
@@ -5597,8 +6182,6 @@ async function launchDetachedResearchSupervisor({
   )
   const command = supervisorCliCommand()
   const childArgv = researchRunChildArgv({ args, root, sessionId, logPath })
-  const supervisorRunId =
-    process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
   const outputFd = openSync(logPath, "a")
   let pid: number | null = null
   try {
@@ -5618,6 +6201,24 @@ async function launchDetachedResearchSupervisor({
     closeSync(outputFd)
   }
 
+  const processIdentity = pid ? inspectProcessIdentity(pid) : null
+
+  if (pid && processIdentity) {
+    await writeSupervisorProcessManifest({
+      root,
+      manifest: {
+        schemaVersion: 1,
+        sessionId,
+        pid,
+        supervisorRunId,
+        processStartedAt: processIdentity.startedAt,
+        commandIdentity: processIdentity.command,
+        mode: "detached",
+        createdAt: new Date().toISOString(),
+      },
+    })
+  }
+
   await persistSupervisorTelemetry({
     root,
     sessionId,
@@ -5626,6 +6227,8 @@ async function launchDetachedResearchSupervisor({
     telemetry: {
       pid,
       supervisorRunId,
+      processStartedAt: processIdentity?.startedAt ?? null,
+      commandIdentity: processIdentity?.command ?? null,
       logPath,
       activeProcessCount: 0,
       launchRate,
@@ -5656,58 +6259,127 @@ async function launchDetachedResearchSupervisor({
   return payload
 }
 
-export async function commandResearchRun(args: Args) {
+async function commandResearchRunImplementation(
+  args: Args,
+  markSessionCreated: () => void
+) {
   const root = await repoRoot(args.options.cwd)
-  const projectPath = await resolveProjectPath(root, args)
-  const state = await readState(root)
-  const explicitSessionId = args.options.session
-  const cachedSessionId =
-    explicitSessionId === undefined
-      ? activeSessionIdFromState({
-          state,
-          projectPath,
-          campaignName: args.options.campaign,
-        })
+  const internalSessionId =
+    process.env.ONYX_LAUNCHER_BYPASS === "1"
+      ? args.options["supervise-session"]
       : undefined
-  let requestedSessionId = explicitSessionId ?? cachedSessionId
-  if (cachedSessionId) {
-    const cachedSessionState = await readRunSessionState({
-      root,
-      sessionId: cachedSessionId,
-      args,
-    })
-    if (sessionStatusIsTerminal(cachedSessionState.session.status)) {
-      requestedSessionId = undefined
-      if (args.options.json !== "true") {
-        console.error(
-          `Cached research session ${cachedSessionId} is ${cachedSessionState.session.status}; creating a fresh session.`
-        )
+  if (
+    args.options.session ||
+    (args.options["supervise-session"] && !internalSessionId)
+  ) {
+    throw new Error(
+      "--session was removed from `onyx research run`; every run creates a new bounded session."
+    )
+  }
+  if (args.options.hypotheses) {
+    throw new Error(
+      "--hypotheses was removed. Add durable hypotheses with `onyx research hypothesis add`, then select them with repeated --hypothesis flags."
+    )
+  }
+  const state = await readState(root)
+  const campaignInfo = await campaignForName(root, args)
+  const campaign = campaignInfo.campaign
+  const effectiveProjectPath = campaignInfo.projectPath
+  const internalSession = internalSessionId
+    ? await getResearchSessionState(internalSessionId, args)
+    : null
+  if (campaign.status === "archived") {
+    throw new Error(
+      `Campaign ${campaign.name} is archived. Unarchive it before starting research.`
+    )
+  }
+  if (!internalSessionId) {
+    for (const [cachedSessionId, local] of Object.entries(
+      state.sessions ?? {}
+    )) {
+      if (
+        local.campaignId !== campaign.id ||
+        local.status !== "running" ||
+        !local.supervisor?.pid
+      ) {
+        continue
       }
-    } else if (cachedSessionState.session.status === "stop_requested") {
+      const processManifest = await readSupervisorProcessManifest(
+        root,
+        cachedSessionId
+      )
+      const supervisorAlive = supervisorProcessIdentityMatches({
+        runtime: local.supervisor,
+        manifest: processManifest,
+        identity: inspectProcessIdentity(local.supervisor.pid),
+      })
+      if (supervisorAlive) continue
+      await cleanupIdentityVerifiedOrphanWorkers({
+        root,
+        sessionId: cachedSessionId,
+        supervisorRunId: local.supervisor.supervisorRunId,
+      })
+      await stopCampaignSession(
+        cachedSessionId,
+        {
+          campaignId: campaign.id,
+          endReason: "supervisor_failed",
+          reason: "cached local supervisor process is no longer running",
+        },
+        args
+      ).catch((error) => {
+        console.warn(
+          `Could not persist supervisor_failed for ${cachedSessionId}: ${errorMessage(error)}. Server abandonment reconciliation remains authoritative.`
+        )
+      })
+      local.status = "failed"
+      local.stopRequested = false
+      local.stopPendingRemote = false
+    }
+    await writeState(root, state)
+  }
+  if (!internalSessionId && args.options.new !== "true") {
+    const live = Object.entries(state.sessions ?? {}).find(([, local]) => {
+      if (local.campaignId !== campaign.id || local.status !== "running")
+        return false
+      const pid = local.supervisor?.pid
+      if (!pid) return false
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    })
+    if (live) {
       throw new Error(
-        `Cached research session ${cachedSessionId} is stop_requested; finish or stop it before starting a new session.`
+        `This machine already has a live supervisor for ${campaign.name} (${live[0]}). Pass --new to create a concurrent session.`
       )
     }
   }
-  const hypotheses = await hypothesisPlansOption(args)
-  if (requestedSessionId && hypotheses) {
+  const internalAssignmentHypothesisIds = new Set(
+    internalSession?.session.assignments.map(
+      (assignment) => assignment.hypothesisId
+    ) ?? []
+  )
+  const selectedHypotheses = internalSession
+    ? internalSession.hypotheses.filter((hypothesis) =>
+        internalAssignmentHypothesisIds.has(hypothesis.id)
+      )
+    : selectRunHypotheses(args, campaignInfo.overview.hypotheses)
+  if (selectedHypotheses.length === 0) {
     throw new Error(
-      "--hypotheses can only be used when creating a new research session. Use `onyx research hypothesis add --session <id>` for an existing session."
+      `Campaign ${campaign.name} has no active hypotheses. Add one with: onyx research hypothesis add --campaign ${campaign.name} --focus <focus> --hypothesis <statement>`
     )
   }
-
-  const sessionState = requestedSessionId
-    ? await existingRunSession({ root, sessionId: requestedSessionId, args })
-    : null
-  const campaignInfo = sessionState ? null : await campaignForName(root, args)
-  const campaign = sessionState?.campaign ?? campaignInfo!.campaign
-  const effectiveProjectPath = campaignInfo?.projectPath ?? projectPath
   const { setup } = await assertLocalSetupReady(root, effectiveProjectPath)
+  const sessionBaseCommitSha = internalSession
+    ? internalSession.session.baseCommitSha
+    : await resolveCommitRef(root, args.options.base ?? "HEAD")
   await assertSetupCommitted({
     root,
     projectPath: effectiveProjectPath,
-    baseCommitSha: campaign.baseCommitSha,
-    requireBaseMatchesHead: true,
+    baseCommitSha: sessionBaseCommitSha,
   })
   await assertMainWorktreeClean(root, "before running research")
 
@@ -5717,12 +6389,11 @@ export async function commandResearchRun(args: Args) {
   if (args.options["max-worker-iterations"] !== undefined) {
     throw new Error("--max-worker-iterations is no longer a worker option.")
   }
-  const sessionMetadata = sessionState?.session.metadata ?? {}
   const workerSettings = args.options["worker-command"]
     ? ({ agentKind: "codex", workerModel: null } satisfies WorkerSettings)
     : await resolveWorkerSettings({
         args,
-        sessionMetadata: sessionState ? sessionMetadata : null,
+        sessionMetadata: null,
         cwd: root,
       })
   const agentKind = workerSettings.agentKind
@@ -5748,29 +6419,16 @@ export async function commandResearchRun(args: Args) {
     throw new Error("--max-launches was removed.")
   }
   const experimentTarget =
-    optionalPositiveIntegerOption(args, "experiments") ??
-    sessionState?.session.experimentTarget ??
-    (typeof sessionMetadata.experimentTarget === "number"
-      ? sessionMetadata.experimentTarget
-      : null)
+    optionalPositiveIntegerOption(args, "experiments") ?? null
   const maxMinutes =
     args.options["max-minutes"] === undefined
       ? null
       : positiveNumberOption(args, "max-minutes", 120)
-  const workerFallback = sessionState
-    ? (sessionState.session.workerTarget ?? 1)
-    : (hypotheses?.length ?? 1)
-  const workerTarget = supervisorWorkerTarget(args, workerFallback)
-  const sessionTarget = sessionState?.session.workerTarget ?? workerTarget
-  if (workerTarget > sessionTarget) {
-    throw new Error(
-      `Session ${sessionState?.session.id} has ${sessionTarget} worker slot(s). Create a new session with --workers ${workerTarget}, or omit --session.`
-    )
-  }
+  const workerTarget = supervisorWorkerTarget(args, 1)
   const maxConcurrency = positiveIntegerOption(
     args,
     "max-concurrency",
-    workerTarget
+    MAX_LOCAL_SUPERVISOR_WORKERS
   )
   if (maxConcurrency > MAX_LOCAL_SUPERVISOR_WORKERS) {
     throw new Error(
@@ -5778,17 +6436,11 @@ export async function commandResearchRun(args: Args) {
     )
   }
   const now = Date.now()
-  const existingDeadlineAt =
-    sessionState?.session.deadlineAt ??
-    (requestedSessionId
-      ? state.sessions?.[requestedSessionId]?.deadlineAt
-      : null) ??
-    null
   const deadlineAt =
     maxMinutes === null
-      ? existingDeadlineAt
+      ? null
       : new Date(now + maxMinutes * 60_000).toISOString()
-  if (!requestedSessionId && experimentTarget === null && deadlineAt === null) {
+  if (experimentTarget === null && deadlineAt === null) {
     throw new Error("Pass --experiments <n> or --max-minutes <n>.")
   }
   const endTimeMs = deadlineAt
@@ -5847,44 +6499,164 @@ export async function commandResearchRun(args: Args) {
   }
   const providerBackoffMs =
     positiveNumberOption(args, "provider-backoff-seconds", 30) * 1000
-  const finalRefPushTimeoutMs =
-    positiveNumberOption(args, "final-ref-push-timeout", 120) * 1000
 
-  let sessionId = requestedSessionId
-  let schedulerSiteId = sessionState?.session.schedulerSiteId ?? null
-  if (!sessionId) {
-    schedulerSiteId = await getResearchSiteId(root)
-    const result = await createCampaignSession(
-      campaign.id,
-      {
-        name: args.options.name ?? `research-${new Date().toISOString()}`,
-        workerTarget,
-        hypotheses,
-        ...(experimentTarget === null ? {} : { experimentTarget }),
-        ...(deadlineAt === null ? {} : { deadlineAt }),
-        ...(schedulerSiteId === null ? {} : { schedulerSiteId }),
-        metadata: {
-          startedBy: "onyx-research-supervisor",
-          experimentTarget,
-          maxMinutes,
-          agentKind: sessionAgentKind,
-          ...workerModelMetadata(workerModel),
-          maxConcurrency,
-          launchBatchSize,
-          launchIntervalSeconds: launchIntervalMs / 1000,
-          presenceIntervalSeconds: presenceIntervalMs / 1000,
-        },
-      },
-      args
+  const schedulerSiteId = await getResearchSiteId(root)
+  const supervisorRunId =
+    process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
+  const sessionEvaluation = await committedSetupAt({
+    root,
+    projectPath: effectiveProjectPath,
+    commitSha: sessionBaseCommitSha,
+  })
+  if (
+    sessionEvaluation.setup.metric.name !== campaign.metricName ||
+    sessionEvaluation.setup.metric.unit !== campaign.metricUnit ||
+    sessionEvaluation.setup.metric.direction !== campaign.metricDirection
+  ) {
+    throw new Error(
+      `Committed setup metric does not match immutable campaign metric ${campaign.metricName}. Create a new campaign for a different metric contract.`
     )
-    sessionId = result.session.id
-    await cacheResearchSessionState({
-      root,
-      campaign,
-      session: result.session,
-      hypotheses: result.hypotheses,
-    }).catch(() => {})
   }
+  const overrides = internalSession
+    ? new Map<string, { ref: string; sourceExperimentId?: string }>(
+        internalSession.session.assignments.map((assignment) => [
+          assignment.hypothesisId,
+          {
+            ref: assignment.startingCommitSha,
+            ...(assignment.sourceExperimentId
+              ? { sourceExperimentId: assignment.sourceExperimentId }
+              : {}),
+          },
+        ])
+      )
+    : await resolveHypothesisBaseOverrides({
+        campaignId: campaign.id,
+        hypotheses: selectedHypotheses,
+        args,
+      })
+  const assignments = [] as Array<{
+    hypothesisId: string
+    startingCommitSha: string
+    sourceExperimentId?: string
+    setupHash: string
+    evaluationFingerprint: string
+  }>
+  for (const hypothesis of selectedHypotheses) {
+    const override = overrides.get(hypothesis.id)
+    const startingCommitSha = await resolveCommitRef(
+      root,
+      override?.ref ?? sessionBaseCommitSha
+    )
+    const snapshot = await committedSetupAt({
+      root,
+      projectPath: effectiveProjectPath,
+      commitSha: startingCommitSha,
+    })
+    if (
+      snapshot.setupHash !== sessionEvaluation.setupHash ||
+      snapshot.fingerprint !== sessionEvaluation.fingerprint
+    ) {
+      throw new Error(
+        `Hypothesis ${hypothesis.name} base ${startingCommitSha} does not contain the session setup/evaluation snapshot. Rebase or cherry-pick the code onto a commit containing the current setup.`
+      )
+    }
+    assignments.push({
+      hypothesisId: hypothesis.id,
+      startingCommitSha,
+      ...(override?.sourceExperimentId
+        ? { sourceExperimentId: override.sourceExperimentId }
+        : {}),
+      setupHash: snapshot.setupHash,
+      evaluationFingerprint: snapshot.fingerprint,
+    })
+  }
+  const workerProtocolPreflight = internalSession
+    ? { skipped: true, reason: "detached supervisor child" }
+    : await preflightWorkerProtocol({ root })
+  const providerInvocation = buildWorkerInvocation({
+    agentKind,
+    workerCommand: args.options["worker-command"],
+    worktree: root,
+    prompt: "Onyx provider preflight",
+    workerModel,
+    providerExecutable: args.options["provider-executable"],
+  })
+  const providerExecutable = args.options["worker-command"]
+    ? undefined
+    : (args.options["provider-executable"] ??
+      (await resolveProviderExecutable(
+        providerInvocation.command,
+        process.env
+      )))
+  if (providerExecutable) {
+    providerInvocation.command = providerExecutable
+    resolvedWorkerArgs.options["provider-executable"] = providerExecutable
+  }
+  const providerPreflight = internalSession
+    ? { skipped: true, version: null, marker: null }
+    : await preflightProviderModel({
+        invocation: providerInvocation,
+        cwd: root,
+        env: providerRuntimeEnvironment(process.env),
+      })
+  let result: {
+    session: ApiSession
+    hypotheses: ApiHypothesis[]
+  }
+  if (internalSession) {
+    result = {
+      session: internalSession.session,
+      hypotheses: internalSession.hypotheses,
+    }
+  } else {
+    try {
+      result = await createCampaignSession(
+        campaign.id,
+        {
+          name: args.options.name ?? `research-${new Date().toISOString()}`,
+          baseCommitSha: sessionBaseCommitSha,
+          setupHash: sessionEvaluation.setupHash,
+          evaluationFingerprint: sessionEvaluation.fingerprint,
+          evaluationManifest: sessionEvaluation.manifest,
+          workerTarget,
+          assignments,
+          ...(experimentTarget === null ? {} : { experimentTarget }),
+          ...(deadlineAt === null ? {} : { deadlineAt }),
+          schedulerSiteId,
+          supervisorRunId,
+          metadata: {
+            startedBy: "onyx-research-supervisor",
+            experimentTarget,
+            maxMinutes,
+            agentKind: sessionAgentKind,
+            ...workerModelMetadata(workerModel),
+            maxConcurrency,
+            launchBatchSize,
+            launchIntervalSeconds: launchIntervalMs / 1000,
+            presenceIntervalSeconds: presenceIntervalMs / 1000,
+            preflight: {
+              workerProtocol: workerProtocolPreflight,
+              provider: providerPreflight,
+              providerExecutable: providerExecutable ?? null,
+            },
+          },
+        },
+        args
+      )
+    } catch (error) {
+      const guidance = sessionCommitVisibilityGuidance(error)
+      if (guidance) throw new Error(guidance)
+      throw error
+    }
+  }
+  markSessionCreated()
+  const sessionId = result.session.id
+  await cacheResearchSessionState({
+    root,
+    campaign,
+    session: result.session,
+    hypotheses: result.hypotheses,
+  }).catch(() => {})
 
   const nextState = await readState(root)
   const key = campaignStateKey(effectiveProjectPath, campaign.name)
@@ -5901,15 +6673,6 @@ export async function commandResearchRun(args: Args) {
     campaignId: campaign.id,
     deadlineAt,
     experimentTarget,
-    acceptedExperimentCount: sessionState?.session.acceptedExperimentCount ?? 0,
-    remainingExperimentCount:
-      experimentTarget === null
-        ? null
-        : Math.max(
-            0,
-            experimentTarget -
-              (sessionState?.session.acceptedExperimentCount ?? 0)
-          ),
     schedulerSiteId,
     status: "running",
   }
@@ -5930,14 +6693,12 @@ export async function commandResearchRun(args: Args) {
       sessionId,
       campaign,
       launchRate,
+      supervisorRunId,
     })
     return
   }
 
-  const refPushQueue = createRefPushQueue({ args })
-  const supervisorRunId =
-    process.env.ONYX_SUPERVISOR_RUN_ID ?? `local-${randomUUID()}`
-  const leaseTokensByWorkerId = new Map<string, string>()
+  const workerCredentialsByWorkerId = new Map<string, string>()
   resetApiTimingSummary()
   try {
     await waitForStartupSessionReady({
@@ -5950,15 +6711,14 @@ export async function commandResearchRun(args: Args) {
       root,
       sessionId,
       status: "failed",
-      finalizationStatus: "failed",
+      cleanupStatus: "failed",
       terminalReason: "failed",
       reason,
       metadata: {
         terminalReason: "failed",
-        finalizationReasons: [reason],
+        cleanupReasons: [reason],
       },
     }).catch(() => {})
-    refPushQueue.stop()
     throw new Error(reason)
   }
   const sessionStateBriefRefresher = createSessionStateBriefRefresher({
@@ -5968,13 +6728,20 @@ export async function commandResearchRun(args: Args) {
   })
   await sessionStateBriefRefresher.writePlaceholder().catch(() => {})
   await sessionStateBriefRefresher.refresh({ force: true }).catch(() => {})
+  const lifecycleHeartbeats = createLifecycleHeartbeatPublisher({
+    args,
+    sessionId,
+    siteId: schedulerSiteId,
+    supervisorRunId,
+  })
   const presenceSupervisor = createPresenceSupervisor({
     root,
     args,
     sessionId,
     supervisorRunId,
     intervalMs: presenceIntervalMs,
-    leaseTokensByWorkerId,
+    maxConcurrency,
+    workerCredentialsByWorkerId,
   })
   presenceSupervisor.request()
 
@@ -5995,9 +6762,17 @@ export async function commandResearchRun(args: Args) {
   let providerBackoffAttempt = 0
   let providerBackoffLogged = false
   let recentProviderFailures: ProviderLaunchFailure[] = []
+  let deterministicSiteFailure: ProviderLaunchFailure | null = null
+  const noProgressThreshold = Math.max(3, Math.min(workerTarget, 20))
+  // Monotonic cache of the authoritative server cursor, used only between
+  // control polls. This is not a locally produced progress counter.
+  let observedAcceptedExperimentCount = 0
+  let noProgressWorkerExitCount = 0
+  let recentNoProgressExits: NoProgressWorkerExit[] = []
+  let noProgressBreakerTripped = false
   let terminalReason: SessionTerminalReason | null = null
-  let providerTerminalFailure: ProviderLaunchFailure | null = null
   let lastStopCheck: ResearchStopCheck | null = null
+  let drainingPresenceSent = false
   let lastGitVerificationAt = 0
   // Verification is push-webhook-first server-side; this loop is only the
   // slow backstop for lost webhooks, plus the final verify at completion.
@@ -6005,16 +6780,57 @@ export async function commandResearchRun(args: Args) {
   let gitVerificationPausedUntil = 0
   let gitVerificationInFlight: Promise<unknown> | null = null
   const supervisorPid = process.pid
+  const supervisorProcessIdentity = inspectProcessIdentity(supervisorPid)
+  if (supervisorProcessIdentity) {
+    await writeSupervisorProcessManifest({
+      root,
+      manifest: {
+        schemaVersion: 1,
+        sessionId,
+        pid: supervisorPid,
+        supervisorRunId,
+        processStartedAt: supervisorProcessIdentity.startedAt,
+        commandIdentity: supervisorProcessIdentity.command,
+        mode: "foreground",
+        createdAt: new Date().toISOString(),
+      },
+    })
+  }
   const supervisorLogPath = args.options["supervisor-log-path"] ?? null
   let lastTelemetryAt = 0
   let stopLogged = false
   // Clear stale worktree bookkeeping left by crashed runs before launching.
   await git(["worktree", "prune"], root).catch(() => {})
+  let controlSnapshotSequence = 0
+  let briefRefreshControlSignature: string | null = null
   const sessionStopChecker = createResearchSessionStopChecker({
     root,
     sessionId,
     args,
     settleBeforeCheck: true,
+    onRemoteControlState: async (control) => {
+      controlSnapshotSequence += 1
+      await writeSupervisorControlStateSnapshot({
+        root,
+        sessionId,
+        snapshot: {
+          schemaVersion: 1,
+          sequence: controlSnapshotSequence,
+          fetchedAt: new Date().toISOString(),
+          control,
+        },
+      })
+      await sessionStateBriefRefresher.patchControlState(control)
+      const nextBriefRefreshControlSignature =
+        sessionStateBriefControlSignature(control)
+      const contextChanged =
+        briefRefreshControlSignature !== null &&
+        briefRefreshControlSignature !== nextBriefRefreshControlSignature
+      briefRefreshControlSignature = nextBriefRefreshControlSignature
+      if (contextChanged) {
+        await sessionStateBriefRefresher.refresh({ force: true })
+      }
+    },
   })
   const currentProviderBackoff = () => {
     if (!providerBackoffReason || Date.now() >= providerBackoffUntil) {
@@ -6039,6 +6855,9 @@ export async function commandResearchRun(args: Args) {
         delayMs?: number
         recentFailures?: ProviderLaunchFailure[]
       } | null
+      noProgressBreaker?: NonNullable<
+        NonNullable<CliState["sessions"]>[string]["supervisor"]
+      >["noProgressBreaker"]
     } = {}
   ) => {
     const now = Date.now()
@@ -6052,6 +6871,8 @@ export async function commandResearchRun(args: Args) {
       telemetry: {
         pid: supervisorPid,
         supervisorRunId,
+        processStartedAt: supervisorProcessIdentity?.startedAt ?? null,
+        commandIdentity: supervisorProcessIdentity?.command ?? null,
         logPath: supervisorLogPath,
         activeProcessCount: options.activeProcessCount ?? activeRuns.size,
         launchRate,
@@ -6060,6 +6881,15 @@ export async function commandResearchRun(args: Args) {
             ? currentProviderBackoff()
             : options.providerBackoff,
         recentFailedLaunches: recentProviderFailures,
+        noProgressBreaker:
+          options.noProgressBreaker === undefined
+            ? {
+                tripped: noProgressBreakerTripped,
+                threshold: noProgressThreshold,
+                count: noProgressWorkerExitCount,
+                recentFailures: recentNoProgressExits,
+              }
+            : options.noProgressBreaker,
         status: options.status ?? "running",
       },
     })
@@ -6082,14 +6912,18 @@ export async function commandResearchRun(args: Args) {
   )
   console.log(`Presence: every ${presenceIntervalMs / 1000}s`)
 
-  let supervisorLoopCompleted = false
   try {
     while (Date.now() < hardEndTimeMs) {
       const loopNow = Date.now()
       void sessionStateBriefRefresher.refresh().catch(() => {})
       await persistRuntimeTelemetry({ activeProcessCount: activeRuns.size })
-      if (providerTerminalFailure && activeRuns.size === 0) break
-      if (providerTerminalFailure) {
+      if (noProgressBreakerTripped && activeRuns.size === 0) break
+      if (noProgressBreakerTripped) {
+        await Promise.race([...activeRuns.values(), sleep(2000)])
+        continue
+      }
+      if (deterministicSiteFailure && activeRuns.size === 0) break
+      if (deterministicSiteFailure) {
         await Promise.race([
           ...activeRuns.values(),
           sleep(Math.min(5000, Math.max(1, hardEndTimeMs - Date.now()))),
@@ -6124,8 +6958,7 @@ export async function commandResearchRun(args: Args) {
               ? verification.rateLimit.retryAfterSeconds
               : null
             if (retryAfterSeconds && retryAfterSeconds > 0) {
-              gitVerificationPausedUntil =
-                Date.now() + retryAfterSeconds * 1000
+              gitVerificationPausedUntil = Date.now() + retryAfterSeconds * 1000
             }
             return null
           })
@@ -6141,6 +6974,10 @@ export async function commandResearchRun(args: Args) {
         console.warn(
           `Stop requested for session ${sessionId}: ${stopCheck.reasons.join(", ")}`
         )
+        await presenceSupervisor
+          .flush({ runtimeStatus: "draining" })
+          .catch(() => {})
+        drainingPresenceSent = true
       }
       if (stopShouldEndSupervisor) {
         if (!terminalReason) {
@@ -6162,6 +6999,14 @@ export async function commandResearchRun(args: Args) {
         ).catch(() => undefined)
       }
       if (controlState?.status && controlState.status !== "running") break
+      const observedAccepted =
+        controlState?.progress.acceptedExperimentCount ??
+        observedAcceptedExperimentCount
+      if (observedAccepted > observedAcceptedExperimentCount) {
+        observedAcceptedExperimentCount = observedAccepted
+        noProgressWorkerExitCount = 0
+        recentNoProgressExits = []
+      }
       if (!controlState) {
         const local = await getLocalSessionState(root, sessionId).catch(
           () => null
@@ -6229,6 +7074,7 @@ export async function commandResearchRun(args: Args) {
               agentKind: effectiveAgentKind,
               runtime: "local" as const,
               leaseSeconds: 180,
+              leaseCredential: createWorkerCredential(),
               metadata: {
                 ...workerModelMetadata(workerModel),
                 launchOrdinal: ordinal,
@@ -6276,9 +7122,16 @@ export async function commandResearchRun(args: Args) {
           }
         }
 
-        const grants = leaseBatch?.grants ?? []
+        const grants: ApiWorkerLease[] =
+          leaseBatch?.grants.map((grant) => ({
+            ...grant,
+            ...leaseBatch.context,
+          })) ?? []
         for (const grant of grants) {
-          leaseTokensByWorkerId.set(grant.worker.id, grant.leaseToken)
+          workerCredentialsByWorkerId.set(
+            grant.worker.id,
+            grant.workerCredential
+          )
         }
         if (grants.length > 0) {
           const existingLocal = await getLocalSessionState(
@@ -6298,13 +7151,15 @@ export async function commandResearchRun(args: Args) {
             workersById.set(grant.worker.id, grant.worker)
             hypothesesById.set(grant.hypothesis.id, grant.hypothesis)
           }
-          await cacheResearchSessionState({
-            root,
-            campaign,
-            session: grants[0]!.session,
-            hypotheses: [...hypothesesById.values()],
-            workers: [...workersById.values()],
-          }).catch(() => {})
+          if (existingLocal) {
+            await cacheResearchSessionState({
+              root,
+              campaign,
+              session: existingLocal.session,
+              hypotheses: [...hypothesesById.values()],
+              workers: [...workersById.values()],
+            }).catch(() => {})
+          }
         }
 
         for (const grant of grants) {
@@ -6316,6 +7171,7 @@ export async function commandResearchRun(args: Args) {
           const runKey = `${Date.now()}:${launched}:${grant.worker.id}`
           const slotIndex = lowestFreeSlot(activeSlotsByRunKey.values())
           activeSlotsByRunKey.set(runKey, slotIndex)
+          const acceptedAtLaunch = observedAcceptedExperimentCount
           const run = runHypothesisOnce({
             root,
             projectPath: effectiveProjectPath,
@@ -6335,12 +7191,13 @@ export async function commandResearchRun(args: Args) {
             startupTimeoutMs,
             stopGraceMs,
             quiet: args.options.quiet === "true",
-            refPushQueue,
             preacquiredLease: grant,
             slotIndex,
-            onRegistered: ({ workerId, leaseToken }) => {
-              leaseTokensByWorkerId.set(workerId, leaseToken)
+            onRegistered: ({ workerId, workerCredential }) => {
+              workerCredentialsByWorkerId.set(workerId, workerCredential)
             },
+            lifecycleHeartbeats,
+            providerExecutable,
             args,
           })
             .then(async (result) => {
@@ -6377,6 +7234,37 @@ export async function commandResearchRun(args: Args) {
                 }
               } else if (result.status === "stopped") stopped += 1
               else failed += 1
+              if (result.siteFatal && result.terminalReason) {
+                deterministicSiteFailure = {
+                  at: new Date().toISOString(),
+                  reason: result.terminalReason,
+                  workerId: result.workerId ?? null,
+                  hypothesisId: result.hypothesis.id,
+                  errorSummary: result.error
+                    ? compactProviderErrorSummary(result.error)
+                    : null,
+                }
+                terminalReason = "failed"
+                await persistRuntimeTelemetry({
+                  force: true,
+                  activeProcessCount: activeRuns.size,
+                  providerBackoff: null,
+                })
+                await stopCampaignSession(
+                  sessionId,
+                  {
+                    campaignId: campaign.id,
+                    endReason: "failed",
+                    reason: `Deterministic worker failure: ${result.terminalReason}`,
+                    metadata: {
+                      reasonCode: "deterministic_worker_failure",
+                      failure: deterministicSiteFailure,
+                    },
+                  },
+                  args
+                ).catch(() => null)
+                return result
+              }
               const backoffReason = providerBackoffReasonForResult(result)
               if (backoffReason) {
                 const failure: ProviderLaunchFailure = {
@@ -6392,34 +7280,11 @@ export async function commandResearchRun(args: Args) {
                   ...recentProviderFailures,
                   failure,
                 ].slice(-20)
-                const terminalProviderFailure =
-                  providerBackoffReasonIsTerminal(backoffReason)
                 providerBackoffAttempt += 1
-                const delayMs = terminalProviderFailure
-                  ? 0
-                  : providerBackoffDelayMs({
-                      baseMs: providerBackoffMs,
-                      attempt: providerBackoffAttempt,
-                    })
-                if (terminalProviderFailure) {
-                  terminalReason = "provider_capacity_exhausted"
-                  providerTerminalFailure = failure
-                  providerBackoffReason = backoffReason
-                  providerBackoffUntil = Date.now()
-                  providerBackoffLogged = true
-                  await persistRuntimeTelemetry({
-                    force: true,
-                    activeProcessCount: activeRuns.size,
-                    providerBackoff: {
-                      reason: backoffReason,
-                      until: new Date().toISOString(),
-                      attempt: providerBackoffAttempt,
-                      delayMs,
-                      recentFailures: recentProviderFailures,
-                    },
-                  })
-                  return result
-                }
+                const delayMs = providerBackoffDelayMs({
+                  baseMs: providerBackoffMs,
+                  attempt: providerBackoffAttempt,
+                })
                 providerBackoffReason = backoffReason
                 providerBackoffUntil = Date.now() + delayMs
                 providerBackoffLogged = false
@@ -6458,6 +7323,59 @@ export async function commandResearchRun(args: Args) {
                   },
                 })
               }
+              if (!backoffReason && result.status !== "stopped") {
+                const latestControl = await getResearchSessionControlState(
+                  sessionId,
+                  args
+                ).catch(() => null)
+                const latestAccepted =
+                  latestControl?.progress.acceptedExperimentCount ??
+                  observedAcceptedExperimentCount
+                if (latestAccepted > observedAcceptedExperimentCount) {
+                  observedAcceptedExperimentCount = latestAccepted
+                  noProgressWorkerExitCount = 0
+                  recentNoProgressExits = []
+                }
+                if (latestAccepted <= acceptedAtLaunch) {
+                  noProgressWorkerExitCount += 1
+                  recentNoProgressExits = [
+                    ...recentNoProgressExits,
+                    {
+                      at: new Date().toISOString(),
+                      workerId: result.workerId ?? null,
+                      hypothesisId: result.hypothesis.id,
+                      status: result.status,
+                      errorSummary: result.error
+                        ? compactProviderErrorSummary(result.error)
+                        : null,
+                    },
+                  ].slice(-20)
+                }
+                if (
+                  noProgressWorkerExitCount >= noProgressThreshold &&
+                  !noProgressBreakerTripped
+                ) {
+                  noProgressBreakerTripped = true
+                  terminalReason = "failed"
+                  const breakerMetadata = {
+                    reasonCode: "worker_no_progress_breaker",
+                    threshold: noProgressThreshold,
+                    count: noProgressWorkerExitCount,
+                    recentFailures: recentNoProgressExits,
+                  }
+                  await persistRuntimeTelemetry({ force: true })
+                  await stopCampaignSession(
+                    sessionId,
+                    {
+                      campaignId: campaign.id,
+                      endReason: "failed",
+                      reason: `No accepted experiment progress across ${noProgressWorkerExitCount} worker exits`,
+                      metadata: breakerMetadata,
+                    },
+                    args
+                  ).catch(() => null)
+                }
+              }
               return result
             })
             .catch((error) => {
@@ -6473,7 +7391,7 @@ export async function commandResearchRun(args: Args) {
               }
             })
             .finally(() => {
-              leaseTokensByWorkerId.delete(grant.worker.id)
+              workerCredentialsByWorkerId.delete(grant.worker.id)
               activeRuns.delete(runKey)
               activeSlotsByRunKey.delete(runKey)
               void persistRuntimeTelemetry({
@@ -6497,7 +7415,7 @@ export async function commandResearchRun(args: Args) {
           controlState?.launch.activeHypothesisCount === undefined ||
           controlState.launch.activeHypothesisCount > 0
         if (activeRuns.size === 0 && openSlots > 0 && !hasActiveHypotheses) {
-          terminalReason = "no_active_hypotheses"
+          terminalReason = "all_hypotheses_closed"
           break
         }
         if (activeRuns.size === 0 && !waitingLogged) {
@@ -6507,22 +7425,29 @@ export async function commandResearchRun(args: Args) {
           )
         }
         if (activeRuns.size > 0) {
-          await Promise.race([...activeRuns.values(), sleep(2000)])
+          await Promise.race([
+            ...activeRuns.values(),
+            sleep(2000 + Math.floor(Math.random() * 500)),
+          ])
         } else {
-          await sleep(3000)
+          await sleep(3000 + Math.floor(Math.random() * 750))
         }
       }
     }
 
+    if (!drainingPresenceSent) {
+      await presenceSupervisor
+        .flush({ runtimeStatus: "draining" })
+        .catch(() => {})
+      drainingPresenceSent = true
+    }
     if (activeRuns.size > 0) {
       console.log(`Waiting for ${activeRuns.size} active worker(s) to finish.`)
       await Promise.allSettled(activeRuns.values())
     }
-    supervisorLoopCompleted = true
   } finally {
     presenceSupervisor.request()
-    await presenceSupervisor.stop()
-    if (!supervisorLoopCompleted) refPushQueue.stop()
+    await presenceSupervisor.stop({ runtimeStatus: "draining" })
   }
 
   const finalState = await readState(root)
@@ -6530,23 +7455,32 @@ export async function commandResearchRun(args: Args) {
   const postLoopLocal = await getLocalSessionState(root, sessionId).catch(
     () => null
   )
+  const finalDeterministicSiteFailure =
+    deterministicSiteFailure as ProviderLaunchFailure | null
   terminalReason =
-    (explicitStop ? "stop_requested" : terminalReason) ??
+    (explicitStop ? "user_stopped" : terminalReason) ??
     (lastStopCheck ? terminalReasonForStopCheck(lastStopCheck) : null) ??
     postLoopLocal?.session.terminalReason ??
     (Number.isFinite(endTimeMs) && Date.now() >= endTimeMs
       ? "deadline_reached"
       : null) ??
-    "no_active_hypotheses"
-  let finalStatus: ApiSession["status"] = providerTerminalFailure
-    ? "failed"
-    : explicitStop
-      ? "stopped"
-      : "completed"
+    "all_hypotheses_closed"
+  let finalStatus: ApiSession["status"] =
+    finalDeterministicSiteFailure || noProgressBreakerTripped
+      ? "failed"
+      : explicitStop
+        ? "stopped"
+        : "completed"
   const initialTerminalMetadata = {
     terminalReason,
-    providerFailure: providerTerminalFailure,
-    finalizationReasons: [],
+    deterministicSiteFailure: finalDeterministicSiteFailure,
+    noProgressBreaker: {
+      tripped: noProgressBreakerTripped,
+      threshold: noProgressThreshold,
+      count: noProgressWorkerExitCount,
+      recentFailures: recentNoProgressExits,
+    },
+    cleanupReasons: [],
   }
   finalState.sessions = finalState.sessions ?? {}
   finalState.sessions[sessionId] = {
@@ -6554,7 +7488,7 @@ export async function commandResearchRun(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     status: finalStatus,
-    finalizationStatus: "running",
+    cleanupStatus: "running",
     stopRequested: false,
     providerBackoff: null,
     terminalReason,
@@ -6564,37 +7498,45 @@ export async function commandResearchRun(args: Args) {
     root,
     sessionId,
     status: finalStatus,
-    finalizationStatus: "running",
+    cleanupStatus: "running",
     terminalReason,
     reason: explicitStop
       ? "stop requested"
-      : providerTerminalFailure
-        ? "provider capacity exhausted"
+      : finalDeterministicSiteFailure
+        ? `deterministic worker failure: ${finalDeterministicSiteFailure.reason}`
         : "research run completed",
     metadata: initialTerminalMetadata,
   }).catch(() => {})
-  await refPushQueue.drain(finalRefPushTimeoutMs)
-  const finalization = await computeSessionFinalizationStatus({
+  await lifecycleHeartbeats.flush().catch((error) => {
+    console.warn(errorMessage(error))
+  })
+  const cleanup = await computeSessionCleanupStatus({
     root,
     sessionId,
   })
-  if (finalization.reasons.length > 0) {
+  if (cleanup.reasons.length > 0) {
     console.warn(
-      `finalization ${finalization.status}: ${finalization.reasons
-        .slice(0, 5)
-        .join("; ")}`
+      `cleanup ${cleanup.status}: ${cleanup.reasons.slice(0, 5).join("; ")}`
     )
   }
-  if (finalization.status === "failed") {
+  if (cleanup.status === "failed") {
     finalStatus = "failed"
     terminalReason = "failed"
   }
-  await writeRemoteSessionFinalization({
+  await writeRemoteSessionCleanup({
     sessionId,
     campaignId: campaign.id,
     status: finalStatus,
-    finalization,
+    cleanup,
     terminalReason,
+    metadata: noProgressBreakerTripped
+      ? {
+          reasonCode: "worker_no_progress_breaker",
+          threshold: noProgressThreshold,
+          count: noProgressWorkerExitCount,
+          recentFailures: recentNoProgressExits,
+        }
+      : undefined,
     args,
   })
   const finalSessionState = await readState(root)
@@ -6604,7 +7546,7 @@ export async function commandResearchRun(args: Args) {
     campaignName: campaign.name,
     campaignId: campaign.id,
     status: finalStatus,
-    finalizationStatus: finalization.status,
+    cleanupStatus: cleanup.status,
     stopRequested: false,
     providerBackoff: null,
     terminalReason,
@@ -6614,50 +7556,38 @@ export async function commandResearchRun(args: Args) {
     root,
     sessionId,
     status: finalStatus,
-    finalizationStatus: finalization.status,
+    cleanupStatus: cleanup.status,
     terminalReason,
     reason:
-      finalization.reasons.length > 0
-        ? finalization.reasons.slice(0, 5).join("; ")
+      cleanup.reasons.length > 0
+        ? cleanup.reasons.slice(0, 5).join("; ")
         : explicitStop
           ? "stop requested"
-          : providerTerminalFailure
-            ? "provider capacity exhausted"
+          : finalDeterministicSiteFailure
+            ? `deterministic worker failure: ${finalDeterministicSiteFailure.reason}`
             : "research run completed",
     metadata: {
       terminalReason,
-      providerFailure: providerTerminalFailure,
-      finalizationReasons: finalization.reasons,
+      deterministicSiteFailure: finalDeterministicSiteFailure,
+      cleanupReasons: cleanup.reasons,
     },
   }).catch(() => {})
-  await verifyResearchCampaignGit(campaign.id, args, {
-    gitVerifyLimit: 100,
-  }).catch(() => null)
-  const reportedFinalizationStatus = finalization.status
+  const finalGitVerificationStartedAt = Date.now()
+  const finalGitVerification = await verifyResearchCampaignGit(
+    campaign.id,
+    args,
+    { gitVerifyLimit: 100 }
+  ).catch(() => null)
+  console.log(
+    `Final Git verification: durationMs=${Date.now() - finalGitVerificationStartedAt} checked=${finalGitVerification?.checkedCount ?? 0} updated=${finalGitVerification?.updatedCount ?? 0} remaining=${finalGitVerification?.remainingCount ?? "unknown"}`
+  )
+  const reportedCleanupStatus = cleanup.status
   const completionLive = await getResearchSessionLive(sessionId, args).catch(
     () => null
   )
   const completionLocal = await getLocalSessionState(root, sessionId).catch(
     () => null
   )
-  const completionManifests = await readWorkerLaunchManifests(
-    root,
-    sessionId
-  ).catch(() => [])
-  const unmeasuredSalvageCount =
-    completionLive?.finalization?.unmeasuredSalvageCount ??
-    completionManifests.filter(
-      (manifest) =>
-        manifest.finalization?.salvaged &&
-        manifest.finalization.finalizationStatus.startsWith(
-          "salvaged_unmeasured"
-        )
-    ).length
-  const discardedAfterCompletionCount = completionManifests.filter(
-    (manifest) =>
-      manifest.finalization?.finalizationStatus ===
-      "discarded_after_completion"
-  ).length
   const acceptedExperiments =
     completionLive?.session.acceptedExperimentCount ??
     completionLocal?.session.acceptedExperimentCount ??
@@ -6673,18 +7603,33 @@ export async function commandResearchRun(args: Args) {
     activeProcessCount: 0,
   })
   await Promise.race([
-    presenceSupervisor.flush({ terminal: true }),
+    presenceSupervisor.flush({
+      terminal: true,
+      runtimeStatus: cleanup.status === "complete" ? "complete" : "failed",
+    }),
     sleep(5000),
   ]).catch(() => {})
 
   console.log(
-    `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; finalization=${reportedFinalizationStatus}.`
+    `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; cleanup=${reportedCleanupStatus}.`
   )
   console.log(
-    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`} unmeasuredSalvage=${unmeasuredSalvageCount} discardedAfterCompletion=${discardedAfterCompletionCount}.`
+    `Experiment counts: accepted=${acceptedExperiments}${completedExperimentTarget === null ? "" : `/${completedExperimentTarget}`}.`
   )
   const apiTimingSummary = renderApiTimingSummary(args)
   if (apiTimingSummary) console.error(apiTimingSummary)
+}
+
+export async function commandResearchRun(args: Args) {
+  let sessionCreated = false
+  try {
+    return await commandResearchRunImplementation(args, () => {
+      sessionCreated = true
+    })
+  } catch (error) {
+    if (!sessionCreated) markResearchPreflightFailure(error)
+    throw error
+  }
 }
 
 export async function commandWorkerRun(args: Args) {
@@ -6789,9 +7734,6 @@ export async function commandWorkerRun(args: Args) {
       "Sync tuning flags were removed. Workers now push refs and report directly to the Onyx API."
     )
   }
-  const finalRefPushTimeoutMs =
-    positiveNumberOption(args, "final-ref-push-timeout", 120) * 1000
-  const refPushQueue = createRefPushQueue({ args })
   const supervisorRunId =
     process.env.ONYX_SUPERVISOR_RUN_ID ?? `manual-${randomUUID()}`
 
@@ -6819,7 +7761,6 @@ export async function commandWorkerRun(args: Args) {
     startupTimeoutMs,
     stopGraceMs,
     quiet: args.options.quiet === "true",
-    refPushQueue,
     args,
   })
   if (result.workerId) {
@@ -6835,13 +7776,12 @@ export async function commandWorkerRun(args: Args) {
       gitLabel: result.resultCommitSha ?? null,
     }).catch(() => {})
   }
-  const pendingRefPushes = await refPushQueue.drain(finalRefPushTimeoutMs)
   if (result.status === "failed") {
     throw new Error(
       `Worker failed for ${hypothesis.name}: ${result.error ?? "unknown error"}`
     )
   }
   console.log(
-    `Worker ${result.status} ${hypothesis.name} at ${result.resultCommitSha ?? "unknown"}; ${pendingRefPushes} ref push(es) pending.`
+    `Worker ${result.status} ${hypothesis.name} at ${result.resultCommitSha ?? "no durable experiment commit"}.`
   )
 }

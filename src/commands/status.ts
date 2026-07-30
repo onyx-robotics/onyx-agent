@@ -49,6 +49,7 @@ export async function commandStatus(args: Args) {
             ? {
                 name: profileName,
                 teamName: profile?.teamName ?? null,
+                teamId: profile?.teamId ?? null,
               }
             : null,
           apiTarget: target ? describeApiTarget(target) : null,

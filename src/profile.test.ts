@@ -699,10 +699,7 @@ describe("CLI profiles", () => {
     })
 
     await withFakeOpenCodeModels(
-      [
-        "opencode/deepseek-v4-flash",
-        "opencode/deepseek-v4-flash-free",
-      ],
+      ["opencode/deepseek-v4-flash", "opencode/deepseek-v4-flash-free"],
       () =>
         captureLogs(() =>
           commandProfile({
@@ -732,10 +729,7 @@ describe("CLI profiles", () => {
 
     await expect(
       withFakeOpenCodeModels(
-        [
-          "opencode/deepseek-v4-flash",
-          "opencode/deepseek-v4-flash-free",
-        ],
+        ["opencode/deepseek-v4-flash", "opencode/deepseek-v4-flash-free"],
         () =>
           commandProfile({
             positional: ["profile", "worker", "set"],

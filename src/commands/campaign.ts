@@ -49,7 +49,7 @@ export async function commandCampaignCreate(args: Args) {
       name,
       projectPath,
       ...(description ? { description } : {}),
-      baseCommitSha,
+      createdFromCommitSha: baseCommitSha,
       setup,
       ...(humanFeedback ? { humanFeedback } : {}),
       promotionRefName,
@@ -130,7 +130,7 @@ export async function commandCampaignUse(args: Args) {
     ...(state.campaigns[key] ?? {}),
     campaignId: campaign.id,
     projectPath,
-    baseCommitSha: campaign.baseCommitSha,
+    baseCommitSha: campaign.createdFromCommitSha ?? undefined,
     description: campaign.description,
     metricName: campaign.metricName,
     metricUnit: campaign.metricUnit,
@@ -170,7 +170,7 @@ export async function commandCampaignStatus(args: Args) {
     `metric: ${campaign?.metricName ?? stateCampaign?.metricName ?? "(unknown)"}`
   )
   console.log(
-    `base: ${campaign?.baseCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`
+    `created from: ${campaign?.createdFromCommitSha ?? stateCampaign?.baseCommitSha ?? "(unknown)"}`
   )
   const promotionRefName =
     campaign?.promotionRefName ?? stateCampaign?.promotionRefName ?? null

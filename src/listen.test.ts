@@ -95,7 +95,7 @@ describe("onyx listen", () => {
       workerId: "worker_123",
     })
     await writeWorkerLaunchManifest({
-      schemaVersion: 1,
+      schemaVersion: 2,
       agentKind: "codex",
       workerModel: null,
       command: "codex",
@@ -110,6 +110,7 @@ describe("onyx listen", () => {
       activityJsonlPath: paths.activityJsonlPath,
       latestStatePath: paths.latestStatePath,
       manifestPath: paths.manifestPath,
+      startingCommitSha: "base-commit",
       sessionId,
       hypothesisId: "hyp_123",
       hypothesisName: "Cache tune",
@@ -127,7 +128,7 @@ describe("onyx listen", () => {
       startupTimedOut: false,
       error: null,
       preflight: null,
-      finalization: null,
+      teardown: null,
     })
     await writeWorkerLatestState(paths.latestStatePath, {
       schemaVersion: 1,
@@ -161,7 +162,7 @@ describe("onyx listen", () => {
       workerId: "worker_456",
     })
     await writeWorkerLaunchManifest({
-      schemaVersion: 1,
+      schemaVersion: 2,
       agentKind: "codex",
       workerModel: null,
       command: "codex",
@@ -176,6 +177,7 @@ describe("onyx listen", () => {
       activityJsonlPath: donePaths.activityJsonlPath,
       latestStatePath: donePaths.latestStatePath,
       manifestPath: donePaths.manifestPath,
+      startingCommitSha: "base-commit",
       sessionId,
       hypothesisId: "hyp_456",
       hypothesisName: "Batch tune",
@@ -193,7 +195,7 @@ describe("onyx listen", () => {
       startupTimedOut: false,
       error: null,
       preflight: null,
-      finalization: null,
+      teardown: null,
     })
     await writeWorkerLatestState(donePaths.latestStatePath, {
       schemaVersion: 1,
@@ -258,7 +260,7 @@ describe("onyx listen", () => {
       workerId: "worker_123",
     })
     await writeWorkerLaunchManifest({
-      schemaVersion: 1,
+      schemaVersion: 2,
       agentKind: "codex",
       workerModel: null,
       command: "codex",
@@ -273,6 +275,7 @@ describe("onyx listen", () => {
       activityJsonlPath: paths.activityJsonlPath,
       latestStatePath: paths.latestStatePath,
       manifestPath: paths.manifestPath,
+      startingCommitSha: "base-commit",
       sessionId,
       hypothesisId: "hyp_123",
       hypothesisName: "Cache tune",
@@ -290,9 +293,27 @@ describe("onyx listen", () => {
       startupTimedOut: false,
       error: null,
       preflight: null,
-      finalization: {
-        finalizationStatus: "already_logged",
-      } as never,
+      teardown: {
+        attemptDelivery: "delivered",
+        runRef: "local/smoke/run",
+        resultCommitSha: "abc123",
+        resultRefPushStatus: "pushed",
+        resultRefPushError: null,
+        headCommitSha: "abc123",
+        commitsAhead: 1,
+        dirty: false,
+        changedPaths: [],
+        diffStat: null,
+        worktreeCleanup: "removed",
+        providerExitCode: 0,
+        providerSignal: null,
+        timedOut: false,
+        startupTimedOut: false,
+        phase: "stopped",
+        providerError: null,
+        reasonCode: "stopped",
+        error: null,
+      },
     })
     await writeState(root, {
       projectPath: "",
@@ -316,7 +337,9 @@ describe("onyx listen", () => {
 
     const text = await captureSnapshot(root)
     // One summary line, no per-slot rows.
-    expect(text).toContain("session completed · 1 workers · 1 already_logged")
+    expect(text).toContain(
+      "session completed · 1 workers · 1 stopped · 1 attempt delivered"
+    )
     expect(text).not.toContain("worker-cache ·")
   })
 
@@ -387,7 +410,6 @@ describe("onyx listen", () => {
               sessions: [],
               workers: [],
               hypotheses: [],
-              summaries: [],
               knowledge: [],
               counts: { experiments: 2, hypothesisCount: 0, activeWorkers: 0 },
             },

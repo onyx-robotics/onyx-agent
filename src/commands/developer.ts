@@ -200,7 +200,7 @@ export async function commandDeveloper(args: Args) {
     const current = await readDeveloperConfig()
     const checkout =
       mode === "dev"
-        ? current.checkout ?? (await linkedDeveloperCheckout())
+        ? (current.checkout ?? (await linkedDeveloperCheckout()))
         : current.checkout
     await syncSkill({
       mode,

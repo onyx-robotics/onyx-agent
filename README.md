@@ -51,6 +51,35 @@ hosted app with `onyx profile use <name>`. Developer mode
 (`onyx developer use dev`) changes which CLI source runs, not which app the
 CLI targets.
 
+## CLI analytics
+
+Official Onyx releases collect one structured outcome event per allowlisted
+user command, starting from the first eligible command. The first eligible
+interactive command also prints a one-time telemetry notice to stderr
+describing collection and how to opt out; the notice is informational and
+does not gate collection. Events
+may include the bounded command name, terminal outcome, rounded duration,
+stable failure stage/reason, version, auth state, and internal team ID. They
+never include arguments, environment variables, local paths, repository
+identity, refs or commits, code, diffs, prompts, research content, metric names
+or values, credentials, exception text, worker output, rendering, keys, rows,
+or polling.
+
+No analytics runs in `onyx-worker`, CI, testbed/synthetic-worker environments,
+developer/source builds, or non-production API profiles. A random installation
+ID is used before the next successful login supplies an internal user ID; old
+installation activity is never linked to that user. Delivery is best effort,
+has a 250 ms shutdown budget, creates no outbox, and cannot change a command's
+exit code.
+
+```bash
+onyx telemetry status
+onyx telemetry disable
+onyx telemetry enable
+```
+
+`ONYX_TELEMETRY_DISABLED=1` and `DO_NOT_TRACK=1` always disable collection.
+
 ## Agent Skill
 
 The installer installs the bundled skill automatically for Claude Code, Codex,
@@ -88,10 +117,11 @@ onyx listen
 ```
 
 The CLI writes research product state directly to `/api/v1`. Supabase/API owns
-campaigns, sessions, hypotheses, worker leases, experiments, summaries,
+campaigns, sessions, hypotheses, worker leases, experiments,
 knowledge, stop state, report settlement, and accepted experiment ordering.
 Local `.git/onyx/` files are runtime artifacts: logs, manifests, workflow
-runs, attempts, session-state briefs, resource locks, and a small `state.json`
+runs, transient pending-report outbox entries, session/control snapshots,
+resource locks, and a small `state.json`
 convenience cache.
 Transient diagnostics use `onyx tools run <tool-id>`, which executes declared
 setup tools without creating workflow or measured-attempt state.
@@ -116,16 +146,19 @@ deeper prose memory or history.
 
 Research commands require API access. The supervisor uses server-assigned
 leases, renews worker liveness in batches, and owns stop scheduling. Workers
+receive one short-lived scoped credential rather than the supervisor's team API
+key. The worker API derives their full assignment identity and exposes only
+brief, experiment, knowledge, and heartbeat operations.
 attempt to push immutable experiment refs while reporting; failed pushes are
 recorded as local-reported evidence instead of blocking metrics. Experiment
 report calls return `recorded` or `duplicate`, and later settlement assigns
 accepted/discarded disposition plus accepted indexes. `onyx exp list`,
 `onyx research status`,
-`onyx listen`, `knowledge list`, and `summary list` read remote API state
+`onyx listen` and `knowledge list` read remote API state
 instead of offline local projections.
 
 `onyx campaign setup` and `onyx research run` require the `onyx/` setup
-surface to be committed. This keeps worker worktrees pinned to a base commit
+surface to be committed. This keeps each session assignment pinned to a commit
 that actually contains `setup.json`, `validation.json`, `onyx.md`, and
 declared workflow tools. GitHub App access is optional for local research:
 public repositories can show web code/diffs once commits and refs are pushed to
@@ -135,6 +168,11 @@ verification. After pushing missing refs or connecting GitHub, use the web
 campaign page or `onyx research status --reconcile` to refresh Git verification
 state.
 
+For `github_public` and `github_app` projects, the exact session and assignment
+base commits must also be visible to GitHub. Push them before starting Research;
+the CLI reports the invisible commit without creating a session when preflight
+validation fails.
+
 Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
 available to the project.
@@ -143,22 +181,26 @@ Hypothesis workers are driven by the TypeScript-rendered Markdown prompt in
 `src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the
 editor and standalone release binaries stay self-contained.
 
-To run multiple local research hypotheses directly from the CLI, use the
-repo-level supervisor with a built-in agent launcher:
+Add durable hypotheses, then start a fresh bounded session with the repo-level
+supervisor:
 
 ```bash
-plans='[{"focus":"Try a bounded search","statement":"A focused local change can improve the configured metric."}]'
-onyx research run --campaign fast-eval --workers 4 --agent codex --hypotheses "$plans" --max-minutes 10 --experiments 20
-onyx research hypothesis add --session <id> --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
+onyx research hypothesis add --campaign fast-eval --name bounded-search --focus "Try a bounded search" --hypothesis "A focused local change can improve the configured metric."
+onyx research run --campaign fast-eval --workers 4 --agent codex --max-minutes 10 --experiments 20
+onyx research hypothesis add --campaign fast-eval --focus "Try a fresh hypothesis" --hypothesis "The new direction may improve score"
 ```
 
-`onyx research run` validates the campaign and starts a detached supervisor by
+`onyx research run` validates committed setup and evaluator fingerprint inputs,
+resolves the provider and worker CLI to absolute paths, performs one structured
+model probe plus a protocol handshake, and aborts before creating a session if
+any deterministic compatibility check fails. It then
+always creates a new assignment-backed session, and starts a detached supervisor by
 default, then prints the session id, supervisor PID, log path, and monitoring
 commands before returning. Use `--json` for parseable startup output in
 orchestrator agents, and `--foreground` only when you intentionally want an
 attached debugging or smoke-test shell.
 
-`--workers` is the active slot target: when a short worker exits, the
+Omitting `--workers` selects one. It is the active slot target: when a short worker exits, the
 supervisor backfills that slot while the session is running. Bound sessions with
 `--experiments <n>` for an exact accepted experiment target, `--max-minutes <n>`
 for a deadline, or both:
@@ -170,10 +212,19 @@ onyx research run --campaign fast-eval --workers 2 --max-concurrency 2 --experim
 For large local runs, the supervisor ramps launches in batches
 (`--launch-batch-size`, default up to 10) separated by
 `--launch-interval-seconds` (default 5), backs off with capped exponential
-jitter when provider startup, rate-limit, overload, auth, or degraded-service
-failures happen, and asks the server for worker leases in idempotent batches.
+jitter only for transient provider rate-limit, overload, or unavailable
+failures, and asks the server for worker leases in idempotent batches.
+Deterministic auth, model, protocol, network-policy, and sandbox failures stop
+the site immediately; evaluation, git, and report-delivery failures retain
+distinct non-backoff terminal reasons.
 The server enforces the worker target, assigns hypotheses, records reports, and
-settles accepted/discarded disposition idempotently after completion.
+settles accepted/discarded disposition idempotently after completion. Batch
+leases return one compact shared research context plus per-worker grants, while
+the supervisor's control poll reads aggregate progress/capacity and canceled
+assignment IDs instead of full worker or assignment lists.
+Use `onyx research scale --workers <n> --session <id>` to change capacity;
+scale-down drains naturally. New hypotheses join future sessions only, while
+closing a hypothesis cancels its open assignments and workers immediately.
 
 Presence is bounded for large sessions: the supervisor sends site telemetry
 every interval while uploading changed worker snapshots by default, a full
@@ -188,26 +239,32 @@ isolated `ONYX_HOME` plus `ONYX_WORKER_CONTEXT` under
 `.git/onyx/worker-runtime/<session>/<workerId>/`, and write raw stdout/stderr logs,
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
-`.git/onyx/worker-logs/`. `onyx research run` owns local worker scheduling,
-server lease acquisition, session-state brief refreshes, adaptive coalesced
-presence updates, batch heartbeats, stop handling, and local child cleanup. `onyx research status --json` reports fresh
+`.git/onyx/worker-logs/`. Runtime directories and context files use restrictive
+permissions, retained output is stream-redacted, and credential-bearing runtime
+directories are deleted during teardown. `onyx research run` owns local worker scheduling,
+server lease acquisition, session-state brief refreshes, supervisor-owned
+control polling, adaptive coalesced presence updates, batch heartbeats, stop
+handling, and local child cleanup. `onyx research status --summary --json`
+provides bounded orchestrator telemetry; detailed `onyx research status --json` reports fresh
 supervisor telemetry when available, including active process count, launch
-rate, provider backoff, recent launch failures, PID, and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
-as a low-level debugging and recovery primitive.
+rate, provider backoff, the no-progress breaker, recent launch failures, PID,
+and log path. `onyx worker run --session <id> --hypothesis <id>` remains available
+as a low-level debugging primitive.
 `onyx research status` shows active-session hypotheses and workers by default,
 including activity/raw log paths, last-output age, timeout state, and manifest
 errors when local manifests are available. `--experiments` is the exact accepted
 experiment target and `--max-minutes` is the optional deadline.
-`onyx listen` shows the same local worker latest-state/manifests and active
-provider backoff metadata alongside the experiment/outbox view.
+`onyx listen` shows the same local worker latest-state/manifests, terminal
+reason and cleanup outcomes, active provider backoff, and no-progress breaker
+alongside the remote experiment view.
 `onyx workflow status --active` shows only actionable running or paused
 workflow runs; use `onyx workflow status --blocked` or `--run <id>` for blocked
 diagnostics.
 
-Each worker gets its own work branch under `refs/heads/onyx/<session>/<worker>`,
-and its worktree lives at `.git/onyx/worktrees/<sessionId>/<workerId>`, while
+Each worker gets a detached disposable worktree at
+`.git/onyx/worktrees/<sessionId>/<workerId>`, while
 worker prompts and logs live under `.git/onyx/`. Workers run
-`onyx-worker research session-state-brief --json` for routine context and
+`onyx-worker research session-state-brief --json` for bounded routine context and
 worker-specific stop guidance. They inspect `stop.shouldStopStartingNewWork`
 and `stop.recommendedAction` at the start of each loop, use
 `onyx-worker research brief` only for fuller prose memory, run the setup
@@ -218,39 +275,29 @@ setup/session/hypothesis/worker context. `onyx research hypothesis add`
 can create another campaign hypothesis at any time from a JSON plan file or inline
 focus/hypothesis flags; a running supervisor picks up new active hypotheses as
 soon as worker slots open. Workers publish shared learning with
-`onyx-worker knowledge add` and read it back through the session-state brief or
-fuller research brief, but successor hypothesis selection remains an
+`onyx-worker knowledge add` and read selected complete items through the
+session-state brief. `onyx-worker knowledge list --json` provides deeper
+history when needed, but successor hypothesis selection remains an
 orchestrator/human decision.
-After the agent exits, the worker harness performs one final best-effort
-commit, checks whether HEAD is already represented by a reported experiment,
-measures/logs exactly one unreported HEAD commit using that commit's parent as
-the workflow base when the session is still accepting experiments, pushes the
-immutable experiment ref, reports directly to `/api/v1`, and pushes the worker
-branch for recovery. If git push or API reporting fails, the manifest records
-the pushed/missing refs and retry instructions; it does not create local
-product state. If the session is already terminal, finalization records
-`discarded_after_completion` locally and does not create an experiment, ranking
-input, result ref, or recovery artifact. Multi-commit, restore-forward, or
-dirty salvage preserves the branch without producing a measured experiment or
-blocked workflow run. Worker
-manifests report `finalizationStatus` as `none`, `already_logged`,
-`measured_and_logged`, `salvaged_unmeasured`,
-`discarded_after_completion`, or `failed`. If
+Workers run in detached disposable worktrees and never create or push worker
+branches. After the agent exits, the harness may deliver exactly one already
+terminal measured attempt, then removes the worktree. It never creates a final
+commit, runs evaluation, or reports dirty, partial, multi-commit, or ambiguous
+scratch work. Manifests retain bounded diagnostics and report terminal attempt
+delivery plus worktree cleanup outcomes, provider exit/signal/timeout details,
+and stable terminal reason codes. If
 `onyx research stop` is requested while a provider process is still running,
 the harness gives it the configured stop grace (30 seconds by default),
-terminates it if needed, then runs the same finalization path. Use
+terminates it if needed, then runs the same teardown path. Use
 `--worker-command` only for custom harnesses.
 
-Stop and finalize campaigns explicitly:
+Stop sessions explicitly:
 
 ```bash
 onyx research stop --session <id>
-onyx research finish --campaign fast-eval
 ```
 
-`finish` reads remote state, writes the final campaign summary through
-`/api/v1`, marks the remote campaign completed, and prints local extraction
-branches such as `onyx/fast-eval/best`.
+Campaigns remain active until explicitly archived.
 
 To delete a research direction entirely — the campaign record with all its
 experiments and matching local cache rows:
@@ -295,8 +342,14 @@ or the bundled agent skill changes, update the public docs in
 Release binaries are built from Bun standalone executables:
 
 ```bash
-bun run build:release
+ONYX_POSTHOG_KEY=phc_production_project_token \
+  ONYX_POSTHOG_HOST=https://e.onyxresearch.ai \
+  bun run build:release
 ```
+
+The release workflow reads the public production project token from the
+`ONYX_POSTHOG_KEY` GitHub Actions secret. Source builds remain telemetry-off,
+and the build keeps the token and all analytics code out of `onyx-worker`.
 
 ## License
 
