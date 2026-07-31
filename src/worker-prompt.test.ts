@@ -143,7 +143,7 @@ describe("hypothesis worker prompt", () => {
       "Do not mark autonomous attempts `accepted` or `rejected`"
     )
     expect(normalizedPrompt).toContain(
-      "If `exp log` says there are zero unlogged attempts, do not amend, reset, or rewrite history"
+      "If `exp log` refuses because no measured attempt exists, do not amend, reset, or rewrite history"
     )
     expect(normalizedPrompt).toContain(
       "failed pushes are recorded as local-reported evidence"

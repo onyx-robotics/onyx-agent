@@ -1237,7 +1237,7 @@ async function executeWorkflow({
 export async function commandExpRun(args: Args) {
   if (optionalFlag(args, "no-log")) {
     throw new Error(
-      "`onyx exp run --no-log` was removed. Use `onyx tools run <tool-id>` for transient diagnostics."
+      "`onyx exp run --no-log` was removed. Use `onyx tools run <tool-name>` for transient diagnostics."
     )
   }
   const root = await repoRoot(args.options.cwd)
@@ -1675,12 +1675,16 @@ async function logExperiment(
     report.experiment.gitStatus === "local_reported" ? " [local-reported]" : ""
   const pushNote =
     resultRefPushStatus === "failed" ? " (experiment ref push failed)" : ""
+  const dispositionNote =
+    report.experiment.disposition === "discarded"
+      ? ` [discarded${report.experiment.dispositionReason ? `: ${report.experiment.dispositionReason}` : ""}]`
+      : ""
   console.log(
     `${report.outcome}: ${record.name} (${report.experiment.status}) for campaign ${campaignName}${
       report.experiment.acceptedIndex
         ? ` as #${report.experiment.acceptedIndex}`
         : ""
-    }${gitNote}${pushNote}`
+    }${gitNote}${pushNote}${dispositionNote}`
   )
   return {
     ...report.experiment,
