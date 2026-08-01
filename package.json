@@ -26,6 +26,7 @@
     "bin",
     "src",
     "skills",
+    "prompts",
     "scripts/install.sh",
     "package.json"
   ],
@@ -34,6 +35,7 @@
     "verify:release-analytics": "bun scripts/verify-release-analytics.ts",
     "ci": "bun run lint && bun run typecheck && bun run test",
     "generate:skill-content": "bun scripts/generate-skill-content.ts",
+    "generate:worker-prompt-content": "bun scripts/generate-worker-prompt-content.ts",
     "lint": "eslint .",
     "test": "bun test",
     "typecheck": "tsc --noEmit"

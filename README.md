@@ -177,9 +177,14 @@ Tool commands in `onyx/setup.json` are language-flexible: point them at Bash,
 Python, Node, hardware vendor CLIs, compiled binaries, or any executable
 available to the project.
 
-Hypothesis workers are driven by the TypeScript-rendered Markdown prompt in
-`src/lib/worker-prompt.ts`, so prompt variables are typechecked directly in the
-editor and standalone release binaries stay self-contained.
+Hypothesis workers are driven by the static Markdown prompt in
+`prompts/hypothesis-worker.md`. It references worker environment variables
+(`$ONYX_WORKER_BIN`, `$ONYX_PROJECT_ROOT`, deadlines, and setup file paths)
+instead of interpolated values, so workers can always re-read live values, and
+the session-state brief remains the single routine context source. After
+editing it, run `bun run generate:worker-prompt-content` so the embedded
+release fallback stays in sync and standalone release binaries stay
+self-contained.
 
 Add durable hypotheses, then start a fresh bounded session with the repo-level
 supervisor:

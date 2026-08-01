@@ -139,7 +139,6 @@ import {
   upsertWorkerLaunch,
 } from "../lib/research-runtime"
 import { assertSetupCommitted } from "../lib/setup-git"
-import { protectedToolPaths } from "../lib/tools"
 import { formatAge } from "../lib/tui"
 import {
   activitySummaryForManifest,
@@ -174,7 +173,7 @@ import {
   type WorkerTerminalReasonCode,
   type ProviderFailureClass,
 } from "../lib/worker-launcher"
-import { renderHypothesisWorkerPrompt } from "../lib/worker-prompt"
+import { readHypothesisWorkerPrompt } from "../lib/worker-prompt"
 
 function createWorkerCredential() {
   return `owx_worker_v1_${randomBytes(32).toString("base64url")}`
@@ -2036,20 +2035,12 @@ function appendBoundedTeardownError(current: string | null, next: unknown) {
 
 async function writeWorkerPrompt({
   root,
-  worktree,
-  projectPath,
-  campaign,
-  setup,
   sessionId,
   hypothesis,
   workerId,
   endTimeMs,
 }: {
   root: string
-  worktree: string
-  projectPath: string
-  campaign: ApiCampaign
-  setup: ResearchSetupFile
   sessionId: string
   hypothesis: ApiHypothesis
   workerId: string
@@ -2061,34 +2052,14 @@ async function writeWorkerPrompt({
     dir,
     `${safeFileSegment(hypothesis.name)}-${safeFileSegment(workerId).slice(0, 12)}.md`
   )
-  const protectedPaths = await protectedToolPaths(root, projectPath)
   const nowMs = Date.now()
   const budgetRemainingMs = Math.max(0, endTimeMs - nowMs)
   const shutdownCushionMs = workerShutdownCushionMs(budgetRemainingMs)
   const researchDeadlineMs = Math.max(nowMs, endTimeMs - shutdownCushionMs)
   const shutdownDeadlineMs = Math.max(nowMs, endTimeMs)
-  const minutesRemaining = Math.max(0, Math.ceil(budgetRemainingMs / 60_000))
-  const markdown = renderHypothesisWorkerPrompt({
-    campaignName: campaign.name,
-    goal: setup.goal ?? campaign.description ?? "not specified",
-    hypothesisId: hypothesis.id,
-    hypothesisName: hypothesis.name,
-    hypothesisPlan: hypothesis.plan,
-    metricLabel: `${campaign.metricName}${campaign.metricUnit ? ` (${campaign.metricUnit})` : ""}, ${campaign.metricDirection}`,
-    minutesRemaining,
-    protectedPaths,
-    projectRoot: projectPath ? join(worktree, projectPath) : worktree,
-    researchDeadlineIso: new Date(researchDeadlineMs).toISOString(),
-    setupFilePath: setupPath(worktree, projectPath),
-    shutdownCushionSeconds: Math.ceil(shutdownCushionMs / 1000),
-    shutdownDeadlineIso: new Date(shutdownDeadlineMs).toISOString(),
-    validationFilePath: validationPath(worktree, projectPath),
-    researchSpecPath: onyxPath(worktree, projectPath, "onyx.md"),
-    sessionId,
-    worktreeRoot: worktree,
-  })
+  const markdown = await readHypothesisWorkerPrompt()
 
-  await writeFile(path, `${markdown}\n`, "utf8")
+  await writeFile(path, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8")
   return {
     path,
     markdown,
@@ -3142,10 +3113,6 @@ async function runHypothesisOnce({
 
     const prompt = await writeWorkerPrompt({
       root,
-      worktree,
-      projectPath,
-      campaign,
-      setup,
       sessionId,
       hypothesis,
       workerId: worker.id,
