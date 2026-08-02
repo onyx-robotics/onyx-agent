@@ -162,6 +162,10 @@ export {
   type ToolRunResult,
 } from "./lib/tools"
 export { USAGE, main } from "./main"
+export {
+  ONYX_AGENT_PROTOCOL_VERSION,
+  ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
+} from "./lib/version"
 export { WORKER_USAGE, workerMain } from "./worker-main"
 export {
   ONYX_WORKER_CONTEXT,
