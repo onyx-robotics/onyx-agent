@@ -15,137 +15,124 @@ describe("hypothesis worker prompt", () => {
     )
   })
 
-  test("renders static env-driven context and core loop rules", async () => {
+  test("renders a static, env-free contract and core loop rules", async () => {
     const prompt = await readHypothesisWorkerPrompt()
-    const normalizedPrompt = prompt.replaceAll(
-      '"$ONYX_WORKER_BIN"',
-      "onyx-worker"
-    )
 
-    // Fully static: no interpolated values anywhere.
+    // Fully static and environment-free: no interpolation, no env vars, no
+    // identity flags. Identity and deadlines flow through the worker runtime
+    // context and the session-state brief instead.
     expect(prompt).not.toContain("${")
-    expect(normalizedPrompt).toContain("# Onyx Research Worker")
+    expect(prompt).not.toContain("$ONYX_")
+    expect(prompt).not.toContain("ONYX_WORKER_BIN")
+    expect(prompt).not.toContain("--campaign")
+    expect(prompt).not.toContain("--session")
+    expect(prompt).not.toContain("--hypothesis ")
+    expect(prompt).toContain("# Onyx Research Worker")
+    expect(prompt).toContain("never pass identity flags")
 
     // The brief is the single bootstrap context source; no values are inlined.
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain(
       "Run `onyx-worker research session-state-brief --json` before anything else"
     )
-    expect(normalizedPrompt).toContain("single routine context source")
-    expect(normalizedPrompt).toContain("`currentHypothesis`")
-    expect(normalizedPrompt).toContain(
-      'onyx-worker research brief --campaign "$ONYX_CAMPAIGN_NAME" --session "$ONYX_SESSION_ID" --hypothesis "$ONYX_HYPOTHESIS_ID"'
-    )
-    expect(normalizedPrompt).not.toContain("- Name:")
-    expect(normalizedPrompt).not.toContain("- Metric:")
-    expect(normalizedPrompt).not.toContain("- Focus:")
-    expect(normalizedPrompt).not.toContain("Hypothesis Plan")
-    expect(normalizedPrompt).not.toContain("Time budget remaining at launch")
+    expect(prompt).toContain("single routine context source")
+    expect(prompt).toContain("`currentHypothesis`")
+    expect(prompt).toContain("run `onyx-worker research brief` for a fuller prose brief")
+    expect(prompt).not.toContain("- Name:")
+    expect(prompt).not.toContain("- Metric:")
+    expect(prompt).not.toContain("- Focus:")
+    expect(prompt).not.toContain("Hypothesis Plan")
+    expect(prompt).not.toContain("Time budget remaining at launch")
 
-    // Environment references replace interpolated values and stay re-readable.
-    expect(normalizedPrompt).toContain("`$ONYX_PROJECT_ROOT`")
-    expect(normalizedPrompt).toContain("`$ONYX_SETUP_FILE` (schema v2)")
-    expect(normalizedPrompt).toContain("`$ONYX_RESEARCH_SPEC_FILE`")
-    expect(normalizedPrompt).toContain(
-      "`$ONYX_VALIDATION_FILE` is diagnostics only"
+    // The project root is the working directory and the onyx/ directory is
+    // the setup surface — no file-path env vars.
+    expect(prompt).toContain(
+      "Your working directory is the project root, inside a detached disposable worktree"
     )
-    expect(normalizedPrompt).toContain(
-      "Treat `$ONYX_PROJECT_ROOT` as the only project root"
-    )
-    expect(normalizedPrompt).toContain(
-      "stable for your whole session"
-    )
-    expect(normalizedPrompt).toContain(
-      "Reserve the final `$ONYX_SHUTDOWN_CUSHION_SECONDS` second(s) for shutdown"
-    )
-    expect(normalizedPrompt).toContain(
-      "exit before `$ONYX_SHUTDOWN_DEADLINE_AT`"
-    )
-    expect(normalizedPrompt).toContain(
-      "Do not start new exploration after `$ONYX_RESEARCH_DEADLINE_AT`"
+    expect(prompt).toContain("`onyx/setup.json` (schema v2)")
+    expect(prompt).toContain("`onyx/onyx.md`")
+    expect(prompt).toContain("`onyx/validation.json` — diagnostics only")
+    expect(prompt).toContain(
+      "Treat your working directory — the project root — as the only root"
     )
 
-    expect(normalizedPrompt).toContain(
-      "The supervisor launched this worker with `onyx-worker`, `ONYX_WORKER_CONTEXT`, and an isolated `ONYX_HOME`"
+    expect(prompt).toContain(
+      "The supervisor launched this worker with `onyx-worker` on `PATH`, `ONYX_WORKER_CONTEXT`, and an isolated `ONYX_HOME`"
     )
-    expect(normalizedPrompt).toContain(
-      "the full `onyx` CLI is the user/orchestrator surface"
+    expect(prompt).toContain(
+      "The full `onyx` CLI is the user/orchestrator surface"
     )
-    expect(normalizedPrompt).toContain("must not be edited during Research")
-    expect(normalizedPrompt).toContain("`scope.protected`")
+    expect(prompt).toContain("must not be edited during Research")
+    expect(prompt).toContain("`scope.protected`")
 
-    // Stop guidance contract.
-    expect(normalizedPrompt).toContain("Start every loop by running")
-    expect(normalizedPrompt).toContain("stop.shouldStopStartingNewWork")
-    expect(normalizedPrompt).toContain("stop.recommendedAction")
-    expect(normalizedPrompt).toContain('recommendedAction` is `"exit"`')
-    expect(normalizedPrompt).toContain('`"finish_current_attempt_then_exit"`')
-    expect(normalizedPrompt).toContain("Do not start another workflow")
+    // Stop guidance contract, including brief-carried time budget.
+    expect(prompt).toContain("Start every loop by running")
+    expect(prompt).toContain("stop.shouldStopStartingNewWork")
+    expect(prompt).toContain("stop.recommendedAction")
+    expect(prompt).toContain("stop.secondsRemaining")
+    expect(prompt).toContain("stop.researchDeadlineAt")
+    expect(prompt).toContain("stop.shutdownCushionSeconds")
+    expect(prompt).toContain("stop.shutdownDeadlineAt")
+    expect(prompt).toContain('recommendedAction` is `"exit"`')
+    expect(prompt).toContain('`"finish_current_attempt_then_exit"`')
+    expect(prompt).toContain("Do not start another workflow")
 
-    // Core workflow loop.
-    expect(normalizedPrompt).toContain(
-      'onyx-worker exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto'
-    )
-    expect(normalizedPrompt).toContain("onyx-worker exp run --resume --auto")
-    expect(normalizedPrompt).toContain(
+    // Core workflow loop, flagless.
+    expect(prompt).toContain("onyx-worker exp run --auto")
+    expect(prompt).toContain("onyx-worker exp run --resume --auto")
+    expect(prompt).toContain(
       "The required order is strict: `exp run --auto`, make exactly one commit, `exp run --resume --auto`, then `exp log`"
     )
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain(
       "Never stack a new experiment commit on top of an unlogged one"
     )
-    expect(normalizedPrompt).toContain("After logging, return to step 1")
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain("After logging, return to step 1")
+    expect(prompt).toContain(
       "If `exp log` refuses because no measured attempt exists, do not amend, reset, or rewrite history"
     )
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain(
       "If `onyx-worker exp log` says the attempt was discarded, treat the session as complete"
     )
-    expect(normalizedPrompt).toContain("onyx-worker workflow status --blocked")
-    expect(normalizedPrompt).toContain("onyx-worker tools run <tool-name>")
-    expect(normalizedPrompt).toContain(
-      'onyx-worker exp log --campaign "$ONYX_CAMPAIGN_NAME"'
-    )
-    expect(normalizedPrompt).toContain("onyx-worker exp list --grep")
-    expect(normalizedPrompt).toContain("onyx-worker knowledge add")
+    expect(prompt).toContain("onyx-worker workflow status --blocked")
+    expect(prompt).toContain("onyx-worker tools run <tool-name>")
+    expect(prompt).toContain("onyx-worker exp log --name")
+    expect(prompt).toContain("onyx-worker exp list --grep")
+    expect(prompt).toContain("onyx-worker knowledge add")
 
     // Research rules.
-    expect(normalizedPrompt).toContain("Primary metric is king")
-    expect(normalizedPrompt).toContain(
-      "Make one small, measured, logged attempt early"
-    )
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain("Primary metric is king")
+    expect(prompt).toContain("Make one small, measured, logged attempt early")
+    expect(prompt).toContain(
       "Do not spend more than a quick orientation pass before the first `onyx-worker exp run`"
     )
-    expect(normalizedPrompt).toContain(
-      "Default to one measured candidate per workflow"
-    )
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain("Default to one measured candidate per workflow")
+    expect(prompt).toContain(
       "Do not run tuning sweeps, grid searches, or batch candidate evaluation unless your hypothesis plan or the research spec explicitly calls for it"
     )
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain(
       "the server records reports first and settles accepted/discarded disposition separately"
     )
-    expect(normalizedPrompt).toContain("Do not ask the user questions")
+    expect(prompt).toContain("Do not ask the user questions")
 
     // Git and state rules.
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain(
       "Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow"
     )
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain(
       "allowed only inside a normal `onyx-worker exp run` attempt"
     )
-    expect(normalizedPrompt).toContain("Product state is remote-first")
-    expect(normalizedPrompt).toContain("call the Onyx API directly")
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain("Product state is remote-first")
+    expect(prompt).toContain("call the Onyx API directly")
+    expect(prompt).toContain(
       "attempts to push the immutable experiment ref before it reports"
     )
-    expect(normalizedPrompt).toContain(
+    expect(prompt).toContain(
       "failed pushes are recorded as local-reported evidence"
     )
 
     // Removed legacy surfaces stay removed.
-    expect(normalizedPrompt).not.toContain("should-stop")
-    expect(normalizedPrompt).not.toContain("onyx-worker sync status")
-    expect(normalizedPrompt).not.toContain(".git/onyx/research.db")
-    expect(normalizedPrompt).not.toContain("loop-state")
+    expect(prompt).not.toContain("should-stop")
+    expect(prompt).not.toContain("onyx-worker sync status")
+    expect(prompt).not.toContain(".git/onyx/research.db")
+    expect(prompt).not.toContain("loop-state")
   })
 })

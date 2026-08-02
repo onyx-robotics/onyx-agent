@@ -178,10 +178,12 @@ Python, Node, hardware vendor CLIs, compiled binaries, or any executable
 available to the project.
 
 Hypothesis workers are driven by the static Markdown prompt in
-`prompts/worker-agent-prompt.md`. It references worker environment variables
-(`$ONYX_WORKER_BIN`, `$ONYX_PROJECT_ROOT`, deadlines, and setup file paths)
-instead of interpolated values, so workers can always re-read live values, and
-the session-state brief remains the single routine context source. After
+`prompts/worker-agent-prompt.md`. It references no environment variables and
+carries no interpolated values: workers start in the project root, run bare
+`onyx-worker` commands (the supervisor pins the verified wrapper first on
+`PATH` and in the `ONYX_WORKER_CONTEXT` runtime context), and read identity,
+the scoped credential, and session deadlines from that context while the
+session-state brief remains the single routine context source. After
 editing it, run `bun run generate:worker-prompt-content` so the embedded
 release fallback stays in sync and standalone release binaries stay
 self-contained.

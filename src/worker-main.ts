@@ -30,7 +30,9 @@ Usage:
 This CLI exposes the worker-safe primitive command surface. Users and
 orchestrators may run it directly for debugging. Supervised workers are launched
 with ONYX_WORKER_CONTEXT and isolated ONYX_HOME so their local state is pinned to
-one worker runtime.
+one worker runtime. Inside a supervised worker runtime the campaign, session,
+hypothesis, and worker identity default from ONYX_WORKER_CONTEXT; the identity
+flags above are overrides for humans and orchestrators outside that runtime.
 `
 
 export async function workerMain(argv = process.argv.slice(2)) {
