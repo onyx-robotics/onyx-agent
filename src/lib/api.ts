@@ -15,6 +15,7 @@ import { apiBaseUrl, apiKey } from "./config"
 import { normalizeRepositoryUrl, repositoryUrl } from "./git"
 import { readState, updateState } from "./runtime-state"
 import { resolveProjectPath } from "./project"
+import { getWorkerRuntimeContextCached } from "./worker-context"
 
 export type ApiProject = {
   id: string
@@ -865,22 +866,25 @@ export async function callApi(
   }
 }
 
-function workerCredential() {
-  const credential = process.env.ONYX_WORKER_CREDENTIAL
+async function workerCredential() {
+  const context = await getWorkerRuntimeContextCached()
+  const credential = context?.workerCredential
   if (!credential?.match(/^owx_worker_v1_[A-Za-z0-9_-]{32,}$/)) {
-    throw new Error("Worker API requires ONYX_WORKER_CREDENTIAL")
+    throw new Error(
+      "Worker API requires a supervised worker runtime (ONYX_WORKER_CONTEXT with a scoped worker credential)"
+    )
   }
   return credential
 }
 
-export function callWorkerApi(
+export async function callWorkerApi(
   method: string,
   path: string,
   body?: unknown,
   args?: Args,
   credentialOverride?: string
 ) {
-  const credential = credentialOverride ?? workerCredential()
+  const credential = credentialOverride ?? (await workerCredential())
   if (!credential.match(/^owx_worker_v1_[A-Za-z0-9_-]{32,}$/)) {
     throw new Error("Worker API requires a valid scoped worker credential")
   }

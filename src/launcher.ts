@@ -66,7 +66,7 @@ export async function runLauncher({
   runMain?: (argv?: string[]) => Promise<unknown>
 } = {}) {
   if (entrypoint === "onyx" && argv[0] === "developer") {
-    if (env.ONYX_WORKER_CONTEXT || env.ONYX_WORKER_ID) {
+    if (env.ONYX_WORKER_CONTEXT) {
       throw new Error(
         "The full `onyx` CLI is not available inside a worker runtime. Use `onyx-worker` for worker-safe research commands."
       )

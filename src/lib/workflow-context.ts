@@ -1,5 +1,6 @@
 import type { Args } from "./args"
 import { readState } from "./runtime-state"
+import { getWorkerRuntimeContextCached } from "./worker-context"
 
 export type WorkerWorkflowContext = {
   sessionId?: string
@@ -7,17 +8,15 @@ export type WorkerWorkflowContext = {
   hypothesisId?: string
 }
 
-function optionOrEnv(args: Args, option: string, env: string) {
-  return args.options[option] ?? process.env[env] ?? undefined
-}
-
-export function resolveWorkerWorkflowContext(
+export async function resolveWorkerWorkflowContext(
   args: Args
-): WorkerWorkflowContext {
+): Promise<WorkerWorkflowContext> {
+  const context = await getWorkerRuntimeContextCached()
   return {
-    sessionId: optionOrEnv(args, "session", "ONYX_SESSION_ID"),
-    workerId: optionOrEnv(args, "worker", "ONYX_WORKER_ID"),
-    hypothesisId: optionOrEnv(args, "hypothesis", "ONYX_HYPOTHESIS_ID"),
+    sessionId: args.options.session ?? context?.sessionId ?? undefined,
+    workerId: args.options.worker ?? context?.workerId ?? undefined,
+    hypothesisId:
+      args.options.hypothesis ?? context?.hypothesisId ?? undefined,
   }
 }
 
@@ -26,11 +25,10 @@ export async function resolveCampaignNameFromContext(
   args: Args,
   missingMessage = "No active campaign. Run `onyx campaign use --name <name>` or pass `--campaign <name>`."
 ) {
+  const context = await getWorkerRuntimeContextCached()
   const state = await readState(root)
   const campaignName =
-    args.options.campaign ??
-    process.env.ONYX_CAMPAIGN_NAME ??
-    state.activeCampaign
+    args.options.campaign ?? context?.campaignName ?? state.activeCampaign
   if (!campaignName) throw new Error(missingMessage)
   return campaignName
 }

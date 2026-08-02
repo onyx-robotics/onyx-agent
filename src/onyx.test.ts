@@ -35,7 +35,6 @@ const MOCK_API_ORIGIN = "https://api.onyx.test"
 
 let previousApiUrl: string | undefined
 let previousApiKey: string | undefined
-let previousWorkerCredential: string | undefined
 let previousFetch: typeof fetch | null = null
 
 async function tempRepo(prefix = "onyx-remote-first-") {
@@ -165,12 +164,9 @@ function installMockApi(
 ) {
   previousApiUrl = process.env.ONYX_API_URL
   previousApiKey = process.env.ONYX_API_KEY
-  previousWorkerCredential = process.env.ONYX_WORKER_CREDENTIAL
   previousFetch = globalThis.fetch
   process.env.ONYX_API_URL = MOCK_API_ORIGIN
   process.env.ONYX_API_KEY = "test-key"
-  process.env.ONYX_WORKER_CREDENTIAL =
-    "owx_worker_v1_test-credential-0000000000000000"
   globalThis.fetch = (async (input, init) => {
     const url = new URL(
       typeof input === "string"
@@ -204,9 +200,6 @@ afterEach(() => {
   else process.env.ONYX_API_URL = previousApiUrl
   if (previousApiKey === undefined) delete process.env.ONYX_API_KEY
   else process.env.ONYX_API_KEY = previousApiKey
-  if (previousWorkerCredential === undefined)
-    delete process.env.ONYX_WORKER_CREDENTIAL
-  else process.env.ONYX_WORKER_CREDENTIAL = previousWorkerCredential
 })
 
 describe("remote-first agent architecture", () => {

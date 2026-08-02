@@ -78,7 +78,7 @@ export async function commandWorkflowStatus(args: Args) {
   const campaignName = args.options.run
     ? null
     : await activeCampaignName(root, args)
-  const context = resolveWorkerWorkflowContext(args)
+  const context = await resolveWorkerWorkflowContext(args)
   const shouldUseWorkerScope = Boolean(!args.options.run && context.workerId)
   const workerScopedRun =
     !shouldUseWorkerScope || !campaignName

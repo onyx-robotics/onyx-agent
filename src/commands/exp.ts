@@ -38,7 +38,7 @@ import {
 } from "../lib/local-attempt-cache"
 import { onyxStateDir, readState, writeState } from "../lib/runtime-state"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
-import { readWorkerRuntimeContext } from "../lib/worker-context"
+import { getWorkerRuntimeContextCached } from "../lib/worker-context"
 import { recordWorkerReportedExperiment } from "../lib/worker-reports"
 import {
   clearLocalAttempt,
@@ -362,7 +362,7 @@ async function resolveAutoResumeWorkflowRun({
   args: Args
   projectPath: string
 }) {
-  const context = resolveWorkerWorkflowContext(args)
+  const context = await resolveWorkerWorkflowContext(args)
   const campaignName = await resolveCampaignName(root, args)
   const candidates = await listWorkflowRuns(
     root,
@@ -801,12 +801,10 @@ async function createWorkflowRun({
 }) {
   const started = new Date().toISOString()
   const runRef = clientRunRef(campaignName)
-  const sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
-  const workerId = args.options.worker ?? process.env.ONYX_WORKER_ID
-  const hypothesisId =
-    args.options.hypothesis ??
-    process.env.ONYX_HYPOTHESIS_ID ??
-    campaign.hypothesisId
+  const workflowContext = await resolveWorkerWorkflowContext(args)
+  const sessionId = workflowContext.sessionId
+  const workerId = workflowContext.workerId
+  const hypothesisId = workflowContext.hypothesisId ?? campaign.hypothesisId
   await assertWorkerCanStartFreshWorkflow({
     root,
     campaignName,
@@ -1279,7 +1277,7 @@ export async function commandExpRun(args: Args) {
       projectPath,
       campaignName,
     })
-    const context = resolveWorkerWorkflowContext(args)
+    const context = await resolveWorkerWorkflowContext(args)
     await assertWorkerCanStartFreshWorkflow({
       root,
       campaignName,
@@ -1386,7 +1384,7 @@ async function logExperiment(
         campaignName,
       })
   const setup = frozen?.setup ?? (await readSetupFile(root, projectPath))
-  const workerRuntimeContext = frozen ? null : await readWorkerRuntimeContext()
+  const workerRuntimeContext = frozen ? null : await getWorkerRuntimeContextCached()
   if (setup.projectPath !== projectPath) {
     throw new Error(
       `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
@@ -1398,7 +1396,7 @@ async function logExperiment(
         workerId: frozen.workerId,
         hypothesisId: frozen.hypothesisId,
       }
-    : resolveWorkerWorkflowContext(args)
+    : await resolveWorkerWorkflowContext(args)
   const explicitRunRef = frozen?.runRef ?? args.options["run-ref"]
   const allowUnmeasuredFailure =
     !explicitRunRef &&
@@ -1492,18 +1490,18 @@ async function logExperiment(
     frozen?.hypothesisId ??
     args.options.hypothesis ??
     usableAttempt?.hypothesisId ??
-    process.env.ONYX_HYPOTHESIS_ID ??
+    workerRuntimeContext?.hypothesisId ??
     campaign.hypothesisId
   const sessionId =
     frozen?.sessionId ??
     args.options.session ??
     usableAttempt?.sessionId ??
-    process.env.ONYX_SESSION_ID
+    workerRuntimeContext?.sessionId
   const workerId =
     frozen?.workerId ??
     args.options.worker ??
     usableAttempt?.workerId ??
-    process.env.ONYX_WORKER_ID
+    workerRuntimeContext?.workerId
   const assignmentId =
     frozen?.assignmentId ??
     args.options.assignment ??
@@ -1725,7 +1723,7 @@ export async function commandExpList(args: Args) {
   }
   const state = await readState(root)
   const campaignName = args.options.campaign ?? state.activeCampaign
-  const workerContext = await readWorkerRuntimeContext().catch(() => null)
+  const workerContext = await getWorkerRuntimeContextCached().catch(() => null)
   const resolvedCampaigns = workerContext
     ? [
         {

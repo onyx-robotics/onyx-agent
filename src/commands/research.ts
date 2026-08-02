@@ -108,7 +108,10 @@ import {
   supervisorControlStateIsFresh,
   writeSupervisorControlStateSnapshot,
 } from "../lib/supervisor-control-state"
-import { readWorkerRuntimeContext } from "../lib/worker-context"
+import {
+  getWorkerRuntimeContextCached,
+  readWorkerRuntimeContext,
+} from "../lib/worker-context"
 import {
   readWorkerFinishMarker,
   type WorkerFinishMarker,
@@ -4199,8 +4202,8 @@ export async function commandResearchClean(args: Args) {
 }
 
 export async function commandResearchBrief(args: Args) {
-  const workerContext = await readWorkerRuntimeContext().catch(() => null)
-  let sessionId = args.options.session ?? process.env.ONYX_SESSION_ID
+  const workerContext = await getWorkerRuntimeContextCached().catch(() => null)
+  let sessionId = args.options.session ?? workerContext?.sessionId
   if (!sessionId) {
     const root = await repoRoot(args.options.cwd)
     const projectPath = await resolveProjectPath(root, args)
@@ -4222,7 +4225,7 @@ export async function commandResearchBrief(args: Args) {
     )
   }
   const hypothesisId =
-    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID ?? undefined
+    args.options.hypothesis ?? workerContext?.hypothesisId ?? undefined
   const brief = workerContext
     ? await getWorkerResearchBrief(args)
     : await getResearchSessionBrief(sessionId, args, { hypothesisId })
@@ -5383,7 +5386,7 @@ export async function commandResearchStop(args: Args) {
 
 export async function commandKnowledgeAdd(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const workerContext = await readWorkerRuntimeContext()
+  const workerContext = await getWorkerRuntimeContextCached()
   const campaign = workerContext
     ? { id: workerContext.campaignId, name: workerContext.campaignName }
     : (await campaignForName(root, args)).campaign
@@ -5415,10 +5418,10 @@ export async function commandKnowledgeAdd(args: Args) {
     )
   }
   const knowledgeBody = {
-    sessionId: args.options.session ?? process.env.ONYX_SESSION_ID,
-    hypothesisId: args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID,
+    sessionId: args.options.session ?? workerContext?.sessionId,
+    hypothesisId: args.options.hypothesis ?? workerContext?.hypothesisId,
     authoredByWorkerId:
-      args.options.worker ?? process.env.ONYX_WORKER_ID ?? undefined,
+      args.options.worker ?? workerContext?.workerId ?? undefined,
     kind,
     title,
     body,
@@ -5439,7 +5442,7 @@ export async function commandKnowledgeAdd(args: Args) {
 
 export async function commandKnowledgeList(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const workerContext = await readWorkerRuntimeContext()
+  const workerContext = await getWorkerRuntimeContextCached()
   const campaign = workerContext
     ? { id: workerContext.campaignId, name: workerContext.campaignName }
     : (await campaignForName(root, args)).campaign
@@ -7613,7 +7616,6 @@ export async function commandWorkerRun(args: Args) {
   const state = await readState(root)
   const sessionId =
     args.options.session ??
-    process.env.ONYX_SESSION_ID ??
     activeSessionIdFromState({
       state,
       projectPath,
@@ -7635,8 +7637,7 @@ export async function commandWorkerRun(args: Args) {
   const { setup } = await assertLocalSetupReady(root, projectPath)
   await assertMainWorktreeClean(root, "before launching a worker")
 
-  const requestedHypothesisId =
-    args.options.hypothesis ?? process.env.ONYX_HYPOTHESIS_ID
+  const requestedHypothesisId = args.options.hypothesis
   const hypothesis =
     (requestedHypothesisId
       ? sessionState.hypotheses.find(

@@ -146,8 +146,6 @@ describe("CLI telemetry", () => {
       "ONYX_SYNTHETIC_WORKER",
       "ONYX_TESTBED",
       "ONYX_WORKER_CONTEXT",
-      "ONYX_WORKER_CREDENTIAL",
-      "ONYX_WORKER_ID",
     ] as const) {
       process.env[key] = "1"
       expect(telemetryEffectiveState({ config }).enabled).toBe(false)

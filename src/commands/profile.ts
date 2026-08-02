@@ -17,7 +17,7 @@ const PROFILE_USAGE =
   "Usage: onyx profile list | onyx profile use <name> | onyx profile delete <name> | onyx profile set-api-key-env <name> <ENV_VAR> | onyx profile worker get [profile] | onyx profile worker set [profile] --agent codex|claude|opencode [--model <model>] | onyx profile worker clear [profile] (--all | --agent | --model codex|claude|opencode)"
 
 function assertProfileMutationAllowed() {
-  if (process.env.ONYX_WORKER_ID) {
+  if (process.env.ONYX_WORKER_CONTEXT) {
     throw new Error(
       "Worker agents cannot mutate Onyx CLI profiles. The worker API target and scoped credential are fixed by the supervisor."
     )

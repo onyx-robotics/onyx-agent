@@ -85,8 +85,6 @@ function executionIsSuppressed() {
     (process.env.NODE_ENV === "test" &&
       !isTruthy(process.env.ONYX_TELEMETRY_TEST)) ||
     process.env.ONYX_WORKER_CONTEXT ||
-    process.env.ONYX_WORKER_ID ||
-    process.env.ONYX_WORKER_CREDENTIAL ||
     process.env.ONYX_SUPERVISOR_RUN_ID ||
     process.env.ONYX_AUTOMATION ||
     process.env.ONYX_SYNTHETIC_WORKER ||

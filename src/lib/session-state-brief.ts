@@ -211,7 +211,7 @@ export function workerSessionStateBriefFromSnapshot({
       items: brief?.knowledge.items ?? [],
       hasMore: brief?.knowledge.hasMore ?? false,
       moreCommand: brief?.knowledge.hasMore
-        ? `"$ONYX_WORKER_BIN" knowledge list --campaign ${JSON.stringify(context.campaignName)} --limit 50`
+        ? "onyx-worker knowledge list --limit 50"
         : null,
     },
     updatedAt: brief?.updatedAt ?? null,

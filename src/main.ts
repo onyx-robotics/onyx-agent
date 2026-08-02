@@ -143,7 +143,7 @@ async function runMainCommand(argv: string[]) {
     return
   }
 
-  if (process.env.ONYX_WORKER_CONTEXT || process.env.ONYX_WORKER_ID) {
+  if (process.env.ONYX_WORKER_CONTEXT) {
     throw new Error(
       "The full `onyx` CLI is not available inside a worker runtime. Use `onyx-worker` for worker-safe research commands."
     )

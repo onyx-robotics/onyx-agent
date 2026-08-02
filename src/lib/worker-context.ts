@@ -57,6 +57,24 @@ function objectField(record: Record<string, unknown>, key: string) {
     : null
 }
 
+let cachedContext: {
+  path: string
+  context: WorkerRuntimeContext
+} | null = null
+
+/**
+ * Memoized worker runtime context. The supervisor writes context.json once
+ * before launch and never mutates it, so a per-process cache is safe.
+ */
+export async function getWorkerRuntimeContextCached() {
+  const path = contextPath()
+  if (!path) return null
+  if (cachedContext && cachedContext.path === path) return cachedContext.context
+  const context = await readWorkerRuntimeContext()
+  if (context) cachedContext = { path, context }
+  return context
+}
+
 export async function readWorkerRuntimeContext() {
   const path = contextPath()
   if (!path) return null

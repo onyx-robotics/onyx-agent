@@ -574,7 +574,7 @@ describe("CLI profiles", () => {
       },
     })
 
-    process.env.ONYX_WORKER_ID = "worker_123"
+    process.env.ONYX_WORKER_CONTEXT = "/tmp/worker-context.json"
     const message = "Worker agents cannot mutate Onyx CLI profiles"
 
     try {
@@ -633,7 +633,7 @@ describe("CLI profiles", () => {
       expect(config.profiles.alpha?.apiKeyEnv).toBeUndefined()
       expect(config.profiles.alpha?.worker).toBeUndefined()
     } finally {
-      delete process.env.ONYX_WORKER_ID
+      delete process.env.ONYX_WORKER_CONTEXT
     }
   })
 
