@@ -15,6 +15,10 @@ import { fileURLToPath } from "node:url"
 
 import { onyxStateDir } from "./runtime-state"
 import { readConfig, type BuiltInWorkerAgent } from "./config"
+import {
+  ONYX_AGENT_PROTOCOL_VERSION,
+  ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
+} from "./version"
 import { gitCommonDir, gitDir } from "./git"
 import { activityLinesForOutput, pathExists, runProcess } from "./process"
 import type { WorkerRuntimeContext } from "./worker-context"
@@ -167,11 +171,13 @@ export async function preflightWorkerProtocol({ root }: { root: string }) {
       workerContextSchemas?: number[]
     }
     if (
-      payload.protocolVersion !== 5 ||
-      !payload.workerContextSchemas?.includes(5)
+      payload.protocolVersion !== ONYX_AGENT_PROTOCOL_VERSION ||
+      !payload.workerContextSchemas?.includes(
+        ONYX_WORKER_CONTEXT_SCHEMA_VERSION
+      )
     ) {
       throw new Error(
-        `expected protocol 5/context 5, received ${compactPreflightOutput(result.stdout)}`
+        `expected protocol ${ONYX_AGENT_PROTOCOL_VERSION}/context ${ONYX_WORKER_CONTEXT_SCHEMA_VERSION}, received ${compactPreflightOutput(result.stdout)}`
       )
     }
     return { ...payload, workerPath: wrapper.workerPath, mode: wrapper.mode }
@@ -937,12 +943,14 @@ export async function preflightWorkerInvocation(
     throw new Error("Worker protocol handshake did not return JSON")
   }
   if (
-    handshakePayload.protocolVersion !== 5 ||
+    handshakePayload.protocolVersion !== ONYX_AGENT_PROTOCOL_VERSION ||
     !Array.isArray(handshakePayload.workerContextSchemas) ||
-    !handshakePayload.workerContextSchemas.includes(5)
+    !handshakePayload.workerContextSchemas.includes(
+      ONYX_WORKER_CONTEXT_SCHEMA_VERSION
+    )
   ) {
     throw new Error(
-      `Worker protocol mismatch: expected protocol 5/context 5, received ${compactPreflightOutput(handshake.stdout)}`
+      `Worker protocol mismatch: expected protocol ${ONYX_AGENT_PROTOCOL_VERSION}/context ${ONYX_WORKER_CONTEXT_SCHEMA_VERSION}, received ${compactPreflightOutput(handshake.stdout)}`
     )
   }
   checks.push({

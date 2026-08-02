@@ -13,7 +13,7 @@ const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
 
 function workerContextFixture() {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     campaignId: "campaign-id-1",
     campaignName: "context-campaign",
     sessionId: "session-ctx",
@@ -45,6 +45,9 @@ function workerContextFixture() {
     setupFile: "/tmp/worktree/onyx/setup.json",
     validationFile: "/tmp/worktree/onyx/validation.json",
     researchSpecFile: "/tmp/worktree/onyx/onyx.md",
+    researchDeadlineAt: "2026-08-02T12:00:00.000Z",
+    shutdownDeadlineAt: "2026-08-02T12:01:30.000Z",
+    shutdownCushionSeconds: 90,
   }
 }
 

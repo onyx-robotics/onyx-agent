@@ -4,7 +4,7 @@ import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 
 export const ONYX_AGENT_PROTOCOL_VERSION = 5
-export const ONYX_WORKER_CONTEXT_SCHEMA_VERSION = 5
+export const ONYX_WORKER_CONTEXT_SCHEMA_VERSION = 6
 
 function sourceBuildSha() {
   try {

@@ -82,11 +82,15 @@ export async function collectLocalResearchStopReasons({
   root,
   sessionId,
   snapshot,
+  researchDeadlineAt = null,
   nowMs = Date.now(),
 }: {
   root: string
   sessionId: string
   snapshot?: SessionStateBriefSnapshot | null
+  /** Worker research deadline (session deadline minus the shutdown cushion)
+   * from the worker runtime context. */
+  researchDeadlineAt?: string | null
   nowMs?: number
 }): Promise<LocalResearchStopCheck> {
   const reasons: string[] = []
@@ -176,8 +180,8 @@ export async function collectLocalResearchStopReasons({
     })
   }
 
-  const workerResearchDeadline = process.env.ONYX_RESEARCH_DEADLINE_AT
-    ? Date.parse(process.env.ONYX_RESEARCH_DEADLINE_AT)
+  const workerResearchDeadline = researchDeadlineAt
+    ? Date.parse(researchDeadlineAt)
     : Number.NaN
   if (
     Number.isFinite(workerResearchDeadline) &&

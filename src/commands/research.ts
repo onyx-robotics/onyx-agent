@@ -112,6 +112,7 @@ import {
   getWorkerRuntimeContextCached,
   readWorkerRuntimeContext,
 } from "../lib/worker-context"
+import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "../lib/version"
 import {
   readWorkerFinishMarker,
   type WorkerFinishMarker,
@@ -3130,7 +3131,7 @@ async function runHypothesisOnce({
     await writeWorkerRuntimeContext({
       paths: runtimePaths,
       context: {
-        schemaVersion: 5,
+        schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
         campaignId: campaign.id,
         campaignName: campaign.name,
         sessionId,
@@ -3162,6 +3163,9 @@ async function runHypothesisOnce({
         setupFile: setupPath(worktree, projectPath),
         validationFile: validationPath(worktree, projectPath),
         researchSpecFile: onyxPath(worktree, projectPath, "onyx.md"),
+        researchDeadlineAt: new Date(prompt.researchDeadlineMs).toISOString(),
+        shutdownDeadlineAt: new Date(prompt.shutdownDeadlineMs).toISOString(),
+        shutdownCushionSeconds: Math.ceil(prompt.shutdownCushionMs / 1000),
       },
     })
     workerCliWrapper = await writeWorkerCliWrapper({ paths: runtimePaths })
@@ -5146,12 +5150,17 @@ async function workerSessionStopGuidance({
       recommendedAction: "continue",
       activeWorkflowCount: 0,
       unloggedAttemptCount: 0,
+      researchDeadlineAt: null,
+      shutdownDeadlineAt: null,
+      shutdownCushionSeconds: null,
+      secondsRemaining: null,
     }
   }
   const stopCheck = await collectLocalResearchStopReasons({
     root,
     sessionId: context.sessionId,
     snapshot,
+    researchDeadlineAt: context.researchDeadlineAt,
   })
   let activeWorkflowCount = 0
   let unloggedAttemptCount = 0
@@ -5177,6 +5186,9 @@ async function workerSessionStopGuidance({
     unloggedAttemptCount = unloggedAttempts.length
   }
   const hasWorkToFinish = activeWorkflowCount > 0 || unloggedAttemptCount > 0
+  const researchDeadlineMs = context.researchDeadlineAt
+    ? Date.parse(context.researchDeadlineAt)
+    : Number.NaN
   return {
     shouldStopStartingNewWork: stopCheck.shouldStop,
     reasonCodes: stopCheck.reasonCodes,
@@ -5188,6 +5200,12 @@ async function workerSessionStopGuidance({
       : "continue",
     activeWorkflowCount,
     unloggedAttemptCount,
+    researchDeadlineAt: context.researchDeadlineAt,
+    shutdownDeadlineAt: context.shutdownDeadlineAt,
+    shutdownCushionSeconds: context.shutdownCushionSeconds,
+    secondsRemaining: Number.isFinite(researchDeadlineMs)
+      ? Math.max(0, Math.round((researchDeadlineMs - Date.now()) / 1000))
+      : null,
   }
 }
 

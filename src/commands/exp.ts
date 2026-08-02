@@ -427,6 +427,7 @@ async function assertWorkerCanStartFreshWorkflow({
     const stopCheck = await collectLocalResearchStopReasons({
       root,
       sessionId: context.sessionId,
+      researchDeadlineAt: context.researchDeadlineAt ?? null,
     })
     if (stopCheck.shouldStop) {
       throw new Error(
@@ -809,7 +810,7 @@ async function createWorkflowRun({
     root,
     campaignName,
     projectPath,
-    context: { sessionId, workerId, hypothesisId },
+    context: { ...workflowContext, hypothesisId },
   })
   if (sessionId && (workerId || hypothesisId)) {
     const blockedWorkflowHypothesisId = workerId ? null : hypothesisId

@@ -27,6 +27,7 @@ import {
   writeWorkerRuntimeContext,
   type WorkerRuntimePaths,
 } from "./lib/worker-launcher"
+import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "./lib/version"
 import { main, USAGE } from "./main"
 import { WORKER_USAGE } from "./worker-main"
 
@@ -68,7 +69,7 @@ async function writeTestWorkerContext({
   await writeWorkerRuntimeContext({
     paths,
     context: {
-      schemaVersion: 5,
+      schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
       campaignId,
       campaignName,
       sessionId: SESSION_ID,
@@ -107,6 +108,9 @@ async function writeTestWorkerContext({
       setupFile: join(root, "onyx/setup.json"),
       validationFile: join(root, "onyx/validation.json"),
       researchSpecFile: join(root, "onyx/onyx.md"),
+      researchDeadlineAt: null,
+      shutdownDeadlineAt: null,
+      shutdownCushionSeconds: null,
     },
   })
   return paths
@@ -369,6 +373,10 @@ describe("remote-first agent architecture", () => {
         recommendedAction: "continue",
         activeWorkflowCount: 0,
         unloggedAttemptCount: 0,
+        researchDeadlineAt: null,
+        shutdownDeadlineAt: null,
+        shutdownCushionSeconds: null,
+        secondsRemaining: null,
       })
       expect(calls).toEqual([])
     } finally {

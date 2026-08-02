@@ -66,6 +66,14 @@ export type WorkerSessionStopGuidance = {
   recommendedAction: "continue" | "finish_current_attempt_then_exit" | "exit"
   activeWorkflowCount: number
   unloggedAttemptCount: number
+  /** Last moment to start new exploration; null when the session has no
+   * deadline. */
+  researchDeadlineAt: string | null
+  /** Hard exit moment for the worker. */
+  shutdownDeadlineAt: string | null
+  shutdownCushionSeconds: number | null
+  /** Seconds until researchDeadlineAt (floor 0); null without a deadline. */
+  secondsRemaining: number | null
 }
 
 function safeSegment(value: string) {
@@ -224,6 +232,10 @@ export function workerSessionStateBriefFromSnapshot({
         recommendedAction: "continue",
         activeWorkflowCount: 0,
         unloggedAttemptCount: 0,
+        researchDeadlineAt: context.researchDeadlineAt ?? null,
+        shutdownDeadlineAt: context.shutdownDeadlineAt ?? null,
+        shutdownCushionSeconds: context.shutdownCushionSeconds ?? null,
+        secondsRemaining: null,
       } satisfies WorkerSessionStopGuidance),
   }
 }

@@ -6,6 +6,8 @@ export type WorkerWorkflowContext = {
   sessionId?: string
   workerId?: string
   hypothesisId?: string
+  /** Worker research deadline from the runtime context; never flag-provided. */
+  researchDeadlineAt?: string
 }
 
 export async function resolveWorkerWorkflowContext(
@@ -17,6 +19,7 @@ export async function resolveWorkerWorkflowContext(
     workerId: args.options.worker ?? context?.workerId ?? undefined,
     hypothesisId:
       args.options.hypothesis ?? context?.hypothesisId ?? undefined,
+    researchDeadlineAt: context?.researchDeadlineAt ?? undefined,
   }
 }
 

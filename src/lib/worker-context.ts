@@ -2,11 +2,12 @@ import { readFile } from "node:fs/promises"
 
 import type { ResearchHypothesisPlan } from "../protocol"
 import type { Args } from "./args"
+import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "./version"
 
 export const ONYX_WORKER_CONTEXT = "ONYX_WORKER_CONTEXT"
 
 export type WorkerRuntimeContext = {
-  schemaVersion: 5
+  schemaVersion: typeof ONYX_WORKER_CONTEXT_SCHEMA_VERSION
   campaignId: string
   campaignName: string
   sessionId: string
@@ -38,6 +39,12 @@ export type WorkerRuntimeContext = {
   setupFile: string
   validationFile: string
   researchSpecFile: string
+  /** Last moment to start new exploration (session deadline minus the
+   * shutdown cushion); null when the session has no deadline. */
+  researchDeadlineAt: string | null
+  /** Hard exit moment for the worker; null when the session has no deadline. */
+  shutdownDeadlineAt: string | null
+  shutdownCushionSeconds: number | null
 }
 
 function contextPath() {
@@ -83,7 +90,7 @@ export async function readWorkerRuntimeContext() {
     throw new Error(`Invalid worker context at ${path}: expected object`)
   }
   const record = parsed as Record<string, unknown>
-  if (record.schemaVersion !== 5) {
+  if (record.schemaVersion !== ONYX_WORKER_CONTEXT_SCHEMA_VERSION) {
     throw new Error(`Invalid worker context at ${path}: unsupported schema`)
   }
 
@@ -97,7 +104,7 @@ export async function readWorkerRuntimeContext() {
   }
 
   const context: WorkerRuntimeContext = {
-    schemaVersion: 5,
+    schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
     campaignId: stringField(record, "campaignId") ?? "",
     campaignName: stringField(record, "campaignName") ?? "",
     sessionId: stringField(record, "sessionId") ?? "",
@@ -135,6 +142,13 @@ export async function readWorkerRuntimeContext() {
     setupFile: stringField(record, "setupFile") ?? "",
     validationFile: stringField(record, "validationFile") ?? "",
     researchSpecFile: stringField(record, "researchSpecFile") ?? "",
+    researchDeadlineAt: stringField(record, "researchDeadlineAt"),
+    shutdownDeadlineAt: stringField(record, "shutdownDeadlineAt"),
+    shutdownCushionSeconds:
+      typeof record.shutdownCushionSeconds === "number" &&
+      Number.isFinite(record.shutdownCushionSeconds)
+        ? record.shutdownCushionSeconds
+        : null,
   }
 
   const missing = Object.entries(context)

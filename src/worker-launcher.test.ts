@@ -13,6 +13,7 @@ import { describe, expect, test } from "bun:test"
 
 import { writeConfig } from "./lib/config"
 import { currentCommit, pushRefs } from "./lib/git"
+import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "./lib/version"
 import {
   runProcess,
   runStreamingProcess,
@@ -67,7 +68,7 @@ async function writeFakeOnyx(path: string) {
       "  exit 0",
       "fi",
       'if [[ "${1:-}" == "diagnostics" && "${2:-}" == "handshake" ]]; then',
-      '  echo "{\\"protocolVersion\\":5,\\"workerContextSchemas\\":[5],\\"capabilities\\":[]}"',
+      '  echo "{\\"protocolVersion\\":5,\\"workerContextSchemas\\":[6],\\"capabilities\\":[]}"',
       "  exit 0",
       "fi",
       'if [[ "${1:-}" == "research" && "${2:-}" == "session-state-brief" ]]; then',
@@ -617,7 +618,7 @@ describe("worker launchers", () => {
     await writeWorkerRuntimeContext({
       paths,
       context: {
-        schemaVersion: 5,
+        schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
         campaignId: "campaign-id",
         campaignName: "campaign",
         sessionId: "session/one",
@@ -656,6 +657,9 @@ describe("worker launchers", () => {
         setupFile: join(root, "worktree", "onyx", "setup.json"),
         validationFile: join(root, "worktree", "onyx", "validation.json"),
         researchSpecFile: join(root, "worktree", "onyx", "onyx.md"),
+        researchDeadlineAt: null,
+        shutdownDeadlineAt: null,
+        shutdownCushionSeconds: null,
       },
     })
 
