@@ -178,7 +178,7 @@ Python, Node, hardware vendor CLIs, compiled binaries, or any executable
 available to the project.
 
 Hypothesis workers are driven by the static Markdown prompt in
-`prompts/hypothesis-worker.md`. It references worker environment variables
+`prompts/worker-agent-prompt.md`. It references worker environment variables
 (`$ONYX_WORKER_BIN`, `$ONYX_PROJECT_ROOT`, deadlines, and setup file paths)
 instead of interpolated values, so workers can always re-read live values, and
 the session-state brief remains the single routine context source. After
