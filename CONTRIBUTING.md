@@ -33,5 +33,6 @@ current API target.
 - Preserve local/offline behavior under `.git/onyx/`.
 - Do not add private Onyx app, Supabase, WorkOS, or GitHub App dependencies to
   this public package.
-- Update `/Users/ted/onyx/docs` when public CLI behavior, flags, local state,
-  sync semantics, install flow, or bundled skill guidance changes.
+- Update the public docs in the `docs/` directory of the onyx-research repo
+  when public CLI behavior, flags, local state, sync semantics, install flow,
+  or bundled skill guidance changes.

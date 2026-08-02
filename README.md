@@ -343,8 +343,8 @@ onyx developer use release
 Restart or reload active agent sessions if they cache skill files.
 
 When public CLI commands, flags, profile behavior, local state, sync behavior,
-or the bundled agent skill changes, update the public docs in
-`/Users/ted/onyx/docs` in the same change.
+or the bundled agent skill changes, update the public docs in the `docs/`
+directory of the onyx-research repo in the same change.
 
 Release binaries are built from Bun standalone executables:
 
