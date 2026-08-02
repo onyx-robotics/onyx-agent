@@ -28,7 +28,9 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).not.toContain("--session")
     expect(prompt).not.toContain("--hypothesis ")
     expect(prompt).toContain("# Onyx Research Worker")
-    expect(prompt).toContain("never pass identity flags")
+    expect(prompt).toContain(
+      "it already knows your campaign, session, hypothesis, and worker identity"
+    )
 
     // The brief is the single bootstrap context source; no values are inlined.
     expect(prompt).toContain(
@@ -48,7 +50,7 @@ describe("hypothesis worker prompt", () => {
     expect(prompt).toContain(
       "Your working directory is the project root, inside a detached disposable worktree"
     )
-    expect(prompt).toContain("`onyx/setup.json` (schema v2)")
+    expect(prompt).toContain("`onyx/setup.json` — the local setup policy")
     expect(prompt).toContain("`onyx/onyx.md`")
     expect(prompt).toContain("`onyx/validation.json` — diagnostics only")
     expect(prompt).toContain(
