@@ -24,7 +24,7 @@ describe("hypothesis worker prompt", () => {
 
     // Fully static: no interpolated values anywhere.
     expect(prompt).not.toContain("${")
-    expect(normalizedPrompt).toContain("# Onyx Hypothesis Worker")
+    expect(normalizedPrompt).toContain("# Onyx Research Worker")
 
     // The brief is the single bootstrap context source; no values are inlined.
     expect(normalizedPrompt).toContain(
