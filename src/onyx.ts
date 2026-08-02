@@ -165,8 +165,9 @@ export { USAGE, main } from "./main"
 export { WORKER_USAGE, workerMain } from "./worker-main"
 export {
   ONYX_WORKER_CONTEXT,
-  assertWorkerContextArgs,
+  parseWorkerRuntimeContext,
   readWorkerRuntimeContext,
+  resolveWorkerScope,
   type WorkerRuntimeContext,
 } from "./lib/worker-context"
 export {

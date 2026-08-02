@@ -8,7 +8,7 @@ import {
 import { commandToolsRun } from "./commands/tools"
 import { commandWorkflowStatus } from "./commands/workflow"
 import { parseArgs } from "./lib/args"
-import { assertWorkerContextArgs } from "./lib/worker-context"
+import { resolveWorkerScope } from "./lib/worker-context"
 import { cliVersionInfo, renderCliVersion } from "./lib/version"
 import { commandResearchFinish } from "./lib/worker-finish"
 
@@ -16,6 +16,7 @@ export const WORKER_USAGE = `onyx-worker - worker-safe Onyx research CLI
 
 Usage:
   onyx-worker --version
+  onyx-worker diagnostics handshake
   onyx-worker research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx-worker research session-state-brief [--json]
   onyx-worker research finish --reason hypothesis_exhausted|goal_satisfied|no_viable_change --summary <text>
@@ -86,7 +87,7 @@ export async function workerMain(argv = process.argv.slice(2)) {
       return
     }
 
-    await assertWorkerContextArgs(args)
+    await resolveWorkerScope(args)
 
     if (command === "research" && sub === "brief")
       return commandResearchBrief(args)

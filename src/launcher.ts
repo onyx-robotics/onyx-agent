@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { readFile } from "node:fs/promises"
+import { access, constants } from "node:fs/promises"
 
 import type { DeveloperCheckout } from "./lib/config"
 
@@ -9,7 +9,7 @@ import {
 } from "./commands/developer"
 import { parseArgs } from "./lib/args"
 import { readConfig } from "./lib/config"
-import { pathExists } from "./lib/process"
+import { parseWorkerRuntimeContext } from "./lib/worker-context"
 import { main } from "./main"
 import { workerMain } from "./worker-main"
 
@@ -22,19 +22,24 @@ const ONYX_WORKER_CLI_REDIRECTED = "ONYX_WORKER_CLI_REDIRECTED"
  * bare `onyx-worker` calls correct even when a login shell reorders PATH in
  * front of the per-worker wrapper bin directory (e.g. a globally installed
  * release binary shadowing a developer-mode checkout).
+ *
+ * This resolution is fail-closed: with ONYX_WORKER_CONTEXT set, an unreadable
+ * or invalid context and a missing or non-executable wrapper are hard errors —
+ * a supervised process must never fall through to developer configuration or
+ * an unpinned CLI. Returns null only when no worker context is present.
  */
 async function pinnedWorkerCliPath(env: NodeJS.ProcessEnv) {
   const contextPath = env.ONYX_WORKER_CONTEXT?.trim()
   if (!contextPath) return null
+  const context = await parseWorkerRuntimeContext(contextPath)
   try {
-    const parsed: unknown = JSON.parse(await readFile(contextPath, "utf8"))
-    if (!parsed || typeof parsed !== "object") return null
-    const workerCliPath = (parsed as Record<string, unknown>).workerCliPath
-    if (typeof workerCliPath !== "string" || !workerCliPath) return null
-    return (await pathExists(workerCliPath)) ? workerCliPath : null
+    await access(context.workerCliPath, constants.X_OK)
   } catch {
-    return null
+    throw new Error(
+      `Supervised worker CLI wrapper at ${context.workerCliPath} is missing or not executable. Stop this worker and let the supervisor relaunch it.`
+    )
   }
+  return context.workerCliPath
 }
 
 async function runPinnedWorkerCli(

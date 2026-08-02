@@ -77,6 +77,14 @@ async function writeTestWorkerContext({
       startingCommitSha: "abc123",
       hypothesisId,
       hypothesisName,
+      campaign: {
+        id: campaignId,
+        name: campaignName,
+        metricName: "error",
+        metricUnit: null,
+        metricDirection: "minimize",
+        baseCommitSha: null,
+      },
       assignment: {
         id: "66666666-6666-4666-8666-666666666666",
         startingCommitSha: "abc123",
@@ -102,7 +110,7 @@ async function writeTestWorkerContext({
       },
       workerId,
       workerCredential: "owx_worker_v1_test-credential-0000000000000000",
-      workerCliPath: null,
+      workerCliPath: join(root, "onyx-worker-wrapper"),
       worktreeRoot: root,
       projectPath: "",
       projectRoot: root,

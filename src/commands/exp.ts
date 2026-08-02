@@ -26,7 +26,7 @@ import {
   type ResearchSetupWorkflowStep,
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
-import { currentCommit, git, repoRoot } from "../lib/git"
+import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
 import { acquireFileResourceLease } from "../lib/resource-locks"
 import { apiExperimentToHistory } from "../lib/history"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
@@ -242,6 +242,23 @@ async function ensureCampaignMetadata({
   projectPath: string
   campaignName: string
 }) {
+  const workerContext = await getWorkerRuntimeContextCached()
+  if (workerContext) {
+    // Supervised workers are pinned to one campaign and one assignment base;
+    // shared convenience state and team-key campaign lookups stay untouched.
+    if (campaignName !== workerContext.campaignName) {
+      throw new Error(
+        `Worker ${workerContext.workerId} is scoped to campaign ${workerContext.campaignName}, not ${campaignName}.`
+      )
+    }
+    return {
+      campaignId: workerContext.campaignId,
+      hypothesisId: workerContext.hypothesisId as string | undefined,
+      metricName: workerContext.campaign.metricName,
+      baseCommitSha: workerContext.assignment.startingCommitSha,
+    }
+  }
+
   const state = await readState(root)
   const key = campaignStateKey(projectPath, campaignName)
   const cached = state.campaigns?.[key]
@@ -387,7 +404,7 @@ async function resolveAutoResumeWorkflowRun({
   return candidates[0]!
 }
 
-async function resolveFreshBaseCommitSha({
+export async function resolveFreshBaseCommitSha({
   root,
   args,
   campaign,
@@ -398,6 +415,25 @@ async function resolveFreshBaseCommitSha({
   campaign: Awaited<ReturnType<typeof ensureCampaignMetadata>>
   context: WorkerWorkflowContext
 }) {
+  const workerContext = await getWorkerRuntimeContextCached()
+  if (workerContext) {
+    let base = args.options.base
+    if (!base) {
+      const dirty = await gitStatus(root)
+      if (dirty) {
+        throw new Error(
+          "Worker-context `onyx exp run` requires a clean git tree before opening a measured workflow."
+        )
+      }
+      base = await currentCommit(root)
+    }
+    await assertWorkerBaseLineage({
+      root,
+      startingCommitSha: workerContext.assignment.startingCommitSha,
+      base,
+    })
+    return base
+  }
   if (args.options.base) return args.options.base
   if (context.workerId) {
     const dirty = await gitStatus(root)
@@ -409,6 +445,28 @@ async function resolveFreshBaseCommitSha({
     return currentCommit(root)
   }
   return process.env.ONYX_BASE_COMMIT ?? campaign.baseCommitSha
+}
+
+/** Worker attempts must build on the assignment starting commit (equal counts
+ * as descent, so iterative commit -> run loops keep working). */
+async function assertWorkerBaseLineage({
+  root,
+  startingCommitSha,
+  base,
+}: {
+  root: string
+  startingCommitSha: string
+  base: string
+}) {
+  const result = await gitResult(
+    ["merge-base", "--is-ancestor", startingCommitSha, base],
+    root
+  )
+  if (result.code !== 0) {
+    throw new Error(
+      `Worker base commit ${base} must descend from the assignment starting commit ${startingCommitSha}. Reset the worktree onto the assignment base before running experiments.`
+    )
+  }
 }
 
 async function assertWorkerCanStartFreshWorkflow({
@@ -1722,9 +1780,10 @@ export async function commandExpList(args: Args) {
       "`--offline` was removed. Experiments are listed from the Onyx API."
     )
   }
-  const state = await readState(root)
-  const campaignName = args.options.campaign ?? state.activeCampaign
-  const workerContext = await getWorkerRuntimeContextCached().catch(() => null)
+  const workerContext = await getWorkerRuntimeContextCached()
+  const campaignName = workerContext
+    ? (args.options.campaign ?? workerContext.campaignName)
+    : (args.options.campaign ?? (await readState(root)).activeCampaign)
   const resolvedCampaigns = workerContext
     ? [
         {

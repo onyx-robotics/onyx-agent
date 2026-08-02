@@ -29,9 +29,17 @@ export async function resolveCampaignNameFromContext(
   missingMessage = "No active campaign. Run `onyx campaign use --name <name>` or pass `--campaign <name>`."
 ) {
   const context = await getWorkerRuntimeContextCached()
+  if (args.options.campaign) {
+    if (context && args.options.campaign !== context.campaignName) {
+      throw new Error(
+        `--campaign conflicts with supervised worker context campaign ${context.campaignName}`
+      )
+    }
+    return args.options.campaign
+  }
+  if (context) return context.campaignName
+
   const state = await readState(root)
-  const campaignName =
-    args.options.campaign ?? context?.campaignName ?? state.activeCampaign
-  if (!campaignName) throw new Error(missingMessage)
-  return campaignName
+  if (!state.activeCampaign) throw new Error(missingMessage)
+  return state.activeCampaign
 }

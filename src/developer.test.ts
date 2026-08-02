@@ -23,6 +23,63 @@ import {
   skillInstallTarget,
 } from "./onyx"
 import { readConfig, writeConfig, type DeveloperCheckout } from "./lib/config"
+import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "./lib/version"
+
+function launcherWorkerContext(root: string, workerCliPath: string) {
+  return {
+    schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
+    campaignId: "campaign-id",
+    campaignName: "campaign",
+    sessionId: "session-id",
+    assignmentId: "assignment-id",
+    startingCommitSha: "a".repeat(40),
+    hypothesisId: "hypothesis-id",
+    hypothesisName: "hypothesis",
+    campaign: {
+      id: "campaign-id",
+      name: "campaign",
+      metricName: "error",
+      metricUnit: null,
+      metricDirection: "minimize",
+      baseCommitSha: null,
+    },
+    assignment: {
+      id: "assignment-id",
+      startingCommitSha: "a".repeat(40),
+      sourceExperimentId: null,
+    },
+    hypothesis: {
+      id: "hypothesis-id",
+      name: "hypothesis",
+      description: null,
+      status: "active",
+      plan: {
+        focus: "Launcher test",
+        statement: "The launcher re-execs the pinned wrapper.",
+        startingPoints: [],
+        avoidList: [],
+        successSignals: [],
+        giveUpSignals: [],
+      },
+      bestMetricValue: null,
+      bestCommitSha: null,
+      experimentCount: 0,
+      lastWorkedAt: null,
+    },
+    workerId: "worker-id",
+    workerCredential: `owx_worker_v1_${"0".repeat(32)}`,
+    workerCliPath,
+    worktreeRoot: root,
+    projectPath: "",
+    projectRoot: root,
+    setupFile: join(root, "onyx/setup.json"),
+    validationFile: join(root, "onyx/validation.json"),
+    researchSpecFile: join(root, "onyx/onyx.md"),
+    researchDeadlineAt: null,
+    shutdownDeadlineAt: null,
+    shutdownCushionSeconds: null,
+  }
+}
 
 let configHome: string | null = null
 let previousConfigHome: string | undefined
@@ -443,7 +500,7 @@ describe("developer mode", () => {
       const contextPath = join(root, "context.json")
       await writeFile(
         contextPath,
-        JSON.stringify({ workerCliPath: wrapperPath }),
+        JSON.stringify(launcherWorkerContext(root, wrapperPath)),
         "utf8"
       )
 
@@ -466,19 +523,130 @@ describe("developer mode", () => {
     }
   })
 
-  test("worker launcher falls through when the pinned wrapper is missing", async () => {
+  test("worker launcher fails closed when the pinned wrapper is missing", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-worker-no-redirect-"))
     try {
       const contextPath = join(root, "context.json")
       await writeFile(
         contextPath,
-        JSON.stringify({ workerCliPath: join(root, "missing-wrapper") }),
+        JSON.stringify(
+          launcherWorkerContext(root, join(root, "missing-wrapper"))
+        ),
         "utf8"
       )
       let ranMain = 0
-      await runLauncher({
+      await expect(
+        runLauncher({
+          argv: ["--version"],
+          env: { ONYX_WORKER_CONTEXT: contextPath },
+          entrypoint: "onyx-worker",
+          runMain: async () => {
+            ranMain += 1
+          },
+          runDev: async () => {
+            throw new Error("should not dispatch to dev")
+          },
+        })
+      ).rejects.toThrow("missing or not executable")
+      expect(ranMain).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker launcher fails closed on unreadable, invalid, or incomplete contexts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-fail-closed-"))
+    try {
+      const wrapperPath = join(root, "onyx-worker")
+      await writeFile(wrapperPath, "#!/bin/sh\nexit 0\n", "utf8")
+      await chmod(wrapperPath, 0o755)
+      const runWith = (contextPath: string) =>
+        runLauncher({
+          argv: ["--version"],
+          env: { ONYX_WORKER_CONTEXT: contextPath },
+          entrypoint: "onyx-worker",
+          runMain: async () => {
+            throw new Error("should not run the local CLI")
+          },
+          runDev: async () => {
+            throw new Error("should not dispatch to dev")
+          },
+        })
+
+      await expect(runWith(join(root, "missing-context.json"))).rejects.toThrow(
+        "missing or unreadable"
+      )
+
+      const badJsonPath = join(root, "bad.json")
+      await writeFile(badJsonPath, "{{{", "utf8")
+      await expect(runWith(badJsonPath)).rejects.toThrow("not valid JSON")
+
+      const wrongSchemaPath = join(root, "wrong-schema.json")
+      await writeFile(
+        wrongSchemaPath,
+        JSON.stringify({
+          ...launcherWorkerContext(root, wrapperPath),
+          schemaVersion: 1,
+        }),
+        "utf8"
+      )
+      await expect(runWith(wrongSchemaPath)).rejects.toThrow(
+        "unsupported schema"
+      )
+
+      const missingCliPath = join(root, "missing-cli.json")
+      const noCli = launcherWorkerContext(root, wrapperPath) as Record<
+        string,
+        unknown
+      >
+      delete noCli.workerCliPath
+      await writeFile(missingCliPath, JSON.stringify(noCli), "utf8")
+      await expect(runWith(missingCliPath)).rejects.toThrow("workerCliPath")
+
+      const notExecutablePath = join(root, "not-executable.json")
+      const plainFile = join(root, "plain-file")
+      await writeFile(plainFile, "not a wrapper", "utf8")
+      await chmod(plainFile, 0o644)
+      await writeFile(
+        notExecutablePath,
+        JSON.stringify(launcherWorkerContext(root, plainFile)),
+        "utf8"
+      )
+      await expect(runWith(notExecutablePath)).rejects.toThrow(
+        "missing or not executable"
+      )
+
+      // Error output must never leak the scoped credential or context body.
+      const credential = launcherWorkerContext(root, wrapperPath)
+        .workerCredential as string
+      for (const path of [badJsonPath, wrongSchemaPath, notExecutablePath]) {
+        const error = await runWith(path).catch((cause: Error) => cause)
+        expect(String(error)).not.toContain(credential)
+        expect(String(error)).not.toContain("owx_worker_v1")
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("redirected worker launcher skips re-exec and runs main", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-redirected-"))
+    try {
+      const contextPath = join(root, "context.json")
+      await writeFile(
+        contextPath,
+        JSON.stringify(
+          launcherWorkerContext(root, join(root, "missing-wrapper"))
+        ),
+        "utf8"
+      )
+      let ranMain = 0
+      const code = await runLauncher({
         argv: ["--version"],
-        env: { ONYX_WORKER_CONTEXT: contextPath },
+        env: {
+          ONYX_WORKER_CONTEXT: contextPath,
+          ONYX_WORKER_CLI_REDIRECTED: "1",
+        },
         entrypoint: "onyx-worker",
         runMain: async () => {
           ranMain += 1
@@ -487,6 +655,7 @@ describe("developer mode", () => {
           throw new Error("should not dispatch to dev")
         },
       })
+      expect(code).toBe(0)
       expect(ranMain).toBe(1)
     } finally {
       await rm(root, { recursive: true, force: true })

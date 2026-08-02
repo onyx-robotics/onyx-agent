@@ -4,6 +4,7 @@ import { join } from "node:path"
 
 import { afterEach, describe, expect, test } from "bun:test"
 
+import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "./version"
 import {
   resolveCampaignNameFromContext,
   resolveWorkerWorkflowContext,
@@ -13,7 +14,7 @@ const previousWorkerContext = process.env.ONYX_WORKER_CONTEXT
 
 function workerContextFixture() {
   return {
-    schemaVersion: 6,
+    schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
     campaignId: "campaign-id-1",
     campaignName: "context-campaign",
     sessionId: "session-ctx",
@@ -21,6 +22,14 @@ function workerContextFixture() {
     startingCommitSha: "a".repeat(40),
     hypothesisId: "hypothesis-ctx",
     hypothesisName: "context hypothesis",
+    campaign: {
+      id: "campaign-id-1",
+      name: "context-campaign",
+      metricName: "error",
+      metricUnit: null,
+      metricDirection: "minimize",
+      baseCommitSha: null,
+    },
     assignment: {
       id: "assignment-ctx",
       startingCommitSha: "a".repeat(40),
@@ -39,6 +48,7 @@ function workerContextFixture() {
     },
     workerId: "worker-ctx",
     workerCredential: `owx_worker_v1_${"0".repeat(32)}`,
+    workerCliPath: "/tmp/worktree/.git/onyx/bin/onyx-worker",
     worktreeRoot: "/tmp/worktree",
     projectPath: "",
     projectRoot: "/tmp/worktree",
@@ -118,5 +128,20 @@ describe("worker workflow context resolution", () => {
       options: {},
     })
     expect(campaignName).toBe("context-campaign")
+  })
+
+  test("conflicting --campaign throws in a worker context", async () => {
+    process.env.ONYX_WORKER_CONTEXT = await writeContextFile(
+      workerContextFixture()
+    )
+    const dir = await mkdtemp(join(tmpdir(), "onyx-campaign-root-"))
+    await expect(
+      resolveCampaignNameFromContext(dir, {
+        positional: [],
+        options: { campaign: "some-other-campaign" },
+      })
+    ).rejects.toThrow(
+      "--campaign conflicts with supervised worker context campaign context-campaign"
+    )
   })
 })

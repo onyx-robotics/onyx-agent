@@ -1,7 +1,10 @@
-import { readFile } from "node:fs/promises"
+import { readFile, realpath } from "node:fs/promises"
+import { sep } from "node:path"
 
 import type { ResearchHypothesisPlan } from "../protocol"
 import type { Args } from "./args"
+import { repoRoot } from "./git"
+import { normalizeProjectPath } from "./project-path"
 import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "./version"
 
 export const ONYX_WORKER_CONTEXT = "ONYX_WORKER_CONTEXT"
@@ -15,6 +18,16 @@ export type WorkerRuntimeContext = {
   startingCommitSha: string
   hypothesisId: string
   hypothesisName: string
+  campaign: {
+    id: string
+    name: string
+    metricName: string
+    metricUnit: string | null
+    metricDirection: "maximize" | "minimize"
+    /** Campaign-level base; workers pin attempts to the assignment starting
+     * commit instead, so this is display/fallback metadata only. */
+    baseCommitSha: string | null
+  }
   assignment: {
     id: string
     startingCommitSha: string
@@ -36,7 +49,7 @@ export type WorkerRuntimeContext = {
   /** Supervisor-pinned worker CLI wrapper. Any `onyx-worker` entrypoint that
    * starts inside this runtime re-execs it, so bare PATH resolution always
    * lands on the supervised CLI even when login shells reorder PATH. */
-  workerCliPath: string | null
+  workerCliPath: string
   worktreeRoot: string
   projectPath: string
   projectRoot: string
@@ -89,7 +102,29 @@ export async function getWorkerRuntimeContextCached() {
 export async function readWorkerRuntimeContext() {
   const path = contextPath()
   if (!path) return null
-  const parsed: unknown = JSON.parse(await readFile(path, "utf8"))
+  return parseWorkerRuntimeContext(path)
+}
+
+/**
+ * Strictly parse and validate a worker runtime context file. Throws an
+ * actionable error on any problem — a set ONYX_WORKER_CONTEXT that cannot be
+ * read is a broken supervised runtime, never something to silently ignore.
+ */
+export async function parseWorkerRuntimeContext(path: string) {
+  let raw: string
+  try {
+    raw = await readFile(path, "utf8")
+  } catch {
+    throw new Error(
+      `Supervised worker context at ${path} is missing or unreadable. Stop this worker and let the supervisor relaunch it.`
+    )
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error(`Invalid worker context at ${path}: not valid JSON`)
+  }
   if (!parsed || typeof parsed !== "object") {
     throw new Error(`Invalid worker context at ${path}: expected object`)
   }
@@ -98,12 +133,13 @@ export async function readWorkerRuntimeContext() {
     throw new Error(`Invalid worker context at ${path}: unsupported schema`)
   }
 
+  const campaign = objectField(record, "campaign")
   const assignment = objectField(record, "assignment")
   const hypothesis = objectField(record, "hypothesis")
   const plan = hypothesis ? objectField(hypothesis, "plan") : null
-  if (!assignment || !hypothesis || !plan) {
+  if (!campaign || !assignment || !hypothesis || !plan) {
     throw new Error(
-      `Invalid worker context at ${path}: missing assignment or hypothesis guidance`
+      `Invalid worker context at ${path}: missing campaign, assignment, or hypothesis guidance`
     )
   }
 
@@ -116,6 +152,15 @@ export async function readWorkerRuntimeContext() {
     startingCommitSha: stringField(record, "startingCommitSha") ?? "",
     hypothesisId: stringField(record, "hypothesisId") ?? "",
     hypothesisName: stringField(record, "hypothesisName") ?? "",
+    campaign: {
+      id: stringField(campaign, "id") ?? "",
+      name: stringField(campaign, "name") ?? "",
+      metricName: stringField(campaign, "metricName") ?? "",
+      metricUnit: stringField(campaign, "metricUnit") ?? null,
+      metricDirection:
+        campaign.metricDirection === "minimize" ? "minimize" : "maximize",
+      baseCommitSha: stringField(campaign, "baseCommitSha") || null,
+    },
     assignment: {
       id: stringField(assignment, "id") ?? "",
       startingCommitSha: stringField(assignment, "startingCommitSha") ?? "",
@@ -140,7 +185,7 @@ export async function readWorkerRuntimeContext() {
     },
     workerId: stringField(record, "workerId") ?? "",
     workerCredential: stringField(record, "workerCredential") ?? "",
-    workerCliPath: stringField(record, "workerCliPath"),
+    workerCliPath: stringField(record, "workerCliPath") ?? "",
     worktreeRoot: stringField(record, "worktreeRoot") ?? "",
     projectPath: stringField(record, "projectPath") ?? "",
     projectRoot: stringField(record, "projectRoot") ?? "",
@@ -162,6 +207,13 @@ export async function readWorkerRuntimeContext() {
         key !== "projectPath" && typeof value === "string" && value === ""
     )
     .map(([key]) => key)
+  if (
+    !context.campaign.id ||
+    !context.campaign.name ||
+    !context.campaign.metricName
+  ) {
+    missing.push("campaign")
+  }
   if (!context.assignment.id || !context.assignment.startingCommitSha) {
     missing.push("assignment")
   }
@@ -196,8 +248,16 @@ function assertSameOption({
   }
 }
 
-export async function assertWorkerContextArgs(args: Args) {
-  const context = await readWorkerRuntimeContext()
+/**
+ * Authoritative supervised-worker scope resolution. Inside a worker runtime
+ * (ONYX_WORKER_CONTEXT set) the context is the single source of scope:
+ * conflicting identity flags are rejected, the process must run inside the
+ * assigned worktree and project root, and every scope option the commands read
+ * is filled from the context so no command falls back to shared convenience
+ * state. Outside a worker runtime this is a no-op returning null.
+ */
+export async function resolveWorkerScope(args: Args) {
+  const context = await getWorkerRuntimeContextCached()
   if (!context) return null
 
   if (args.options.profile !== undefined) {
@@ -208,6 +268,11 @@ export async function assertWorkerContextArgs(args: Args) {
   if (args.options["api-url"] !== undefined) {
     throw new Error(
       "--api-url is not allowed in a supervised worker context; the worker runtime pins the API target."
+    )
+  }
+  if (args.options.project !== undefined) {
+    throw new Error(
+      "--project is not allowed in a supervised worker context; the worker runtime pins the project."
     )
   }
 
@@ -225,6 +290,12 @@ export async function assertWorkerContextArgs(args: Args) {
   })
   assertSameOption({
     args,
+    name: "assignment",
+    expected: context.assignmentId,
+    label: "assignment",
+  })
+  assertSameOption({
+    args,
     name: "hypothesis",
     expected: context.hypothesisId,
     label: "hypothesis",
@@ -235,18 +306,62 @@ export async function assertWorkerContextArgs(args: Args) {
     expected: context.workerId,
     label: "worker",
   })
-  assertSameOption({
-    args,
-    name: "cwd",
-    expected: context.worktreeRoot,
-    label: "worktree",
-  })
-  assertSameOption({
-    args,
-    name: "project-path",
-    expected: context.projectPath,
-    label: "project path",
-  })
+  if (
+    args.options["project-path"] !== undefined &&
+    normalizeProjectPath(args.options["project-path"]) !==
+      normalizeProjectPath(context.projectPath)
+  ) {
+    throw new Error(
+      `--project-path conflicts with supervised worker context project path "${context.projectPath}"`
+    )
+  }
+
+  await assertWorkerRootBoundary(args, context)
+
+  args.options.campaign ??= context.campaignName
+  args.options.session ??= context.sessionId
+  args.options.assignment ??= context.assignmentId
+  args.options.hypothesis ??= context.hypothesisId
+  args.options.worker ??= context.workerId
+  args.options["project-path"] ??= context.projectPath
+  args.options.cwd ??= context.worktreeRoot
 
   return context
+}
+
+/**
+ * A supervised worker may only operate inside its assigned worktree and
+ * project scope; a worker command invoked from another checkout must fail
+ * before reading setup, touching git, or calling the API.
+ */
+async function assertWorkerRootBoundary(
+  args: Args,
+  context: WorkerRuntimeContext
+) {
+  const effectiveCwd = args.options.cwd ?? process.cwd()
+  const realWorktree = await realpath(context.worktreeRoot)
+  let realCwd: string
+  let realRoot: string
+  try {
+    realCwd = await realpath(effectiveCwd)
+    realRoot = await realpath(await repoRoot(effectiveCwd))
+  } catch {
+    throw new Error(
+      `This onyx-worker is scoped to worktree ${context.worktreeRoot} but is not running inside a git checkout (cwd ${effectiveCwd}). Run worker commands from the assigned worktree.`
+    )
+  }
+  if (realRoot !== realWorktree) {
+    throw new Error(
+      `This onyx-worker is scoped to worktree ${context.worktreeRoot} but is running inside ${realRoot}. Run worker commands from the assigned worktree.`
+    )
+  }
+  const realProjectRoot = await realpath(context.projectRoot)
+  if (
+    realCwd !== realProjectRoot &&
+    !realCwd.startsWith(realProjectRoot + sep)
+  ) {
+    throw new Error(
+      `This onyx-worker is scoped to project root ${context.projectRoot} but the working directory is ${effectiveCwd}. Run worker commands from inside the project scope.`
+    )
+  }
 }

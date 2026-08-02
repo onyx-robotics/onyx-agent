@@ -178,14 +178,21 @@ Python, Node, hardware vendor CLIs, compiled binaries, or any executable
 available to the project.
 
 Hypothesis workers are driven by the static Markdown prompt in
-`prompts/worker-agent-prompt.md`. It references no environment variables and
-carries no interpolated values: workers start in the project root, run bare
-`onyx-worker` commands (the supervisor pins the verified wrapper first on
-`PATH` and in the `ONYX_WORKER_CONTEXT` runtime context), and read identity,
-the scoped credential, and session deadlines from that context while the
-session-state brief remains the single routine context source. After
-editing it, run `bun run generate:worker-prompt-content` so the embedded
-release fallback stays in sync and standalone release binaries stay
+`prompts/worker-agent-prompt.md`. It carries no interpolated values and
+dereferences no environment variables — it may name bootstrap variables such as
+`PATH`, `ONYX_WORKER_CONTEXT`, and `ONYX_HOME`, but contains no worker
+identity, credentials, paths, or deadline values. Workers start in the project
+root, run bare `onyx-worker` commands (the supervisor pins the verified
+wrapper first on `PATH` and in the `ONYX_WORKER_CONTEXT` runtime context), and
+the CLI reads identity, the scoped credential, and session deadlines from that
+context while the session-state brief remains the single routine context
+source. Inside a supervised runtime the context is authoritative: worker
+commands never consult the shared `.git/onyx/state.json` convenience state,
+`--project` is rejected, conflicting identity flags fail, experiment bases
+must descend from the assignment starting commit, and commands refuse to
+operate outside the assigned worktree and project scope. After
+editing the prompt, run `bun run generate:worker-prompt-content` so the
+embedded release fallback stays in sync and standalone release binaries stay
 self-contained.
 
 Add durable hypotheses, then start a fresh bounded session with the repo-level
@@ -243,7 +250,12 @@ directly in non-interactive mode, receive the worker prompt over stdin, and use
 the explicit `onyx-worker` CLI surface for worker-safe primitives while the full
 `onyx` CLI remains the user/orchestrator surface. Supervised workers get
 isolated `ONYX_HOME` plus `ONYX_WORKER_CONTEXT` under
-`.git/onyx/worker-runtime/<session>/<workerId>/`, and write raw stdout/stderr logs,
+`.git/onyx/worker-runtime/<session>/<workerId>/`. `ONYX_HOME` and the temp
+directories are isolated per worker, while the process's ordinary `HOME` and a
+deliberate allowlist of provider, git, proxy, and TLS variables pass through
+so provider and git authentication keep working (the supervisor also injects
+`ONYX_API_URL`); the environment filter is a credential-scoping measure, not a
+filesystem security boundary. Workers write raw stdout/stderr logs,
 readable `.activity.log` files, structured `.activity.jsonl` files,
 per-worker latest-state JSON snapshots, and launch manifests under
 `.git/onyx/worker-logs/`. Runtime directories and context files use restrictive
@@ -297,6 +309,29 @@ and stable terminal reason codes. If
 the harness gives it the configured stop grace (30 seconds by default),
 terminates it if needed, then runs the same teardown path. Use
 `--worker-command` only for custom harnesses.
+
+### Custom harness contract (experimental)
+
+`--worker-command "<cmd>"` replaces the built-in provider launchers with your
+own worker process. The contract is intentionally small and may still change:
+
+- The command runs via `sh -lc` with the working directory set to the project
+  root inside the worker's disposable worktree.
+- Bare `onyx-worker` resolves to the supervisor-pinned wrapper (first on
+  `PATH`); run it by name and pass no identity flags.
+- `onyx-worker research session-state-brief --json` is the data API for
+  identity, assignment, campaign, progress, deadline, and stop guidance.
+  `onyx-worker diagnostics handshake` prints version, protocol, and
+  capability metadata.
+- `ONYX_WORKER_CONTEXT` is a bootstrap implementation detail consumed by
+  `onyx-worker`; do not parse the context file. The scoped worker credential
+  stays internal to the CLI and must never be read or forwarded by the
+  harness.
+- No worker prompt is delivered to custom commands — the harness brings its
+  own agent behavior and follows the standard flow: `onyx-worker exp run`,
+  one commit, `onyx-worker exp run --resume`, then `onyx-worker exp log`.
+- The legacy per-value `ONYX_*` identity, path, and deadline variables were
+  removed deliberately and will not return.
 
 Stop sessions explicitly:
 

@@ -1,4 +1,4 @@
 #!/usr/bin/env bun
-import { runWorkerCli } from "../src/worker-launcher"
+import { runWorkerCli } from "../src/launcher"
 
 await runWorkerCli()

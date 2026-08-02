@@ -1,32 +1,26 @@
 import { join } from "node:path"
 
 import type { Args } from "./args"
+import { normalizeProjectPath } from "./project-path"
 import { readState } from "./runtime-state"
+import { getWorkerRuntimeContextCached } from "./worker-context"
 
 export const ONYX_DIR = "onyx"
 
-export function normalizeProjectPath(value?: string | null) {
-  const path = (value ?? "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+|\/+$/g, "")
-    .replace(/\/+/g, "/")
-  if (path === ".") return ""
-  if (
-    path.includes("\0") ||
-    path.split("/").some((segment) => segment === "." || segment === "..")
-  ) {
-    throw new Error(
-      "--project-path must be a relative path without '.' or '..'"
-    )
-  }
-  return path
-}
+export { normalizeProjectPath } from "./project-path"
 
 export async function resolveProjectPath(root: string, args: Args) {
+  const context = await getWorkerRuntimeContextCached()
   if (args.options["project-path"] !== undefined) {
-    return normalizeProjectPath(args.options["project-path"])
+    const flagPath = normalizeProjectPath(args.options["project-path"])
+    if (context && flagPath !== normalizeProjectPath(context.projectPath)) {
+      throw new Error(
+        `--project-path conflicts with supervised worker context project path "${context.projectPath}"`
+      )
+    }
+    return flagPath
   }
+  if (context) return normalizeProjectPath(context.projectPath)
 
   const state = await readState(root)
   return normalizeProjectPath(state.projectPath)

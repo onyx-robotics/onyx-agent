@@ -3140,6 +3140,14 @@ async function runHypothesisOnce({
         startingCommitSha: lease.assignment.startingCommitSha,
         hypothesisId: hypothesis.id,
         hypothesisName: hypothesis.name,
+        campaign: {
+          id: campaign.id,
+          name: campaign.name,
+          metricName: campaign.metricName,
+          metricUnit: campaign.metricUnit,
+          metricDirection: campaign.metricDirection,
+          baseCommitSha: campaign.baseCommitSha || null,
+        },
         assignment: {
           id: lease.assignment.id,
           startingCommitSha: lease.assignment.startingCommitSha,
@@ -4185,7 +4193,7 @@ export async function commandResearchClean(args: Args) {
 }
 
 export async function commandResearchBrief(args: Args) {
-  const workerContext = await getWorkerRuntimeContextCached().catch(() => null)
+  const workerContext = await getWorkerRuntimeContextCached()
   let sessionId = args.options.session ?? workerContext?.sessionId
   if (!sessionId) {
     const root = await repoRoot(args.options.cwd)
@@ -5194,7 +5202,7 @@ export async function commandResearchSessionStateBrief(args: Args) {
       "`--compact` was removed; session-state-brief now returns the single bounded worker context."
     )
   }
-  const context = await readWorkerRuntimeContext()
+  const context = await getWorkerRuntimeContextCached()
   if (!context) {
     throw new Error(
       "session-state-brief is only available inside a supervised worker context."
