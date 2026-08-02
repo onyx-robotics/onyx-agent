@@ -40,6 +40,9 @@ export type WorkerInvocation = {
 
 type WorkerInvocationOptions = {
   worktree: string
+  /** Directory the provider process starts in — the project root inside the
+   * worktree. Defaults to the worktree root when omitted. */
+  launchDir?: string
   prompt: string
   addedWritableRoots: string[]
   workerModel: string | null
@@ -567,6 +570,7 @@ export function buildWorkerInvocation({
   agentKind,
   workerCommand,
   worktree,
+  launchDir,
   prompt,
   addedWritableRoots = [],
   workerModel = null,
@@ -576,6 +580,7 @@ export function buildWorkerInvocation({
   agentKind: string
   workerCommand?: string
   worktree: string
+  launchDir?: string
   prompt: string
   addedWritableRoots?: string[]
   workerModel?: string | null
@@ -595,6 +600,7 @@ export function buildWorkerInvocation({
 
   return providerAdapter(agentKind).buildInvocation({
     worktree,
+    launchDir,
     prompt,
     addedWritableRoots,
     workerModel,
@@ -645,16 +651,19 @@ const providerAdapters: Record<BuiltInWorkerAgent, ProviderAdapter> = {
     classifyFailure: classifyProviderFailure,
     buildInvocation({
       worktree,
+      launchDir,
       prompt,
       addedWritableRoots,
       workerModel,
       providerExecutable,
     }) {
       const modelArgs = workerModel ? ["--model", workerModel] : []
-      const writableArgs = addedWritableRoots.flatMap((root) => [
-        "--add-dir",
-        root,
-      ])
+      // The workspace-write sandbox scopes writes to the --cd directory, so
+      // the worktree root must stay writable when launching from a project
+      // subdirectory.
+      const writableArgs = unique([worktree, ...addedWritableRoots]).flatMap(
+        (root) => ["--add-dir", root]
+      )
       const args = [
         "--search",
         "--ask-for-approval",
@@ -669,7 +678,7 @@ const providerAdapters: Record<BuiltInWorkerAgent, ProviderAdapter> = {
         "workspace-write",
         ...modelArgs,
         "--cd",
-        worktree,
+        launchDir ?? worktree,
         ...writableArgs,
         "--json",
         "--color",
@@ -738,6 +747,7 @@ const providerAdapters: Record<BuiltInWorkerAgent, ProviderAdapter> = {
     classifyFailure: classifyProviderFailure,
     buildInvocation({
       worktree,
+      launchDir,
       prompt,
       workerModel,
       workerTitle,
@@ -748,7 +758,7 @@ const providerAdapters: Record<BuiltInWorkerAgent, ProviderAdapter> = {
         "run",
         "--pure",
         "--dir",
-        worktree,
+        launchDir ?? worktree,
         "--format",
         "json",
         "--title",
@@ -929,6 +939,51 @@ export async function preflightWorkerInvocation(
       )
     }
     return result
+  }
+
+  // Workers invoke bare `onyx-worker` through PATH (the wrapper bin dir is
+  // prepended by workerRuntimeEnvironment, and any modern onyx-worker
+  // entrypoint re-execs the pinned wrapper inside a worker runtime). Verify
+  // the effective binary through a login shell, since provider shells may
+  // source profile files that reorder PATH in front of the wrapper.
+  const bareResolution = await runProcess(
+    "sh",
+    ["-lc", "onyx-worker diagnostics handshake --json"],
+    {
+      cwd: options.cwd,
+      env: options.env,
+      timeoutMs: options.timeoutMs ?? 10_000,
+    }
+  )
+  let barePayload: Record<string, unknown> | null = null
+  try {
+    barePayload = JSON.parse(bareResolution.stdout) as Record<string, unknown>
+  } catch {
+    barePayload = null
+  }
+  const bareResolutionOk =
+    bareResolution.code === 0 &&
+    !bareResolution.timedOut &&
+    barePayload?.protocolVersion === ONYX_AGENT_PROTOCOL_VERSION &&
+    Array.isArray(barePayload.workerContextSchemas) &&
+    barePayload.workerContextSchemas.includes(
+      ONYX_WORKER_CONTEXT_SCHEMA_VERSION
+    )
+  checks.push({
+    name: "onyx-worker PATH resolution",
+    status: bareResolutionOk ? "passed" : "failed",
+    output: bareResolutionOk
+      ? null
+      : compactPreflightOutput(
+          [bareResolution.stdout.trim(), bareResolution.stderr.trim()]
+            .filter(Boolean)
+            .join("\n")
+        ) || null,
+  })
+  if (!bareResolutionOk) {
+    throw new Error(
+      `Worker environment preflight failed (onyx-worker PATH resolution): bare \`onyx-worker\` in a login shell did not answer the protocol ${ONYX_AGENT_PROTOCOL_VERSION}/context ${ONYX_WORKER_CONTEXT_SCHEMA_VERSION} handshake. A shell profile is likely resolving an outdated onyx-worker install ahead of the supervised wrapper (${options.onyxWorkerPath}); upgrade or remove that install.`
+    )
   }
 
   const handshake = await runCheck(

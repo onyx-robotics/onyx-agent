@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 
 import { commandResearchRun, commandResearchStatus } from "./commands/research"
 import { setupHash, type ResearchSetupFile } from "./lib/contract"
@@ -34,12 +34,12 @@ let previousFetch: typeof fetch | null = null
 type ApiCall = { method: string; path: string; body: unknown }
 
 const FAKE_WORKER_COMMAND = [
-  '"$ONYX_WORKER_BIN" exp run --campaign "$ONYX_CAMPAIGN_NAME" --auto',
+  "onyx-worker exp run --auto",
   "printf 'result\\n' > src/result.txt",
   "git add src/result.txt",
   "git commit -m 'fake worker result'",
-  '"$ONYX_WORKER_BIN" exp run --resume --auto',
-  '"$ONYX_WORKER_BIN" exp log',
+  "onyx-worker exp run --resume --auto",
+  "onyx-worker exp log",
 ].join(" && ")
 
 function nowIso() {
@@ -911,7 +911,20 @@ function installSupervisorApi({
   return calls
 }
 
+// Workers resolve bare `onyx-worker` through login shells, so a developer
+// machine's profile (e.g. ~/.local/bin with an installed release) could
+// shadow the per-worker wrapper. Pin HOME to an empty directory so the
+// supervisor smoke stays hermetic.
+let previousHome: string | undefined
+
+beforeEach(async () => {
+  previousHome = process.env.HOME
+  process.env.HOME = await mkdtemp(join(tmpdir(), "onyx-smoke-home-"))
+})
+
 afterEach(() => {
+  if (previousHome === undefined) delete process.env.HOME
+  else process.env.HOME = previousHome
   if (previousFetch) globalThis.fetch = previousFetch
   previousFetch = null
   if (previousApiUrl === undefined) delete process.env.ONYX_API_URL

@@ -1,4 +1,5 @@
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -420,6 +421,75 @@ describe("developer mode", () => {
       if (previousDistribution === undefined)
         delete process.env.ONYX_DISTRIBUTION
       else process.env.ONYX_DISTRIBUTION = previousDistribution
+    }
+  })
+
+  test("worker launcher re-execs the pinned wrapper from the runtime context", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-redirect-"))
+    try {
+      const markerPath = join(root, "marker.txt")
+      const wrapperPath = join(root, "onyx-worker")
+      await writeFile(
+        wrapperPath,
+        [
+          "#!/bin/sh",
+          `printf '%s' "$*" > ${JSON.stringify(markerPath)}`,
+          "exit 3",
+          "",
+        ].join("\n"),
+        "utf8"
+      )
+      await chmod(wrapperPath, 0o755)
+      const contextPath = join(root, "context.json")
+      await writeFile(
+        contextPath,
+        JSON.stringify({ workerCliPath: wrapperPath }),
+        "utf8"
+      )
+
+      const code = await runLauncher({
+        argv: ["exp", "list"],
+        env: { ONYX_WORKER_CONTEXT: contextPath },
+        entrypoint: "onyx-worker",
+        runMain: async () => {
+          throw new Error("should not run the local CLI")
+        },
+        runDev: async () => {
+          throw new Error("should not dispatch to dev")
+        },
+      })
+
+      expect(code).toBe(3)
+      expect(await readFile(markerPath, "utf8")).toBe("exp list")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("worker launcher falls through when the pinned wrapper is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-no-redirect-"))
+    try {
+      const contextPath = join(root, "context.json")
+      await writeFile(
+        contextPath,
+        JSON.stringify({ workerCliPath: join(root, "missing-wrapper") }),
+        "utf8"
+      )
+      let ranMain = 0
+      await runLauncher({
+        argv: ["--version"],
+        env: { ONYX_WORKER_CONTEXT: contextPath },
+        entrypoint: "onyx-worker",
+        runMain: async () => {
+          ranMain += 1
+        },
+        runDev: async () => {
+          throw new Error("should not dispatch to dev")
+        },
+      })
+      expect(ranMain).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 

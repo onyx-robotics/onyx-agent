@@ -33,6 +33,10 @@ export type WorkerRuntimeContext = {
   }
   workerId: string
   workerCredential: string
+  /** Supervisor-pinned worker CLI wrapper. Any `onyx-worker` entrypoint that
+   * starts inside this runtime re-execs it, so bare PATH resolution always
+   * lands on the supervised CLI even when login shells reorder PATH. */
+  workerCliPath: string | null
   worktreeRoot: string
   projectPath: string
   projectRoot: string
@@ -136,6 +140,7 @@ export async function readWorkerRuntimeContext() {
     },
     workerId: stringField(record, "workerId") ?? "",
     workerCredential: stringField(record, "workerCredential") ?? "",
+    workerCliPath: stringField(record, "workerCliPath"),
     worktreeRoot: stringField(record, "worktreeRoot") ?? "",
     projectPath: stringField(record, "projectPath") ?? "",
     projectRoot: stringField(record, "projectRoot") ?? "",

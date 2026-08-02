@@ -3065,7 +3065,7 @@ async function runHypothesisOnce({
       onyxWorkerPath: null,
       workerContextPath: null,
       addedWritableRoots: [],
-      cwd: worktree,
+      cwd: projectPath ? join(worktree, projectPath) : worktree,
       promptPath: "",
       logPath: initialLaunchPaths.logPath,
       activityLogPath: initialLaunchPaths.activityLogPath,
@@ -3128,6 +3128,7 @@ async function runHypothesisOnce({
       workerId: worker.id,
     })
     const projectRoot = projectPath ? join(worktree, projectPath) : worktree
+    workerCliWrapper = await writeWorkerCliWrapper({ paths: runtimePaths })
     await writeWorkerRuntimeContext({
       paths: runtimePaths,
       context: {
@@ -3157,6 +3158,7 @@ async function runHypothesisOnce({
         },
         workerId: worker.id,
         workerCredential: workerCredential,
+        workerCliPath: workerCliWrapper.workerPath,
         worktreeRoot: worktree,
         projectPath,
         projectRoot,
@@ -3168,7 +3170,6 @@ async function runHypothesisOnce({
         shutdownCushionSeconds: Math.ceil(prompt.shutdownCushionMs / 1000),
       },
     })
-    workerCliWrapper = await writeWorkerCliWrapper({ paths: runtimePaths })
     const workerBaseEnv = workerRuntimeEnvironment({
       baseEnv: process.env,
       wrapper: workerCliWrapper,
@@ -3178,29 +3179,6 @@ async function runHypothesisOnce({
     const workerRunEnv = {
       ...workerBaseEnv,
       ...workerApiEnv,
-      ONYX_CAMPAIGN_ID: campaign.id,
-      ONYX_CAMPAIGN_NAME: campaign.name,
-      ONYX_SESSION_ID: sessionId,
-      ONYX_HYPOTHESIS_ID: hypothesis.id,
-      ONYX_HYPOTHESIS_NAME: hypothesis.name,
-      ONYX_WORKER_ID: worker.id,
-      ONYX_WORKER_CREDENTIAL: workerCredential,
-      ONYX_WORKER_BIN: workerCliWrapper.workerPath,
-      ONYX_WORKER_PROMPT_FILE: prompt.path,
-      ONYX_WORKTREE_ROOT: worktree,
-      ONYX_PROJECT_ROOT: projectRoot,
-      ONYX_SETUP_FILE: setupPath(worktree, projectPath),
-      ONYX_VALIDATION_FILE: validationPath(worktree, projectPath),
-      ONYX_RESEARCH_SPEC_FILE: onyxPath(worktree, projectPath, "onyx.md"),
-      ONYX_RESEARCH_DEADLINE_AT: new Date(
-        prompt.researchDeadlineMs
-      ).toISOString(),
-      ONYX_SHUTDOWN_DEADLINE_AT: new Date(
-        prompt.shutdownDeadlineMs
-      ).toISOString(),
-      ONYX_SHUTDOWN_CUSHION_SECONDS: String(
-        Math.ceil(prompt.shutdownCushionMs / 1000)
-      ),
       ...(effectiveAgentKind === "opencode"
         ? { OPENCODE_DISABLE_PROJECT_CONFIG: "1" }
         : {}),
@@ -3212,6 +3190,7 @@ async function runHypothesisOnce({
       agentKind,
       workerCommand,
       worktree,
+      launchDir: projectRoot,
       prompt: prompt.markdown,
       addedWritableRoots,
       workerModel,
@@ -3235,7 +3214,7 @@ async function runHypothesisOnce({
       onyxWorkerPath: workerCliWrapper.workerPath,
       workerContextPath: runtimePaths.contextPath,
       addedWritableRoots: preparedInvocation.addedWritableRoots,
-      cwd: worktree,
+      cwd: projectRoot,
       promptPath: prompt.path,
       logPath: preparedLaunchPaths.logPath,
       activityLogPath: preparedLaunchPaths.activityLogPath,
@@ -3267,7 +3246,7 @@ async function runHypothesisOnce({
         args
       )
     const preflight = await preflightWorkerInvocation(preparedInvocation, {
-      cwd: worktree,
+      cwd: projectRoot,
       env: workerRunEnv,
       campaignName: campaign.name,
       sessionId,
@@ -3388,7 +3367,7 @@ async function runHypothesisOnce({
           preparedInvocation.command,
           preparedInvocation.args,
           {
-            cwd: worktree!,
+            cwd: projectRoot,
             timeoutMs: Math.max(
               1,
               Math.min(workerTimeoutMs, hardEndTimeMs - Date.now())

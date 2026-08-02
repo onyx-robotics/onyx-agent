@@ -146,6 +146,7 @@ describe("worker launchers", () => {
     const codex = buildWorkerInvocation({
       agentKind: "codex",
       worktree: "/tmp/worktree",
+      launchDir: "/tmp/worktree/apps/ml",
       prompt,
       addedWritableRoots,
       workerModel: "gpt-5-codex",
@@ -160,6 +161,7 @@ describe("worker launchers", () => {
     const opencode = buildWorkerInvocation({
       agentKind: "opencode",
       worktree: "/tmp/worktree",
+      launchDir: "/tmp/worktree/apps/ml",
       prompt,
       workerModel: "openrouter/qwen/qwen3-coder",
       workerTitle: "worker_123",
@@ -181,6 +183,8 @@ describe("worker launchers", () => {
       "--model",
       "gpt-5-codex",
       "--cd",
+      "/tmp/worktree/apps/ml",
+      "--add-dir",
       "/tmp/worktree",
       "--add-dir",
       "/tmp/worktree/.git",
@@ -224,7 +228,7 @@ describe("worker launchers", () => {
       "run",
       "--pure",
       "--dir",
-      "/tmp/worktree",
+      "/tmp/worktree/apps/ml",
       "--format",
       "json",
       "--title",
@@ -300,6 +304,7 @@ describe("worker launchers", () => {
     const stdinFile = join(root, "stdin.txt")
     const env = {
       ...process.env,
+      HOME: root,
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       FAKE_ARGS_FILE: argsFile,
       FAKE_CWD_FILE: cwdFile,
@@ -475,6 +480,7 @@ describe("worker launchers", () => {
 
     const env = {
       ...process.env,
+      HOME: root,
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       FAKE_ARGS_FILE: join(root, "args.txt"),
       FAKE_CWD_FILE: join(root, "cwd.txt"),
@@ -492,6 +498,51 @@ describe("worker launchers", () => {
     })
 
     expect(preflight.version).toContain("claude fake 2.0")
+  })
+
+  test("preflight fails when a stale onyx-worker shadows the wrapper in login shells", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-worker-shadowed-"))
+    const bin = join(root, "bin")
+    const staleBin = join(root, "stale-bin")
+    const worktree = join(root, "worktree")
+    await mkdir(bin)
+    await mkdir(staleBin)
+    await mkdir(worktree)
+    await runProcess("git", ["init"], { cwd: worktree })
+    await writeFakeAgent(join(bin, "codex"), "codex fake 1.0")
+    await writeFakeOnyx(join(bin, "onyx-worker"))
+    // A stale install answering an old worker-context schema, resolved ahead
+    // of the wrapper the way a profile-prepended ~/.local/bin would be.
+    await writeFile(
+      join(staleBin, "onyx-worker"),
+      [
+        "#!/usr/bin/env bash",
+        'echo "{\\"protocolVersion\\":5,\\"workerContextSchemas\\":[5],\\"capabilities\\":[]}"',
+        "",
+      ].join("\n"),
+      "utf8"
+    )
+    await chmod(join(staleBin, "onyx-worker"), 0o755)
+
+    const invocation = buildWorkerInvocation({
+      agentKind: "codex",
+      worktree,
+      prompt: "do useful work",
+    })
+    await expect(
+      preflightWorkerInvocation(invocation, {
+        cwd: worktree,
+        env: {
+          ...process.env,
+          HOME: root,
+          PATH: `${staleBin}:${bin}:${process.env.PATH ?? ""}`,
+          FAKE_ARGS_FILE: join(root, "args.txt"),
+          FAKE_CWD_FILE: join(root, "cwd.txt"),
+          FAKE_STDIN_FILE: join(root, "stdin.txt"),
+        },
+        onyxWorkerPath: join(bin, "onyx-worker"),
+      })
+    ).rejects.toThrow("onyx-worker PATH resolution")
   })
 
   test("OpenCode preflight failures include install guidance", async () => {
@@ -552,6 +603,7 @@ describe("worker launchers", () => {
       cwd: worktree,
       env: {
         ...process.env,
+        HOME: root,
         PATH: `${bin}:${process.env.PATH ?? ""}`,
       },
       campaignName: "smoke",
@@ -651,6 +703,7 @@ describe("worker launchers", () => {
         },
         workerId: "worker/one",
         workerCredential: "owx_worker_v1_test-credential-0000000000000000",
+        workerCliPath: null,
         worktreeRoot: join(root, "worktree"),
         projectPath: "",
         projectRoot: join(root, "worktree"),

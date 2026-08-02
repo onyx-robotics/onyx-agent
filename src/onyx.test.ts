@@ -102,6 +102,7 @@ async function writeTestWorkerContext({
       },
       workerId,
       workerCredential: "owx_worker_v1_test-credential-0000000000000000",
+      workerCliPath: null,
       worktreeRoot: root,
       projectPath: "",
       projectRoot: root,

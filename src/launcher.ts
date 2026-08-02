@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { readFile } from "node:fs/promises"
 
 import type { DeveloperCheckout } from "./lib/config"
 
@@ -8,10 +9,48 @@ import {
 } from "./commands/developer"
 import { parseArgs } from "./lib/args"
 import { readConfig } from "./lib/config"
+import { pathExists } from "./lib/process"
 import { main } from "./main"
 import { workerMain } from "./worker-main"
 
 export const ONYX_LAUNCHER_BYPASS = "ONYX_LAUNCHER_BYPASS"
+const ONYX_WORKER_CLI_REDIRECTED = "ONYX_WORKER_CLI_REDIRECTED"
+
+/**
+ * Inside a supervised worker runtime, every `onyx-worker` entrypoint defers to
+ * the supervisor-pinned wrapper recorded in the runtime context. This keeps
+ * bare `onyx-worker` calls correct even when a login shell reorders PATH in
+ * front of the per-worker wrapper bin directory (e.g. a globally installed
+ * release binary shadowing a developer-mode checkout).
+ */
+async function pinnedWorkerCliPath(env: NodeJS.ProcessEnv) {
+  const contextPath = env.ONYX_WORKER_CONTEXT?.trim()
+  if (!contextPath) return null
+  try {
+    const parsed: unknown = JSON.parse(await readFile(contextPath, "utf8"))
+    if (!parsed || typeof parsed !== "object") return null
+    const workerCliPath = (parsed as Record<string, unknown>).workerCliPath
+    if (typeof workerCliPath !== "string" || !workerCliPath) return null
+    return (await pathExists(workerCliPath)) ? workerCliPath : null
+  } catch {
+    return null
+  }
+}
+
+async function runPinnedWorkerCli(
+  workerCliPath: string,
+  argv: string[],
+  env: NodeJS.ProcessEnv
+) {
+  return new Promise<number>((resolve, reject) => {
+    const child = spawn(workerCliPath, argv, {
+      env: { ...env, [ONYX_WORKER_CLI_REDIRECTED]: "1" },
+      stdio: "inherit",
+    })
+    child.on("error", reject)
+    child.on("close", (code) => resolve(code ?? 1))
+  })
+}
 
 export type DevCommandRunner = (
   checkout: DeveloperCheckout,
@@ -78,6 +117,16 @@ export async function runLauncher({
   if (env[ONYX_LAUNCHER_BYPASS] === "1") {
     await runMain(argv)
     return 0
+  }
+
+  if (
+    entrypoint === "onyx-worker" &&
+    env[ONYX_WORKER_CLI_REDIRECTED] !== "1"
+  ) {
+    const workerCliPath = await pinnedWorkerCliPath(env)
+    if (workerCliPath) {
+      return runPinnedWorkerCli(workerCliPath, argv, env)
+    }
   }
 
   const config = await readConfig()
