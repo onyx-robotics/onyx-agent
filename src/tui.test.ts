@@ -148,7 +148,7 @@ describe("frame height", () => {
       rows: 60,
       color: false,
     }).map(stripAnsi)
-    expect(tall.filter((line) => line.includes("exp-")).length).toBe(12)
+    expect(tall.filter((line) => line.includes("exp-")).length).toBe(17)
   })
 })
 

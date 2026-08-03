@@ -331,7 +331,7 @@ function sessionIsTerminal(status: string | null | undefined) {
 
 const MAX_SLOT_ROWS = 8
 // Experiment rows shown in the listen box; the tail is what matters live.
-const MAX_TABLE_ROWS = 12
+const MAX_TABLE_ROWS = 17
 
 export type ListenSlotRow = {
   slotIndex: number | null
