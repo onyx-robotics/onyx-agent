@@ -2,14 +2,24 @@ import { createServer, type Server } from "node:http"
 
 import { runProcess } from "./process"
 
+export function browserOpenCommand(platform: NodeJS.Platform, url: string) {
+  if (platform === "darwin") return { command: "open", args: [url] }
+  if (platform === "win32") {
+    // `cmd /c start` re-parses the command line, so an unescaped `&` ends the
+    // command and truncates the login URL before `state` and `profiles` — the
+    // browser then reports a missing redirect_uri/state. Quoting the URL does
+    // not fix it: Node escapes those quotes as `\"` when building the Windows
+    // command line, and cmd does not treat `\` as an escape, so the quoted
+    // region closes at the first `\"` and the `&` splits the URL anyway. Caret
+    // escaping is what survives both layers. The empty argument before the URL
+    // is the `start` window title and must stay.
+    return { command: "cmd", args: ["/c", "start", "", url.replace(/&/g, "^&")] }
+  }
+  return { command: "xdg-open", args: [url] }
+}
+
 export async function openBrowser(url: string) {
-  const command =
-    process.platform === "darwin"
-      ? "open"
-      : process.platform === "win32"
-        ? "cmd"
-        : "xdg-open"
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url]
+  const { command, args } = browserOpenCommand(process.platform, url)
   try {
     const result = await runProcess(command, args)
     if (result.code === 0) return
