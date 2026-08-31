@@ -237,7 +237,8 @@ describe("developer mode", () => {
         profiles: {
           alpha: {
             apiUrl: "https://app.onyx.test",
-            apiKey: "onyx_key",
+            credentialId: "11111111-1111-4111-8111-111111111111",
+            credentialStore: "file",
             teamId: "22222222-2222-4222-8222-222222222222",
             teamName: "Alpha Team",
             updatedAt: "2026-06-06T12:00:00.000Z",

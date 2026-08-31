@@ -11,7 +11,7 @@ import type {
 } from "../protocol"
 
 import type { Args } from "./args"
-import { apiBaseUrl, apiKey } from "./config"
+import { apiBaseUrl, apiCredential, selectedProfileWithName } from "./config"
 import { normalizeRepositoryUrl, repositoryUrl } from "./git"
 import { readState, updateState } from "./runtime-state"
 import { resolveProjectPath } from "./project"
@@ -786,18 +786,27 @@ export async function callApi(
       ? AbortSignal.timeout(timeoutMs)
       : undefined
   const startedAt = Date.now()
-  const requestOnce = async () =>
+  const resolveCredential = async (forceRefresh = false) => {
+    if (credentialOverride) return credentialOverride
+    if (process.env.ONYX_API_KEY) return process.env.ONYX_API_KEY
+    if (!forceRefresh) return apiCredential(args)
+    const { name, profile } = await selectedProfileWithName(args)
+    const { accessTokenForProfile } = await import("./oauth-credentials")
+    return accessTokenForProfile({ name, profile, forceRefresh: true })
+  }
+  const requestOnce = async (forceRefresh = false) =>
     fetch(`${await apiBaseUrl(args)}${path}`, {
       method,
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${credentialOverride ?? (await apiKey(args))}`,
+        authorization: `Bearer ${await resolveCredential(forceRefresh)}`,
       },
       body: body ? JSON.stringify(body) : undefined,
       signal,
     })
   try {
     let response: Response | null = null
+    let refreshedAfterUnauthorized = false
     for (let attempt = 1; attempt <= API_RETRY_ATTEMPTS; attempt += 1) {
       try {
         response = await requestOnce()
@@ -814,6 +823,15 @@ export async function callApi(
         continue
       }
       if (
+        response.status === 401 &&
+        !refreshedAfterUnauthorized &&
+        !credentialOverride &&
+        !process.env.ONYX_API_KEY
+      ) {
+        refreshedAfterUnauthorized = true
+        response = await requestOnce(true)
+      }
+      if (
         attempt === API_RETRY_ATTEMPTS ||
         !RETRYABLE_API_STATUSES.has(response.status)
       ) {
@@ -826,6 +844,19 @@ export async function callApi(
     }
     if (!response) {
       throw new Error(`No response received for ${method} ${path}`)
+    }
+    if (
+      response.status === 401 &&
+      refreshedAfterUnauthorized &&
+      !credentialOverride &&
+      !process.env.ONYX_API_KEY
+    ) {
+      const { name, profile } = await selectedProfileWithName(args)
+      const { deleteCredential } = await import("./credential-store")
+      await deleteCredential(profile.credentialId)
+      throw new Error(
+        `Login for profile "${name}" is no longer valid. Run \`onyx login\`.`
+      )
     }
 
     const text = await response.text()
@@ -1054,7 +1085,7 @@ export async function resolveProject(
     if (error instanceof ApiError) {
       if (error.status === 401 || error.status === 403) {
         throw new Error(
-          `Onyx API could not resolve this repository because authentication failed (${error.status}). Run \`onyx status\` and refresh or switch profiles.`
+          `Onyx API could not resolve this repository because authentication failed (${error.status}). Run \`onyx status\`, \`onyx login\`, or switch profiles.`
         )
       }
       if (error.status !== 404) {

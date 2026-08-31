@@ -1,10 +1,19 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import {
+  chmod,
+  mkdir,
+  readFile,
+  rename,
+  stat,
+  writeFile,
+} from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
 import type { Args } from "./args"
 
 const CONFIG_FILE = "config.json"
+export const CONFIG_VERSION = 2 as const
 export const DEFAULT_API_URL = "https://app.onyxresearch.ai"
 
 export const BUILT_IN_WORKER_AGENTS = ["codex", "claude", "opencode"] as const
@@ -17,9 +26,8 @@ export type WorkerProfileConfig = {
 
 export type CliProfile = {
   apiUrl: string
-  apiKey?: string
-  apiKeyId?: string
-  apiKeyEnv?: string
+  credentialId: string
+  credentialStore: "keyring" | "file"
   teamId: string
   teamName: string
   userId?: string
@@ -48,19 +56,26 @@ export type TelemetryConfig = {
 }
 
 export type Config = {
+  version: typeof CONFIG_VERSION
   profiles: Record<string, CliProfile>
   currentProfile: string
+  credentialFallbackWarningShownAt?: string
   developer: DeveloperConfig
   telemetry: TelemetryConfig
 }
 
-export type ConfigInput = Omit<Config, "developer" | "telemetry"> & {
+export type ConfigInput = Omit<
+  Config,
+  "developer" | "telemetry" | "version"
+> & {
+  version?: typeof CONFIG_VERSION
   developer?: DeveloperConfig
   telemetry?: TelemetryConfig
 }
 
 export function emptyConfig(): Config {
   return {
+    version: CONFIG_VERSION,
     profiles: {},
     currentProfile: "",
     developer: { mode: "release" },
@@ -164,6 +179,9 @@ function normalizeCliProfile(value: unknown): CliProfile | null {
   const candidate = value as Partial<CliProfile>
   if (
     typeof candidate.apiUrl !== "string" ||
+    typeof candidate.credentialId !== "string" ||
+    (candidate.credentialStore !== "keyring" &&
+      candidate.credentialStore !== "file") ||
     typeof candidate.teamId !== "string" ||
     typeof candidate.teamName !== "string" ||
     typeof candidate.updatedAt !== "string"
@@ -173,15 +191,8 @@ function normalizeCliProfile(value: unknown): CliProfile | null {
   const worker = normalizeWorkerProfileConfig(candidate.worker)
   return {
     apiUrl: candidate.apiUrl,
-    ...(typeof candidate.apiKey === "string"
-      ? { apiKey: candidate.apiKey }
-      : {}),
-    ...(typeof candidate.apiKeyId === "string"
-      ? { apiKeyId: candidate.apiKeyId }
-      : {}),
-    ...(typeof candidate.apiKeyEnv === "string"
-      ? { apiKeyEnv: candidate.apiKeyEnv }
-      : {}),
+    credentialId: candidate.credentialId,
+    credentialStore: candidate.credentialStore,
     teamId: candidate.teamId,
     teamName: candidate.teamName,
     ...(typeof candidate.userId === "string"
@@ -266,9 +277,24 @@ export async function readConfig(): Promise<Config> {
       await readFile(configPath(), "utf8")
     ) as Partial<Config>
 
+    if (parsed.version !== CONFIG_VERSION) {
+      return {
+        ...emptyConfig(),
+        developer: normalizeDeveloperConfig(parsed.developer),
+        telemetry: normalizeTelemetryConfig(parsed.telemetry),
+      }
+    }
+
     const config = {
+      version: CONFIG_VERSION,
       profiles: normalizeProfiles(parsed.profiles),
       currentProfile: parsed.currentProfile ?? "",
+      ...(typeof parsed.credentialFallbackWarningShownAt === "string"
+        ? {
+            credentialFallbackWarningShownAt:
+              parsed.credentialFallbackWarningShownAt,
+          }
+        : {}),
       developer: normalizeDeveloperConfig(parsed.developer),
       telemetry: normalizeTelemetryConfig(parsed.telemetry),
     }
@@ -280,7 +306,8 @@ export async function readConfig(): Promise<Config> {
 }
 
 export async function writeConfig(config: ConfigInput) {
-  await mkdir(configDir(), { recursive: true })
+  await mkdir(configDir(), { recursive: true, mode: 0o700 })
+  await chmod(configDir(), 0o700)
   const developer =
     config.developer === undefined
       ? await readExistingDeveloperConfig()
@@ -289,11 +316,13 @@ export async function writeConfig(config: ConfigInput) {
     config.telemetry === undefined
       ? await readExistingTelemetryConfig()
       : normalizeTelemetryConfig(config.telemetry)
+  const temporaryPath = `${configPath()}.${randomUUID()}.tmp`
   await writeFile(
-    configPath(),
+    temporaryPath,
     `${JSON.stringify(
       {
         ...config,
+        version: CONFIG_VERSION,
         developer,
         telemetry,
       },
@@ -305,6 +334,9 @@ export async function writeConfig(config: ConfigInput) {
       mode: 0o600,
     }
   )
+  await chmod(temporaryPath, 0o600)
+  await rename(temporaryPath, configPath())
+  await chmod(configPath(), 0o600)
   configCache = null
 }
 
@@ -406,22 +438,30 @@ export async function apiBaseUrl(
   )
 }
 
-export async function apiKey(args?: Args) {
+export async function apiCredential(args?: Args) {
   if (process.env.ONYX_API_KEY) return process.env.ONYX_API_KEY
-
   const { name, profile } = await selectedProfileEntry(args)
-  if (profile.apiKeyEnv) {
-    const value = process.env[profile.apiKeyEnv]
-    if (value?.trim()) return value
+  const { accessTokenForProfile } = await import("./oauth-credentials")
+  return accessTokenForProfile({ name, profile })
+}
 
-    throw new Error(
-      `Profile "${name}" expects API key in ${profile.apiKeyEnv}, but that environment variable is not set or empty.`
-    )
+export async function selectedProfileWithName(args?: Args) {
+  return selectedProfileEntry(args)
+}
+
+export async function resetUnsupportedConfigForLogin() {
+  try {
+    const parsed = JSON.parse(
+      await readFile(configPath(), "utf8")
+    ) as Partial<Config>
+    if (parsed.version === CONFIG_VERSION) return false
+    await writeConfig({
+      ...emptyConfig(),
+      developer: normalizeDeveloperConfig(parsed.developer),
+      telemetry: normalizeTelemetryConfig(parsed.telemetry),
+    })
+    return true
+  } catch {
+    return false
   }
-
-  if (profile.apiKey) return profile.apiKey
-
-  throw new Error(
-    `Profile "${name}" has no API key. Run \`onyx login --refresh\` or \`onyx profile set-api-key-env ${name} <ENV_VAR>\`.`
-  )
 }

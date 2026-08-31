@@ -56,6 +56,8 @@ beforeEach(async () => {
     profiles: {
       onyx: {
         apiUrl: DEFAULT_API_URL,
+        credentialId: "44444444-4444-4444-8444-444444444444",
+        credentialStore: "file",
         teamId: "11111111-1111-4111-8111-111111111111",
         teamName: "Onyx",
         userId: "22222222-2222-4222-8222-222222222222",

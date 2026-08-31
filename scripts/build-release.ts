@@ -11,6 +11,14 @@ const releaseTargets = [
   "bun-linux-x64-baseline",
 ] as const
 
+const keyringPackageByTarget: Record<string, string> = {
+  "bun-darwin-arm64": "@napi-rs/keyring-darwin-arm64",
+  "bun-darwin-x64": "@napi-rs/keyring-darwin-x64",
+  "bun-linux-arm64": "@napi-rs/keyring-linux-arm64-gnu",
+  "bun-linux-x64": "@napi-rs/keyring-linux-x64-gnu",
+  "bun-linux-x64-baseline": "@napi-rs/keyring-linux-x64-gnu",
+}
+
 type BuildOptions = {
   targets: readonly string[]
   outputDirectory: string
@@ -79,6 +87,20 @@ if (posthogHost !== "https://e.onyxresearch.ai") {
 
 const outputs: string[] = []
 for (const target of options.targets) {
+  const resolvedTarget =
+    target === "current"
+      ? `bun-${process.platform === "darwin" ? "darwin" : "linux"}-${process.arch}`
+      : target
+  const keyringPackage = keyringPackageByTarget[resolvedTarget]
+  if (keyringPackage) {
+    try {
+      Bun.resolveSync(keyringPackage, import.meta.dir)
+    } catch {
+      throw new Error(
+        `Missing ${keyringPackage} for ${target}. Install release dependencies with: bun install '--os=*' '--cpu=*'`
+      )
+    }
+  }
   for (const [prefix, entry] of [
     ["onyx", "./bin/onyx.js"],
     ["onyx-worker", "./bin/onyx-worker.js"],
