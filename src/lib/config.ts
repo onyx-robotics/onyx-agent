@@ -26,6 +26,7 @@ export type WorkerProfileConfig = {
 
 export type CliProfile = {
   apiUrl: string
+  cliSessionId?: string
   credentialId: string
   credentialStore: "keyring" | "file"
   teamId: string
@@ -191,6 +192,9 @@ function normalizeCliProfile(value: unknown): CliProfile | null {
   const worker = normalizeWorkerProfileConfig(candidate.worker)
   return {
     apiUrl: candidate.apiUrl,
+    ...(typeof candidate.cliSessionId === "string"
+      ? { cliSessionId: candidate.cliSessionId }
+      : {}),
     credentialId: candidate.credentialId,
     credentialStore: candidate.credentialStore,
     teamId: candidate.teamId,

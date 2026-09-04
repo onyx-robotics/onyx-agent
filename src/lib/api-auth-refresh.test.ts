@@ -14,6 +14,7 @@ const originalFetch = globalThis.fetch
 
 const profile: CliProfile = {
   apiUrl: "https://app.example.test",
+  cliSessionId: "33333333-3333-4333-8333-333333333333",
   credentialId: "11111111-1111-4111-8111-111111111111",
   credentialStore: "file",
   teamId: "22222222-2222-4222-8222-222222222222",
@@ -54,8 +55,17 @@ afterEach(async () => {
 
 describe("API authentication recovery", () => {
   test("removes an OAuth credential after refresh cannot resolve a final 401", async () => {
-    globalThis.fetch = mock(async (input: string | URL | Request) => {
+    const receivedCliSessionIds: Array<string | null> = []
+    globalThis.fetch = mock(async (input: string | URL | Request, init) => {
       const url = String(input)
+      if (
+        url.startsWith(profile.apiUrl) &&
+        !url.endsWith("/api/v1/cli/auth/config")
+      ) {
+        receivedCliSessionIds.push(
+          new Headers(init?.headers).get("x-onyx-cli-session-id")
+        )
+      }
       if (url.endsWith("/api/v1/cli/auth/config")) {
         return Response.json({
           data: {
@@ -84,5 +94,9 @@ describe("API authentication recovery", () => {
       "Run `onyx login`"
     )
     expect(await readCredential(profile.credentialId, "file")).toBeNull()
+    expect(receivedCliSessionIds).not.toHaveLength(0)
+    expect(receivedCliSessionIds).toEqual(
+      receivedCliSessionIds.map(() => profile.cliSessionId!)
+    )
   })
 })

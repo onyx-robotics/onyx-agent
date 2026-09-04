@@ -27,7 +27,12 @@ export async function commandLogout(args: Args) {
         `${profile.apiUrl}/api/v1/cli/auth/session`,
         {
           method: "DELETE",
-          headers: { authorization: `Bearer ${token}` },
+          headers: {
+            authorization: `Bearer ${token}`,
+            ...(profile.cliSessionId
+              ? { "x-onyx-cli-session-id": profile.cliSessionId }
+              : {}),
+          },
         }
       )
       if (!response.ok) {

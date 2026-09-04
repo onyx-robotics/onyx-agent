@@ -247,7 +247,12 @@ async function revokeOldProfile(profile: CliProfile | undefined) {
     const token = await accessTokenForProfile({ name: "previous", profile })
     await fetch(`${profile.apiUrl}/api/v1/cli/auth/session`, {
       method: "DELETE",
-      headers: { authorization: `Bearer ${token}` },
+      headers: {
+        authorization: `Bearer ${token}`,
+        ...(profile.cliSessionId
+          ? { "x-onyx-cli-session-id": profile.cliSessionId }
+          : {}),
+      },
     })
   } catch {
     // The prior session remains remotely revocable from Settings.
@@ -295,12 +300,14 @@ export async function commandLogin(args: Args) {
     accessToken: credential.accessToken,
   })
   const team = await chooseTeam(teams, args.options.team)
+  const cliSessionId = randomUUID()
   const session = await authenticatedData<BoundSession>({
     apiUrl,
     path: "/api/v1/cli/auth/session",
     accessToken: credential.accessToken,
     method: "POST",
     body: {
+      sessionId: cliSessionId,
       teamId: team.id,
       deviceName: args.options["device-name"] ?? hostname(),
       platform: `${platform()} ${release()}`,
@@ -330,6 +337,7 @@ export async function commandLogin(args: Args) {
         ...config.profiles,
         [profileName]: {
           apiUrl,
+          cliSessionId: session.id,
           credentialId,
           credentialStore,
           teamId: session.teamId,
@@ -350,7 +358,10 @@ export async function commandLogin(args: Args) {
     await deleteCredential(credentialId)
     await fetch(`${apiUrl}/api/v1/cli/auth/session`, {
       method: "DELETE",
-      headers: { authorization: `Bearer ${credential.accessToken}` },
+      headers: {
+        authorization: `Bearer ${credential.accessToken}`,
+        "x-onyx-cli-session-id": session.id,
+      },
     }).catch(() => undefined)
     throw error
   }

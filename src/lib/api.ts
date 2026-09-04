@@ -794,12 +794,20 @@ export async function callApi(
     const { accessTokenForProfile } = await import("./oauth-credentials")
     return accessTokenForProfile({ name, profile, forceRefresh: true })
   }
+  const resolveCliSessionHeaders = async (): Promise<Record<string, string>> => {
+    if (credentialOverride || process.env.ONYX_API_KEY) return {}
+    const { profile } = await selectedProfileWithName(args)
+    return profile.cliSessionId
+      ? { "x-onyx-cli-session-id": profile.cliSessionId }
+      : {}
+  }
   const requestOnce = async (forceRefresh = false) =>
     fetch(`${await apiBaseUrl(args)}${path}`, {
       method,
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${await resolveCredential(forceRefresh)}`,
+        ...(await resolveCliSessionHeaders()),
       },
       body: body ? JSON.stringify(body) : undefined,
       signal,
