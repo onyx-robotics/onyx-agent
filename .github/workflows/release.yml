@@ -22,7 +22,7 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
-      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile --os="*" --cpu="*"
       - run: bun run ci
       - name: Build official release binaries
         env:
