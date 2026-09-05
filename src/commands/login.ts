@@ -1,6 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { hostname, platform, release } from "node:os"
-import { createInterface } from "node:readline/promises"
 
 import { ApiError } from "../lib/api"
 import { confirmApiUrlTrust } from "../lib/api-url-trust"
@@ -29,6 +28,7 @@ import {
   type CliAuthConfig,
   type OAuthTokenResponse,
 } from "../lib/oauth-client"
+import { terminalQuestion } from "../lib/terminal-prompt"
 
 export const LOCAL_API_URL = "http://localhost:3000"
 
@@ -293,20 +293,15 @@ async function chooseTeam(
   }
   console.log("Choose a team:")
   teams.forEach((team, index) => console.log(`  ${index + 1}. ${team.name}`))
-  const prompt = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  })
-  try {
-    const answer = await prompt.question(`Team [1-${teams.length}]: `)
-    const index = Number(answer) - 1
-    if (!Number.isInteger(index) || !teams[index]) {
-      throw new Error("Invalid team selection")
-    }
-    return teams[index]
-  } finally {
-    prompt.close()
+  const answer = await terminalQuestion(
+    `Team [1-${teams.length}]: `,
+    "Login canceled."
+  )
+  const index = Number(answer) - 1
+  if (!Number.isInteger(index) || !teams[index]) {
+    throw new Error("Invalid team selection")
   }
+  return teams[index]
 }
 
 async function revokeRemoteSession({

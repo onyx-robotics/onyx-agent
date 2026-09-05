@@ -33,8 +33,10 @@ curl -fsSL https://onyxresearch.ai/install.sh | bash
 
 The installer places `onyx` in `~/.local/bin` (override with
 `ONYX_INSTALL_DIR`), walks you through PATH setup if needed, and opens browser
-login — press `Ctrl+C` to authenticate later with `onyx login`. Set
-`ONYX_INSTALL_NO_PROMPT=1` for non-interactive installs.
+login on a local desktop. SSH sessions use device authorization instead. Press
+`Ctrl+C` to authenticate later with `onyx login`. Installs without a controlling
+terminal skip login rather than waiting; set `ONYX_INSTALL_NO_PROMPT=1` to skip
+all interactive setup explicitly.
 
 ## Quickstart
 
