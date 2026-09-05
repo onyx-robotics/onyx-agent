@@ -276,17 +276,28 @@ describe("install script", () => {
     })
   })
 
-  test("runs browser login with the installed binary by default", async () => {
+  test("runs login with the installed binary by default", async () => {
     await withFixture(async (fixture) => {
       const result = await runInstall(fixture, {
         PATH: `${fixture.fakeBin}:${fixture.home}/.local/bin:${originalPath}`,
       })
 
       expect(result.code).toBe(0)
-      expect(result.stdout).toContain("Waiting for browser login...")
+      expect(result.stdout).toContain("Waiting for login...")
       expect(result.stdout).toContain("Onyx login complete.")
       expect(await readFile(fixture.logPath, "utf8")).toContain("login")
     })
+  })
+
+  test("interactive install keeps browser login attached to the terminal", async () => {
+    const script = await readFile(`${packageRoot}/scripts/install.sh`, "utf8")
+
+    expect(script).toContain(
+      '"$install_path" login --browser < /dev/tty > /dev/tty 2>&1'
+    )
+    expect(script).not.toContain(
+      '"$install_path" login > "$login_log" 2>&1 &'
+    )
   })
 
   test("API key auth override prints the global environment variable", async () => {

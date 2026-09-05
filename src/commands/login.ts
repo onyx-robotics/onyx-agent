@@ -146,8 +146,12 @@ async function browserCredential({
     await callback.close()
     return null
   }
-  if (!opened) console.log(`Open this URL to log in:\n${url}`)
-  else console.log("Waiting for browser login...")
+  if (!opened) {
+    console.log(`Open this URL to log in:\n${url}`)
+  } else {
+    console.log("Waiting for browser login...")
+    console.log(`If the browser did not open, visit:\n${url}`)
+  }
   const code = await callback.waitForCode()
   return exchangeAuthorizationCode({
     config,
