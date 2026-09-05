@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test"
 import {
   mkdir,
   mkdtemp,
@@ -315,7 +323,9 @@ describe("onyx login", () => {
       worker: { agent: "claude", models: { claude: "claude-opus-5" } },
     })
     expect(config.telemetry).toEqual({ enabled: false })
-    expect(await readFile(configPath(), "utf8")).not.toContain("onyx_secret_key")
+    expect(await readFile(configPath(), "utf8")).not.toContain(
+      "onyx_secret_key"
+    )
   })
 
   test("a failed login leaves a legacy config, its keys, and its credentials untouched", async () => {
@@ -346,7 +356,7 @@ describe("onyx login", () => {
     }
     // The idempotent binding request was retried, then the legacy file was
     // left exactly as it was: no rewrite, no backup, no credential cleanup.
-    expect(recorded.sessionBodies.length).toBeGreaterThan(1)
+    expect(recorded.sessionBodies).toHaveLength(3)
     expect(await readFile(configPath(), "utf8")).toBe(legacyRaw)
     expect(
       (await readdir(configDir())).filter((name) => name.includes("backup"))

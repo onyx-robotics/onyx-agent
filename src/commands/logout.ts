@@ -1,4 +1,5 @@
 import { optionalFlag, type Args } from "../lib/args"
+import { authFetch } from "../lib/auth-fetch"
 import { readConfig, writeConfig } from "../lib/config"
 import { deleteCredential } from "../lib/credential-store"
 import { accessTokenForProfile } from "../lib/oauth-credentials"
@@ -23,7 +24,7 @@ export async function commandLogout(args: Args) {
     if (!profile) throw new Error(`Unknown Onyx CLI profile "${name}".`)
     try {
       const token = await accessTokenForProfile({ name, profile })
-      const response = await fetch(
+      const response = await authFetch(
         `${profile.apiUrl}/api/v1/cli/auth/session`,
         {
           method: "DELETE",
@@ -37,7 +38,9 @@ export async function commandLogout(args: Args) {
         const code = await response
           .clone()
           .json()
-          .then((payload: { error?: { code?: string } }) => payload?.error?.code)
+          .then(
+            (payload: { error?: { code?: string } }) => payload?.error?.code
+          )
           .catch(() => undefined)
         if (code === "cli_session_revoked" || code === "cli_session_invalid") {
           console.log(`Profile ${name} was already logged out remotely.`)

@@ -8,7 +8,9 @@ import {
   deleteCredential,
   keyringSupported,
   readCredential,
+  setCredentialLockTimingForTests,
   setKeyringEntryFactoryForTests,
+  withCredentialLock,
   writeCredential,
 } from "./credential-store"
 
@@ -23,12 +25,99 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  setCredentialLockTimingForTests()
   setKeyringEntryFactoryForTests(null)
   if (originalHome === undefined) delete process.env.ONYX_HOME
   else process.env.ONYX_HOME = originalHome
   if (originalStore === undefined) delete process.env.ONYX_TEST_CREDENTIAL_STORE
   else process.env.ONYX_TEST_CREDENTIAL_STORE = originalStore
   await rm(runtimeRoot, { recursive: true, force: true })
+})
+
+describe("credential refresh lock", () => {
+  test("serializes refresh owners", async () => {
+    const id = "77777777-7777-4777-8777-777777777777"
+    let releaseFirst!: () => void
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const order: string[] = []
+    const first = withCredentialLock(id, async () => {
+      order.push("first-enter")
+      await firstCanFinish
+      order.push("first-exit")
+    })
+    while (!order.includes("first-enter")) await Bun.sleep(1)
+    const second = withCredentialLock(id, async () => {
+      order.push("second-enter")
+    })
+    await Bun.sleep(10)
+    expect(order).toEqual(["first-enter"])
+    releaseFirst()
+    await Promise.all([first, second])
+    expect(order).toEqual(["first-enter", "first-exit", "second-enter"])
+  })
+
+  test("takes over a stale lock without allowing the late owner to release its replacement", async () => {
+    setCredentialLockTimingForTests({ staleMs: 20, waitMs: 500, pollMs: 2 })
+    const id = "88888888-8888-4888-8888-888888888888"
+    let releaseFirst!: () => void
+    let releaseSecond!: () => void
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const secondCanFinish = new Promise<void>((resolve) => {
+      releaseSecond = resolve
+    })
+    let firstEntered = false
+    let secondEntered = false
+    let thirdEntered = false
+
+    const first = withCredentialLock(id, async () => {
+      firstEntered = true
+      await firstCanFinish
+    })
+    while (!firstEntered) await Bun.sleep(1)
+    await Bun.sleep(25)
+    const second = withCredentialLock(id, async () => {
+      secondEntered = true
+      await secondCanFinish
+    })
+    while (!secondEntered) await Bun.sleep(1)
+
+    releaseFirst()
+    await first
+    const third = withCredentialLock(id, async () => {
+      thirdEntered = true
+    })
+    await Bun.sleep(5)
+    expect(thirdEntered).toBe(false)
+
+    releaseSecond()
+    await Promise.all([second, third])
+    expect(thirdEntered).toBe(true)
+  })
+
+  test("bounds acquisition when a live owner does not finish", async () => {
+    setCredentialLockTimingForTests({ staleMs: 1_000, waitMs: 20, pollMs: 2 })
+    const id = "99999999-9999-4999-8999-999999999999"
+    let releaseFirst!: () => void
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    let firstEntered = false
+    const first = withCredentialLock(id, async () => {
+      firstEntered = true
+      await firstCanFinish
+    })
+    while (!firstEntered) await Bun.sleep(1)
+
+    await expect(withCredentialLock(id, async () => undefined)).rejects.toThrow(
+      "Timed out waiting"
+    )
+    releaseFirst()
+    await first
+  })
 })
 
 describe("fallback credential store", () => {

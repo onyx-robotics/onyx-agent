@@ -12,6 +12,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { emptyConfig, readConfig, writeConfig, type CliProfile } from "./config"
+import { clearCachedAccessTokensForTests } from "./credential-access-cache"
 import {
   readCredential,
   setKeyringEntryFactoryForTests,
@@ -41,12 +42,14 @@ const profile: CliProfile = {
 }
 
 beforeEach(async () => {
+  clearCachedAccessTokensForTests()
   runtimeRoot = await mkdtemp(join(tmpdir(), "onyx-refresh-test-"))
   process.env.ONYX_HOME = runtimeRoot
   process.env.ONYX_TEST_CREDENTIAL_STORE = "file"
 })
 
 afterEach(async () => {
+  clearCachedAccessTokensForTests()
   setKeyringEntryFactoryForTests(null)
   globalThis.fetch = originalFetch
   if (originalHome === undefined) delete process.env.ONYX_HOME
@@ -126,8 +129,248 @@ describe("OAuth credential refresh manager", () => {
     expect(await readCredential(profile.credentialId, "file")).toBeNull()
   })
 
+  test("keeps a newer durable credential after stale invalid_grant", async () => {
+    await writeCredential(
+      profile.credentialId,
+      { accessToken: "old", refreshToken: "old-refresh", expiresAt: 0 },
+      "file"
+    )
+    globalThis.fetch = mock(async () => {
+      await writeCredential(
+        profile.credentialId,
+        {
+          accessToken: "newer-access",
+          refreshToken: "newer-refresh",
+          expiresAt: Date.now() + 900_000,
+        },
+        "file"
+      )
+      return Response.json({ error: "invalid_grant" }, { status: 400 })
+    }) as unknown as typeof fetch
+
+    expect(await accessTokenForProfile({ name: "team", profile })).toBe(
+      "newer-access"
+    )
+    expect(await readCredential(profile.credentialId, "file")).toMatchObject({
+      refreshToken: "newer-refresh",
+    })
+  })
+
+  test("finds a newer file generation after another process changed the profile store", async () => {
+    const keyringProfile: CliProfile = {
+      ...profile,
+      credentialStore: "keyring",
+    }
+    await writeConfig({
+      ...emptyConfig(),
+      profiles: { team: keyringProfile },
+      currentProfile: "team",
+    })
+    setKeyringEntryFactoryForTests(() => ({
+      getPassword: async () =>
+        JSON.stringify({
+          accessToken: "old",
+          refreshToken: "old-refresh",
+          expiresAt: 0,
+        }),
+      setPassword: async () => undefined,
+      deleteCredential: async () => true,
+    }))
+    globalThis.fetch = mock(async () => {
+      const fileProfile: CliProfile = {
+        ...keyringProfile,
+        credentialStore: "file",
+        updatedAt: "2026-09-05T13:00:00.000Z",
+      }
+      await writeCredential(
+        profile.credentialId,
+        {
+          accessToken: "newer-file-access",
+          refreshToken: "newer-file-refresh",
+          expiresAt: Date.now() + 900_000,
+        },
+        "file"
+      )
+      await writeConfig({
+        ...emptyConfig(),
+        profiles: { team: fileProfile },
+        currentProfile: "team",
+      })
+      return Response.json({ error: "invalid_grant" }, { status: 400 })
+    }) as unknown as typeof fetch
+
+    expect(
+      await accessTokenForProfile({ name: "team", profile: keyringProfile })
+    ).toBe("newer-file-access")
+    expect(await readCredential(profile.credentialId, "file")).toMatchObject({
+      refreshToken: "newer-file-refresh",
+    })
+  })
+
+  test("reuses a cached access token without repeated keyring reads", async () => {
+    const keyringProfile: CliProfile = {
+      ...profile,
+      credentialStore: "keyring",
+    }
+    const stored = JSON.stringify({
+      accessToken: "cached-access",
+      refreshToken: "cached-refresh",
+      expiresAt: Date.now() + 900_000,
+    })
+    let reads = 0
+    setKeyringEntryFactoryForTests(() => ({
+      getPassword: async () => {
+        reads += 1
+        return stored
+      },
+      setPassword: async () => undefined,
+      deleteCredential: async () => true,
+    }))
+
+    expect(
+      await accessTokenForProfile({ name: "team", profile: keyringProfile })
+    ).toBe("cached-access")
+    expect(
+      await accessTokenForProfile({ name: "team", profile: keyringProfile })
+    ).toBe("cached-access")
+    expect(reads).toBe(1)
+  })
+
+  test("re-reads the keyring after the 60-second cache window", async () => {
+    const keyringProfile: CliProfile = {
+      ...profile,
+      credentialStore: "keyring",
+    }
+    let now = 1_800_000_000_000
+    const clock = spyOn(Date, "now").mockImplementation(() => now)
+    let reads = 0
+    setKeyringEntryFactoryForTests(() => ({
+      getPassword: async () => {
+        reads += 1
+        return JSON.stringify({
+          accessToken: `access-${reads}`,
+          refreshToken: "refresh",
+          expiresAt: now + 900_000,
+        })
+      },
+      setPassword: async () => undefined,
+      deleteCredential: async () => true,
+    }))
+    try {
+      expect(
+        await accessTokenForProfile({ name: "team", profile: keyringProfile })
+      ).toBe("access-1")
+      now += 60_001
+      expect(
+        await accessTokenForProfile({ name: "team", profile: keyringProfile })
+      ).toBe("access-2")
+      expect(reads).toBe(2)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  test("profile store identity changes bypass an older cache entry", async () => {
+    const firstProfile: CliProfile = { ...profile, credentialStore: "keyring" }
+    let accessToken = "first-access"
+    let reads = 0
+    setKeyringEntryFactoryForTests(() => ({
+      getPassword: async () => {
+        reads += 1
+        return JSON.stringify({
+          accessToken,
+          refreshToken: "refresh",
+          expiresAt: Date.now() + 900_000,
+        })
+      },
+      setPassword: async () => undefined,
+      deleteCredential: async () => true,
+    }))
+    expect(
+      await accessTokenForProfile({ name: "team", profile: firstProfile })
+    ).toBe("first-access")
+    accessToken = "updated-access"
+    expect(
+      await accessTokenForProfile({
+        name: "team",
+        profile: { ...firstProfile, updatedAt: "2026-09-05T13:00:00.000Z" },
+      })
+    ).toBe("updated-access")
+    expect(reads).toBe(2)
+  })
+
+  test("forced refresh bypasses the cache and re-reads under the lock", async () => {
+    const keyringProfile: CliProfile = {
+      ...profile,
+      credentialStore: "keyring",
+    }
+    let stored = JSON.stringify({
+      accessToken: "cached-access",
+      refreshToken: "cached-refresh",
+      expiresAt: Date.now() + 900_000,
+    })
+    let reads = 0
+    setKeyringEntryFactoryForTests(() => ({
+      getPassword: async () => {
+        reads += 1
+        return stored
+      },
+      setPassword: async (value) => {
+        stored = value
+      },
+      deleteCredential: async () => true,
+    }))
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        access_token: "forced-access",
+        refresh_token: "forced-refresh",
+        expires_in: 900,
+      })
+    ) as unknown as typeof fetch
+
+    await accessTokenForProfile({ name: "team", profile: keyringProfile })
+    expect(
+      await accessTokenForProfile({
+        name: "team",
+        profile: keyringProfile,
+        forceRefresh: true,
+      })
+    ).toBe("forced-access")
+    expect(reads).toBe(3)
+  })
+
+  test("credential writes invalidate the process cache", async () => {
+    await writeCredential(
+      profile.credentialId,
+      {
+        accessToken: "first-access",
+        refreshToken: "first-refresh",
+        expiresAt: Date.now() + 900_000,
+      },
+      "file"
+    )
+    expect(await accessTokenForProfile({ name: "team", profile })).toBe(
+      "first-access"
+    )
+    await writeCredential(
+      profile.credentialId,
+      {
+        accessToken: "second-access",
+        refreshToken: "second-refresh",
+        expiresAt: Date.now() + 900_000,
+      },
+      "file"
+    )
+    expect(await accessTokenForProfile({ name: "team", profile })).toBe(
+      "second-access"
+    )
+  })
+
   test("keeps a rotated refresh token when the keyring write fails", async () => {
-    const keyringProfile: CliProfile = { ...profile, credentialStore: "keyring" }
+    const keyringProfile: CliProfile = {
+      ...profile,
+      credentialStore: "keyring",
+    }
     await writeConfig({
       ...emptyConfig(),
       profiles: { team: keyringProfile },
@@ -138,9 +381,11 @@ describe("OAuth credential refresh manager", () => {
       refreshToken: "old-refresh",
       expiresAt: 0,
     })
+    let writes = 0
     setKeyringEntryFactoryForTests(() => ({
       getPassword: async () => stored,
       setPassword: async () => {
+        writes += 1
         throw new Error("keyring write denied")
       },
       deleteCredential: async () => true,
@@ -166,5 +411,6 @@ describe("OAuth credential refresh manager", () => {
       refreshToken: "rotated-refresh",
     })
     expect((await readConfig()).profiles.team?.credentialStore).toBe("file")
+    expect(writes).toBe(1)
   })
 })

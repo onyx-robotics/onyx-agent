@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises"
 
 import { ApiError } from "../lib/api"
 import { confirmApiUrlTrust } from "../lib/api-url-trust"
+import { authFetch } from "../lib/auth-fetch"
 import { optionalFlag, type Args } from "../lib/args"
 import {
   apiBaseUrl,
@@ -156,10 +157,7 @@ async function browserCredential({
   })
 }
 
-async function deviceCredential(
-  freshness: LoginFreshness,
-  timeoutMs: number
-) {
+async function deviceCredential(freshness: LoginFreshness, timeoutMs: number) {
   const device = freshness.device
   if (!device) {
     throw new Error("Onyx server did not start device authorization")
@@ -198,7 +196,7 @@ async function authenticatedData<T>({
   for (let attempt = 1; attempt <= LOGIN_REQUEST_ATTEMPTS; attempt += 1) {
     let response: Response
     try {
-      response = await fetch(`${apiUrl}${path}`, {
+      response = await authFetch(`${apiUrl}${path}`, {
         method,
         headers: {
           accept: "application/json",
@@ -316,7 +314,7 @@ async function revokeRemoteSession({
   accessToken: string
   cliSessionId?: string
 }) {
-  await fetch(`${apiUrl}/api/v1/cli/auth/session`, {
+  await authFetch(`${apiUrl}/api/v1/cli/auth/session`, {
     method: "DELETE",
     headers: {
       authorization: `Bearer ${accessToken}`,
@@ -478,8 +476,12 @@ export async function commandLogin(args: Args) {
     if (staged) backupPath = await writeLegacyConfigBackup(staged)
     await writeConfig({
       ...config,
-      ...(fallbackWarningShownAt ? { credentialFallbackWarningShownAt: fallbackWarningShownAt } : {}),
-      ...(staged ? { developer: staged.developer, telemetry: staged.telemetry } : {}),
+      ...(fallbackWarningShownAt
+        ? { credentialFallbackWarningShownAt: fallbackWarningShownAt }
+        : {}),
+      ...(staged
+        ? { developer: staged.developer, telemetry: staged.telemetry }
+        : {}),
       ...(showCredentialFallbackWarning
         ? { credentialFallbackWarningShownAt: new Date().toISOString() }
         : {}),

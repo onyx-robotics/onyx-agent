@@ -61,7 +61,10 @@ describe("server-issued login freshness", () => {
         },
       })
     ) as unknown as typeof fetch
-    const freshness = await createServerLoginAttempt({ apiUrl, flow: "browser" })
+    const freshness = await createServerLoginAttempt({
+      apiUrl,
+      flow: "browser",
+    })
     expect(() =>
       freshness.proof({ accessToken: "a", refreshToken: "r", expiresAt: 1 })
     ).toThrow("did not return an ID token")
@@ -87,7 +90,10 @@ describe("server-issued login freshness", () => {
     ).rejects.toThrow("Too many login attempts")
 
     globalThis.fetch = mock(async () =>
-      Response.json({ error: { code: "internal_server_error" } }, { status: 500 })
+      Response.json(
+        { error: { code: "internal_server_error" } },
+        { status: 500 }
+      )
     ) as unknown as typeof fetch
     await expect(
       createServerLoginAttempt({ apiUrl, flow: "browser" })
@@ -121,7 +127,9 @@ describe("server-issued login freshness", () => {
       }
       polls += 1
       if (polls === 1) {
-        return Response.json({ data: { status: "pending", retryAfterSeconds: 1 } })
+        return Response.json({
+          data: { status: "pending", retryAfterSeconds: 1 },
+        })
       }
       if (polls === 2) {
         return Response.json({ error: { code: "internal" } }, { status: 503 })
@@ -192,9 +200,9 @@ describe("server-issued login freshness", () => {
     }) as unknown as typeof setTimeout
     try {
       const freshness = await freshnessForFlow("device", { apiUrl })
-      await expect(freshness.device!.poll({ timeoutMs: 60_000 })).rejects.toThrow(
-        "denied in the browser"
-      )
+      await expect(
+        freshness.device!.poll({ timeoutMs: 60_000 })
+      ).rejects.toThrow("denied in the browser")
     } finally {
       globalThis.setTimeout = originalSetTimeout
     }
@@ -243,6 +251,69 @@ describe("server-issued login freshness", () => {
       const credential = await freshness.device!.poll({ timeoutMs: 60_000 })
       expect(credential.accessToken).toBe("a")
       expect(polls).toBe(2)
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+    }
+  })
+
+  test("backs off transient device polls and honors a larger Retry-After", async () => {
+    let polls = 0
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/api/v1/cli/auth/attempts")) {
+        return Response.json({
+          data: {
+            attemptId: "55555555-5555-4555-8555-555555555555",
+            nonce: NONCE,
+            expiresAt: "2026-09-04T12:15:00.000Z",
+            device: {
+              deviceCode: "raw-device-code",
+              userCode: "ABCD-EFGH",
+              verificationUri: "https://auth.example.test/device",
+              expiresIn: 600,
+              interval: 1,
+            },
+          },
+        })
+      }
+      polls += 1
+      if (polls === 1) {
+        return Response.json(
+          {},
+          { status: 429, headers: { "retry-after": "7" } }
+        )
+      }
+      if (polls === 2) throw new TypeError("connection reset")
+      if (polls === 3) {
+        return Response.json(
+          {},
+          { status: 503, headers: { "retry-after": "45" } }
+        )
+      }
+      return Response.json({
+        data: {
+          status: "authorized",
+          tokens: {
+            accessToken: "a",
+            refreshToken: "r",
+            idToken: idTokenWith({ sub: "user_1" }),
+            expiresIn: 900,
+          },
+        },
+      })
+    }) as unknown as typeof fetch
+    const delays: number[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = ((callback: TimerHandler, delay?: number) => {
+      delays.push(delay ?? 0)
+      if (typeof callback === "function") callback()
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+    try {
+      const freshness = await freshnessForFlow("device", { apiUrl })
+      expect(
+        (await freshness.device!.poll({ timeoutMs: 60_000 })).accessToken
+      ).toBe("a")
+      expect(delays).toEqual([1_000, 7_000, 14_000, 45_000])
     } finally {
       globalThis.setTimeout = originalSetTimeout
     }

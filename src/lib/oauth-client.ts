@@ -1,4 +1,5 @@
 import type { OAuthCredential } from "./credential-store"
+import { authFetch } from "./auth-fetch"
 
 export type CliAuthConfig = {
   clientId: string
@@ -136,7 +137,10 @@ export function validateCliAuthConfig(
       )
     }
   }
-  if (!data.scopes.includes("openid") || !data.scopes.includes("offline_access")) {
+  if (
+    !data.scopes.includes("openid") ||
+    !data.scopes.includes("offline_access")
+  ) {
     throw new Error(
       "CLI authentication scopes must include openid and offline_access"
     )
@@ -156,7 +160,7 @@ export function validateCliAuthConfig(
 export async function fetchCliAuthConfig(
   apiUrl: string
 ): Promise<CliAuthConfig> {
-  const response = await fetch(`${apiUrl}/api/v1/cli/auth/config`, {
+  const response = await authFetch(`${apiUrl}/api/v1/cli/auth/config`, {
     headers: { accept: "application/json" },
   })
   const payload = await responseJson(response)
@@ -175,7 +179,7 @@ async function tokenRequest(
 ): Promise<OAuthTokenResponse> {
   let response: Response
   try {
-    response = await fetch(endpoint, {
+    response = await authFetch(endpoint, {
       method: "POST",
       headers: {
         accept: "application/json",
@@ -286,21 +290,30 @@ export async function startDeviceAuthorization(
   config: CliAuthConfig,
   { nonce }: { nonce?: string } = {}
 ): Promise<DeviceAuthorization> {
-  const response = await fetch(config.deviceAuthorizationEndpoint, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      client_id: config.clientId,
-      scope: config.scopes.join(" "),
-      // RFC 8628 defines no nonce; OIDC providers that honor it echo it in
-      // the device-flow ID token, which is how headless logins prove
-      // freshness to Onyx.
-      ...(nonce ? { nonce } : {}),
-    }),
-  })
+  let response: Response
+  try {
+    response = await authFetch(config.deviceAuthorizationEndpoint, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        client_id: config.clientId,
+        scope: config.scopes.join(" "),
+        // RFC 8628 defines no nonce; OIDC providers that honor it echo it in
+        // the device-flow ID token, which is how headless logins prove
+        // freshness to Onyx.
+        ...(nonce ? { nonce } : {}),
+      }),
+    })
+  } catch {
+    throw new OAuthRequestError(
+      "Unable to reach the authentication server",
+      "network_error",
+      true
+    )
+  }
   const payload = await responseJson(response)
   if (!response.ok) {
     throw new OAuthRequestError(
@@ -339,7 +352,10 @@ export async function pollDeviceTokens({
     Date.now() + Math.min(timeoutMs, authorization.expiresIn * 1_000)
   let intervalMs = Math.max(authorization.interval, 1) * 1_000
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(intervalMs, deadline - Date.now()))
+    )
+    if (Date.now() >= deadline) break
     try {
       return await tokenRequest(
         config.tokenEndpoint,
@@ -353,10 +369,13 @@ export async function pollDeviceTokens({
       if (!(error instanceof OAuthRequestError)) throw error
       if (error.code === "authorization_pending") continue
       if (error.code === "slow_down") {
-        intervalMs += 5_000
+        intervalMs = Math.min(30_000, intervalMs + 5_000)
         continue
       }
-      if (error.transient) continue
+      if (error.transient) {
+        intervalMs = Math.min(30_000, Math.max(1_000, intervalMs * 2))
+        continue
+      }
       throw error
     }
   }

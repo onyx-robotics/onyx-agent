@@ -12,12 +12,22 @@ import {
 import { join } from "node:path"
 
 import { configDir } from "./config"
+import { invalidateCachedCredential } from "./credential-access-cache"
 
 const KEYRING_SERVICE = "ai.onyxresearch.onyx-cli"
 const CREDENTIALS_DIRECTORY = "credentials"
 // A locked or half-started Secret Service can block a native keyring call
 // indefinitely; bound it and fall back to the private file store instead.
 const KEYRING_TIMEOUT_MS = 3_000
+const DEFAULT_LOCK_STALE_MS = 60_000
+const DEFAULT_LOCK_WAIT_MS = 65_000
+const DEFAULT_LOCK_POLL_MS = 100
+
+let lockTiming = {
+  staleMs: DEFAULT_LOCK_STALE_MS,
+  waitMs: DEFAULT_LOCK_WAIT_MS,
+  pollMs: DEFAULT_LOCK_POLL_MS,
+}
 
 /** The keyring exists but did not answer; the credential may still be there. */
 export class CredentialStoreUnavailableError extends Error {
@@ -51,6 +61,19 @@ export function setKeyringEntryFactoryForTests(
   keyringEntryFactoryForTests = factory
 }
 
+/** Test hook: shorten lock timing without weakening production thresholds. */
+export function setCredentialLockTimingForTests(
+  timing?: Partial<typeof lockTiming>
+) {
+  lockTiming = timing
+    ? { ...lockTiming, ...timing }
+    : {
+        staleMs: DEFAULT_LOCK_STALE_MS,
+        waitMs: DEFAULT_LOCK_WAIT_MS,
+        pollMs: DEFAULT_LOCK_POLL_MS,
+      }
+}
+
 export function keyringSupported(env: NodeJS.ProcessEnv = process.env) {
   if (env.ONYX_TEST_CREDENTIAL_STORE === "file") return false
   // Linux keyrings speak Secret Service over the session D-Bus; headless
@@ -63,7 +86,10 @@ export function keyringSupported(env: NodeJS.ProcessEnv = process.env) {
 
 function withKeyringTimeout<T>(work: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new KeyringTimeoutError()), KEYRING_TIMEOUT_MS)
+    const timer = setTimeout(
+      () => reject(new KeyringTimeoutError()),
+      KEYRING_TIMEOUT_MS
+    )
     timer.unref()
     work().then(
       (value) => {
@@ -161,7 +187,9 @@ async function writeKeyringCredential(
   const entry = await keyringEntry(credentialId)
   if (!entry) return false
   try {
-    await withKeyringTimeout(() => entry.setPassword(JSON.stringify(credential)))
+    await withKeyringTimeout(() =>
+      entry.setPassword(JSON.stringify(credential))
+    )
     return true
   } catch {
     return false
@@ -209,6 +237,7 @@ export async function writeCredential(
   credential: OAuthCredential,
   preferredStore?: CredentialStoreKind
 ): Promise<CredentialStoreKind> {
+  invalidateCachedCredential(credentialId)
   if (preferredStore !== "file") {
     if (await writeKeyringCredential(credentialId, credential)) {
       await unlink(credentialFilePath(credentialId)).catch(() => undefined)
@@ -242,6 +271,7 @@ export async function readCredential(
 }
 
 export async function deleteCredential(credentialId: string) {
+  invalidateCachedCredential(credentialId)
   await deleteKeyringCredential(credentialId)
   await unlink(credentialFilePath(credentialId)).catch(() => undefined)
 }
@@ -253,25 +283,36 @@ function lockPath(credentialId: string) {
 async function acquireCredentialLock(credentialId: string) {
   await ensureCredentialDirectory()
   const path = lockPath(credentialId)
-  const deadline = Date.now() + 10_000
+  const owner = randomUUID()
+  const deadline = Date.now() + lockTiming.waitMs
   while (Date.now() < deadline) {
     try {
       const handle = await open(path, "wx", 0o600)
+      try {
+        await handle.writeFile(`${owner}\n`, "utf8")
+      } catch (error) {
+        await handle.close().catch(() => undefined)
+        await unlink(path).catch(() => undefined)
+        throw error
+      }
       return async () => {
         await handle.close()
-        await unlink(path).catch(() => undefined)
+        const currentOwner = await readFile(path, "utf8").catch(() => null)
+        if (currentOwner?.trim() === owner) {
+          await unlink(path).catch(() => undefined)
+        }
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
       try {
-        if (Date.now() - (await stat(path)).mtimeMs > 30_000) {
+        if (Date.now() - (await stat(path)).mtimeMs > lockTiming.staleMs) {
           await unlink(path)
           continue
         }
       } catch {
         continue
       }
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      await new Promise((resolve) => setTimeout(resolve, lockTiming.pollMs))
     }
   }
   throw new Error("Timed out waiting for another Onyx process to refresh login")

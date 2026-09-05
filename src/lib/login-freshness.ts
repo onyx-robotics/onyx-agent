@@ -1,4 +1,23 @@
 import type { OAuthTokenResponse } from "./oauth-client"
+import { AUTH_REQUEST_TIMEOUT_MS, authFetch } from "./auth-fetch"
+
+const MAX_DEVICE_POLL_INTERVAL_MS = 30_000
+
+function nextTransientPollInterval(intervalMs: number) {
+  return Math.max(
+    intervalMs,
+    Math.min(MAX_DEVICE_POLL_INTERVAL_MS, Math.max(1_000, intervalMs * 2))
+  )
+}
+
+function retryAfterMs(response: Response) {
+  const raw = response.headers.get("retry-after")
+  if (!raw) return 0
+  const seconds = Number(raw)
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1_000
+  const at = Date.parse(raw)
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0
+}
 
 /**
  * Freshness proof for creating a CLI session binding.
@@ -79,14 +98,23 @@ export async function createServerLoginAttempt({
   apiUrl: string
   flow: LoginFlow
 }): Promise<LoginFreshness> {
-  const response = await fetch(`${apiUrl}/api/v1/cli/auth/attempts`, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ flow }),
-  })
+  let response: Response
+  try {
+    response = await authFetch(`${apiUrl}/api/v1/cli/auth/attempts`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ flow }),
+    })
+  } catch (error) {
+    throw new Error(
+      `Unable to reach the Onyx API at ${apiUrl}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
   const payload = await readJson<AttemptPayload>(response)
   if (response.status === 429) {
     throw new Error(
@@ -179,10 +207,13 @@ function brokeredDevice({
       const deadline = Date.now() + Math.min(timeoutMs, expiresIn * 1_000)
       let intervalMs = initialInterval * 1_000
       while (Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, intervalMs))
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(intervalMs, deadline - Date.now()))
+        )
+        if (Date.now() >= deadline) break
         let response: Response
         try {
-          response = await fetch(
+          response = await authFetch(
             `${apiUrl}/api/v1/cli/auth/attempts/${attemptId}/device`,
             {
               method: "POST",
@@ -191,11 +222,16 @@ function brokeredDevice({
                 "content-type": "application/json",
               },
               body: JSON.stringify({ deviceCode }),
-            }
+            },
+            Math.max(
+              1,
+              Math.min(AUTH_REQUEST_TIMEOUT_MS, deadline - Date.now())
+            )
           )
         } catch {
-          // Connection-level failures are transient within the deadline; the
-          // user keeps their place in the ceremony.
+          // RFC 8628 requires reduced polling frequency after connection
+          // failures. The user keeps their place within the ceremony deadline.
+          intervalMs = nextTransientPollInterval(intervalMs)
           continue
         }
         const payload = await readJson<{
@@ -213,6 +249,10 @@ function brokeredDevice({
         }>(response)
         if (response.status === 503 || response.status === 429) {
           // Onyx or WorkOS is briefly unavailable; keep the user's place.
+          intervalMs = Math.max(
+            nextTransientPollInterval(intervalMs),
+            retryAfterMs(response)
+          )
           continue
         }
         if (!response.ok) {
@@ -225,7 +265,10 @@ function brokeredDevice({
         const data = payload.data
         if (data?.status === "pending") {
           if (typeof data.retryAfterSeconds === "number") {
-            intervalMs = Math.max(1, data.retryAfterSeconds) * 1_000
+            intervalMs = Math.max(
+              intervalMs,
+              Math.max(1, data.retryAfterSeconds) * 1_000
+            )
           }
           continue
         }
