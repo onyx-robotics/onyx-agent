@@ -134,7 +134,9 @@ has_tty() {
     return 1
   fi
 
-  [ -r /dev/tty ] && [ -w /dev/tty ]
+  # Permission checks alone are insufficient: containers commonly expose a
+  # /dev/tty device without giving the process a controlling terminal.
+  (exec 9<>/dev/tty && [ -t 9 ]) 2>/dev/null
 }
 
 install_path_for_user() {
@@ -275,7 +277,7 @@ setup_path() {
 
 print_auth_followup() {
   user_cmd="$(install_path_for_user)"
-  status_line "Authenticate later with browser login:"
+  status_line "Authenticate later:"
   status_code "$user_cmd login"
   status_line "Or use a global API key:"
   status_code 'export ONYX_API_KEY="onyx_..."'
@@ -283,34 +285,32 @@ print_auth_followup() {
 
 print_prompt_auth_followup() {
   user_cmd="$(install_path_for_user)"
-  prompt_line "Login later with browser login:"
+  prompt_line "Authenticate later:"
   prompt_code "$user_cmd login"
   prompt_line "Or use a global API key:"
   prompt_code 'export ONYX_API_KEY="onyx_..."'
 }
 
-run_login_without_cancel() {
-  status_line "Waiting for login..."
-  if "$install_path" login; then
-    status_success "Onyx login complete."
-  else
-    status_warn "Onyx login did not complete."
-    print_auth_followup
-  fi
-}
-
-run_login_with_cancel() {
-  prompt_start "Authenticate" "Opening browser login... Press Ctrl+C to cancel."
+run_login_with_terminal() {
+  login_mode="$1"
+  prompt_start "Authenticate" "Starting interactive login... Press Ctrl+C to cancel."
 
   # `curl ... | bash` leaves the installer's stdin attached to the script
-  # pipe. Running login in the background with redirected output therefore
-  # makes the CLI detect a headless shell and silently choose device auth.
-  # Keep the interactive login in the foreground, attach its input to the
-  # controlling terminal, and explicitly select browser auth.
-  if "$install_path" login --browser < /dev/tty > /dev/tty 2>&1; then
+  # pipe. Attach only the login's input to the controlling terminal. stdout
+  # and stderr must remain inherited: reopening them onto /dev/tty crashes
+  # Bun's macOS TTY stream initialization. Auto mode opens a browser locally
+  # and preserves the CLI's SSH/headless detection for device authorization.
+  if [ "$login_mode" = "browser" ]; then
+    set -- login --browser
+  elif [ "$login_mode" = "device" ]; then
+    set -- login --device
+  else
+    set -- login
+  fi
+  if "$install_path" "$@" < /dev/tty; then
     prompt_success "Onyx login complete."
   else
-    prompt_warn "Browser login did not complete."
+    prompt_warn "Onyx login did not complete."
     print_prompt_auth_followup
   fi
 }
@@ -329,11 +329,20 @@ setup_auth() {
     skip)
       print_auth_followup
       ;;
-    login|browser|"")
+    login|"")
       if has_tty; then
-        run_login_with_cancel
+        run_login_with_terminal auto
       else
-        run_login_without_cancel
+        status_warn "No interactive terminal detected; skipping login."
+        print_auth_followup
+      fi
+      ;;
+    browser|device)
+      if has_tty; then
+        run_login_with_terminal "${ONYX_INSTALL_AUTH}"
+      else
+        status_warn "No interactive terminal detected; skipping login."
+        print_auth_followup
       fi
       ;;
     *)
@@ -369,9 +378,6 @@ prepare_install_path() {
       die "Refusing to overwrite existing file: $target_path. Remove it, move it, or choose another directory with ONYX_INSTALL_DIR."
     fi
 
-    if [ -L "$target_path" ]; then
-      rm -f "$target_path"
-    fi
   fi
 }
 
@@ -420,6 +426,7 @@ need() {
 need curl
 need grep
 need awk
+need mktemp
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha_cmd="sha256sum"
@@ -437,17 +444,28 @@ status_success "Required tools found."
 prepare_install_dir
 status_success "Install directory ready: $INSTALL_DIR"
 
-tmp="${TMPDIR:-/tmp}/onyx-install.$$"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/onyx-install.XXXXXX")" || die "Unable to create a temporary install directory"
+install_stage="$INSTALL_DIR/.onyx.new.$$"
+worker_install_stage="$INSTALL_DIR/.onyx-worker.new.$$"
 cleanup() {
   rm -rf "$tmp"
+  rm -f "$install_stage" "$worker_install_stage"
 }
 trap cleanup EXIT INT TERM
-mkdir -p "$tmp"
+
+download() {
+  curl -fsSL \
+    --retry 3 \
+    --retry-delay 1 \
+    --connect-timeout 10 \
+    --max-time 120 \
+    "$1" -o "$2"
+}
 
 status_line "Downloading Onyx agent $VERSION for $target..."
-curl -fsSL "$asset_url" -o "$tmp/$asset"
-curl -fsSL "$worker_asset_url" -o "$tmp/$worker_asset"
-curl -fsSL "$checksums_url" -o "$tmp/checksums.txt"
+download "$asset_url" "$tmp/$asset"
+download "$worker_asset_url" "$tmp/$worker_asset"
+download "$checksums_url" "$tmp/checksums.txt"
 status_success "Downloaded release assets."
 
 verify_asset_checksum() {
@@ -471,10 +489,12 @@ verify_asset_checksum "$worker_asset"
 status_success "Checksum verified."
 
 status_line "Installing onyx and onyx-worker..."
-cp "$tmp/$asset" "$install_path"
-cp "$tmp/$worker_asset" "$worker_install_path"
-chmod 0755 "$install_path"
-chmod 0755 "$worker_install_path"
+cp "$tmp/$asset" "$install_stage"
+cp "$tmp/$worker_asset" "$worker_install_stage"
+chmod 0755 "$install_stage"
+chmod 0755 "$worker_install_stage"
+mv -f "$install_stage" "$install_path"
+mv -f "$worker_install_stage" "$worker_install_path"
 write_install_marker
 status_success "Installed onyx to $install_path"
 status_success "Installed onyx-worker to $worker_install_path"

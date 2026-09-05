@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test"
 
-import { createLoopbackCallback } from "./lib/login"
+import {
+  BROWSER_OPEN_TIMEOUT_MS,
+  createLoopbackCallback,
+  openBrowser,
+} from "./lib/login"
 
 const callbacks: Array<Awaited<ReturnType<typeof createLoopbackCallback>>> = []
 
@@ -67,5 +71,68 @@ describe("OAuth loopback callback", () => {
     expect((await fetch(url)).status).toBe(200)
     expect((await fetch(url)).status).toBe(409)
     expect(await callback.waitForCode()).toBe("one-time-code")
+  })
+})
+
+describe("browser opener", () => {
+  test("uses the native macOS and Linux openers with a bounded wait", async () => {
+    const calls: Array<{
+      command: string
+      args: string[]
+      timeoutMs: number | undefined
+    }> = []
+    const run: NonNullable<
+      NonNullable<Parameters<typeof openBrowser>[1]>["run"]
+    > = async (command, args, options) => {
+      calls.push({ command, args, timeoutMs: options?.timeoutMs })
+      return { code: 0, stdout: "", stderr: "", timedOut: false }
+    }
+
+    expect(
+      await openBrowser("https://example.test/login", {
+        platform: "darwin",
+        run,
+      })
+    ).toBe(true)
+    expect(
+      await openBrowser("https://example.test/login", {
+        platform: "linux",
+        run,
+      })
+    ).toBe(true)
+    expect(calls).toEqual([
+      {
+        command: "open",
+        args: ["https://example.test/login"],
+        timeoutMs: BROWSER_OPEN_TIMEOUT_MS,
+      },
+      {
+        command: "xdg-open",
+        args: ["https://example.test/login"],
+        timeoutMs: BROWSER_OPEN_TIMEOUT_MS,
+      },
+    ])
+  })
+
+  test("falls back when the opener times out or is unavailable", async () => {
+    expect(
+      await openBrowser("https://example.test/login", {
+        platform: "linux",
+        run: async () => ({
+          code: null,
+          stdout: "",
+          stderr: "",
+          timedOut: true,
+        }),
+      })
+    ).toBe(false)
+    expect(
+      await openBrowser("https://example.test/login", {
+        platform: "darwin",
+        run: async () => {
+          throw new Error("open is unavailable")
+        },
+      })
+    ).toBe(false)
   })
 })
