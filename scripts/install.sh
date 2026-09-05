@@ -296,10 +296,12 @@ run_login_with_terminal() {
   prompt_start "Authenticate" "Starting interactive login... Press Ctrl+C to cancel."
 
   # `curl ... | bash` leaves the installer's stdin attached to the script
-  # pipe. Attach only the login's input to the controlling terminal. stdout
-  # and stderr must remain inherited: reopening them onto /dev/tty crashes
-  # Bun's macOS TTY stream initialization. Auto mode opens a browser locally
-  # and preserves the CLI's SSH/headless detection for device authorization.
+  # pipe. Attach fd 0 to the controlling terminal and mark this special launch
+  # so the macOS CLI opens a fresh /dev/tty reader instead of Bun's inherited
+  # stdin stream, which can stop delivering bytes after a piped parent. stdout
+  # and stderr remain inherited: reopening them onto /dev/tty crashes Bun's
+  # macOS TTY stream initialization. Auto mode opens a browser locally and
+  # preserves the CLI's SSH/headless detection for device authorization.
   if [ "$login_mode" = "browser" ]; then
     set -- login --browser
   elif [ "$login_mode" = "device" ]; then
@@ -307,7 +309,7 @@ run_login_with_terminal() {
   else
     set -- login
   fi
-  if "$install_path" "$@" < /dev/tty; then
+  if ONYX_INSTALLER_LOGIN=1 "$install_path" "$@" < /dev/tty; then
     prompt_success "Onyx login complete."
   else
     prompt_warn "Onyx login did not complete."

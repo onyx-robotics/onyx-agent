@@ -391,6 +391,15 @@ describe("install script", () => {
     })
   })
 
+  test("marks installer login so macOS prompts can bypass Bun's inherited stdin", async () => {
+    const script = await readFile(`${packageRoot}/scripts/install.sh`, "utf8")
+
+    expect(script).toContain(
+      'ONYX_INSTALLER_LOGIN=1 "$install_path" "$@" < /dev/tty'
+    )
+    expect(script).not.toContain('> /dev/tty 2>&1')
+  })
+
   test("API key auth override prints the global environment variable", async () => {
     await withFixture(async (fixture) => {
       const result = await runInstall(fixture, {
