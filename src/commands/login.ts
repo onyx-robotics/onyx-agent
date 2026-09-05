@@ -7,12 +7,14 @@ import { confirmApiUrlTrust } from "../lib/api-url-trust"
 import { optionalFlag, type Args } from "../lib/args"
 import {
   apiBaseUrl,
-  migrateLegacyConfigForLogin,
   normalizeProfileName,
   readConfig,
+  stageLegacyConfigMigration,
+  writeLegacyConfigBackup,
   type CliProfile,
   type Config,
   type LegacyProfileMetadata,
+  type StagedLegacyConfigMigration,
   writeConfig,
 } from "../lib/config"
 import { deleteCredential, writeCredential } from "../lib/credential-store"
@@ -171,6 +173,14 @@ async function deviceCredential(
   return device.poll({ timeoutMs })
 }
 
+const LOGIN_REQUEST_ATTEMPTS = 3
+const LOGIN_RETRY_STATUSES = new Set([429, 502, 503, 504])
+
+/**
+ * Pre-binding requests are idempotent (team listing is read-only and the
+ * binding request carries a client-generated session id), so connection
+ * failures and transient statuses are retried with the exact same payload.
+ */
 async function authenticatedData<T>({
   apiUrl,
   path,
@@ -184,22 +194,48 @@ async function authenticatedData<T>({
   method?: string
   body?: unknown
 }): Promise<T> {
-  const response = await fetch(`${apiUrl}${path}`, {
-    method,
-    headers: {
-      accept: "application/json",
-      authorization: `Bearer ${accessToken}`,
-      ...(body ? { "content-type": "application/json" } : {}),
-    },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-  })
-  const payload = (await response.json().catch(() => null)) as {
-    data?: T
-  } | null
-  if (!response.ok || !payload || payload.data === undefined) {
-    throw new ApiError(method, path, response.status, payload)
+  let lastError: unknown
+  for (let attempt = 1; attempt <= LOGIN_REQUEST_ATTEMPTS; attempt += 1) {
+    let response: Response
+    try {
+      response = await fetch(`${apiUrl}${path}`, {
+        method,
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${accessToken}`,
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      })
+    } catch (error) {
+      lastError = error
+      if (attempt < LOGIN_REQUEST_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+        continue
+      }
+      throw new Error(
+        `Unable to reach the Onyx API at ${apiUrl}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+    const payload = (await response.json().catch(() => null)) as {
+      data?: T
+    } | null
+    if (response.ok && payload && payload.data !== undefined) {
+      return payload.data
+    }
+    lastError = new ApiError(method, path, response.status, payload)
+    if (
+      LOGIN_RETRY_STATUSES.has(response.status) &&
+      attempt < LOGIN_REQUEST_ATTEMPTS
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+      continue
+    }
+    throw lastError
   }
-  return payload.data
+  throw lastError
 }
 
 function loginFailureMessage(error: unknown) {
@@ -307,9 +343,9 @@ async function revokeOldProfile(profile: CliProfile | undefined) {
 }
 
 async function removeStaleLegacyCredentials(
-  migration: Awaited<ReturnType<typeof migrateLegacyConfigForLogin>>
+  staged: StagedLegacyConfigMigration
 ) {
-  for (const stale of migration.staleCredentials) {
+  for (const stale of staged.staleCredentials) {
     try {
       const { readCredential } = await import("../lib/credential-store")
       const credential = await readCredential(
@@ -338,12 +374,14 @@ export async function commandLogin(args: Args) {
       )
     }
   }
-  const migration = await migrateLegacyConfigForLogin()
-  if (migration.migrated) {
+  // Older configs are only read here; the rewrite, backup, and credential
+  // cleanup happen after the new profile has been stored, so a cancelled or
+  // failed login leaves the existing configuration untouched.
+  const staged = await stageLegacyConfigMigration()
+  if (staged) {
     console.warn(
-      `Migrated your Onyx CLI config to the current login format. A sanitized backup (no keys or tokens) was written to ${migration.backupPath}.`
+      "Your Onyx CLI config uses an older format; it will be migrated once this login completes."
     )
-    await removeStaleLegacyCredentials(migration)
   }
 
   const apiUrl = await loginBaseUrl(args)
@@ -386,6 +424,8 @@ export async function commandLogin(args: Args) {
       apiUrl,
       path: "/api/v1/cli/auth/teams",
       accessToken: credential.accessToken,
+      method: "POST",
+      body: { attemptId: proof.attemptId, idToken: proof.idToken },
     })
     const team = await chooseTeam(teams, args.options.team)
     session = await authenticatedData<BoundSession>({
@@ -410,28 +450,36 @@ export async function commandLogin(args: Args) {
   }
 
   const config = await readConfig()
+  const legacyProfiles = staged?.legacyProfiles ?? {}
   const profileName = profileNameForLoginResult({
     config,
-    legacyProfiles: migration.legacyProfiles,
+    legacyProfiles,
     apiUrl,
     teamId: session.teamId,
     teamName: session.teamName,
   })
   const previous = config.profiles[profileName]
-  const legacy = Object.values(migration.legacyProfiles).find(
+  const legacy = Object.values(legacyProfiles).find(
     (profile) => profile.teamId === session.teamId && profile.apiUrl === apiUrl
   )
   const worker = previous?.worker ?? legacy?.worker
   const credentialId = randomUUID()
+  let backupPath: string | undefined
   try {
     const credentialStore = await writeCredential(
       credentialId,
       persistableCredential(credential)
     )
+    const fallbackWarningShownAt =
+      config.credentialFallbackWarningShownAt ??
+      staged?.credentialFallbackWarningShownAt
     const showCredentialFallbackWarning =
-      credentialStore === "file" && !config.credentialFallbackWarningShownAt
+      credentialStore === "file" && !fallbackWarningShownAt
+    if (staged) backupPath = await writeLegacyConfigBackup(staged)
     await writeConfig({
       ...config,
+      ...(fallbackWarningShownAt ? { credentialFallbackWarningShownAt: fallbackWarningShownAt } : {}),
+      ...(staged ? { developer: staged.developer, telemetry: staged.telemetry } : {}),
       ...(showCredentialFallbackWarning
         ? { credentialFallbackWarningShownAt: new Date().toISOString() }
         : {}),
@@ -470,6 +518,12 @@ export async function commandLogin(args: Args) {
       cliSessionId: session.id,
     })
     throw error
+  }
+  if (staged) {
+    await removeStaleLegacyCredentials(staged)
+    console.warn(
+      `Migrated your Onyx CLI config to the current login format. A sanitized backup (no keys or tokens) was written to ${backupPath}.`
+    )
   }
   await revokeOldProfile(previous)
   console.log(

@@ -170,15 +170,20 @@ async function writeKeyringCredential(
 
 async function readKeyringCredential(credentialId: string) {
   const entry = await keyringEntry(credentialId)
-  if (!entry) return null
+  if (!entry) {
+    throw new CredentialStoreUnavailableError(
+      "The system keyring is not available in this environment"
+    )
+  }
   let value: string | null
   try {
     value = (await withKeyringTimeout(() => entry.getPassword())) ?? null
   } catch (error) {
-    if (error instanceof KeyringTimeoutError) {
-      throw new CredentialStoreUnavailableError(error.message)
-    }
-    return null
+    // Only a successful lookup with no entry means "missing"; locked or
+    // broken keyrings must not send the user back through login.
+    throw new CredentialStoreUnavailableError(
+      error instanceof Error ? error.message : "The system keyring failed"
+    )
   }
   if (!value) return null
   try {
@@ -222,7 +227,17 @@ export async function readCredential(
   credentialId: string,
   store: CredentialStoreKind
 ): Promise<OAuthCredential | null> {
-  if (store === "keyring") return readKeyringCredential(credentialId)
+  if (store !== "keyring") return readCredentialFile(credentialId)
+  // A refresh may have fallen back to the private file when the keyring was
+  // unavailable; that copy wins over a missing or unreachable keyring entry.
+  try {
+    const fromKeyring = await readKeyringCredential(credentialId)
+    if (fromKeyring) return fromKeyring
+  } catch (error) {
+    const fromFile = await readCredentialFile(credentialId)
+    if (fromFile) return fromFile
+    throw error
+  }
   return readCredentialFile(credentialId)
 }
 

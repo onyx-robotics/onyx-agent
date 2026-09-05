@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -29,14 +36,18 @@ function idTokenWith(claims: Record<string, unknown>) {
 type Recorded = {
   attempts: unknown[]
   devicePolls: Array<Record<string, unknown>>
+  teamsBodies: Array<Record<string, unknown>>
   sessionBodies: Array<Record<string, unknown>>
   sessionHeaders: Headers[]
 }
 
-function installFetch(overrides: { tokenIdToken?: string | null } = {}) {
+function installFetch(
+  overrides: { tokenIdToken?: string | null; sessionStatus?: number } = {}
+) {
   const recorded: Recorded = {
     attempts: [],
     devicePolls: [],
+    teamsBodies: [],
     sessionBodies: [],
     sessionHeaders: [],
   }
@@ -122,6 +133,10 @@ function installFetch(overrides: { tokenIdToken?: string | null } = {}) {
       throw new Error(`Device login must not call WorkOS directly: ${url}`)
     }
     if (url === `${apiUrl}/api/v1/cli/auth/teams`) {
+      if (init?.method !== "POST") throw new Error("teams must be POSTed")
+      recorded.teamsBodies.push(
+        JSON.parse(String(init?.body)) as Record<string, unknown>
+      )
       return Response.json({
         data: [{ id: TEAM_ID, name: "Acme Robotics", role: "admin" }],
       })
@@ -131,6 +146,12 @@ function installFetch(overrides: { tokenIdToken?: string | null } = {}) {
       if (init?.method === "DELETE") return Response.json({ data: {} })
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>
       recorded.sessionBodies.push(body)
+      if (overrides.sessionStatus) {
+        return Response.json(
+          { error: { code: "internal_server_error", message: "boom" } },
+          { status: overrides.sessionStatus }
+        )
+      }
       return Response.json(
         {
           data: {
@@ -194,6 +215,13 @@ describe("onyx login", () => {
     expect(recorded.devicePolls).toEqual([
       { deviceCode: "device-code-secret" },
       { deviceCode: "device-code-secret" },
+    ])
+    // Team discovery carries the same proof as binding.
+    expect(recorded.teamsBodies).toEqual([
+      {
+        attemptId: "55555555-5555-4555-8555-555555555555",
+        idToken: idTokenWith({ sub: "user_1" }),
+      },
     ])
     expect(recorded.sessionBodies).toHaveLength(1)
     const body = recorded.sessionBodies[0]!
@@ -288,5 +316,40 @@ describe("onyx login", () => {
     })
     expect(config.telemetry).toEqual({ enabled: false })
     expect(await readFile(configPath(), "utf8")).not.toContain("onyx_secret_key")
+  })
+
+  test("a failed login leaves a legacy config, its keys, and its credentials untouched", async () => {
+    await mkdir(configDir(), { recursive: true })
+    const legacyRaw = JSON.stringify({
+      profiles: {
+        robots: {
+          apiUrl,
+          apiKey: "onyx_secret_key",
+          teamId: TEAM_ID,
+          teamName: "Acme Robotics",
+          updatedAt: "2026-06-01T00:00:00.000Z",
+        },
+      },
+      currentProfile: "robots",
+      developer: { mode: "release" },
+      telemetry: { enabled: false },
+    })
+    await writeFile(configPath(), legacyRaw)
+    const recorded = installFetch({ sessionStatus: 503 })
+    const log = spyOn(console, "log").mockImplementation(() => undefined)
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined)
+    try {
+      await expect(commandLogin(deviceLoginArgs())).rejects.toBeDefined()
+    } finally {
+      log.mockRestore()
+      warn.mockRestore()
+    }
+    // The idempotent binding request was retried, then the legacy file was
+    // left exactly as it was: no rewrite, no backup, no credential cleanup.
+    expect(recorded.sessionBodies.length).toBeGreaterThan(1)
+    expect(await readFile(configPath(), "utf8")).toBe(legacyRaw)
+    expect(
+      (await readdir(configDir())).filter((name) => name.includes("backup"))
+    ).toEqual([])
   })
 })

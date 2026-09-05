@@ -1,10 +1,11 @@
-import type { CliProfile } from "./config"
+import { updateProfileCredentialStore, type CliProfile } from "./config"
 import {
   CredentialStoreUnavailableError,
   deleteCredential,
   readCredential,
   withCredentialLock,
   writeCredential,
+  type OAuthCredential,
 } from "./credential-store"
 import {
   OAuthRequestError,
@@ -65,21 +66,18 @@ export async function accessTokenForProfile({
       return credential.accessToken
     }
 
+    let refreshed: OAuthCredential
     try {
-      const refreshed = await refreshOAuthCredential({
-        config: {
-          clientId: profile.oauth.clientId,
-          tokenEndpoint: profile.oauth.tokenEndpoint,
-          scopes: profile.oauth.scopes,
-        },
-        credential,
-      })
-      await writeCredential(
-        profile.credentialId,
-        persistableCredential(refreshed),
-        profile.credentialStore
+      refreshed = persistableCredential(
+        await refreshOAuthCredential({
+          config: {
+            clientId: profile.oauth.clientId,
+            tokenEndpoint: profile.oauth.tokenEndpoint,
+            scopes: profile.oauth.scopes,
+          },
+          credential,
+        })
       )
-      return refreshed.accessToken
     } catch (error) {
       if (error instanceof OAuthRequestError && error.code === "invalid_grant") {
         await deleteCredential(profile.credentialId)
@@ -98,5 +96,52 @@ export async function accessTokenForProfile({
         `Onyx could not refresh the login for profile "${name}" (${detail}). Try again; run \`onyx login\` only if this persists.`
       )
     }
+
+    // WorkOS may have rotated the refresh token, so the new credential must
+    // land somewhere durable even if the preferred store is unavailable.
+    await persistRefreshedCredential({ name, profile, refreshed })
+    return refreshed.accessToken
   })
+}
+
+async function persistRefreshedCredential({
+  name,
+  profile,
+  refreshed,
+}: {
+  name: string
+  profile: CliProfile
+  refreshed: OAuthCredential
+}) {
+  try {
+    await writeCredential(
+      profile.credentialId,
+      refreshed,
+      profile.credentialStore
+    )
+    return
+  } catch (preferredError) {
+    let store: "keyring" | "file"
+    try {
+      store = await writeCredential(profile.credentialId, refreshed)
+    } catch (fallbackError) {
+      throw new Error(
+        `Onyx refreshed the login for profile "${name}" but could not store it (${
+          fallbackError instanceof Error
+            ? fallbackError.message
+            : String(fallbackError)
+        }; ${
+          preferredError instanceof Error
+            ? preferredError.message
+            : String(preferredError)
+        }). Run \`onyx login\` again.`
+      )
+    }
+    if (store !== profile.credentialStore) {
+      await updateProfileCredentialStore(name, store).catch(() => undefined)
+      console.warn(
+        `The system keyring was unavailable; the refreshed login for profile "${name}" is stored in a permission-restricted local file.`
+      )
+    }
+  }
 }

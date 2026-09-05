@@ -548,11 +548,10 @@ function legacyProfileMetadata(value: unknown): LegacyProfileMetadata | null {
   }
 }
 
-export type LegacyConfigMigration = {
-  migrated: boolean
-  backupPath?: string
+export type StagedLegacyConfigMigration = {
+  legacyVersion: number | null
   legacyProfiles: Record<string, LegacyProfileMetadata>
-  /** v2 credential references to remove from the keyring/file store. */
+  /** v2 credential references to remove once the new login is stored. */
   staleCredentials: Array<{
     credentialId: string
     credentialStore: "keyring" | "file"
@@ -560,21 +559,23 @@ export type LegacyConfigMigration = {
     cliSessionId?: string
   }>
   currentProfile: string
+  credentialFallbackWarningShownAt?: string
+  developer: DeveloperConfig
+  telemetry: TelemetryConfig
 }
 
 /**
- * Upgrades an older config file in place for `onyx login`. A sanitized backup
- * (no API keys, no credential references) keeps profile names, team metadata,
- * worker defaults, developer mode, and telemetry preferences; the live config
- * is rewritten as an empty current-format file so every other command stops
- * seeing stale profiles.
+ * Reads an older config file without modifying anything. `onyx login` stages
+ * the migration up front, completes the new login, stores the new profile, and
+ * only then writes the sanitized backup and removes stale credentials, so a
+ * cancelled or failed login never destroys the existing configuration.
  */
-export async function migrateLegacyConfigForLogin(): Promise<LegacyConfigMigration> {
+export async function stageLegacyConfigMigration(): Promise<StagedLegacyConfigMigration | null> {
   let raw: string
   try {
     raw = await readFile(configPath(), "utf8")
   } catch {
-    return { migrated: false, legacyProfiles: {}, staleCredentials: [], currentProfile: "" }
+    return null
   }
   let parsed: Partial<Config> & Record<string, unknown>
   try {
@@ -582,12 +583,10 @@ export async function migrateLegacyConfigForLogin(): Promise<LegacyConfigMigrati
   } catch {
     parsed = {}
   }
-  if (parsed.version === CONFIG_VERSION) {
-    return { migrated: false, legacyProfiles: {}, staleCredentials: [], currentProfile: "" }
-  }
+  if (parsed.version === CONFIG_VERSION) return null
 
   const legacyProfiles: Record<string, LegacyProfileMetadata> = {}
-  const staleCredentials: LegacyConfigMigration["staleCredentials"] = []
+  const staleCredentials: StagedLegacyConfigMigration["staleCredentials"] = []
   const rawProfiles =
     parsed.profiles && typeof parsed.profiles === "object"
       ? (parsed.profiles as Record<string, unknown>)
@@ -613,47 +612,120 @@ export async function migrateLegacyConfigForLogin(): Promise<LegacyConfigMigrati
       })
     }
   }
+  return {
+    legacyVersion: typeof parsed.version === "number" ? parsed.version : null,
+    legacyProfiles,
+    staleCredentials,
+    currentProfile:
+      typeof parsed.currentProfile === "string" ? parsed.currentProfile : "",
+    ...(typeof parsed.credentialFallbackWarningShownAt === "string"
+      ? {
+          credentialFallbackWarningShownAt:
+            parsed.credentialFallbackWarningShownAt,
+        }
+      : {}),
+    developer: normalizeDeveloperConfig(parsed.developer),
+    telemetry: normalizeTelemetryConfig(parsed.telemetry),
+  }
+}
 
+/**
+ * Writes the sanitized backup for a staged migration (profile names, team
+ * metadata, worker defaults, developer mode, telemetry preferences; no API
+ * keys, tokens, or credential references). Returns the backup path.
+ */
+export async function writeLegacyConfigBackup(
+  staged: StagedLegacyConfigMigration
+): Promise<string> {
   const label =
-    typeof parsed.version === "number" ? `v${parsed.version}` : "unversioned"
+    staged.legacyVersion === null ? "unversioned" : `v${staged.legacyVersion}`
   const backupPath = join(
     configDir(),
     `config.${label}.backup.${new Date().toISOString().replace(/[:.]/g, "-")}.json`
   )
-  const currentProfile =
-    typeof parsed.currentProfile === "string" ? parsed.currentProfile : ""
   await mkdir(configDir(), { recursive: true, mode: 0o700 })
   await chmod(configDir(), 0o700)
   await writePrivateJsonFile(backupPath, {
-    version: typeof parsed.version === "number" ? parsed.version : null,
+    version: staged.legacyVersion,
     sanitized: true,
-    profiles: legacyProfiles,
-    currentProfile,
-    ...(typeof parsed.credentialFallbackWarningShownAt === "string"
+    profiles: staged.legacyProfiles,
+    currentProfile: staged.currentProfile,
+    ...(staged.credentialFallbackWarningShownAt
       ? {
           credentialFallbackWarningShownAt:
-            parsed.credentialFallbackWarningShownAt,
+            staged.credentialFallbackWarningShownAt,
         }
       : {}),
-    developer: normalizeDeveloperConfig(parsed.developer),
-    telemetry: normalizeTelemetryConfig(parsed.telemetry),
+    developer: staged.developer,
+    telemetry: staged.telemetry,
   })
+  return backupPath
+}
+
+export type LegacyConfigMigration = {
+  migrated: boolean
+  backupPath?: string
+  legacyProfiles: Record<string, LegacyProfileMetadata>
+  staleCredentials: StagedLegacyConfigMigration["staleCredentials"]
+  currentProfile: string
+}
+
+/**
+ * Stages, backs up, and rewrites an older config as an empty current-format
+ * file in one step. `onyx login` uses the staged variant so the rewrite
+ * happens only after the new profile is stored.
+ */
+export async function migrateLegacyConfigForLogin(): Promise<LegacyConfigMigration> {
+  const staged = await stageLegacyConfigMigration()
+  if (!staged) {
+    return {
+      migrated: false,
+      legacyProfiles: {},
+      staleCredentials: [],
+      currentProfile: "",
+    }
+  }
+  const backupPath = await writeLegacyConfigBackup(staged)
   await writeConfig({
     ...emptyConfig(),
-    ...(typeof parsed.credentialFallbackWarningShownAt === "string"
+    ...(staged.credentialFallbackWarningShownAt
       ? {
           credentialFallbackWarningShownAt:
-            parsed.credentialFallbackWarningShownAt,
+            staged.credentialFallbackWarningShownAt,
         }
       : {}),
-    developer: normalizeDeveloperConfig(parsed.developer),
-    telemetry: normalizeTelemetryConfig(parsed.telemetry),
+    developer: staged.developer,
+    telemetry: staged.telemetry,
   })
   return {
     migrated: true,
     backupPath,
-    legacyProfiles,
-    staleCredentials,
-    currentProfile,
+    legacyProfiles: staged.legacyProfiles,
+    staleCredentials: staged.staleCredentials,
+    currentProfile: staged.currentProfile,
   }
+}
+
+/**
+ * Records where a profile's credential actually lives after a refresh had to
+ * fall back from the keyring to the private file store.
+ */
+export async function updateProfileCredentialStore(
+  name: string,
+  credentialStore: "keyring" | "file"
+): Promise<void> {
+  const config = await readConfig()
+  const profile = config.profiles[name]
+  if (!profile || profile.credentialStore === credentialStore) return
+  await writeConfig({
+    ...config,
+    profiles: {
+      ...config.profiles,
+      [name]: {
+        ...profile,
+        credentialStore,
+        updatedAt: new Date().toISOString(),
+      },
+    },
+  })
 }

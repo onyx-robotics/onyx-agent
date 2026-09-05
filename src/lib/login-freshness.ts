@@ -180,17 +180,24 @@ function brokeredDevice({
       let intervalMs = initialInterval * 1_000
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, intervalMs))
-        const response = await fetch(
-          `${apiUrl}/api/v1/cli/auth/attempts/${attemptId}/device`,
-          {
-            method: "POST",
-            headers: {
-              accept: "application/json",
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({ deviceCode }),
-          }
-        )
+        let response: Response
+        try {
+          response = await fetch(
+            `${apiUrl}/api/v1/cli/auth/attempts/${attemptId}/device`,
+            {
+              method: "POST",
+              headers: {
+                accept: "application/json",
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({ deviceCode }),
+            }
+          )
+        } catch {
+          // Connection-level failures are transient within the deadline; the
+          // user keeps their place in the ceremony.
+          continue
+        }
         const payload = await readJson<{
           data?: {
             status?: unknown

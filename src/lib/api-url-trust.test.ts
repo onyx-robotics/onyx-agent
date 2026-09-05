@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 
 import { parseArgs } from "./args"
 import { classifyApiUrl, confirmApiUrlTrust } from "./api-url-trust"
@@ -36,16 +36,28 @@ describe("custom API URL trust", () => {
   test("requires confirmation or --trust-api-url for custom servers", async () => {
     const apiUrl = "https://onyx.example.com"
     const answers: string[] = []
-    await confirmApiUrlTrust({
-      apiUrl,
-      config,
-      args: parseArgs(["login"]),
-      ask: async (prompt) => {
-        answers.push(prompt)
-        return "y"
-      },
+    const printed: string[] = []
+    const log = spyOn(console, "log").mockImplementation((...parts) => {
+      printed.push(parts.map(String).join(" "))
     })
+    try {
+      await confirmApiUrlTrust({
+        apiUrl,
+        config,
+        args: parseArgs(["login"]),
+        ask: async (prompt) => {
+          answers.push(prompt)
+          return "y"
+        },
+      })
+    } finally {
+      log.mockRestore()
+    }
     expect(answers).toHaveLength(1)
+    // The disclosure names the strongest exposure: brokered device login hands
+    // the custom server the refresh token.
+    expect(printed.join("\n")).toContain("refresh token")
+    expect(printed.join("\n")).toContain(config.issuer)
     await expect(
       confirmApiUrlTrust({
         apiUrl,

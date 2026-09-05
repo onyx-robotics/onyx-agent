@@ -1,10 +1,22 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import type { CliProfile } from "./config"
-import { readCredential, writeCredential } from "./credential-store"
+import { emptyConfig, readConfig, writeConfig, type CliProfile } from "./config"
+import {
+  readCredential,
+  setKeyringEntryFactoryForTests,
+  writeCredential,
+} from "./credential-store"
 import { accessTokenForProfile } from "./oauth-credentials"
 
 let runtimeRoot = ""
@@ -35,6 +47,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  setKeyringEntryFactoryForTests(null)
   globalThis.fetch = originalFetch
   if (originalHome === undefined) delete process.env.ONYX_HOME
   else process.env.ONYX_HOME = originalHome
@@ -111,5 +124,47 @@ describe("OAuth credential refresh manager", () => {
       accessTokenForProfile({ name: "team", profile })
     ).rejects.toThrow("expired or been revoked")
     expect(await readCredential(profile.credentialId, "file")).toBeNull()
+  })
+
+  test("keeps a rotated refresh token when the keyring write fails", async () => {
+    const keyringProfile: CliProfile = { ...profile, credentialStore: "keyring" }
+    await writeConfig({
+      ...emptyConfig(),
+      profiles: { team: keyringProfile },
+      currentProfile: "team",
+    })
+    const stored = JSON.stringify({
+      accessToken: "old",
+      refreshToken: "old-refresh",
+      expiresAt: 0,
+    })
+    setKeyringEntryFactoryForTests(() => ({
+      getPassword: async () => stored,
+      setPassword: async () => {
+        throw new Error("keyring write denied")
+      },
+      deleteCredential: async () => true,
+    }))
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        access_token: "rotated-access",
+        refresh_token: "rotated-refresh",
+        expires_in: 900,
+      })
+    ) as unknown as typeof fetch
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined)
+    try {
+      expect(
+        await accessTokenForProfile({ name: "team", profile: keyringProfile })
+      ).toBe("rotated-access")
+    } finally {
+      warn.mockRestore()
+    }
+    // The rotated credential landed in the private file and the profile now
+    // points at it, so the next refresh does not present a dead token.
+    expect(await readCredential(profile.credentialId, "file")).toMatchObject({
+      refreshToken: "rotated-refresh",
+    })
+    expect((await readConfig()).profiles.team?.credentialStore).toBe("file")
   })
 })

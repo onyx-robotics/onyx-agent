@@ -12,6 +12,7 @@ import {
   legacyConfigMessage,
   migrateLegacyConfigForLogin,
   readConfig,
+  stageLegacyConfigMigration,
 } from "./config"
 
 let runtimeRoot = ""
@@ -153,6 +154,22 @@ describe("legacy config migration", () => {
     expect(await readFile(migration.backupPath!, "utf8")).not.toContain(
       "credentialId"
     )
+  })
+
+  test("staging reads the legacy file without touching it", async () => {
+    await writeRawConfig(v1Config)
+    const before = await readFile(configPath(), "utf8")
+    const staged = await stageLegacyConfigMigration()
+    expect(staged?.currentProfile).toBe("acme")
+    expect(Object.keys(staged?.legacyProfiles ?? {}).sort()).toEqual([
+      "acme",
+      "ci",
+    ])
+    expect(staged?.telemetry).toEqual({ enabled: false, anonymousId: "anon-1" })
+    expect(await readFile(configPath(), "utf8")).toBe(before)
+    expect(
+      (await readdir(configDir())).filter((name) => name.includes("backup"))
+    ).toEqual([])
   })
 
   test("is a no-op for current configs", async () => {

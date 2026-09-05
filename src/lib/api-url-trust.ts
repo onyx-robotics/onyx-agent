@@ -49,7 +49,9 @@ export async function confirmApiUrlTrust({
     `  API URL:   ${apiUrl}`,
     `  Issuer:    ${config.issuer}`,
     `  Client ID: ${config.clientId}`,
-    `This server will receive your Onyx access token. Only continue if you operate it or trust its operator.`,
+    `This server chooses the WorkOS issuer and client you sign in to and receives your access and ID tokens.`,
+    `For device login it also completes the WorkOS exchange on your behalf and receives your refresh token, which stays valid until you log out.`,
+    `Only continue if you operate this server or trust its operator.`,
   ].join("\n")
 
   if (!ask && (!process.stdin.isTTY || !process.stdout.isTTY)) {

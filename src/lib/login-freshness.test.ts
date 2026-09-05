@@ -199,4 +199,52 @@ describe("server-issued login freshness", () => {
       globalThis.setTimeout = originalSetTimeout
     }
   })
+
+  test("device polling survives connection failures within the deadline", async () => {
+    let polls = 0
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/api/v1/cli/auth/attempts")) {
+        return Response.json({
+          data: {
+            attemptId: "55555555-5555-4555-8555-555555555555",
+            nonce: NONCE,
+            expiresAt: "2026-09-04T12:15:00.000Z",
+            device: {
+              deviceCode: "raw-device-code",
+              userCode: "ABCD-EFGH",
+              verificationUri: "https://auth.example.test/device",
+              expiresIn: 600,
+              interval: 1,
+            },
+          },
+        })
+      }
+      polls += 1
+      if (polls === 1) throw new TypeError("fetch failed")
+      return Response.json({
+        data: {
+          status: "authorized",
+          tokens: {
+            accessToken: "a",
+            refreshToken: "r",
+            idToken: idTokenWith({ sub: "user_1" }),
+            expiresIn: 900,
+          },
+        },
+      })
+    }) as unknown as typeof fetch
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = ((callback: TimerHandler) => {
+      if (typeof callback === "function") callback()
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+    try {
+      const freshness = await freshnessForFlow("device", { apiUrl })
+      const credential = await freshness.device!.poll({ timeoutMs: 60_000 })
+      expect(credential.accessToken).toBe("a")
+      expect(polls).toBe(2)
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+    }
+  })
 })

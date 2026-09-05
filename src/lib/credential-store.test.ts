@@ -129,11 +129,34 @@ describe("native keyring guard rails", () => {
     }
     expect(await writeCredential(id, credential)).toBe("file")
     expect(await readCredential(id, "file")).toEqual(credential)
-    await expect(readCredential(id, "keyring")).rejects.toEqual(
-      expect.any(CredentialStoreUnavailableError)
-    )
+    // A profile that still says "keyring" recovers the file copy that the
+    // fallback wrote instead of reporting the keyring outage.
+    expect(await readCredential(id, "keyring")).toEqual(credential)
+    await expect(
+      readCredential("55555555-5555-4555-8555-555555555555", "keyring")
+    ).rejects.toEqual(expect.any(CredentialStoreUnavailableError))
     // Deleting must not hang either.
     await deleteCredential(id)
     expect(await readCredential(id, "file")).toBeNull()
   }, 15_000)
+
+  test("any keyring error reads as unavailable, never as a missing credential", async () => {
+    setKeyringEntryFactoryForTests(() => ({
+      getPassword: async () => {
+        throw new Error("The keyring is locked")
+      },
+      setPassword: async () => undefined,
+      deleteCredential: async () => true,
+    }))
+    await expect(
+      readCredential("66666666-6666-4666-8666-666666666666", "keyring")
+    ).rejects.toThrow("locked")
+
+    // No keyring in this environment at all (for example Linux without a
+    // session bus) is also "unavailable", not "log in again".
+    setKeyringEntryFactoryForTests(() => null)
+    await expect(
+      readCredential("66666666-6666-4666-8666-666666666666", "keyring")
+    ).rejects.toEqual(expect.any(CredentialStoreUnavailableError))
+  })
 })
