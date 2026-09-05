@@ -14,5 +14,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.13
-      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile --os="*" --cpu="*"
       - run: bun run ci
+      - name: Verify cross-platform release binaries
+        env:
+          ONYX_POSTHOG_KEY: phc_ci_release_build
+          ONYX_POSTHOG_HOST: https://e.onyxresearch.ai
+        run: bun run build:release
