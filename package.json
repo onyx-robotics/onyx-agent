@@ -1,6 +1,7 @@
 {
   "name": "@onyx-robotics/agent",
   "version": "0.1.13",
+  "packageManager": "bun@1.3.13",
   "description": "Onyx agent CLI and packaged agent skill for local research workflows.",
   "type": "module",
   "private": false,
@@ -34,12 +35,13 @@
   "scripts": {
     "build:release": "bun scripts/build-release.ts",
     "verify:release-analytics": "bun scripts/verify-release-analytics.ts",
-    "ci": "bun run lint && bun run typecheck && bun run test",
+    "ci": "bun run verify:lockfile && bun run lint && bun run typecheck && bun run test",
     "generate:skill-content": "bun scripts/generate-skill-content.ts",
     "generate:worker-prompt-content": "bun scripts/generate-worker-prompt-content.ts",
     "lint": "eslint .",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:lockfile": "bun scripts/verify-lockfile.ts"
   },
   "dependencies": {
     "@napi-rs/keyring": "^1.3.0",
