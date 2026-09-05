@@ -53,11 +53,22 @@ describe("OAuth loopback callback", () => {
       lingerMs: 0,
     })
     callbacks.push(callback)
-    const result = callback.waitForCode()
-    await fetch(
-      `${callback.redirectUri}?error=access_denied&error_description=Denied&state=expected-state`
+    const rejection = callback.waitForCode().then(
+      () => {
+        throw new Error("Expected the callback to reject")
+      },
+      (error: unknown) => error
     )
-    await expect(result).rejects.toThrow("Denied")
+    expect(
+      (
+        await fetch(
+          `${callback.redirectUri}?error=access_denied&error_description=Denied&state=expected-state`
+        )
+      ).status
+    ).toBe(400)
+    const error = await rejection
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain("Denied")
   })
 
   test("rejects callback replay after consuming the one-time code", async () => {
