@@ -21,10 +21,26 @@ Use `onyx developer link .` and `onyx developer use dev` when you want the
 installed `onyx` command and managed skill files to follow this checkout.
 Developer mode does not change which app the CLI targets — the API URL still
 comes from the active profile (or `--api-url`/`ONYX_API_URL`). To log to a
-locally running app instead of the hosted one, create a local profile with
+locally running app instead of the hosted one, create a local OAuth session with
 `onyx login --local` and switch between profiles with
 `onyx profile use <name>`; `onyx status` and `onyx developer status` print the
 current API target.
+
+Login binds each profile to a one-time server attempt: `onyx login` requests
+an attempt from `POST /api/v1/cli/auth/attempts`. Browser logins send its
+nonce through the WorkOS authorization request and present the returned ID
+token when binding the team. Device logins are brokered because WorkOS does
+not echo the nonce through device authorization: the attempt response carries
+the device code and user code, the CLI polls
+`POST /api/v1/cli/auth/attempts/{id}/device`, and the server completes the
+exchange and hands tokens back once. `src/lib/login-freshness.ts` is the
+single seam for both proofs; keep any flow change confined there. Profiles use config format v3 and pin the
+OAuth issuer, client ID, and token endpoint used for refresh. Native keyring
+storage is skipped on Linux without `DBUS_SESSION_BUS_ADDRESS` and bounded by
+a short timeout; official binaries bundle `@napi-rs/keyring` for darwin
+(arm64/x64) and linux-gnu (arm64/x64) only, and other platforms use the
+private file store. `scripts/probe-workos-device-nonce.ts` checks whether a
+WorkOS environment echoes the nonce through the device flow and refresh.
 
 ## Regenerating embedded skill and prompt content
 

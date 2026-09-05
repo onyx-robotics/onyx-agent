@@ -103,11 +103,10 @@ export {
 } from "./commands/developer"
 export { commandAgent } from "./commands/agent"
 export { commandLogin } from "./commands/login"
+export { commandLogout } from "./commands/logout"
 export {
   commandProfile,
-  commandProfileDelete,
   commandProfileList,
-  commandProfileSetApiKeyEnv,
   commandProfileUse,
 } from "./commands/profile"
 export {

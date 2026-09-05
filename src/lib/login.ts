@@ -12,143 +12,54 @@ export async function openBrowser(url: string) {
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url]
   try {
     const result = await runProcess(command, args)
-    if (result.code === 0) return
+    return result.code === 0
   } catch {
-    // Fall through to printing the URL for headless or minimal systems.
+    return false
   }
-  console.log(`Open this URL to log in:\n${url}`)
-}
-
-export type CliLoginResult = {
-  apiKey?: string
-  apiKeyId?: string
-  apiUrl?: string
-  teamId: string
-  teamName: string
-  userId?: string
-  profileName?: string
-  alreadyConfigured: boolean
 }
 
 const LOGIN_COMPLETE_MESSAGE =
   "Onyx CLI login complete. You can close this tab."
 
-const ONYX_MARK_SVG = `<svg width="381" height="509" viewBox="0 0 381 509" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M381 382.14L233 508.018V424.447L298.75 368.525L190.501 151.379L82.25 368.526L149 425.297V508.867L0 382.14L190.501 0L381 382.14Z" fill="currentColor"/></svg>`
-const CHECK_ICON_SVG = `<svg class="title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>`
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;")
+}
 
-export function cliLoginCompleteHtml() {
+function loginResultHtml({
+  title,
+  message,
+}: {
+  title: string
+  message: string
+}) {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Onyx CLI login complete</title>
+  <title>${escapeHtml(title)}</title>
   <style>
-    :root {
-      color-scheme: light;
-      --background: oklch(1 0 0);
-      --foreground: oklch(0.145 0 0);
-      --card: oklch(1 0 0);
-      --card-foreground: oklch(0.145 0 0);
-      --muted-foreground: oklch(0.556 0 0);
-      --border: oklch(0.922 0 0);
-      --success: oklch(0.627 0.194 149.214);
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      background: var(--background);
-      color: var(--foreground);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-
-    main {
-      width: 100%;
-      max-width: 672px;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 32px;
-      margin-bottom: 32px;
-      font-size: 48px;
-      line-height: 1.1;
-      font-weight: 600;
-      letter-spacing: 0;
-    }
-
-    .brand svg {
-      width: 60px;
-      height: 80px;
-      flex: none;
-    }
-
-    .card {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--card);
-      color: var(--card-foreground);
-      box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
-    }
-
-    .card-header {
-      padding: 24px;
-    }
-
-    .title-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .title-icon {
-      width: 20px;
-      height: 20px;
-      flex: none;
-      color: var(--success);
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 16px;
-      line-height: 24px;
-      font-weight: 600;
-      letter-spacing: 0;
-    }
-
-    p {
-      margin: 8px 0 0;
-      color: var(--muted-foreground);
-      font-size: 14px;
-      line-height: 20px;
-    }
+    :root { color-scheme: light dark; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 24px; font-family: ui-sans-serif, system-ui, sans-serif; }
+    main { width: min(100%, 560px); border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 10px; padding: 28px; }
+    h1 { margin: 0; font-size: 18px; }
+    p { margin: 10px 0 0; opacity: .7; }
   </style>
 </head>
-<body>
-  <main>
-    <div class="brand">${ONYX_MARK_SVG}<span>Onyx</span></div>
-    <section class="card" aria-labelledby="title">
-      <div class="card-header">
-        <div class="title-row">
-          ${CHECK_ICON_SVG}
-          <h1 id="title">${LOGIN_COMPLETE_MESSAGE}</h1>
-        </div>
-        <p>Your CLI profile is ready to use.</p>
-      </div>
-    </section>
-  </main>
-</body>
+<body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></main></body>
 </html>`
+}
+
+export function cliLoginCompleteHtml() {
+  return loginResultHtml({
+    title: "Onyx CLI login complete",
+    message: LOGIN_COMPLETE_MESSAGE,
+  })
 }
 
 function closeServer(server: Server) {
@@ -158,7 +69,6 @@ function closeServer(server: Server) {
       resolveClose()
     }, 1_000)
     forceClose.unref()
-
     server.close(() => {
       clearTimeout(forceClose)
       resolveClose()
@@ -167,115 +77,123 @@ function closeServer(server: Server) {
   })
 }
 
-export async function waitForCliLogin({
-  port,
+export type LoopbackCallback = {
+  redirectUri: string
+  waitForCode: () => Promise<string>
+  close: () => Promise<void>
+}
+
+export async function createLoopbackCallback({
   state,
   timeoutMs,
-  lingerMs = 2_000,
+  lingerMs = 1_500,
 }: {
-  port: number
   state: string
   timeoutMs: number
   lingerMs?: number
-}): Promise<CliLoginResult> {
-  let server: Server | null = null
-  let timeout: ReturnType<typeof setTimeout> | null = null
+}): Promise<LoopbackCallback> {
   let completed = false
-  const login = new Promise<CliLoginResult>((resolveLogin, reject) => {
-    server = createServer((request, response) => {
-      response.setHeader("connection", "close")
-
-      const url = new URL(request.url ?? "/", `http://127.0.0.1:${port}`)
-      if (url.pathname !== "/callback") {
-        response.writeHead(404).end("Not found")
-        return
-      }
-
-      if (url.searchParams.get("state") !== state) {
-        response.writeHead(400).end("Invalid state")
-        if (!completed) {
-          reject(new Error("Login callback returned an invalid state."))
-        }
-        return
-      }
-
-      // Browsers can replay the redirect (connection retry, duplicate form
-      // submit, refresh); answer repeats with the same success page instead
-      // of letting them land on a closed port.
-      if (completed) {
-        response
-          .writeHead(200, { "content-type": "text/html; charset=utf-8" })
-          .end(cliLoginCompleteHtml())
-        return
-      }
-
-      const teamId = url.searchParams.get("team_id")
-      const teamName = url.searchParams.get("team_name")
-      if (!teamId || !teamName) {
-        response.writeHead(400).end("Missing team")
-        reject(new Error("Login callback did not include a team."))
-        return
-      }
-
-      const alreadyConfigured =
-        url.searchParams.get("already_configured") === "true"
-      const key = url.searchParams.get("api_key")
-      if (!alreadyConfigured && !key) {
-        response.writeHead(400).end("Missing API key")
-        reject(new Error("Login callback did not include an API key."))
-        return
-      }
-
-      completed = true
-      response
-        .writeHead(200, { "content-type": "text/html; charset=utf-8" })
-        .end(cliLoginCompleteHtml())
-      resolveLogin({
-        apiKey: key ?? undefined,
-        apiKeyId: url.searchParams.get("api_key_id") ?? undefined,
-        apiUrl: url.searchParams.get("api_url") ?? undefined,
-        teamId,
-        teamName,
-        userId: url.searchParams.get("user_id") ?? undefined,
-        profileName: url.searchParams.get("profile_name") ?? undefined,
-        alreadyConfigured,
-      })
-    })
-    server.on("error", (error) => {
-      const code = (error as NodeJS.ErrnoException).code
-      reject(
-        code === "EADDRINUSE"
-          ? new Error(
-              `Port ${port} is already in use. Another onyx login may still be waiting; close it or pass --port <number>.`
-            )
-          : error
-      )
-    })
-    server.listen(port, "127.0.0.1")
+  let resolveCode!: (code: string) => void
+  let rejectCode!: (error: Error) => void
+  const result = new Promise<string>((resolve, reject) => {
+    resolveCode = resolve
+    rejectCode = reject
   })
 
-  try {
-    const result = await Promise.race([
-      login,
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(
-          () => reject(new Error("Timed out waiting for browser login.")),
-          timeoutMs
-        )
-        timeout.unref()
-      }),
-    ])
-    if (lingerMs > 0) {
-      // Keep serving the success page briefly so browser-side replays of the
-      // callback hit a live server rather than a refused connection.
-      await new Promise((resolveLinger) => {
-        const linger = setTimeout(resolveLinger, lingerMs)
-        linger.unref()
-      })
+  const server = createServer((request, response) => {
+    response.setHeader("connection", "close")
+    const address = server.address()
+    const port = typeof address === "object" && address ? address.port : 0
+    const url = new URL(request.url ?? "/", `http://127.0.0.1:${port}`)
+    if (url.pathname !== "/callback") {
+      response.writeHead(404).end("Not found")
+      return
     }
-    return result
-  } finally {
-    if (timeout) clearTimeout(timeout)
-    if (server) await closeServer(server)
+    if (url.searchParams.get("state") !== state) {
+      response.writeHead(400).end("Invalid state")
+      return
+    }
+    if (completed) {
+      response
+        .writeHead(409, { "content-type": "text/html; charset=utf-8" })
+        .end(
+          loginResultHtml({
+            title: "Onyx CLI callback already used",
+            message: "This one-time login callback has already been consumed.",
+          })
+        )
+      return
+    }
+
+    const error = url.searchParams.get("error")
+    if (error) {
+      completed = true
+      const description =
+        url.searchParams.get("error_description") ?? "Login was not completed"
+      response
+        .writeHead(400, { "content-type": "text/html; charset=utf-8" })
+        .end(
+          loginResultHtml({
+            title: "Onyx CLI login failed",
+            message: description,
+          })
+        )
+      rejectCode(new Error(`${description} (${error})`))
+      return
+    }
+
+    const code = url.searchParams.get("code")
+    if (!code) {
+      response.writeHead(400).end("Missing authorization code")
+      return
+    }
+    completed = true
+    response
+      .writeHead(200, { "content-type": "text/html; charset=utf-8" })
+      .end(cliLoginCompleteHtml())
+    resolveCode(code)
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => resolve())
+  })
+  const address = server.address()
+  if (!address || typeof address === "string") {
+    await closeServer(server)
+    throw new Error("Unable to determine the CLI login callback port")
+  }
+  let closed = false
+  const close = async () => {
+    if (closed) return
+    closed = true
+    await closeServer(server)
+  }
+
+  return {
+    redirectUri: `http://127.0.0.1:${address.port}/callback`,
+    close,
+    async waitForCode() {
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      try {
+        const code = await Promise.race([
+          result,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error("Timed out waiting for browser login.")),
+              timeoutMs
+            )
+            timeout.unref()
+          }),
+        ])
+        if (lingerMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, lingerMs))
+        }
+        return code
+      } finally {
+        if (timeout) clearTimeout(timeout)
+        await close()
+      }
+    },
   }
 }

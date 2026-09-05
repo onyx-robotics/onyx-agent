@@ -4,12 +4,11 @@ import { z } from "zod"
 
 export const CLI_ANALYTICS_COMMAND_NAMES = [
   "login",
+  "logout",
   "agent.skill-path",
   "agent.install-skill",
   "profile.list",
   "profile.use",
-  "profile.delete",
-  "profile.set-api-key-env",
   "profile.worker",
   "campaign.setup",
   "campaign.use",
@@ -101,7 +100,12 @@ export const cliAnalyticsPreflightStageSchema = z.enum(
   CLI_ANALYTICS_PREFLIGHT_STAGES
 )
 
-const cliAuthTypeSchema = z.enum(["anonymous", "session", "api_key"])
+const cliAuthTypeSchema = z.enum([
+  "anonymous",
+  "session",
+  "cli_session",
+  "api_key",
+])
 
 export const cliAnalyticsEventSchemas = {
   "cli:command_complete": z

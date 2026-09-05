@@ -10,6 +10,7 @@ import {
 import { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
 import { commandListen } from "./commands/listen"
 import { commandLogin } from "./commands/login"
+import { commandLogout } from "./commands/logout"
 import { commandProfile } from "./commands/profile"
 import {
   commandResearchBrief,
@@ -50,13 +51,12 @@ Usage:
   onyx developer use release [--skill-dir <path>] [--quiet]
   onyx developer sync-skill [--skill-dir <path>] [--quiet]
   onyx developer unlink [--skill-dir <path>] [--quiet]
-  onyx login [--api-url <url>] [--local] [--print-url] [--refresh] [--port <port>] [--timeout <ms>]
+  onyx login [--api-url <url>] [--local] [--browser|--device] [--team <team-id-or-name>] [--device-name <label>] [--timeout <ms>] [--trust-api-url]
+  onyx logout [--profile <name>|--all]
   onyx agent skill-path
   onyx agent install-skill [--dir <path>] [--quiet]
   onyx profile list
   onyx profile use <name>
-  onyx profile delete <name>
-  onyx profile set-api-key-env <name> <ENV_VAR>
   onyx profile worker get [profile]
   onyx profile worker set [profile] --agent codex|claude|opencode [--model <model>]
   onyx profile worker clear [profile] (--all | --agent | --model codex|claude|opencode)
@@ -107,11 +107,11 @@ experiment refs before reporting results; \`onyx exp list\`, \`onyx research sta
 and knowledge read from the remote API.
 
 Env:
-  ONYX_API_KEY   overrides the selected profile API key
+  ONYX_API_KEY   uses a manual API key instead of the selected CLI session
   ONYX_API_URL   overrides the selected profile API URL
   ONYX_TELEMETRY_DISABLED=1 disables official-release CLI analytics
   DO_NOT_TRACK=1 disables official-release CLI analytics
-  Profiles may store a key locally or read it from apiKeyEnv
+  Interactive login tokens are stored in the native keyring when available
 `
 
 async function runMainCommand(argv: string[]) {
@@ -150,6 +150,7 @@ async function runMainCommand(argv: string[]) {
   }
 
   if (command === "login") return commandLogin(args)
+  if (command === "logout") return commandLogout(args)
   if (command === "agent") return commandAgent(args)
   if (command === "profile") return commandProfile(args)
   if (command === "telemetry") return commandTelemetry(args)

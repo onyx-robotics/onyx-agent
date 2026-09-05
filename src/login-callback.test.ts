@@ -1,123 +1,71 @@
-import { describe, expect, test } from "bun:test"
-import { request } from "node:http"
+import { afterEach, describe, expect, test } from "bun:test"
 
-import { waitForCliLogin } from "./lib/login"
+import { createLoopbackCallback } from "./lib/login"
 
-const BASE_PORT = 47310
+const callbacks: Array<Awaited<ReturnType<typeof createLoopbackCallback>>> = []
 
-function callbackUrl(port: number, params: Record<string, string>) {
-  const url = new URL(`http://127.0.0.1:${port}/callback`)
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value)
-  }
-  return url.toString()
-}
+afterEach(async () => {
+  await Promise.all(callbacks.splice(0).map((callback) => callback.close()))
+})
 
-const validParams = {
-  state: "state-1",
-  team_id: "team-1",
-  team_name: "Team One",
-  api_key: "onyx_secret",
-  api_key_id: "key-1",
-  api_url: "http://localhost:3000",
-}
-
-async function waitForListen(port: number) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      await localRequest(`http://127.0.0.1:${port}/`, "HEAD")
-      return
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 20))
-    }
-  }
-  throw new Error(`Callback server on port ${port} never started listening.`)
-}
-
-function localRequest(url: string, method = "GET") {
-  return new Promise<{ status: number; text: string }>((resolve, reject) => {
-    const outgoing = request(url, { method }, (response) => {
-      const chunks: Buffer[] = []
-      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)))
-      response.on("end", () =>
-        resolve({
-          status: response.statusCode ?? 0,
-          text: Buffer.concat(chunks).toString("utf8"),
-        })
-      )
-    })
-    outgoing.on("error", reject)
-    outgoing.end()
-  })
-}
-
-describe("waitForCliLogin callback server", () => {
-  test("resolves the login and serves replayed callbacks during the linger window", async () => {
-    const port = BASE_PORT
-    const login = waitForCliLogin({
-      port,
-      state: "state-1",
-      timeoutMs: 5_000,
-      lingerMs: 1_000,
-    })
-    await waitForListen(port)
-
-    const first = await localRequest(callbackUrl(port, validParams))
-    expect(first.status).toBe(200)
-    expect(first.text).toContain("login complete")
-
-    // A browser replay (retry, duplicate submit, refresh) inside the linger
-    // window must land on the success page, not a refused connection.
-    const replay = await localRequest(callbackUrl(port, validParams))
-    expect(replay.status).toBe(200)
-    expect(replay.text).toContain("login complete")
-
-    const result = await login
-    expect(result.teamId).toBe("team-1")
-    expect(result.apiKey).toBe("onyx_secret")
-    expect(result.alreadyConfigured).toBe(false)
-  })
-
-  test("rejects with a friendly error when the port is already in use", async () => {
-    const port = BASE_PORT + 1
-    const holder = waitForCliLogin({
-      port,
-      state: "holder",
-      timeoutMs: 5_000,
+describe("OAuth loopback callback", () => {
+  test("uses a dynamic loopback port and returns only the authorization code", async () => {
+    const callback = await createLoopbackCallback({
+      state: "expected-state",
+      timeoutMs: 2_000,
       lingerMs: 0,
     })
-    await waitForListen(port)
-
-    await expect(
-      waitForCliLogin({ port, state: "second", timeoutMs: 5_000, lingerMs: 0 })
-    ).rejects.toThrow(/already in use/)
-
-    // Release the holder so the test suite exits cleanly.
-    const release = await localRequest(
-      callbackUrl(port, { ...validParams, state: "holder" })
+    callbacks.push(callback)
+    expect(callback.redirectUri).toMatch(
+      /^http:\/\/127\.0\.0\.1:\d+\/callback$/
     )
-    expect(release.status).toBe(200)
-    await holder
+
+    const response = await fetch(
+      `${callback.redirectUri}?code=authorization-code&state=expected-state`
+    )
+    expect(response.status).toBe(200)
+    expect(await callback.waitForCode()).toBe("authorization-code")
   })
 
-  test("rejects callbacks with a mismatched state", async () => {
-    const port = BASE_PORT + 2
-    const login = waitForCliLogin({
-      port,
-      state: "expected",
-      timeoutMs: 5_000,
+  test("ignores invalid-state requests and continues waiting", async () => {
+    const callback = await createLoopbackCallback({
+      state: "expected-state",
+      timeoutMs: 2_000,
       lingerMs: 0,
     })
-    await waitForListen(port)
-    const rejection = login.then(
-      () => null,
-      (error: Error) => error
-    )
+    callbacks.push(callback)
+    expect(
+      (await fetch(`${callback.redirectUri}?code=attacker&state=wrong-state`))
+        .status
+    ).toBe(400)
+    await fetch(`${callback.redirectUri}?code=real-code&state=expected-state`)
+    expect(await callback.waitForCode()).toBe("real-code")
+  })
 
-    const response = await localRequest(
-      callbackUrl(port, { ...validParams, state: "wrong" })
+  test("surfaces OAuth denial without accepting a code", async () => {
+    const callback = await createLoopbackCallback({
+      state: "expected-state",
+      timeoutMs: 2_000,
+      lingerMs: 0,
+    })
+    callbacks.push(callback)
+    const result = callback.waitForCode()
+    await fetch(
+      `${callback.redirectUri}?error=access_denied&error_description=Denied&state=expected-state`
     )
-    expect(response.status).toBe(400)
-    expect((await rejection)?.message).toMatch(/invalid state/)
+    await expect(result).rejects.toThrow("Denied")
+  })
+
+  test("rejects callback replay after consuming the one-time code", async () => {
+    const callback = await createLoopbackCallback({
+      state: "expected-state",
+      timeoutMs: 2_000,
+      lingerMs: 250,
+    })
+    callbacks.push(callback)
+    const url = `${callback.redirectUri}?code=one-time-code&state=expected-state`
+    expect((await fetch(url)).status).toBe(200)
+    expect((await fetch(url)).status).toBe(409)
+    expect(await callback.waitForCode()).toBe("one-time-code")
   })
 })

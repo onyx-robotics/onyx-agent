@@ -11,7 +11,7 @@ import type {
 } from "../protocol"
 
 import type { Args } from "./args"
-import { apiBaseUrl, apiKey } from "./config"
+import { apiBaseUrl, apiCredential, selectedProfileWithName } from "./config"
 import { normalizeRepositoryUrl, repositoryUrl } from "./git"
 import { readState, updateState } from "./runtime-state"
 import { resolveProjectPath } from "./project"
@@ -768,6 +768,13 @@ function emitApiTiming(
 // safe. Timeouts (AbortError) are not retried — the overall budget is spent.
 const RETRYABLE_API_STATUSES = new Set([429, 502, 503, 504])
 const API_RETRY_ATTEMPTS = 3
+// Typed CLI session failures the server returns with 401. None of them are
+// fixed by refreshing the WorkOS token.
+const CLI_SESSION_ERROR_CODES = new Set([
+  "cli_session_required",
+  "cli_session_revoked",
+  "cli_session_invalid",
+])
 
 function apiRetryDelayMs(attempt: number) {
   return 250 * attempt + Math.floor(Math.random() * 100)
@@ -786,18 +793,50 @@ export async function callApi(
       ? AbortSignal.timeout(timeoutMs)
       : undefined
   const startedAt = Date.now()
-  const requestOnce = async () =>
+  const resolveCredential = async (forceRefresh = false) => {
+    if (credentialOverride) return credentialOverride
+    if (process.env.ONYX_API_KEY) return process.env.ONYX_API_KEY
+    if (!forceRefresh) return apiCredential(args)
+    const { name, profile } = await selectedProfileWithName(args)
+    const { accessTokenForProfile } = await import("./oauth-credentials")
+    return accessTokenForProfile({ name, profile, forceRefresh: true })
+  }
+  const usesProfileCredential =
+    !credentialOverride && !process.env.ONYX_API_KEY
+  const resolveCliSessionHeaders = async (): Promise<Record<string, string>> => {
+    if (!usesProfileCredential) return {}
+    const { profile } = await selectedProfileWithName(args)
+    return { "x-onyx-cli-session-id": profile.cliSessionId }
+  }
+  // The server names why a CLI credential was rejected; only some reasons
+  // are worth a token refresh, and only explicit session revocation should
+  // cost the user their stored login.
+  const readErrorCode = async (response: Response) => {
+    try {
+      const payload = (await response.clone().json()) as {
+        error?: { code?: unknown }
+      }
+      return typeof payload?.error?.code === "string"
+        ? payload.error.code
+        : null
+    } catch {
+      return null
+    }
+  }
+  const requestOnce = async (forceRefresh = false) =>
     fetch(`${await apiBaseUrl(args)}${path}`, {
       method,
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${credentialOverride ?? (await apiKey(args))}`,
+        authorization: `Bearer ${await resolveCredential(forceRefresh)}`,
+        ...(await resolveCliSessionHeaders()),
       },
       body: body ? JSON.stringify(body) : undefined,
       signal,
     })
   try {
     let response: Response | null = null
+    let refreshedAfterUnauthorized = false
     for (let attempt = 1; attempt <= API_RETRY_ATTEMPTS; attempt += 1) {
       try {
         response = await requestOnce()
@@ -814,6 +853,17 @@ export async function callApi(
         continue
       }
       if (
+        response.status === 401 &&
+        !refreshedAfterUnauthorized &&
+        usesProfileCredential
+      ) {
+        const code = await readErrorCode(response)
+        if (!code || !CLI_SESSION_ERROR_CODES.has(code)) {
+          refreshedAfterUnauthorized = true
+          response = await requestOnce(true)
+        }
+      }
+      if (
         attempt === API_RETRY_ATTEMPTS ||
         !RETRYABLE_API_STATUSES.has(response.status)
       ) {
@@ -826,6 +876,27 @@ export async function callApi(
     }
     if (!response) {
       throw new Error(`No response received for ${method} ${path}`)
+    }
+    if (response.status === 401 && usesProfileCredential) {
+      const code = await readErrorCode(response)
+      if (code === "cli_session_revoked" || code === "cli_session_invalid") {
+        const { name, profile } = await selectedProfileWithName(args)
+        const { deleteCredential } = await import("./credential-store")
+        await deleteCredential(profile.credentialId)
+        throw new Error(
+          code === "cli_session_revoked"
+            ? `This device's login for profile "${name}" was revoked from Settings. Run \`onyx login\`.`
+            : `The CLI session for profile "${name}" is no longer valid. Run \`onyx login\`.`
+        )
+      }
+      if (code === "cli_session_required") {
+        const { name } = await selectedProfileWithName(args)
+        throw new Error(
+          `Profile "${name}" is missing its CLI session ID. Run \`onyx login\`.`
+        )
+      }
+      // Any other 401 (including a token the identity provider rejected after
+      // one refresh) keeps the stored login; the caller sees an ApiError.
     }
 
     const text = await response.text()
@@ -847,6 +918,19 @@ export async function callApi(
     })
 
     if (!response.ok) {
+      if (
+        response.status === 503 &&
+        (payload as { error?: { code?: string } } | null)?.error?.code ===
+          "cli_auth_temporarily_unavailable"
+      ) {
+        throw new ApiError(
+          method,
+          path,
+          response.status,
+          payload,
+          "Onyx could not reach its identity provider; try again shortly. Your login is intact."
+        )
+      }
       throw new ApiError(method, path, response.status, payload)
     }
 
@@ -894,16 +978,27 @@ export async function callWorkerApi(
 export class ApiError extends Error {
   status: number
   payload: unknown
+  /** Stable error code from the `{ error: { code } }` envelope, when present. */
+  code: string | null
 
-  constructor(method: string, path: string, status: number, payload: unknown) {
+  constructor(
+    method: string,
+    path: string,
+    status: number,
+    payload: unknown,
+    message?: string
+  ) {
     super(
-      `${method} ${path} failed (${status}): ${
-        typeof payload === "string" ? payload : JSON.stringify(payload)
-      }`
+      message ??
+        `${method} ${path} failed (${status}): ${
+          typeof payload === "string" ? payload : JSON.stringify(payload)
+        }`
     )
     this.name = "ApiError"
     this.status = status
     this.payload = payload
+    const code = (payload as { error?: { code?: unknown } } | null)?.error?.code
+    this.code = typeof code === "string" ? code : null
   }
 }
 
@@ -1051,17 +1146,18 @@ export async function resolveProject(
     }).catch(() => {})
     return project
   } catch (error) {
-    if (error instanceof ApiError) {
-      if (error.status === 401 || error.status === 403) {
-        throw new Error(
-          `Onyx API could not resolve this repository because authentication failed (${error.status}). Run \`onyx status\` and refresh or switch profiles.`
-        )
-      }
-      if (error.status !== 404) {
-        throw new Error(
-          `Onyx API project resolve failed (${error.status}). ${error.message}`
-        )
-      }
+    // Credential, revocation, and network failures carry their own actionable
+    // messages; only an API 404 means the repository has no project yet.
+    if (!(error instanceof ApiError)) throw error
+    if (error.status === 401 || error.status === 403) {
+      throw new Error(
+        `Onyx API could not resolve this repository because authentication failed (${error.status}). Run \`onyx status\`, \`onyx login\`, or switch profiles.`
+      )
+    }
+    if (error.status !== 404) {
+      throw new Error(
+        `Onyx API project resolve failed (${error.status}). ${error.message}`
+      )
     }
     throw new Error(
       "No Onyx project is tracking this repository yet. Start a campaign with `onyx campaign setup`, or grant Onyx GitHub access to this repository and sync again."

@@ -1,40 +1,47 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { hostname, platform, release } from "node:os"
+import { createInterface } from "node:readline/promises"
 
+import { ApiError } from "../lib/api"
+import { confirmApiUrlTrust } from "../lib/api-url-trust"
+import { authFetch } from "../lib/auth-fetch"
 import { optionalFlag, type Args } from "../lib/args"
 import {
   apiBaseUrl,
   normalizeProfileName,
   readConfig,
+  stageLegacyConfigMigration,
+  writeLegacyConfigBackup,
   type CliProfile,
   type Config,
+  type LegacyProfileMetadata,
+  type StagedLegacyConfigMigration,
   writeConfig,
 } from "../lib/config"
+import { deleteCredential, writeCredential } from "../lib/credential-store"
+import { createLoopbackCallback, openBrowser } from "../lib/login"
+import { freshnessForFlow, type LoginFreshness } from "../lib/login-freshness"
+import {
+  buildAuthorizationUrl,
+  exchangeAuthorizationCode,
+  fetchCliAuthConfig,
+  persistableCredential,
+  type CliAuthConfig,
+  type OAuthTokenResponse,
+} from "../lib/oauth-client"
 
 export const LOCAL_API_URL = "http://localhost:3000"
-import { openBrowser, waitForCliLogin, type CliLoginResult } from "../lib/login"
 
-export type CliLoginProfileManifestEntry = {
-  profileName: string
+type CliTeam = {
+  id: string
+  name: string
+  role: "admin" | "editor" | "viewer"
+}
+type BoundSession = {
+  id: string
+  userId: string
   teamId: string
-  apiUrl: string
-  apiKeyId?: string
-}
-
-export function loginProfileManifest(
-  config: Config
-): CliLoginProfileManifestEntry[] {
-  return Object.entries(config.profiles).map(([profileName, profile]) => ({
-    profileName,
-    teamId: profile.teamId,
-    apiUrl: profile.apiUrl,
-    ...(profile.apiKeyId ? { apiKeyId: profile.apiKeyId } : {}),
-  }))
-}
-
-export function encodeLoginProfileManifest(
-  profiles: CliLoginProfileManifestEntry[]
-) {
-  return Buffer.from(JSON.stringify(profiles), "utf8").toString("base64url")
+  teamName: string
 }
 
 export function profileNameForTeam(teamName: string) {
@@ -44,11 +51,13 @@ export function profileNameForTeam(teamName: string) {
 
 export function profileNameForLoginResult({
   config,
+  legacyProfiles = {},
   apiUrl,
   teamId,
   teamName,
 }: {
   config: Config
+  legacyProfiles?: Record<string, LegacyProfileMetadata>
   apiUrl: string
   teamId: string
   teamName: string
@@ -56,123 +65,22 @@ export function profileNameForLoginResult({
   const existing = Object.entries(config.profiles).find(
     ([, profile]) => profile.teamId === teamId && profile.apiUrl === apiUrl
   )
-
-  if (existing) {
-    return existing[0]
-  }
-
+  if (existing) return existing[0]
+  const legacy = Object.entries(legacyProfiles).find(
+    ([name, profile]) =>
+      profile.teamId === teamId &&
+      profile.apiUrl === apiUrl &&
+      !config.profiles[name]
+  )
+  if (legacy) return legacy[0]
   const baseName = profileNameForTeam(teamName)
   let candidate = baseName
   let suffix = 2
-
   while (config.profiles[candidate]) {
     candidate = `${baseName}-${suffix}`
     suffix += 1
   }
-
   return candidate
-}
-
-export function buildCliLoginUrl({
-  baseUrl,
-  redirectUri,
-  state,
-  profiles,
-  refresh,
-}: {
-  baseUrl: string
-  redirectUri: string
-  state: string
-  profiles: CliLoginProfileManifestEntry[]
-  refresh: boolean
-}) {
-  const loginUrl = new URL("/cli/login", baseUrl)
-  loginUrl.searchParams.set("redirect_uri", redirectUri)
-  loginUrl.searchParams.set("state", state)
-  loginUrl.searchParams.set("profiles", encodeLoginProfileManifest(profiles))
-  if (refresh) {
-    loginUrl.searchParams.set("refresh", "true")
-  }
-
-  return loginUrl
-}
-
-function storedProfileFromLoginResult({
-  apiUrl,
-  result,
-  existing,
-}: {
-  apiUrl: string
-  result: CliLoginResult
-  existing?: CliProfile
-}): CliProfile {
-  if (!result.apiKey) {
-    throw new Error("Login callback did not include an API key.")
-  }
-
-  return {
-    apiUrl,
-    apiKey: result.apiKey,
-    ...(result.apiKeyId ? { apiKeyId: result.apiKeyId } : {}),
-    ...(result.userId ? { userId: result.userId } : {}),
-    teamId: result.teamId,
-    teamName: result.teamName,
-    ...(existing?.worker ? { worker: existing.worker } : {}),
-    updatedAt: new Date().toISOString(),
-  }
-}
-
-export async function saveLoginProfile({
-  baseUrl,
-  result,
-}: {
-  baseUrl: string
-  result: CliLoginResult
-}) {
-  const config = await readConfig()
-  const apiUrl = result.apiUrl ?? baseUrl
-  const profileName = profileNameForLoginResult({
-    config,
-    apiUrl,
-    teamId: result.teamId,
-    teamName: result.teamName,
-  })
-
-  if (result.alreadyConfigured) {
-    if (!config.profiles[profileName]) {
-      throw new Error(
-        "Login selected an already configured team, but no matching local profile was found."
-      )
-    }
-
-    await writeConfig({
-      ...config,
-      profiles: {
-        ...config.profiles,
-        [profileName]: {
-          ...config.profiles[profileName],
-          ...(result.userId ? { userId: result.userId } : {}),
-          updatedAt: new Date().toISOString(),
-        },
-      },
-      currentProfile: profileName,
-    })
-    return { profileName, apiUrl, alreadyConfigured: true }
-  }
-
-  await writeConfig({
-    profiles: {
-      ...config.profiles,
-      [profileName]: storedProfileFromLoginResult({
-        apiUrl,
-        result,
-        existing: config.profiles[profileName],
-      }),
-    },
-    currentProfile: profileName,
-  })
-
-  return { profileName, apiUrl, alreadyConfigured: false }
 }
 
 export async function loginBaseUrl(args: Args) {
@@ -185,45 +93,442 @@ export async function loginBaseUrl(args: Args) {
   return apiBaseUrl(args, { allowDefault: true })
 }
 
+function base64Url(bytes: Uint8Array) {
+  return Buffer.from(bytes).toString("base64url")
+}
+
+export function shouldUseDeviceFlow(args: Args) {
+  if (optionalFlag(args, "browser") && optionalFlag(args, "device")) {
+    throw new Error("Pass either --browser or --device, not both.")
+  }
+  if (optionalFlag(args, "browser")) return false
+  if (optionalFlag(args, "device")) return true
+  return Boolean(
+    process.env.SSH_CONNECTION ||
+    process.env.SSH_TTY ||
+    !process.stdin.isTTY ||
+    !process.stdout.isTTY
+  )
+}
+
+async function browserCredential({
+  config,
+  nonce,
+  timeoutMs,
+  forceBrowser,
+}: {
+  config: CliAuthConfig
+  nonce: string
+  timeoutMs: number
+  forceBrowser: boolean
+}): Promise<OAuthTokenResponse | null> {
+  const state = base64Url(randomBytes(32))
+  const codeVerifier = base64Url(randomBytes(48))
+  const codeChallenge = base64Url(
+    createHash("sha256").update(codeVerifier).digest()
+  )
+  let callback
+  try {
+    callback = await createLoopbackCallback({ state, timeoutMs })
+  } catch (error) {
+    if (forceBrowser) throw error
+    return null
+  }
+  const url = buildAuthorizationUrl({
+    config,
+    redirectUri: callback.redirectUri,
+    state,
+    nonce,
+    codeChallenge,
+  })
+  const opened = await openBrowser(url.toString())
+  if (!opened && !forceBrowser) {
+    await callback.close()
+    return null
+  }
+  if (!opened) console.log(`Open this URL to log in:\n${url}`)
+  else console.log("Waiting for browser login...")
+  const code = await callback.waitForCode()
+  return exchangeAuthorizationCode({
+    config,
+    code,
+    redirectUri: callback.redirectUri,
+    codeVerifier,
+  })
+}
+
+async function deviceCredential(freshness: LoginFreshness, timeoutMs: number) {
+  const device = freshness.device
+  if (!device) {
+    throw new Error("Onyx server did not start device authorization")
+  }
+  console.log(`Open ${device.verificationUri}`)
+  console.log(`Enter code: ${device.userCode}`)
+  if (device.verificationUriComplete) {
+    console.log(`Direct link: ${device.verificationUriComplete}`)
+  }
+  console.log("Waiting for device authorization...")
+  return device.poll({ timeoutMs })
+}
+
+const LOGIN_REQUEST_ATTEMPTS = 3
+const LOGIN_RETRY_STATUSES = new Set([429, 502, 503, 504])
+
+/**
+ * Pre-binding requests are idempotent (team listing is read-only and the
+ * binding request carries a client-generated session id), so connection
+ * failures and transient statuses are retried with the exact same payload.
+ */
+async function authenticatedData<T>({
+  apiUrl,
+  path,
+  accessToken,
+  method = "GET",
+  body,
+}: {
+  apiUrl: string
+  path: string
+  accessToken: string
+  method?: string
+  body?: unknown
+}): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= LOGIN_REQUEST_ATTEMPTS; attempt += 1) {
+    let response: Response
+    try {
+      response = await authFetch(`${apiUrl}${path}`, {
+        method,
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${accessToken}`,
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      })
+    } catch (error) {
+      lastError = error
+      if (attempt < LOGIN_REQUEST_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+        continue
+      }
+      throw new Error(
+        `Unable to reach the Onyx API at ${apiUrl}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+    const payload = (await response.json().catch(() => null)) as {
+      data?: T
+    } | null
+    if (response.ok && payload && payload.data !== undefined) {
+      return payload.data
+    }
+    lastError = new ApiError(method, path, response.status, payload)
+    if (
+      LOGIN_RETRY_STATUSES.has(response.status) &&
+      attempt < LOGIN_REQUEST_ATTEMPTS
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+      continue
+    }
+    throw lastError
+  }
+  throw lastError
+}
+
+function loginFailureMessage(error: unknown) {
+  if (!(error instanceof ApiError)) return null
+  switch (error.code) {
+    case "cli_login_attempt_expired":
+      return "Login took too long; run `onyx login` again."
+    case "cli_login_attempt_consumed":
+      return "This login attempt was already used; run `onyx login` again."
+    case "cli_login_attempt_invalid":
+      return "Onyx could not verify this login; run `onyx login` again."
+    case "cli_auth_temporarily_unavailable":
+      return "Onyx could not reach its identity provider; try again shortly."
+    case "cli_token_invalid":
+      return "WorkOS returned a token Onyx does not accept for the CLI; run `onyx login` again."
+    default:
+      return null
+  }
+}
+
+export function resolveRequestedTeam(teams: CliTeam[], requested: string) {
+  const byId = teams.find((team) => team.id === requested)
+  if (byId) return byId
+  const matches = teams.filter(
+    (team) => team.name.toLowerCase() === requested.toLowerCase()
+  )
+  if (matches.length === 1) return matches[0]
+  if (matches.length > 1) {
+    throw new Error(
+      `Team name "${requested}" is ambiguous. Pass one of these team IDs: ${matches
+        .map((team) => team.id)
+        .join(", ")}`
+    )
+  }
+  throw new Error(
+    `Team "${requested}" was not found. Available teams: ${teams
+      .map((team) => `${team.name} (${team.id})`)
+      .join(", ")}`
+  )
+}
+
+async function chooseTeam(
+  teams: CliTeam[],
+  requested?: string
+): Promise<CliTeam> {
+  if (teams.length === 0) throw new Error("This account has no Onyx teams.")
+  if (requested) return resolveRequestedTeam(teams, requested)!
+  if (teams.length === 1) return teams[0]!
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(
+      "This account belongs to multiple teams. Pass --team <team-id-or-name>."
+    )
+  }
+  console.log("Choose a team:")
+  teams.forEach((team, index) => console.log(`  ${index + 1}. ${team.name}`))
+  const prompt = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  })
+  try {
+    const answer = await prompt.question(`Team [1-${teams.length}]: `)
+    const index = Number(answer) - 1
+    if (!Number.isInteger(index) || !teams[index]) {
+      throw new Error("Invalid team selection")
+    }
+    return teams[index]
+  } finally {
+    prompt.close()
+  }
+}
+
+async function revokeRemoteSession({
+  apiUrl,
+  accessToken,
+  cliSessionId,
+}: {
+  apiUrl: string
+  accessToken: string
+  cliSessionId?: string
+}) {
+  await authFetch(`${apiUrl}/api/v1/cli/auth/session`, {
+    method: "DELETE",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      ...(cliSessionId ? { "x-onyx-cli-session-id": cliSessionId } : {}),
+    },
+  }).catch(() => undefined)
+}
+
+async function revokeOldProfile(profile: CliProfile | undefined) {
+  if (!profile) return
+  try {
+    const { accessTokenForProfile } = await import("../lib/oauth-credentials")
+    const token = await accessTokenForProfile({ name: "previous", profile })
+    await revokeRemoteSession({
+      apiUrl: profile.apiUrl,
+      accessToken: token,
+      cliSessionId: profile.cliSessionId,
+    })
+  } catch {
+    // The prior session remains remotely revocable from Settings.
+  } finally {
+    await deleteCredential(profile.credentialId)
+  }
+}
+
+async function removeStaleLegacyCredentials(
+  staged: StagedLegacyConfigMigration
+) {
+  for (const stale of staged.staleCredentials) {
+    try {
+      const { readCredential } = await import("../lib/credential-store")
+      const credential = await readCredential(
+        stale.credentialId,
+        stale.credentialStore
+      )
+      if (credential && credential.expiresAt > Date.now()) {
+        await revokeRemoteSession({
+          apiUrl: stale.apiUrl,
+          accessToken: credential.accessToken,
+          cliSessionId: stale.cliSessionId,
+        })
+      }
+    } catch {
+      // Best effort; the old session stays revocable from Settings.
+    }
+    await deleteCredential(stale.credentialId).catch(() => undefined)
+  }
+}
+
 export async function commandLogin(args: Args) {
-  const baseUrl = await loginBaseUrl(args)
-  const port = Number(args.options.port ?? 8765)
-  const state = randomUUID()
-  const redirectUri = `http://127.0.0.1:${port}/callback`
+  for (const removed of ["refresh", "print-url", "port"]) {
+    if (args.options[removed] !== undefined) {
+      throw new Error(
+        `--${removed} was removed; use onyx login --browser or --device.`
+      )
+    }
+  }
+  // Older configs are only read here; the rewrite, backup, and credential
+  // cleanup happen after the new profile has been stored, so a cancelled or
+  // failed login leaves the existing configuration untouched.
+  const staged = await stageLegacyConfigMigration()
+  if (staged) {
+    console.warn(
+      "Your Onyx CLI config uses an older format; it will be migrated once this login completes."
+    )
+  }
+
+  const apiUrl = await loginBaseUrl(args)
+  const timeoutMs = Number(args.options.timeout ?? 600_000)
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("--timeout must be a positive number of milliseconds")
+  }
+  const authConfig = await fetchCliAuthConfig(apiUrl)
+  await confirmApiUrlTrust({ apiUrl, config: authConfig, args })
+
+  const forceBrowser = optionalFlag(args, "browser")
+  let flow: "browser" | "device" = shouldUseDeviceFlow(args)
+    ? "device"
+    : "browser"
+  let freshness: LoginFreshness = await freshnessForFlow(flow, { apiUrl })
+  let credential: OAuthTokenResponse | null =
+    flow === "browser"
+      ? await browserCredential({
+          config: authConfig,
+          nonce: freshness.nonce,
+          timeoutMs,
+          forceBrowser,
+        })
+      : null
+  if (!credential) {
+    if (flow === "browser") {
+      // The browser attempt simply expires server-side; device login needs
+      // its own attempt so the flow recorded with the session is accurate.
+      flow = "device"
+      freshness = await freshnessForFlow(flow, { apiUrl })
+    }
+    credential = await deviceCredential(freshness, timeoutMs)
+  }
+  const proof = freshness.proof(credential)
+
+  let teams: CliTeam[]
+  let session: BoundSession
+  try {
+    teams = await authenticatedData<CliTeam[]>({
+      apiUrl,
+      path: "/api/v1/cli/auth/teams",
+      accessToken: credential.accessToken,
+      method: "POST",
+      body: { attemptId: proof.attemptId, idToken: proof.idToken },
+    })
+    const team = await chooseTeam(teams, args.options.team)
+    session = await authenticatedData<BoundSession>({
+      apiUrl,
+      path: "/api/v1/cli/auth/session",
+      accessToken: credential.accessToken,
+      method: "POST",
+      body: {
+        sessionId: randomUUID(),
+        attemptId: proof.attemptId,
+        idToken: proof.idToken,
+        teamId: team.id,
+        deviceName: args.options["device-name"] ?? hostname(),
+        platform: `${platform()} ${release()}`,
+        authFlow: flow,
+      },
+    })
+  } catch (error) {
+    const message = loginFailureMessage(error)
+    if (message) throw new Error(message)
+    throw error
+  }
+
   const config = await readConfig()
-  const loginUrl = buildCliLoginUrl({
-    baseUrl,
-    redirectUri,
-    state,
-    profiles: loginProfileManifest(config),
-    refresh: optionalFlag(args, "refresh"),
+  const legacyProfiles = staged?.legacyProfiles ?? {}
+  const profileName = profileNameForLoginResult({
+    config,
+    legacyProfiles,
+    apiUrl,
+    teamId: session.teamId,
+    teamName: session.teamName,
   })
-
-  const loginPromise = waitForCliLogin({
-    port,
-    state,
-    // New-account signup (email verification, team naming) can easily take
-    // more than a couple of minutes before the browser reaches the callback.
-    timeoutMs: Number(args.options.timeout ?? 600_000),
-  })
-
-  if (optionalFlag(args, "print-url")) {
-    console.log(loginUrl.toString())
-  } else {
-    console.log(`Opening browser login at ${baseUrl} ...`)
-    await openBrowser(loginUrl.toString())
-    console.log("Waiting for browser login...")
-  }
-
-  const result = await loginPromise
-  const saved = await saveLoginProfile({ baseUrl, result })
-  if (saved.alreadyConfigured) {
-    console.log(
-      `Using existing profile ${saved.profileName} for ${result.teamName} (${result.teamId}) at ${saved.apiUrl}`
+  const previous = config.profiles[profileName]
+  const legacy = Object.values(legacyProfiles).find(
+    (profile) => profile.teamId === session.teamId && profile.apiUrl === apiUrl
+  )
+  const worker = previous?.worker ?? legacy?.worker
+  const credentialId = randomUUID()
+  let backupPath: string | undefined
+  try {
+    const credentialStore = await writeCredential(
+      credentialId,
+      persistableCredential(credential)
     )
-  } else {
-    console.log(
-      `Logged in profile ${saved.profileName} for ${result.teamName} (${result.teamId}) at ${saved.apiUrl}`
+    const fallbackWarningShownAt =
+      config.credentialFallbackWarningShownAt ??
+      staged?.credentialFallbackWarningShownAt
+    const showCredentialFallbackWarning =
+      credentialStore === "file" && !fallbackWarningShownAt
+    if (staged) backupPath = await writeLegacyConfigBackup(staged)
+    await writeConfig({
+      ...config,
+      ...(fallbackWarningShownAt
+        ? { credentialFallbackWarningShownAt: fallbackWarningShownAt }
+        : {}),
+      ...(staged
+        ? { developer: staged.developer, telemetry: staged.telemetry }
+        : {}),
+      ...(showCredentialFallbackWarning
+        ? { credentialFallbackWarningShownAt: new Date().toISOString() }
+        : {}),
+      profiles: {
+        ...config.profiles,
+        [profileName]: {
+          apiUrl,
+          cliSessionId: session.id,
+          credentialId,
+          credentialStore,
+          oauth: {
+            issuer: authConfig.issuer,
+            clientId: authConfig.clientId,
+            tokenEndpoint: authConfig.tokenEndpoint,
+            scopes: [...authConfig.scopes],
+          },
+          teamId: session.teamId,
+          teamName: session.teamName,
+          userId: session.userId,
+          ...(worker ? { worker } : {}),
+          updatedAt: new Date().toISOString(),
+        },
+      },
+      currentProfile: profileName,
+    })
+    if (showCredentialFallbackWarning) {
+      console.warn(
+        "No native credential store was available; OAuth tokens are stored in a permission-restricted local file."
+      )
+    }
+  } catch (error) {
+    await deleteCredential(credentialId)
+    await revokeRemoteSession({
+      apiUrl,
+      accessToken: credential.accessToken,
+      cliSessionId: session.id,
+    })
+    throw error
+  }
+  if (staged) {
+    await removeStaleLegacyCredentials(staged)
+    console.warn(
+      `Migrated your Onyx CLI config to the current login format. A sanitized backup (no keys or tokens) was written to ${backupPath}.`
     )
   }
+  await revokeOldProfile(previous)
+  console.log(
+    `Logged in profile ${profileName} for ${session.teamName} (${session.teamId}) at ${apiUrl}`
+  )
 }

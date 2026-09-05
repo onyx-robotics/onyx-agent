@@ -464,7 +464,11 @@ export async function recordCliCommand({
               reason_code: failure.reasonCode,
             }
           : {}),
-        auth_type: profile ? "api_key" : "anonymous",
+        auth_type: process.env.ONYX_API_KEY
+          ? "api_key"
+          : profile
+            ? "cli_session"
+            : "anonymous",
         official_distribution:
           cliVersionInfo("onyx").distribution === "release",
       },
