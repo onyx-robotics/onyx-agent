@@ -51,7 +51,7 @@ Usage:
   onyx developer use release [--skill-dir <path>] [--quiet]
   onyx developer sync-skill [--skill-dir <path>] [--quiet]
   onyx developer unlink [--skill-dir <path>] [--quiet]
-  onyx login [--api-url <url>] [--local] [--browser|--device] [--team <team-id-or-name>] [--device-name <label>] [--timeout <ms>]
+  onyx login [--api-url <url>] [--local] [--browser|--device] [--team <team-id-or-name>] [--device-name <label>] [--timeout <ms>] [--trust-api-url]
   onyx logout [--profile <name>|--all]
   onyx agent skill-path
   onyx agent install-skill [--dir <path>] [--quiet]

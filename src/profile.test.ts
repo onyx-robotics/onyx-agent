@@ -17,7 +17,7 @@ import {
   configPath,
   emptyConfig,
   readConfig,
-  resetUnsupportedConfigForLogin,
+  migrateLegacyConfigForLogin,
   writeConfig,
   type CliProfile,
 } from "./lib/config"
@@ -30,8 +30,15 @@ const originalStore = process.env.ONYX_TEST_CREDENTIAL_STORE
 function profile(overrides: Partial<CliProfile> = {}): CliProfile {
   return {
     apiUrl: "https://app.onyx.test",
+    cliSessionId: "66666666-6666-4666-8666-666666666666",
     credentialId: "11111111-1111-4111-8111-111111111111",
     credentialStore: "file",
+    oauth: {
+      issuer: "https://auth.example.test",
+      clientId: "client",
+      tokenEndpoint: "https://auth.example.test/token",
+      scopes: ["openid", "offline_access"],
+    },
     teamId: "22222222-2222-4222-8222-222222222222",
     teamName: "Alpha Team",
     userId: "33333333-3333-4333-8333-333333333333",
@@ -82,7 +89,7 @@ describe("versioned CLI profiles", () => {
         telemetry: { enabled: false },
       })
     )
-    expect(await resetUnsupportedConfigForLogin()).toBe(true)
+    expect((await migrateLegacyConfigForLogin()).migrated).toBe(true)
     expect(await readConfig()).toMatchObject({
       version: CONFIG_VERSION,
       profiles: {},

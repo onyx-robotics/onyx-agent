@@ -2,29 +2,29 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { hostname, platform, release } from "node:os"
 import { createInterface } from "node:readline/promises"
 
+import { ApiError } from "../lib/api"
+import { confirmApiUrlTrust } from "../lib/api-url-trust"
 import { optionalFlag, type Args } from "../lib/args"
 import {
   apiBaseUrl,
+  migrateLegacyConfigForLogin,
   normalizeProfileName,
   readConfig,
-  resetUnsupportedConfigForLogin,
   type CliProfile,
   type Config,
+  type LegacyProfileMetadata,
   writeConfig,
 } from "../lib/config"
-import {
-  deleteCredential,
-  writeCredential,
-  type OAuthCredential,
-} from "../lib/credential-store"
+import { deleteCredential, writeCredential } from "../lib/credential-store"
 import { createLoopbackCallback, openBrowser } from "../lib/login"
+import { freshnessForFlow, type LoginFreshness } from "../lib/login-freshness"
 import {
   buildAuthorizationUrl,
   exchangeAuthorizationCode,
   fetchCliAuthConfig,
-  pollDeviceTokens,
-  startDeviceAuthorization,
+  persistableCredential,
   type CliAuthConfig,
+  type OAuthTokenResponse,
 } from "../lib/oauth-client"
 
 export const LOCAL_API_URL = "http://localhost:3000"
@@ -48,11 +48,13 @@ export function profileNameForTeam(teamName: string) {
 
 export function profileNameForLoginResult({
   config,
+  legacyProfiles = {},
   apiUrl,
   teamId,
   teamName,
 }: {
   config: Config
+  legacyProfiles?: Record<string, LegacyProfileMetadata>
   apiUrl: string
   teamId: string
   teamName: string
@@ -61,6 +63,13 @@ export function profileNameForLoginResult({
     ([, profile]) => profile.teamId === teamId && profile.apiUrl === apiUrl
   )
   if (existing) return existing[0]
+  const legacy = Object.entries(legacyProfiles).find(
+    ([name, profile]) =>
+      profile.teamId === teamId &&
+      profile.apiUrl === apiUrl &&
+      !config.profiles[name]
+  )
+  if (legacy) return legacy[0]
   const baseName = profileNameForTeam(teamName)
   let candidate = baseName
   let suffix = 2
@@ -101,15 +110,16 @@ export function shouldUseDeviceFlow(args: Args) {
 
 async function browserCredential({
   config,
+  nonce,
   timeoutMs,
   forceBrowser,
 }: {
   config: CliAuthConfig
+  nonce: string
   timeoutMs: number
   forceBrowser: boolean
-}): Promise<OAuthCredential | null> {
+}): Promise<OAuthTokenResponse | null> {
   const state = base64Url(randomBytes(32))
-  const nonce = base64Url(randomBytes(32))
   const codeVerifier = base64Url(randomBytes(48))
   const codeChallenge = base64Url(
     createHash("sha256").update(codeVerifier).digest()
@@ -144,15 +154,21 @@ async function browserCredential({
   })
 }
 
-async function deviceCredential(config: CliAuthConfig, timeoutMs: number) {
-  const authorization = await startDeviceAuthorization(config)
-  console.log(`Open ${authorization.verificationUri}`)
-  console.log(`Enter code: ${authorization.userCode}`)
-  if (authorization.verificationUriComplete) {
-    console.log(`Direct link: ${authorization.verificationUriComplete}`)
+async function deviceCredential(
+  freshness: LoginFreshness,
+  timeoutMs: number
+) {
+  const device = freshness.device
+  if (!device) {
+    throw new Error("Onyx server did not start device authorization")
+  }
+  console.log(`Open ${device.verificationUri}`)
+  console.log(`Enter code: ${device.userCode}`)
+  if (device.verificationUriComplete) {
+    console.log(`Direct link: ${device.verificationUriComplete}`)
   }
   console.log("Waiting for device authorization...")
-  return pollDeviceTokens({ config, authorization, timeoutMs })
+  return device.poll({ timeoutMs })
 }
 
 async function authenticatedData<T>({
@@ -177,16 +193,31 @@ async function authenticatedData<T>({
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   })
-  const payload = (await response.json().catch(() => ({}))) as {
+  const payload = (await response.json().catch(() => null)) as {
     data?: T
-    error?: { message?: string }
-  }
-  if (!response.ok || payload.data === undefined) {
-    throw new Error(
-      payload.error?.message ?? `Onyx API request failed (${response.status})`
-    )
+  } | null
+  if (!response.ok || !payload || payload.data === undefined) {
+    throw new ApiError(method, path, response.status, payload)
   }
   return payload.data
+}
+
+function loginFailureMessage(error: unknown) {
+  if (!(error instanceof ApiError)) return null
+  switch (error.code) {
+    case "cli_login_attempt_expired":
+      return "Login took too long; run `onyx login` again."
+    case "cli_login_attempt_consumed":
+      return "This login attempt was already used; run `onyx login` again."
+    case "cli_login_attempt_invalid":
+      return "Onyx could not verify this login; run `onyx login` again."
+    case "cli_auth_temporarily_unavailable":
+      return "Onyx could not reach its identity provider; try again shortly."
+    case "cli_token_invalid":
+      return "WorkOS returned a token Onyx does not accept for the CLI; run `onyx login` again."
+    default:
+      return null
+  }
 }
 
 export function resolveRequestedTeam(teams: CliTeam[], requested: string) {
@@ -240,24 +271,62 @@ async function chooseTeam(
   }
 }
 
+async function revokeRemoteSession({
+  apiUrl,
+  accessToken,
+  cliSessionId,
+}: {
+  apiUrl: string
+  accessToken: string
+  cliSessionId?: string
+}) {
+  await fetch(`${apiUrl}/api/v1/cli/auth/session`, {
+    method: "DELETE",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      ...(cliSessionId ? { "x-onyx-cli-session-id": cliSessionId } : {}),
+    },
+  }).catch(() => undefined)
+}
+
 async function revokeOldProfile(profile: CliProfile | undefined) {
   if (!profile) return
   try {
     const { accessTokenForProfile } = await import("../lib/oauth-credentials")
     const token = await accessTokenForProfile({ name: "previous", profile })
-    await fetch(`${profile.apiUrl}/api/v1/cli/auth/session`, {
-      method: "DELETE",
-      headers: {
-        authorization: `Bearer ${token}`,
-        ...(profile.cliSessionId
-          ? { "x-onyx-cli-session-id": profile.cliSessionId }
-          : {}),
-      },
+    await revokeRemoteSession({
+      apiUrl: profile.apiUrl,
+      accessToken: token,
+      cliSessionId: profile.cliSessionId,
     })
   } catch {
     // The prior session remains remotely revocable from Settings.
   } finally {
     await deleteCredential(profile.credentialId)
+  }
+}
+
+async function removeStaleLegacyCredentials(
+  migration: Awaited<ReturnType<typeof migrateLegacyConfigForLogin>>
+) {
+  for (const stale of migration.staleCredentials) {
+    try {
+      const { readCredential } = await import("../lib/credential-store")
+      const credential = await readCredential(
+        stale.credentialId,
+        stale.credentialStore
+      )
+      if (credential && credential.expiresAt > Date.now()) {
+        await revokeRemoteSession({
+          apiUrl: stale.apiUrl,
+          accessToken: credential.accessToken,
+          cliSessionId: stale.cliSessionId,
+        })
+      }
+    } catch {
+      // Best effort; the old session stays revocable from Settings.
+    }
+    await deleteCredential(stale.credentialId).catch(() => undefined)
   }
 }
 
@@ -269,63 +338,96 @@ export async function commandLogin(args: Args) {
       )
     }
   }
-  const reset = await resetUnsupportedConfigForLogin()
-  if (reset) {
+  const migration = await migrateLegacyConfigForLogin()
+  if (migration.migrated) {
     console.warn(
-      "Legacy CLI profiles were removed. Complete login to create a secure session."
+      `Migrated your Onyx CLI config to the current login format. A sanitized backup (no keys or tokens) was written to ${migration.backupPath}.`
     )
+    await removeStaleLegacyCredentials(migration)
   }
+
   const apiUrl = await loginBaseUrl(args)
   const timeoutMs = Number(args.options.timeout ?? 600_000)
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("--timeout must be a positive number of milliseconds")
   }
   const authConfig = await fetchCliAuthConfig(apiUrl)
+  await confirmApiUrlTrust({ apiUrl, config: authConfig, args })
+
   const forceBrowser = optionalFlag(args, "browser")
   let flow: "browser" | "device" = shouldUseDeviceFlow(args)
     ? "device"
     : "browser"
-  let credential =
+  let freshness: LoginFreshness = await freshnessForFlow(flow, { apiUrl })
+  let credential: OAuthTokenResponse | null =
     flow === "browser"
-      ? await browserCredential({ config: authConfig, timeoutMs, forceBrowser })
+      ? await browserCredential({
+          config: authConfig,
+          nonce: freshness.nonce,
+          timeoutMs,
+          forceBrowser,
+        })
       : null
   if (!credential) {
-    flow = "device"
-    credential = await deviceCredential(authConfig, timeoutMs)
+    if (flow === "browser") {
+      // The browser attempt simply expires server-side; device login needs
+      // its own attempt so the flow recorded with the session is accurate.
+      flow = "device"
+      freshness = await freshnessForFlow(flow, { apiUrl })
+    }
+    credential = await deviceCredential(freshness, timeoutMs)
   }
+  const proof = freshness.proof(credential)
 
-  const teams = await authenticatedData<CliTeam[]>({
-    apiUrl,
-    path: "/api/v1/cli/auth/teams",
-    accessToken: credential.accessToken,
-  })
-  const team = await chooseTeam(teams, args.options.team)
-  const cliSessionId = randomUUID()
-  const session = await authenticatedData<BoundSession>({
-    apiUrl,
-    path: "/api/v1/cli/auth/session",
-    accessToken: credential.accessToken,
-    method: "POST",
-    body: {
-      sessionId: cliSessionId,
-      teamId: team.id,
-      deviceName: args.options["device-name"] ?? hostname(),
-      platform: `${platform()} ${release()}`,
-      authFlow: flow,
-    },
-  })
+  let teams: CliTeam[]
+  let session: BoundSession
+  try {
+    teams = await authenticatedData<CliTeam[]>({
+      apiUrl,
+      path: "/api/v1/cli/auth/teams",
+      accessToken: credential.accessToken,
+    })
+    const team = await chooseTeam(teams, args.options.team)
+    session = await authenticatedData<BoundSession>({
+      apiUrl,
+      path: "/api/v1/cli/auth/session",
+      accessToken: credential.accessToken,
+      method: "POST",
+      body: {
+        sessionId: randomUUID(),
+        attemptId: proof.attemptId,
+        idToken: proof.idToken,
+        teamId: team.id,
+        deviceName: args.options["device-name"] ?? hostname(),
+        platform: `${platform()} ${release()}`,
+        authFlow: flow,
+      },
+    })
+  } catch (error) {
+    const message = loginFailureMessage(error)
+    if (message) throw new Error(message)
+    throw error
+  }
 
   const config = await readConfig()
   const profileName = profileNameForLoginResult({
     config,
+    legacyProfiles: migration.legacyProfiles,
     apiUrl,
     teamId: session.teamId,
     teamName: session.teamName,
   })
   const previous = config.profiles[profileName]
+  const legacy = Object.values(migration.legacyProfiles).find(
+    (profile) => profile.teamId === session.teamId && profile.apiUrl === apiUrl
+  )
+  const worker = previous?.worker ?? legacy?.worker
   const credentialId = randomUUID()
   try {
-    const credentialStore = await writeCredential(credentialId, credential)
+    const credentialStore = await writeCredential(
+      credentialId,
+      persistableCredential(credential)
+    )
     const showCredentialFallbackWarning =
       credentialStore === "file" && !config.credentialFallbackWarningShownAt
     await writeConfig({
@@ -340,10 +442,16 @@ export async function commandLogin(args: Args) {
           cliSessionId: session.id,
           credentialId,
           credentialStore,
+          oauth: {
+            issuer: authConfig.issuer,
+            clientId: authConfig.clientId,
+            tokenEndpoint: authConfig.tokenEndpoint,
+            scopes: [...authConfig.scopes],
+          },
           teamId: session.teamId,
           teamName: session.teamName,
           userId: session.userId,
-          ...(previous?.worker ? { worker: previous.worker } : {}),
+          ...(worker ? { worker } : {}),
           updatedAt: new Date().toISOString(),
         },
       },
@@ -356,13 +464,11 @@ export async function commandLogin(args: Args) {
     }
   } catch (error) {
     await deleteCredential(credentialId)
-    await fetch(`${apiUrl}/api/v1/cli/auth/session`, {
-      method: "DELETE",
-      headers: {
-        authorization: `Bearer ${credential.accessToken}`,
-        "x-onyx-cli-session-id": session.id,
-      },
-    }).catch(() => undefined)
+    await revokeRemoteSession({
+      apiUrl,
+      accessToken: credential.accessToken,
+      cliSessionId: session.id,
+    })
     throw error
   }
   await revokeOldProfile(previous)

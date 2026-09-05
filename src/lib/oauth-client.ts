@@ -11,6 +11,14 @@ export type CliAuthConfig = {
   loopbackRedirectUri: string
 }
 
+/** Token response; `idToken` is only needed at login to prove freshness. */
+export type OAuthTokenResponse = OAuthCredential & { idToken?: string }
+
+export type OAuthEndpointConfig = Pick<
+  CliAuthConfig,
+  "clientId" | "tokenEndpoint" | "scopes"
+>
+
 export type DeviceAuthorization = {
   deviceCode: string
   userCode: string
@@ -55,6 +63,96 @@ function requiredNumber(value: unknown, field: string) {
   return value
 }
 
+function isLoopbackHost(hostname: string) {
+  return (
+    hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]"
+  )
+}
+
+/**
+ * The API server advertises where to log in; never follow that blindly. Every
+ * OAuth endpoint must be HTTPS on the issuer's own origin, and the API itself
+ * must be HTTPS unless it is a local development server.
+ */
+export function validateCliAuthConfig(
+  value: unknown,
+  { apiUrl }: { apiUrl: string }
+): CliAuthConfig {
+  const data = value as Partial<CliAuthConfig> | undefined
+  if (
+    !data ||
+    typeof data.clientId !== "string" ||
+    !data.clientId ||
+    typeof data.issuer !== "string" ||
+    typeof data.authorizationEndpoint !== "string" ||
+    typeof data.tokenEndpoint !== "string" ||
+    typeof data.deviceAuthorizationEndpoint !== "string" ||
+    typeof data.jwksUri !== "string" ||
+    !Array.isArray(data.scopes) ||
+    !data.scopes.every((scope) => typeof scope === "string") ||
+    data.loopbackRedirectUri !== "http://127.0.0.1:*/callback"
+  ) {
+    throw new Error(
+      "Onyx server returned invalid CLI authentication configuration"
+    )
+  }
+
+  let api: URL
+  try {
+    api = new URL(apiUrl)
+  } catch {
+    throw new Error(`Invalid Onyx API URL: ${apiUrl}`)
+  }
+  if (api.protocol !== "https:" && !isLoopbackHost(api.hostname)) {
+    throw new Error(
+      `Refusing to log in over ${api.protocol.replace(":", "")}; the Onyx API URL must use https (localhost is exempt).`
+    )
+  }
+
+  let issuer: URL
+  try {
+    issuer = new URL(data.issuer)
+  } catch {
+    throw new Error("CLI authentication issuer is not a valid URL")
+  }
+  if (issuer.protocol !== "https:") {
+    throw new Error("CLI authentication issuer must use https")
+  }
+  for (const [name, endpoint] of [
+    ["authorizationEndpoint", data.authorizationEndpoint],
+    ["tokenEndpoint", data.tokenEndpoint],
+    ["deviceAuthorizationEndpoint", data.deviceAuthorizationEndpoint],
+    ["jwksUri", data.jwksUri],
+  ] as const) {
+    let url: URL
+    try {
+      url = new URL(endpoint)
+    } catch {
+      throw new Error(`CLI authentication ${name} is not a valid URL`)
+    }
+    if (url.protocol !== "https:" || url.origin !== issuer.origin) {
+      throw new Error(
+        `CLI authentication ${name} must be an https URL on the issuer origin ${issuer.origin}`
+      )
+    }
+  }
+  if (!data.scopes.includes("openid") || !data.scopes.includes("offline_access")) {
+    throw new Error(
+      "CLI authentication scopes must include openid and offline_access"
+    )
+  }
+  return {
+    clientId: data.clientId,
+    issuer: data.issuer,
+    authorizationEndpoint: data.authorizationEndpoint,
+    tokenEndpoint: data.tokenEndpoint,
+    deviceAuthorizationEndpoint: data.deviceAuthorizationEndpoint,
+    jwksUri: data.jwksUri,
+    scopes: [...data.scopes],
+    loopbackRedirectUri: data.loopbackRedirectUri,
+  }
+}
+
 export async function fetchCliAuthConfig(
   apiUrl: string
 ): Promise<CliAuthConfig> {
@@ -67,27 +165,14 @@ export async function fetchCliAuthConfig(
       `Unable to load CLI authentication configuration (${response.status})`
     )
   }
-  const data = payload.data as Partial<CliAuthConfig> | undefined
-  if (
-    !data ||
-    typeof data.clientId !== "string" ||
-    typeof data.authorizationEndpoint !== "string" ||
-    typeof data.tokenEndpoint !== "string" ||
-    typeof data.deviceAuthorizationEndpoint !== "string" ||
-    !Array.isArray(data.scopes)
-  ) {
-    throw new Error(
-      "Onyx server returned invalid CLI authentication configuration"
-    )
-  }
-  return data as CliAuthConfig
+  return validateCliAuthConfig(payload.data, { apiUrl })
 }
 
 async function tokenRequest(
   endpoint: string,
   body: URLSearchParams,
   previousRefreshToken?: string
-): Promise<OAuthCredential> {
+): Promise<OAuthTokenResponse> {
   let response: Response
   try {
     response = await fetch(endpoint, {
@@ -132,6 +217,20 @@ async function tokenRequest(
     accessToken: requiredString(payload.access_token, "access_token"),
     refreshToken,
     expiresAt: Date.now() + expiresIn * 1_000,
+    ...(typeof payload.id_token === "string" && payload.id_token
+      ? { idToken: payload.id_token }
+      : {}),
+  }
+}
+
+/** Strips the ID token before a credential is persisted. */
+export function persistableCredential(
+  response: OAuthTokenResponse
+): OAuthCredential {
+  return {
+    accessToken: response.accessToken,
+    refreshToken: response.refreshToken,
+    expiresAt: response.expiresAt,
   }
 }
 
@@ -184,7 +283,8 @@ export function exchangeAuthorizationCode({
 }
 
 export async function startDeviceAuthorization(
-  config: CliAuthConfig
+  config: CliAuthConfig,
+  { nonce }: { nonce?: string } = {}
 ): Promise<DeviceAuthorization> {
   const response = await fetch(config.deviceAuthorizationEndpoint, {
     method: "POST",
@@ -195,6 +295,10 @@ export async function startDeviceAuthorization(
     body: new URLSearchParams({
       client_id: config.clientId,
       scope: config.scopes.join(" "),
+      // RFC 8628 defines no nonce; OIDC providers that honor it echo it in
+      // the device-flow ID token, which is how headless logins prove
+      // freshness to Onyx.
+      ...(nonce ? { nonce } : {}),
     }),
   })
   const payload = await responseJson(response)
@@ -266,7 +370,7 @@ export async function refreshOAuthCredential({
   config,
   credential,
 }: {
-  config: CliAuthConfig
+  config: OAuthEndpointConfig
   credential: OAuthCredential
 }) {
   let lastError: unknown

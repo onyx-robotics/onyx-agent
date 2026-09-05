@@ -14,8 +14,15 @@ const originalFetch = globalThis.fetch
 
 const profile: CliProfile = {
   apiUrl: "https://app.example.test",
+  cliSessionId: "33333333-3333-4333-8333-333333333333",
   credentialId: "11111111-1111-4111-8111-111111111111",
   credentialStore: "file",
+  oauth: {
+    issuer: "https://auth.example.test",
+    clientId: "client",
+    tokenEndpoint: "https://auth.example.test/token",
+    scopes: ["openid", "offline_access"],
+  },
   teamId: "22222222-2222-4222-8222-222222222222",
   teamName: "Team",
   updatedAt: "2026-08-23T12:00:00.000Z",
@@ -44,27 +51,15 @@ describe("OAuth credential refresh manager", () => {
       "file"
     )
     let tokenRequests = 0
+    const urls: string[] = []
     globalThis.fetch = mock(async (input: string | URL | Request) => {
-      const url = String(input)
-      if (url.endsWith("/api/v1/cli/auth/config")) {
-        return Response.json({
-          data: {
-            clientId: "client",
-            issuer: "https://auth.example.test",
-            authorizationEndpoint: "https://auth.example.test/authorize",
-            tokenEndpoint: "https://auth.example.test/token",
-            deviceAuthorizationEndpoint: "https://auth.example.test/device",
-            jwksUri: "https://auth.example.test/jwks",
-            scopes: ["openid", "offline_access"],
-            loopbackRedirectUri: "http://127.0.0.1:*/callback",
-          },
-        })
-      }
+      urls.push(String(input))
       tokenRequests += 1
       return Response.json({
         access_token: "new-access",
         refresh_token: "new-refresh",
         expires_in: 900,
+        id_token: "a.b.c",
       })
     }) as unknown as typeof fetch
 
@@ -75,10 +70,31 @@ describe("OAuth credential refresh manager", () => {
       ])
     ).toEqual(["new-access", "new-access"])
     expect(tokenRequests).toBe(1)
-    expect(await readCredential(profile.credentialId, "file")).toMatchObject({
+    // Refresh goes straight to the endpoint pinned at login; the API server's
+    // live configuration is never consulted.
+    expect(urls).toEqual([profile.oauth.tokenEndpoint])
+    const stored = await readCredential(profile.credentialId, "file")
+    expect(stored).toMatchObject({
       accessToken: "new-access",
       refreshToken: "new-refresh",
     })
+    expect(JSON.stringify(stored)).not.toContain("a.b.c")
+  })
+
+  test("keeps the credential when the token endpoint is unavailable", async () => {
+    await writeCredential(
+      profile.credentialId,
+      { accessToken: "old", refreshToken: "old-refresh", expiresAt: 0 },
+      "file"
+    )
+    globalThis.fetch = mock(async () =>
+      Response.json({ error: "temporarily_unavailable" }, { status: 503 })
+    ) as unknown as typeof fetch
+
+    await expect(
+      accessTokenForProfile({ name: "team", profile })
+    ).rejects.toThrow("could not refresh")
+    expect(await readCredential(profile.credentialId, "file")).not.toBeNull()
   })
 
   test("removes a credential rejected with invalid_grant", async () => {
@@ -87,20 +103,9 @@ describe("OAuth credential refresh manager", () => {
       { accessToken: "old", refreshToken: "revoked", expiresAt: 0 },
       "file"
     )
-    globalThis.fetch = mock(async (input: string | URL | Request) => {
-      if (String(input).endsWith("/api/v1/cli/auth/config")) {
-        return Response.json({
-          data: {
-            clientId: "client",
-            authorizationEndpoint: "https://auth.example.test/authorize",
-            tokenEndpoint: "https://auth.example.test/token",
-            deviceAuthorizationEndpoint: "https://auth.example.test/device",
-            scopes: ["openid", "offline_access"],
-          },
-        })
-      }
-      return Response.json({ error: "invalid_grant" }, { status: 400 })
-    }) as unknown as typeof fetch
+    globalThis.fetch = mock(async () =>
+      Response.json({ error: "invalid_grant" }, { status: 400 })
+    ) as unknown as typeof fetch
 
     await expect(
       accessTokenForProfile({ name: "team", profile })

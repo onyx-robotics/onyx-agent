@@ -15,6 +15,68 @@ import { configDir } from "./config"
 
 const KEYRING_SERVICE = "ai.onyxresearch.onyx-cli"
 const CREDENTIALS_DIRECTORY = "credentials"
+// A locked or half-started Secret Service can block a native keyring call
+// indefinitely; bound it and fall back to the private file store instead.
+const KEYRING_TIMEOUT_MS = 3_000
+
+/** The keyring exists but did not answer; the credential may still be there. */
+export class CredentialStoreUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "CredentialStoreUnavailableError"
+  }
+}
+
+class KeyringTimeoutError extends Error {
+  constructor() {
+    super(`The system keyring did not respond within ${KEYRING_TIMEOUT_MS}ms`)
+    this.name = "KeyringTimeoutError"
+  }
+}
+
+type KeyringEntryLike = {
+  getPassword: () => Promise<string | null | undefined>
+  setPassword: (value: string) => Promise<void>
+  deleteCredential: () => Promise<boolean>
+}
+
+let keyringEntryFactoryForTests:
+  | ((credentialId: string) => KeyringEntryLike | null)
+  | null = null
+
+/** Test hook: substitute the native keyring with an in-memory or hanging one. */
+export function setKeyringEntryFactoryForTests(
+  factory: ((credentialId: string) => KeyringEntryLike | null) | null
+) {
+  keyringEntryFactoryForTests = factory
+}
+
+export function keyringSupported(env: NodeJS.ProcessEnv = process.env) {
+  if (env.ONYX_TEST_CREDENTIAL_STORE === "file") return false
+  // Linux keyrings speak Secret Service over the session D-Bus; headless
+  // shells and CI have none, and probing without it can hang.
+  if (process.platform === "linux" && !env.DBUS_SESSION_BUS_ADDRESS) {
+    return false
+  }
+  return true
+}
+
+function withKeyringTimeout<T>(work: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new KeyringTimeoutError()), KEYRING_TIMEOUT_MS)
+    timer.unref()
+    work().then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
 
 export type OAuthCredential = {
   accessToken: string
@@ -77,8 +139,13 @@ async function readCredentialFile(credentialId: string) {
   }
 }
 
-async function keyringEntry(credentialId: string) {
-  if (process.env.ONYX_TEST_CREDENTIAL_STORE === "file") return null
+async function keyringEntry(
+  credentialId: string
+): Promise<KeyringEntryLike | null> {
+  if (keyringEntryFactoryForTests) {
+    return keyringEntryFactoryForTests(credentialId)
+  }
+  if (!keyringSupported()) return null
   try {
     const { AsyncEntry } = await import("@napi-rs/keyring")
     return new AsyncEntry(KEYRING_SERVICE, credentialId)
@@ -94,7 +161,7 @@ async function writeKeyringCredential(
   const entry = await keyringEntry(credentialId)
   if (!entry) return false
   try {
-    await entry.setPassword(JSON.stringify(credential))
+    await withKeyringTimeout(() => entry.setPassword(JSON.stringify(credential)))
     return true
   } catch {
     return false
@@ -104,9 +171,17 @@ async function writeKeyringCredential(
 async function readKeyringCredential(credentialId: string) {
   const entry = await keyringEntry(credentialId)
   if (!entry) return null
+  let value: string | null
   try {
-    const value = await entry.getPassword()
-    if (!value) return null
+    value = (await withKeyringTimeout(() => entry.getPassword())) ?? null
+  } catch (error) {
+    if (error instanceof KeyringTimeoutError) {
+      throw new CredentialStoreUnavailableError(error.message)
+    }
+    return null
+  }
+  if (!value) return null
+  try {
     const parsed: unknown = JSON.parse(value)
     return validCredential(parsed) ? parsed : null
   } catch {
@@ -118,7 +193,7 @@ async function deleteKeyringCredential(credentialId: string) {
   const entry = await keyringEntry(credentialId)
   if (!entry) return
   try {
-    await entry.deleteCredential()
+    await withKeyringTimeout(() => entry.deleteCredential())
   } catch {
     // Missing, locked, or unavailable keyrings are handled by file cleanup.
   }

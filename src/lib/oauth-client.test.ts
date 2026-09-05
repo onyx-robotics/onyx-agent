@@ -3,8 +3,11 @@ import { afterEach, describe, expect, mock, test } from "bun:test"
 import {
   buildAuthorizationUrl,
   OAuthRequestError,
+  persistableCredential,
   pollDeviceTokens,
   refreshOAuthCredential,
+  startDeviceAuthorization,
+  validateCliAuthConfig,
   type CliAuthConfig,
 } from "./oauth-client"
 
@@ -128,5 +131,83 @@ describe("OAuth public-client protocol", () => {
         timeoutMs: 60_000,
       })
     ).rejects.toEqual(expect.any(OAuthRequestError))
+  })
+
+  test("sends the server nonce with device authorization and surfaces the ID token", async () => {
+    let deviceBody = ""
+    const responses = [
+      Response.json({
+        device_code: "device-code",
+        user_code: "ABCD-EFGH",
+        verification_uri: "https://auth.example.test/activate",
+        expires_in: 600,
+        interval: 1,
+      }),
+      Response.json({
+        access_token: "access",
+        refresh_token: "refresh",
+        expires_in: 900,
+        id_token: "h.p.s",
+      }),
+    ]
+    globalThis.fetch = mock(async (_input: unknown, init?: RequestInit) => {
+      if (responses.length === 2) deviceBody = String(init?.body)
+      return responses.shift()!
+    }) as unknown as typeof fetch
+    globalThis.setTimeout = ((callback: TimerHandler) => {
+      if (typeof callback === "function") callback()
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+
+    const authorization = await startDeviceAuthorization(config, {
+      nonce: "server-nonce",
+    })
+    expect(new URLSearchParams(deviceBody).get("nonce")).toBe("server-nonce")
+    const credential = await pollDeviceTokens({
+      config,
+      authorization,
+      timeoutMs: 60_000,
+    })
+    expect(credential.idToken).toBe("h.p.s")
+    expect(persistableCredential(credential)).toEqual({
+      accessToken: "access",
+      refreshToken: "refresh",
+      expiresAt: credential.expiresAt,
+    })
+  })
+})
+
+describe("CLI auth configuration validation", () => {
+  const apiUrl = "https://app.example.test"
+
+  test("accepts https endpoints on the issuer origin", () => {
+    expect(validateCliAuthConfig(config, { apiUrl })).toEqual(config)
+    expect(
+      validateCliAuthConfig(config, { apiUrl: "http://localhost:3000" }).clientId
+    ).toBe(config.clientId)
+  })
+
+  test("rejects plaintext, cross-origin, or incomplete configurations", () => {
+    expect(() =>
+      validateCliAuthConfig(
+        { ...config, tokenEndpoint: "http://auth.example.test/oauth2/token" },
+        { apiUrl }
+      )
+    ).toThrow("issuer origin")
+    expect(() =>
+      validateCliAuthConfig(
+        { ...config, tokenEndpoint: "https://evil.example/oauth2/token" },
+        { apiUrl }
+      )
+    ).toThrow("issuer origin")
+    expect(() =>
+      validateCliAuthConfig(config, { apiUrl: "http://onyx.internal:3000" })
+    ).toThrow("must use https")
+    expect(() =>
+      validateCliAuthConfig({ ...config, scopes: ["openid"] }, { apiUrl })
+    ).toThrow("offline_access")
+    expect(() =>
+      validateCliAuthConfig({ ...config, issuer: undefined }, { apiUrl })
+    ).toThrow("invalid CLI authentication configuration")
   })
 })

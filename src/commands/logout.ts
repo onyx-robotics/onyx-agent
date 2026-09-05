@@ -29,16 +29,23 @@ export async function commandLogout(args: Args) {
           method: "DELETE",
           headers: {
             authorization: `Bearer ${token}`,
-            ...(profile.cliSessionId
-              ? { "x-onyx-cli-session-id": profile.cliSessionId }
-              : {}),
+            "x-onyx-cli-session-id": profile.cliSessionId,
           },
         }
       )
       if (!response.ok) {
-        console.warn(
-          `Remote logout for ${name} failed (${response.status}); remove it from Settings if it remains visible.`
-        )
+        const code = await response
+          .clone()
+          .json()
+          .then((payload: { error?: { code?: string } }) => payload?.error?.code)
+          .catch(() => undefined)
+        if (code === "cli_session_revoked" || code === "cli_session_invalid") {
+          console.log(`Profile ${name} was already logged out remotely.`)
+        } else {
+          console.warn(
+            `Remote logout for ${name} failed (${response.status}); remove it from Settings if it remains visible.`
+          )
+        }
       }
     } catch {
       console.warn(
