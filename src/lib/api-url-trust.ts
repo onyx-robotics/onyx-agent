@@ -1,8 +1,7 @@
-import { createInterface } from "node:readline/promises"
-
 import { optionalFlag, type Args } from "./args"
 import { DEFAULT_API_URL } from "./config"
 import type { CliAuthConfig } from "./oauth-client"
+import { terminalQuestion } from "./terminal-prompt"
 
 export type ApiUrlTrust = "production" | "localhost" | "custom"
 
@@ -62,20 +61,8 @@ export async function confirmApiUrlTrust({
   console.log(summary)
   const answer = ask
     ? await ask("Continue? [y/N] ")
-    : await promptOnce("Continue? [y/N] ")
+    : await terminalQuestion("Continue? [y/N] ", "Login cancelled.")
   if (!/^y(es)?$/i.test(answer.trim())) {
     throw new Error("Login cancelled.")
-  }
-}
-
-async function promptOnce(question: string) {
-  const prompt = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  })
-  try {
-    return await prompt.question(question)
-  } finally {
-    prompt.close()
   }
 }

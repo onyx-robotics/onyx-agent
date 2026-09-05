@@ -2,17 +2,30 @@ import { createServer, type Server } from "node:http"
 
 import { runProcess } from "./process"
 
-export async function openBrowser(url: string) {
+export const BROWSER_OPEN_TIMEOUT_MS = 5_000
+
+export async function openBrowser(
+  url: string,
+  options: {
+    platform?: NodeJS.Platform
+    timeoutMs?: number
+    run?: typeof runProcess
+  } = {}
+) {
+  const targetPlatform = options.platform ?? process.platform
   const command =
-    process.platform === "darwin"
+    targetPlatform === "darwin"
       ? "open"
-      : process.platform === "win32"
+      : targetPlatform === "win32"
         ? "cmd"
         : "xdg-open"
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url]
+  const args =
+    targetPlatform === "win32" ? ["/c", "start", "", url] : [url]
   try {
-    const result = await runProcess(command, args)
-    return result.code === 0
+    const result = await (options.run ?? runProcess)(command, args, {
+      timeoutMs: options.timeoutMs ?? BROWSER_OPEN_TIMEOUT_MS,
+    })
+    return result.code === 0 && !result.timedOut
   } catch {
     return false
   }

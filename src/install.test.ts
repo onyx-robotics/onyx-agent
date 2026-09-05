@@ -45,6 +45,7 @@ async function installFixture() {
   const home = join(root, "home")
   const fakeBin = join(root, "fake-bin")
   const logPath = join(root, "onyx-commands.log")
+  const curlLogPath = join(root, "curl-commands.log")
   const assetPath = join(root, "onyx-asset")
 
   await mkdir(home, { recursive: true })
@@ -61,6 +62,10 @@ if [ "$1" = "agent" ] && [ "$2" = "install-skill" ]; then
   exit 0
 fi
 if [ "$1" = "login" ]; then
+  if [ "\${ONYX_FAKE_REQUIRE_TTY:-}" = "1" ]; then
+    bun -e 'if (!process.stdin.isTTY || !process.stdout.isTTY) process.exit(23); console.log("fake tty login complete")'
+    exit $?
+  fi
   echo "fake login complete"
   exit 0
 fi
@@ -75,6 +80,7 @@ exit 0
   await writeExecutable(
     join(fakeBin, "curl"),
     `#!/bin/sh
+echo "$*" >> "$ONYX_FAKE_CURL_LOG"
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -104,6 +110,14 @@ esac
   await writeExecutable(
     join(fakeBin, "sha256sum"),
     `#!/bin/sh
+case "$1" in
+  *onyx-worker-*)
+    if [ "\${ONYX_FAKE_BAD_WORKER_CHECKSUM:-}" = "1" ]; then
+      printf 'bad  %s\\n' "$1"
+      exit 0
+    fi
+    ;;
+esac
 printf 'hash  %s\\n' "$1"
 `
   )
@@ -113,6 +127,7 @@ printf 'hash  %s\\n' "$1"
     home,
     fakeBin,
     logPath,
+    curlLogPath,
     assetPath,
     async cleanup() {
       await rm(root, { recursive: true, force: true })
@@ -133,6 +148,7 @@ async function runInstall(
       SHELL: "/bin/bash",
       ONYX_FAKE_ASSET: fixture.assetPath,
       ONYX_FAKE_LOG: fixture.logPath,
+      ONYX_FAKE_CURL_LOG: fixture.curlLogPath,
       ONYX_INSTALL_OS: "Linux",
       ONYX_INSTALL_ARCH: "x86_64",
       // Force the non-interactive code paths so assertions do not depend on
@@ -146,6 +162,49 @@ async function runInstall(
   const stdout = await new Response(process.stdout).text()
   const stderr = await new Response(process.stderr).text()
   const code = await process.exited
+  return { code, stdout, stderr }
+}
+
+async function runInteractivePipedInstall(
+  fixture: Awaited<ReturnType<typeof installFixture>>,
+  env: Record<string, string> = {}
+) {
+  const runner = join(fixture.root, "piped-install.sh")
+  await writeExecutable(
+    runner,
+    `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' '# installer input arrives through a pipe' | bash "$ONYX_PACKAGE_ROOT/scripts/install.sh"
+`
+  )
+  const command =
+    process.platform === "darwin"
+      ? ["script", "-q", "/dev/null", runner]
+      : ["script", "-q", "-e", "-c", runner, "/dev/null"]
+  const child = Bun.spawn(command, {
+    cwd: packageRoot,
+    env: {
+      ...Bun.env,
+      HOME: fixture.home,
+      PATH: `${fixture.fakeBin}:${originalPath}`,
+      SHELL: "/bin/bash",
+      TERM: "dumb",
+      ONYX_PACKAGE_ROOT: packageRoot,
+      ONYX_FAKE_ASSET: fixture.assetPath,
+      ONYX_FAKE_LOG: fixture.logPath,
+      ONYX_FAKE_CURL_LOG: fixture.curlLogPath,
+      ONYX_FAKE_REQUIRE_TTY: "1",
+      ONYX_INSTALL_OS: process.platform === "darwin" ? "Darwin" : "Linux",
+      ONYX_INSTALL_ARCH: process.arch === "arm64" ? "arm64" : "x86_64",
+      ONYX_INSTALL_PATH_ANSWER: "no",
+      ...env,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const stdout = await new Response(child.stdout).text()
+  const stderr = await new Response(child.stderr).text()
+  const code = await child.exited
   return { code, stdout, stderr }
 }
 
@@ -205,6 +264,10 @@ describe("install script", () => {
       expect(
         await readFile(`${fixture.home}/.local/bin/.onyx-install`, "utf8")
       ).toContain(`worker_path=${fixture.home}/.local/bin/onyx-worker`)
+      const curlLog = await readFile(fixture.curlLogPath, "utf8")
+      expect(curlLog).toContain("--retry 3")
+      expect(curlLog).toContain("--connect-timeout 10")
+      expect(curlLog).toContain("--max-time 120")
     })
   })
 
@@ -252,7 +315,7 @@ describe("install script", () => {
       })
 
       expect(result.code).toBe(0)
-      expect(result.stdout).toContain("Authenticate later with browser login:")
+      expect(result.stdout).toContain("Authenticate later:")
       expect(result.stdout).toContain('export ONYX_API_KEY="onyx_..."')
       expect(result.stdout).not.toContain(">  Make onyx available")
       expect(result.stdout).not.toContain(">  Authenticate")
@@ -276,28 +339,56 @@ describe("install script", () => {
     })
   })
 
-  test("runs login with the installed binary by default", async () => {
+  test("does not replace a managed install until every checksum passes", async () => {
     await withFixture(async (fixture) => {
+      const installDir = `${fixture.home}/.local/bin`
+      const onyxPath = `${installDir}/onyx`
+      const workerPath = `${installDir}/onyx-worker`
+      await mkdir(installDir, { recursive: true })
+      await writeFile(onyxPath, "old onyx\n")
+      await writeFile(workerPath, "old worker\n")
+      await writeFile(
+        `${installDir}/.onyx-install`,
+        `managed-by=onyx-installer\npath=${onyxPath}\nworker_path=${workerPath}\n`
+      )
+
       const result = await runInstall(fixture, {
-        PATH: `${fixture.fakeBin}:${fixture.home}/.local/bin:${originalPath}`,
+        ONYX_FAKE_BAD_WORKER_CHECKSUM: "1",
       })
 
-      expect(result.code).toBe(0)
-      expect(result.stdout).toContain("Waiting for login...")
-      expect(result.stdout).toContain("Onyx login complete.")
-      expect(await readFile(fixture.logPath, "utf8")).toContain("login")
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain("Checksum mismatch")
+      expect(await readFile(onyxPath, "utf8")).toBe("old onyx\n")
+      expect(await readFile(workerPath, "utf8")).toBe("old worker\n")
     })
   })
 
-  test("interactive install keeps browser login attached to the terminal", async () => {
-    const script = await readFile(`${packageRoot}/scripts/install.sh`, "utf8")
+  test("a headless install skips login instead of starting a long ceremony", async () => {
+    await withFixture(async (fixture) => {
+      const result = await runInstall(fixture)
 
-    expect(script).toContain(
-      '"$install_path" login --browser < /dev/tty > /dev/tty 2>&1'
-    )
-    expect(script).not.toContain(
-      '"$install_path" login > "$login_log" 2>&1 &'
-    )
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain(
+        "No interactive terminal detected; skipping login."
+      )
+      expect(result.stdout).toContain("Authenticate later:")
+      expect(await readFile(fixture.logPath, "utf8")).not.toContain("login")
+    })
+  })
+
+  test("piped interactive install gives Bun a real TTY without reopening stdout", async () => {
+    await withFixture(async (fixture) => {
+      const result = await runInteractivePipedInstall(fixture)
+
+      expect(result.code).toBe(0)
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        "fake tty login complete"
+      )
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("EINVAL")
+      const commands = (await readFile(fixture.logPath, "utf8")).split("\n")
+      expect(commands).toContain("login")
+      expect(commands).not.toContain("login --browser")
+    })
   })
 
   test("API key auth override prints the global environment variable", async () => {
