@@ -290,53 +290,24 @@ print_prompt_auth_followup() {
 }
 
 run_login_without_cancel() {
-  status_line "Waiting for browser login..."
+  status_line "Waiting for login..."
   if "$install_path" login; then
     status_success "Onyx login complete."
   else
-    status_warn "Browser login did not complete."
+    status_warn "Onyx login did not complete."
     print_auth_followup
   fi
 }
 
 run_login_with_cancel() {
-  login_log="$tmp/login.log"
-  cancel_file="$tmp/login-canceled"
+  prompt_start "Authenticate" "Opening browser login... Press Ctrl+C to cancel."
 
-  prompt_start "Authenticate" "Waiting for browser login... Press ESC to cancel or use API key."
-  "$install_path" login > "$login_log" 2>&1 &
-  login_pid=$!
-
-  (
-    while kill -0 "$login_pid" 2>/dev/null; do
-      key=""
-      if IFS= read -rsn1 -t 1 key < /dev/tty 2>/dev/null; then
-        if [[ "$key" == $'\e' ]]; then
-          : > "$cancel_file"
-          kill "$login_pid" 2>/dev/null || true
-          exit 0
-        fi
-      fi
-    done
-  ) &
-  cancel_pid=$!
-
-  if wait "$login_pid"; then
-    login_status=0
-  else
-    login_status=$?
-  fi
-
-  kill "$cancel_pid" 2>/dev/null || true
-  wait "$cancel_pid" 2>/dev/null || true
-
-  if [ -f "$cancel_file" ]; then
-    prompt_warn "Browser login canceled."
-    print_prompt_auth_followup
-    return 0
-  fi
-
-  if [ "$login_status" -eq 0 ]; then
+  # `curl ... | bash` leaves the installer's stdin attached to the script
+  # pipe. Running login in the background with redirected output therefore
+  # makes the CLI detect a headless shell and silently choose device auth.
+  # Keep the interactive login in the foreground, attach its input to the
+  # controlling terminal, and explicitly select browser auth.
+  if "$install_path" login --browser < /dev/tty > /dev/tty 2>&1; then
     prompt_success "Onyx login complete."
   else
     prompt_warn "Browser login did not complete."
