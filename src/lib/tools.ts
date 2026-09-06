@@ -132,7 +132,7 @@ async function acquireResources({
 }) {
   const releases: Array<() => Promise<void>> = []
   try {
-    for (const resourceName of command.resources) {
+    for (const resourceName of [...new Set(command.resources)].sort()) {
       const resource = api.resources[resourceName]
       releases.push(
         await acquireResourceSlot({
@@ -186,6 +186,7 @@ export async function runToolCommand({
   }
 
   const release = await acquireResources({ root, api, command })
+  let protectionUncertain = false
   try {
     const cwd = resolveCwd(root, projectPath, command.cwd)
     const toolEnv = {
@@ -223,13 +224,18 @@ export async function runToolCommand({
               timeoutMs,
             }
           )
+    protectionUncertain = result.protectionUncertain ?? false
+    if (protectionUncertain)
+      throw new Error(
+        "Tool process termination is uncertain; retaining resource locks for explicit idle reset"
+      )
     return {
       ...result,
       commandName: name,
       outputSummary: summarizeToolOutput(result, command.outputLimitBytes),
     }
   } finally {
-    await release()
+    if (!protectionUncertain) await release()
   }
 }
 

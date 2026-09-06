@@ -1,3 +1,11 @@
+import {
+  deliveryDestination,
+  initialReportBody,
+  preserveResultRef,
+  withAttemptDeliveryOwner,
+  pushAttemptRef,
+  acknowledgeReport,
+} from "../lib/report-delivery"
 import { randomUUID } from "node:crypto"
 import { mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
@@ -27,7 +35,6 @@ import {
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
-import { acquireFileResourceLease } from "../lib/resource-locks"
 import { apiExperimentToHistory } from "../lib/history"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
@@ -41,7 +48,6 @@ import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { getWorkerRuntimeContextCached } from "../lib/worker-context"
 import { recordWorkerReportedExperiment } from "../lib/worker-reports"
 import {
-  clearLocalAttempt,
   abandonBlockedWorkflowRunsForSession,
   listWorkflowSteps,
   listLocalAttempts,
@@ -806,7 +812,25 @@ async function writeTerminalAttempt({
     workerId: run.workerId,
     hypothesisId: run.hypothesisId,
   }
+  const workerContext = await getWorkerRuntimeContextCached()
+  const destination =
+    run.deliveryDestination ?? workerContext?.deliveryDestination
+  if (destination && (run.assignmentId ?? workerContext?.assignmentId)) {
+    record.delivery = {
+      version: 1,
+      destination,
+      body: initialReportBody(
+        record,
+        run.assignmentId ?? workerContext?.assignmentId
+      ),
+      sealed: false,
+      attempts: 0,
+      nextAttemptAt: Date.now() + 30_000,
+      state: "pending",
+    }
+  }
   await writeLocalAttempt({ root, record })
+  await preserveResultRef(root, resultCommitSha, run.resultRef)
   const workflowStatus = finalStatus as LocalWorkflowRun["status"]
   const terminalRun = {
     ...run,
@@ -880,7 +904,16 @@ async function createWorkflowRun({
       reason: "A new workflow run superseded this blocked workflow attempt.",
     }).catch(() => [])
   }
+  const runtimeContext = await getWorkerRuntimeContextCached()
   const run: LocalWorkflowRun = {
+    deliveryDestination:
+      runtimeContext?.deliveryDestination ??
+      (await deliveryDestination(
+        campaign.campaignId,
+        (await resolveProject(root, args)).id,
+        args
+      )),
+    assignmentId: runtimeContext?.assignmentId ?? args.options.assignment,
     id: randomUUID(),
     campaignId: campaign.campaignId,
     campaignName,
@@ -1420,10 +1453,17 @@ export class ExperimentDeliveryError extends Error {
   }
 }
 
-async function logExperiment(
+async function logExperimentOwned(
   args: Args,
-  frozen?: FrozenExperimentDeliveryContext
-) {
+  frozen?: FrozenExperimentDeliveryContext,
+  ownedRunRef?: string
+): Promise<
+  Awaited<ReturnType<typeof reportCampaignExperiment>>["experiment"] & {
+    deliveryOutcome: "recorded" | "duplicate"
+    deliveryResultRefPushStatus: "pushed" | "failed"
+    deliveryResultRefPushError: string | null
+  }
+> {
   const root = frozen?.root ?? (await repoRoot(args.options.cwd))
   const projectPath =
     frozen?.projectPath ?? (await resolveProjectPath(root, args))
@@ -1443,7 +1483,9 @@ async function logExperiment(
         campaignName,
       })
   const setup = frozen?.setup ?? (await readSetupFile(root, projectPath))
-  const workerRuntimeContext = frozen ? null : await getWorkerRuntimeContextCached()
+  const workerRuntimeContext = frozen
+    ? null
+    : await getWorkerRuntimeContextCached()
   if (setup.projectPath !== projectPath) {
     throw new Error(
       `onyx/setup.json projectPath is "${setup.projectPath}", but the active project path is "${projectPath}".`
@@ -1470,6 +1512,15 @@ async function logExperiment(
         runRef: explicitRunRef,
         context,
       })
+  if (lastRun && !ownedRunRef) {
+    return withAttemptDeliveryOwner(root, lastRun.runRef, () =>
+      logExperimentOwned(
+        { ...args, options: { ...args.options, "run-ref": lastRun.runRef } },
+        frozen,
+        lastRun.runRef
+      )
+    )
+  }
   const usableAttempt =
     lastRun?.campaignName === campaignName &&
     lastRun.projectPath === projectPath
@@ -1540,7 +1591,13 @@ async function logExperiment(
       : metricValue === null
         ? {}
         : { ...(usableAttempt?.metrics ?? {}), [metricName]: metricValue }
-  const runRef = usableAttempt?.runRef ?? clientRunRef(campaignName)
+  const runRef =
+    usableAttempt?.runRef ?? ownedRunRef ?? clientRunRef(campaignName)
+  if (!ownedRunRef) {
+    return withAttemptDeliveryOwner(root, runRef, () =>
+      logExperimentOwned(args, frozen, runRef)
+    )
+  }
   const resultRef =
     (frozen ? undefined : args.options["result-ref"]) ??
     usableAttempt?.resultRef ??
@@ -1564,6 +1621,7 @@ async function logExperiment(
   const assignmentId =
     frozen?.assignmentId ??
     args.options.assignment ??
+    usableAttempt?.delivery?.body.assignmentId ??
     workerRuntimeContext?.assignmentId
   if (!sessionId || !hypothesisId || !assignmentId) {
     throw new Error(
@@ -1618,48 +1676,30 @@ async function logExperiment(
   let resultRefPushStatus: "pushed" | "failed" = "pushed"
   let resultRefPushedAt: string | undefined
   let resultRefPushError: string | undefined
-  // Cap concurrent result-ref pushes across every worker of this clone via
-  // the shared file-lease mechanism (locks live under the common git dir).
-  // 100 workers finishing evals together otherwise fan out 100 simultaneous
-  // pushes to origin. On lease timeout the push proceeds uncapped: pushing
-  // is more important than the cap.
-  const releasePushSlot = await acquireFileResourceLease({
-    root,
-    resourceName: "onyx-result-ref-push",
-    slots: 4,
-    timeoutMs: 120_000,
-    leaseMs: 180_000,
-    ownerId: `${process.pid}:${runRef}`,
-    metadata: { pid: process.pid, runRef },
-  }).catch(() => null)
-  try {
-    let lastPushError: unknown = null
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        await git(["push", "origin", `${resultCommitSha}:${resultRef}`], root)
-        resultRefPushedAt = new Date().toISOString()
-        lastPushError = null
-        break
-      } catch (error) {
-        lastPushError = error
-        if (attempt < 3) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, 150 * attempt + Math.floor(Math.random() * 150))
-          )
-        }
-      }
-    }
-    if (lastPushError) throw lastPushError
-  } catch (error) {
-    resultRefPushStatus = "failed"
-    resultRefPushError = errorMessage(error)
-    console.warn(
-      `Warning: failed to push experiment ref ${resultRef} after three attempts. Onyx will record the result as local-reported. ${resultRefPushError}`
-    )
-  } finally {
-    await releasePushSlot?.()
+  await preserveResultRef(root, resultCommitSha, resultRef)
+  if (!usableAttempt?.delivery?.sealed) {
+    const pushed = await pushAttemptRef(root, {
+      runRef,
+      resultCommitSha,
+      resultRef,
+    })
+    resultRefPushStatus = pushed.resultRefPushStatus
+    resultRefPushedAt = pushed.resultRefPushedAt
+    resultRefPushError = pushed.resultRefPushError
+    if (resultRefPushError)
+      console.warn(
+        `Warning: failed to push experiment ref ${resultRef}; retained for recovery. ${resultRefPushError}`
+      )
   }
-  const reportBody = {
+  if (usableAttempt?.delivery?.sealed) {
+    resultRefPushStatus =
+      usableAttempt.delivery.body.resultRefPushStatus === "pushed"
+        ? "pushed"
+        : "failed"
+    resultRefPushedAt = usableAttempt.delivery.body.resultRefPushedAt
+    resultRefPushError = usableAttempt.delivery.body.resultRefPushError
+  }
+  const preparedReportBody = {
     sessionId,
     assignmentId,
     hypothesisId,
@@ -1695,6 +1735,31 @@ async function logExperiment(
     completedAt: record.completedAt ?? completedAt,
     provenance: [],
   }
+  const reportBody = usableAttempt?.delivery?.sealed
+    ? usableAttempt.delivery.body
+    : preparedReportBody
+  const pendingAttempt = usableAttempt ?? {
+    ...record,
+    schemaVersion: 1 as const,
+  }
+  if (!pendingAttempt.delivery) {
+    pendingAttempt.delivery = {
+      version: 1,
+      destination: await deliveryDestination(
+        campaign.campaignId,
+        (await resolveProject(root, args)).id,
+        args
+      ),
+      body: reportBody,
+      sealed: true,
+      attempts: 0,
+      nextAttemptAt: 0,
+      state: "pending",
+    }
+  }
+  pendingAttempt.delivery.body = reportBody
+  pendingAttempt.delivery.sealed = true
+  await writeLocalAttempt({ root, record: pendingAttempt })
   const scopedWorkerCredential =
     frozen?.workerCredential ?? workerRuntimeContext?.workerCredential
   const report = await (
@@ -1708,6 +1773,14 @@ async function logExperiment(
       resultRefPushError: resultRefPushError ?? null,
     })
   })
+  if (
+    !["recorded", "duplicate"].includes(report.outcome) ||
+    report.experiment.runRef !== runRef
+  ) {
+    throw new Error(
+      "Report acknowledgement did not match the pending attempt; retaining it for recovery"
+    )
+  }
   const workerContextPath = process.env.ONYX_WORKER_CONTEXT?.trim()
   if (workerRuntimeContext && workerContextPath) {
     await recordWorkerReportedExperiment({
@@ -1718,7 +1791,7 @@ async function logExperiment(
       runRef,
     }).catch(() => {})
   }
-  await clearLocalAttempt(root, { runRef }).catch(() => {})
+  await acknowledgeReport(root, pendingAttempt)
   await emitEvent(root, {
     type: "exp_logged",
     campaignName,
@@ -1749,6 +1822,13 @@ async function logExperiment(
     deliveryResultRefPushStatus: resultRefPushStatus,
     deliveryResultRefPushError: resultRefPushError ?? null,
   }
+}
+
+async function logExperiment(
+  args: Args,
+  frozen?: FrozenExperimentDeliveryContext
+) {
+  return logExperimentOwned(args, frozen)
 }
 
 /**

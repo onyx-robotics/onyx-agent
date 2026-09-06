@@ -1,3 +1,4 @@
+import { open } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import {
   mkdir,
@@ -37,7 +38,7 @@ import {
 import { acquireFileResourceLease } from "./resource-locks"
 
 export type LocalCampaign = ApiCampaign & {
-  status: "active" | "completed" | "archived"
+  status: "active" | "archived"
   projectPath: string
   setup: ResearchSetupFile | Record<string, unknown>
   humanFeedback: string | null
@@ -66,6 +67,8 @@ export type LocalWorkflowStepStatus =
   | "skipped"
 
 export type LocalWorkflowRun = {
+  deliveryDestination?: import("./report-delivery").DeliveryDestination
+  assignmentId?: string
   id: string
   campaignId: string | null
   campaignName: string
@@ -183,11 +186,27 @@ async function jsonFile<T>(path: string, fallback: T): Promise<T> {
   }
 }
 
-async function writeJson(path: string, value: unknown) {
+async function writeJson(path: string, value: unknown, durable = false) {
   await mkdir(dirname(path), { recursive: true }).catch(() => {})
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`
   await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8")
+  if (durable) {
+    const file = await open(tmp, "r")
+    try {
+      await file.sync()
+    } finally {
+      await file.close()
+    }
+  }
   await rename(tmp, path)
+  if (durable) {
+    const directory = await open(dirname(path), "r")
+    try {
+      await directory.sync()
+    } finally {
+      await directory.close()
+    }
+  }
 }
 
 async function campaignsPath(root: string) {
@@ -258,7 +277,7 @@ function campaignFromInput({
   metricDirection: "maximize" | "minimize"
   humanFeedback?: string | null
   promotionRefName?: string | null
-  status?: "active" | "completed" | "archived"
+  status?: "active" | "archived"
   createdAt?: string
   updatedAt?: string
   bestExperimentId?: string | null
@@ -590,24 +609,6 @@ export async function cacheLocalCampaign({
     await writeCampaigns(root, campaigns)
     return local
   })
-}
-
-export async function completeLocalCampaign({
-  root,
-  campaignId,
-}: {
-  root: string
-  campaignId: string
-}) {
-  const campaigns = await readCampaigns(root)
-  const entry = Object.entries(campaigns).find(
-    ([, campaign]) => campaign.id === campaignId
-  )
-  if (!entry) throw new Error("Local campaign not found")
-  const [key, campaign] = entry
-  campaigns[key] = { ...campaign, status: "completed", updatedAt: nowIso() }
-  await writeCampaigns(root, campaigns)
-  return campaigns[key]
 }
 
 export async function localCampaignByName({
@@ -1050,34 +1051,6 @@ export async function logLocalExperiment(input: {
   return result.experiment
 }
 
-export async function markExperimentRefsVerified(_input: {
-  root: string
-  refs: Array<{ runRef: string; commitSha: string; ref: string }>
-}) {
-  void _input
-}
-
-export async function applyRemoteExperimentGitStatuses(_input: {
-  root: string
-  experiments: ApiCampaignExperiment[]
-}) {
-  void _input
-}
-
-export async function applyRemoteProjectionDeltas(_input: {
-  root: string
-  deltas: {
-    campaigns: ApiCampaign[]
-    sessions: ApiSession[]
-    hypotheses: ApiHypothesis[]
-    workers: ApiWorker[]
-    experiments: ApiCampaignExperiment[]
-    knowledge: ApiKnowledge[]
-  }
-}) {
-  void _input
-}
-
 export async function writeLocalAttempt({
   root,
   record,
@@ -1085,7 +1058,7 @@ export async function writeLocalAttempt({
   root: string
   record: CachedAttemptRecord
 }) {
-  await writeJson(await attemptPathForRunRef(root, record.runRef), record)
+  await writeJson(await attemptPathForRunRef(root, record.runRef), record, true)
 }
 
 export async function readLocalAttempt(
@@ -1103,7 +1076,12 @@ export async function listLocalAttempts(
     await attemptsDir(root)
   )
   return attempts
-    .filter((attempt) => matchesAttempt(attempt, selector))
+    .filter(
+      (attempt) =>
+        typeof attempt.runRef === "string" &&
+        typeof attempt.createdAt === "string" &&
+        matchesAttempt(attempt, selector)
+    )
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
 }
 
@@ -1384,25 +1362,6 @@ export async function acquireLocalResourceLease(input: {
   metadata?: Record<string, unknown>
 }) {
   return acquireFileResourceLease(input)
-}
-
-export async function renewLocalResourceLease(_input: {
-  root: string
-  resourceName: string
-  ownerId: string
-  leaseMs: number
-}) {
-  void _input
-  return
-}
-
-export async function cleanupExpiredResourceLeases(_root: string) {
-  void _root
-}
-
-export async function listLocalResourceLeases(_root: string) {
-  void _root
-  return []
 }
 
 export async function localBriefMarkdown() {

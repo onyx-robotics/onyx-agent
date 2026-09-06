@@ -59,6 +59,7 @@ export type CliState = {
       status?: string
       terminalReason?: string | null
       cleanupStatus?:
+        | "unknown"
         | "not_started"
         | "running"
         | "complete"

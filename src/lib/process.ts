@@ -9,6 +9,7 @@ export type ProcessResult = {
   stderr: string
   timedOut: boolean
   cancelled?: boolean
+  protectionUncertain?: boolean
   stdoutTruncated?: boolean
   stderrTruncated?: boolean
   stdoutBytes?: number
@@ -300,6 +301,8 @@ export function runProcess(
     cwd?: string
     env?: NodeJS.ProcessEnv
     stdin?: string
+    inheritedFds?: number[]
+    killGraceMs?: number
     timeoutMs?: number
   } = {}
 ): Promise<ProcessResult> {
@@ -307,17 +310,43 @@ export function runProcess(
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      detached: options.timeoutMs !== undefined && process.platform !== "win32",
+      stdio: [
+        options.stdin === undefined ? "ignore" : "pipe",
+        "pipe",
+        "pipe",
+        ...(options.inheritedFds ?? []),
+      ],
     })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let timedOut = false
+    let protectionUncertain = false
+    let escalation: ReturnType<typeof setTimeout> | null = null
+    const terminate = (signal: NodeJS.Signals) => {
+      try {
+        if (
+          options.timeoutMs !== undefined &&
+          process.platform !== "win32" &&
+          child.pid
+        )
+          process.kill(-child.pid, signal)
+        else child.kill(signal)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH")
+          protectionUncertain = true
+      }
+    }
     const timeout =
       options.timeoutMs === undefined
         ? null
         : setTimeout(() => {
             timedOut = true
-            child.kill("SIGTERM")
+            terminate("SIGTERM")
+            escalation = setTimeout(
+              () => terminate("SIGKILL"),
+              options.killGraceMs ?? 30_000
+            )
           }, options.timeoutMs)
 
     if (options.stdin !== undefined) {
@@ -325,14 +354,49 @@ export function runProcess(
     }
     child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk))
     child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk))
-    child.on("error", reject)
-    child.on("close", (code) => {
+    child.on("error", (error) => {
+      if (timeout) clearTimeout(timeout)
+      if (escalation) clearTimeout(escalation)
+      reject(error)
+    })
+    child.on("close", async (code) => {
+      // A shell may exit while descendants with redirected stdio are still alive.
+      // Keep exclusion until the whole process group has exited; uncertainty retains it.
+      const groupAlive = () => {
+        if (
+          options.timeoutMs === undefined ||
+          process.platform === "win32" ||
+          !child.pid
+        )
+          return false
+        try {
+          process.kill(-child.pid, 0)
+          return true
+        } catch (error) {
+          return (error as NodeJS.ErrnoException).code !== "ESRCH"
+        }
+      }
+      if (groupAlive()) {
+        terminate("SIGTERM")
+        const grace = Date.now() + (options.killGraceMs ?? 30_000)
+        while (groupAlive() && Date.now() < grace)
+          await new Promise((resolve) => setTimeout(resolve, 20))
+        if (groupAlive()) {
+          terminate("SIGKILL")
+          const reapDeadline = Date.now() + 1000
+          while (groupAlive() && Date.now() < reapDeadline)
+            await new Promise((resolve) => setTimeout(resolve, 20))
+        }
+        protectionUncertain ||= groupAlive()
+      }
+      if (escalation) clearTimeout(escalation)
       if (timeout) clearTimeout(timeout)
       resolveProcess({
         code,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
         timedOut,
+        protectionUncertain,
       })
     })
   })
@@ -402,9 +466,7 @@ export async function runStreamingProcess(
       const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value)
       let offset = 0
       while (offset < buffer.byteLength && logBytes < logLimitBytes) {
-        const segmentOffset = logRotated
-          ? logBytes - logSegmentLimit
-          : logBytes
+        const segmentOffset = logRotated ? logBytes - logSegmentLimit : logBytes
         const segmentRemaining = Math.max(0, logSegmentLimit - segmentOffset)
         if (segmentRemaining === 0 && !logRotated) {
           const rotatedOut = log
