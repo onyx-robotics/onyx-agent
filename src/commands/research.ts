@@ -1278,11 +1278,19 @@ function createPresenceSupervisor({
       )
       cleanupRevision = response.cleanupRevision ?? cleanupRevision
       responses.push(response)
-      for (const worker of chunk) {
-        lastSent.set(worker.snapshot.id, worker.signature)
+      if (response.siteAccepted) {
+        for (const worker of chunk) {
+          if (
+            !response.ignoredWorkers.some(
+              (ignored) => ignored.id === worker.snapshot.id
+            )
+          )
+            lastSent.set(worker.snapshot.id, worker.signature)
+        }
       }
     }
-    if (shouldSendFull) lastFullSnapshotAt = Date.now()
+    if (shouldSendFull && responses.every((response) => response.siteAccepted))
+      lastFullSnapshotAt = Date.now()
     const ignoredCount = responses.reduce(
       (total, response) => total + response.ignoredCount,
       0

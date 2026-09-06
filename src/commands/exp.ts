@@ -1,9 +1,10 @@
-import { runProcess } from "../lib/process"
 import {
   deliveryDestination,
   initialReportBody,
   preserveResultRef,
-  withDeliveryOwner,
+  withAttemptDeliveryOwner,
+  pushAttemptRef,
+  acknowledgeReport,
 } from "../lib/report-delivery"
 import { randomUUID } from "node:crypto"
 import { mkdir, writeFile } from "node:fs/promises"
@@ -34,10 +35,6 @@ import {
 } from "../lib/contract"
 import { emitEvent } from "../lib/events"
 import { currentCommit, git, gitResult, repoRoot } from "../lib/git"
-import {
-  acquireFileResourceLease,
-  ResourceLockContentionError,
-} from "../lib/resource-locks"
 import { apiExperimentToHistory } from "../lib/history"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
@@ -51,7 +48,6 @@ import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { getWorkerRuntimeContextCached } from "../lib/worker-context"
 import { recordWorkerReportedExperiment } from "../lib/worker-reports"
 import {
-  clearLocalAttempt,
   abandonBlockedWorkflowRunsForSession,
   listWorkflowSteps,
   listLocalAttempts,
@@ -1459,8 +1455,15 @@ export class ExperimentDeliveryError extends Error {
 
 async function logExperimentOwned(
   args: Args,
-  frozen?: FrozenExperimentDeliveryContext
-) {
+  frozen?: FrozenExperimentDeliveryContext,
+  ownedRunRef?: string
+): Promise<
+  Awaited<ReturnType<typeof reportCampaignExperiment>>["experiment"] & {
+    deliveryOutcome: "recorded" | "duplicate"
+    deliveryResultRefPushStatus: "pushed" | "failed"
+    deliveryResultRefPushError: string | null
+  }
+> {
   const root = frozen?.root ?? (await repoRoot(args.options.cwd))
   const projectPath =
     frozen?.projectPath ?? (await resolveProjectPath(root, args))
@@ -1509,6 +1512,15 @@ async function logExperimentOwned(
         runRef: explicitRunRef,
         context,
       })
+  if (lastRun && !ownedRunRef) {
+    return withAttemptDeliveryOwner(root, lastRun.runRef, () =>
+      logExperimentOwned(
+        { ...args, options: { ...args.options, "run-ref": lastRun.runRef } },
+        frozen,
+        lastRun.runRef
+      )
+    )
+  }
   const usableAttempt =
     lastRun?.campaignName === campaignName &&
     lastRun.projectPath === projectPath
@@ -1579,7 +1591,13 @@ async function logExperimentOwned(
       : metricValue === null
         ? {}
         : { ...(usableAttempt?.metrics ?? {}), [metricName]: metricValue }
-  const runRef = usableAttempt?.runRef ?? clientRunRef(campaignName)
+  const runRef =
+    usableAttempt?.runRef ?? ownedRunRef ?? clientRunRef(campaignName)
+  if (!ownedRunRef) {
+    return withAttemptDeliveryOwner(root, runRef, () =>
+      logExperimentOwned(args, frozen, runRef)
+    )
+  }
   const resultRef =
     (frozen ? undefined : args.options["result-ref"]) ??
     usableAttempt?.resultRef ??
@@ -1655,74 +1673,23 @@ async function logExperimentOwned(
     workerId,
     hypothesisId,
   }
-  let pushProtectionUncertain = false
   let resultRefPushStatus: "pushed" | "failed" = "pushed"
   let resultRefPushedAt: string | undefined
   let resultRefPushError: string | undefined
-  // Cap concurrent result-ref pushes across every worker of this clone via
-  // the shared file-lease mechanism (locks live under the common git dir).
-  // 100 workers finishing evals together otherwise fan out 100 simultaneous
-  // pushes to origin. On contention, retain the local ref and report failed push evidence.
   await preserveResultRef(root, resultCommitSha, resultRef)
-  const releasePushSlot = usableAttempt?.delivery?.sealed
-    ? null
-    : await acquireFileResourceLease({
-        root,
-        resourceName: "onyx-result-ref-push",
-        slots: 4,
-        timeoutMs: 120_000,
-        leaseMs: 180_000,
-        ownerId: `${process.pid}:${runRef}`,
-        metadata: { pid: process.pid, runRef },
-      }).catch((error) => {
-        if (error instanceof ResourceLockContentionError) return null
-        throw error
-      })
-  try {
-    if (!usableAttempt?.delivery?.sealed) {
-      if (!releasePushSlot)
-        throw new Error("No push slot available; retained immutable local ref")
-      let lastPushError: unknown = null
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        try {
-          const pushed = await runProcess(
-            "git",
-            ["push", "origin", `${resultCommitSha}:${resultRef}`],
-            { cwd: root, timeoutMs: 180_000 }
-          )
-          pushProtectionUncertain = pushed.protectionUncertain ?? false
-          if (pushProtectionUncertain)
-            throw new Error(
-              "Push process termination is uncertain; retaining its slot"
-            )
-          if (pushed.code !== 0 || pushed.timedOut)
-            throw new Error(pushed.stderr || "Git push failed or timed out")
-          resultRefPushedAt = new Date().toISOString()
-          lastPushError = null
-          break
-        } catch (error) {
-          lastPushError = error
-          if (pushProtectionUncertain) break
-          if (attempt < 3) {
-            await new Promise((resolve) =>
-              setTimeout(
-                resolve,
-                150 * attempt + Math.floor(Math.random() * 150)
-              )
-            )
-          }
-        }
-      }
-      if (lastPushError) throw lastPushError
-    }
-  } catch (error) {
-    resultRefPushStatus = "failed"
-    resultRefPushError = errorMessage(error)
-    console.warn(
-      `Warning: failed to push experiment ref ${resultRef} ; Onyx will record the result as local-reported. ${resultRefPushError}`
-    )
-  } finally {
-    if (!pushProtectionUncertain) await releasePushSlot?.()
+  if (!usableAttempt?.delivery?.sealed) {
+    const pushed = await pushAttemptRef(root, {
+      runRef,
+      resultCommitSha,
+      resultRef,
+    })
+    resultRefPushStatus = pushed.resultRefPushStatus
+    resultRefPushedAt = pushed.resultRefPushedAt
+    resultRefPushError = pushed.resultRefPushError
+    if (resultRefPushError)
+      console.warn(
+        `Warning: failed to push experiment ref ${resultRef}; retained for recovery. ${resultRefPushError}`
+      )
   }
   if (usableAttempt?.delivery?.sealed) {
     resultRefPushStatus =
@@ -1824,7 +1791,7 @@ async function logExperimentOwned(
       runRef,
     }).catch(() => {})
   }
-  await clearLocalAttempt(root, { runRef }).catch(() => {})
+  await acknowledgeReport(root, pendingAttempt)
   await emitEvent(root, {
     type: "exp_logged",
     campaignName,
@@ -1861,8 +1828,7 @@ async function logExperiment(
   args: Args,
   frozen?: FrozenExperimentDeliveryContext
 ) {
-  const root = frozen?.root ?? (await repoRoot(args.options.cwd))
-  return withDeliveryOwner(root, () => logExperimentOwned(args, frozen))
+  return logExperimentOwned(args, frozen)
 }
 
 /**

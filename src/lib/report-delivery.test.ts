@@ -6,6 +6,7 @@ import { git } from "./git"
 import {
   preserveResultRef,
   withDeliveryOwner,
+  withAttemptDeliveryOwner,
   recoverReports,
   pendingReportSummary,
   saveCleanupReceipt,
@@ -91,6 +92,174 @@ test("DTO adaptation leaves arbitrary nested metadata and plans untouched", () =
   expect(payload.data.session).not.toHaveProperty("status")
 })
 
+test("different attempts report concurrently while recovery skips an occupied attempt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "onyx-report-concurrency-"))
+  try {
+    await git(["init", "--quiet"], root)
+    let unlock!: () => void
+    let entered!: () => void
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      unlock = resolve
+    })
+    const first = withAttemptDeliveryOwner(root, "first", async () => {
+      entered()
+      await gate
+    })
+    await ready
+    try {
+      expect(
+        await withAttemptDeliveryOwner(root, "second", async () => "reported")
+      ).toBe("reported")
+      await expect(
+        withAttemptDeliveryOwner(root, "first", async () => {}, 0)
+      ).rejects.toThrow("Timed out")
+      // Drainer exclusion does not block either foreground attempt.
+      await withDeliveryOwner(root, async () => {
+        expect(
+          await withAttemptDeliveryOwner(root, "third", async () => "reported")
+        ).toBe("reported")
+        expect(
+          (await recoverReports(root, { positional: [], options: {} })).pending
+        ).toBe(0)
+      })
+    } finally {
+      unlock()
+      await first
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("recovery pushes unsealed measurements and retains acknowledged reports until failed pushes recover", async () => {
+  const { writeLocalAttempt, listLocalAttempts } =
+    await import("./research-runtime")
+  const root = await mkdtemp(join(tmpdir(), "onyx-recovery-push-"))
+  const previousKey = process.env.ONYX_API_KEY
+  const previousUrl = process.env.ONYX_API_URL
+  const bodies: Array<Record<string, unknown>> = []
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (request.method === "GET") {
+        const path = new URL(request.url).pathname
+        if (!path.endsWith("/overview") && !path.includes("/projects/"))
+          return new Response("Unsupported GET", { status: 405 })
+        return Response.json({
+          data: new URL(request.url).pathname.includes("/projects/")
+            ? { teamId: "team" }
+            : { campaign: { projectId: "project" } },
+        })
+      }
+      const body = (await request.json()) as Record<string, unknown>
+      bodies.push(body)
+      return Response.json({
+        data: { outcome: "recorded", experiment: { runRef: body.runRef } },
+      })
+    },
+  })
+  process.env.ONYX_API_KEY = "fixture-key"
+  process.env.ONYX_API_URL = server.url.origin
+  try {
+    await git(["init", "--quiet"], root)
+    await git(
+      [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "measurement",
+      ],
+      root
+    )
+    const commit = await git(["rev-parse", "HEAD"], root)
+    const remote = join(root, "remote.git")
+    await git(["init", "--bare", remote], root)
+    await git(["remote", "add", "origin", remote], root)
+    const attempt = (runRef: string) =>
+      ({
+        schemaVersion: 1,
+        createdAt: new Date().toISOString(),
+        runRef,
+        resultCommitSha: commit,
+        resultRef: `refs/onyx/experiments/campaign/${runRef}`,
+        sessionId: "session",
+        delivery: {
+          version: 1,
+          destination: {
+            apiUrl: server.url.origin,
+            teamId: "team",
+            campaignId: "campaign",
+          },
+          body: {
+            runRef,
+            resultCommitSha: commit,
+            resultRef: `refs/onyx/experiments/campaign/${runRef}`,
+            name: "Saved measurement",
+            resultRefPushStatus: "failed",
+            resultRefPushError: "Not pushed yet",
+          },
+          sealed: false,
+          attempts: 0,
+          nextAttemptAt: 0,
+          state: "pending",
+        },
+      }) as unknown as Parameters<typeof writeLocalAttempt>[0]["record"]
+    const args = { positional: [], options: {} }
+    const first = attempt("unsealed")
+    await writeLocalAttempt({ root, record: first })
+    await withAttemptDeliveryOwner(root, first.runRef, async () => {
+      await recoverReports(root, args)
+      expect(bodies).toHaveLength(0)
+      expect((await listLocalAttempts(root))[0]?.delivery?.sealed).toBe(false)
+    })
+    await recoverReports(root, args)
+    expect(bodies[0]?.resultRefPushStatus).toBe("pushed")
+    expect(bodies[0]).not.toHaveProperty("resultRefPushError")
+    expect(
+      await git(["--git-dir", remote, "rev-parse", first.resultRef], root)
+    ).toBe(commit)
+    expect(await listLocalAttempts(root)).toHaveLength(0)
+
+    await git(
+      ["remote", "set-url", "origin", join(root, "unavailable.git")],
+      root
+    )
+    await writeLocalAttempt({ root, record: attempt("outage") })
+    await recoverReports(root, args)
+    expect(bodies).toHaveLength(2)
+    expect(bodies[1]?.resultRefPushStatus).toBe("failed")
+    const pending = (await listLocalAttempts(root))[0]!
+    expect(pending.delivery?.reportAcknowledged).toBe(true)
+    expect<unknown>(pending.delivery?.body).toEqual(bodies[1])
+    expect((await pendingReportSummary(root)).blocked).toBe(1)
+    // Only the saved commit/ref is needed: no experiment worktree or branch.
+    await git(["remote", "set-url", "origin", remote], root)
+    pending.delivery!.nextAttemptAt = 0
+    await writeLocalAttempt({ root, record: pending })
+    await recoverReports(root, args)
+    expect(bodies).toHaveLength(2)
+    expect(
+      await git(["--git-dir", remote, "rev-parse", pending.resultRef], root)
+    ).toBe(commit)
+    expect(await listLocalAttempts(root)).toHaveLength(0)
+  } finally {
+    server.stop(true)
+    if (previousKey === undefined) delete process.env.ONYX_API_KEY
+    else process.env.ONYX_API_KEY = previousKey
+    if (previousUrl === undefined) delete process.env.ONYX_API_URL
+    else process.env.ONYX_API_URL = previousUrl
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("recovery replays the frozen report after a lost acknowledgement and preserves definitive failures", async () => {
   const { writeLocalAttempt, listLocalAttempts, clearLocalAttempt } =
     await import("./research-runtime")
@@ -135,12 +304,16 @@ test("recovery replays the frozen report after a lost acknowledgement and preser
             )
           : Response.json({ data: {} })
       }
-      if (request.method === "GET")
+      if (request.method === "GET") {
+        const path = new URL(request.url).pathname
+        if (!path.endsWith("/overview") && !path.includes("/projects/"))
+          return new Response("Unsupported GET", { status: 405 })
         return Response.json({
           data: path.includes("/projects/")
             ? { teamId: mode === "wrong-team" ? "foreign" : "team" }
-            : { projectId: "project" },
+            : { campaign: { projectId: "project" } },
         })
+      }
       const body = (await request.json()) as { runRef: string }
       reports.push(body)
       if (mode === "conflict")
@@ -180,6 +353,9 @@ test("recovery replays the frozen report after a lost acknowledgement and preser
       ],
       root
     )
+    const remote = join(root, "remote.git")
+    await git(["init", "--bare", remote], root)
+    await git(["remote", "add", "origin", remote], root)
     const commit = await git(["rev-parse", "HEAD"], root)
     const body = {
       runRef: "attempt",

@@ -146,11 +146,17 @@ and the custom harness contract.
 `onyx research recover --dry-run --json` inspects pending reports; omit `--dry-run`
 to attempt bounded delivery. Supervisors recover every 30 seconds while running.
 Frozen report bodies and immutable local refs survive network failures and cleanup.
+Recovery pushes saved commits even after their worktrees are removed. An acknowledged
+report with a failed push stays pending until its ref reaches origin; retries never
+change its frozen report body. Independent attempts report concurrently, and recovery
+skips attempts currently owned by a foreground reporter.
 Unsupported old records are retained for inspection, not converted automatically.
 `research clean` refuses active or pending execution state and preserves recovery evidence.
 
 Locks never expire under a holder. After stopping all users of a resource, use
 `onyx research locks reset --resource <name> --confirm-idle [--dry-run]`.
-Internal push and report locks are `onyx-result-ref-push` and `onyx-report-delivery`.
+Internal push and drainer locks are `onyx-result-ref-push` and `onyx-report-delivery`.
+Per-attempt locks use `onyx-report-attempt-<sha256 of runRef>`; errors identify the
+specific resource and lock path.
 A missing PID alone does not prove its descendants stopped. Kernel-lock activation
 remains gated on compiled tests on every release target.
