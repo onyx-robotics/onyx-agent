@@ -1,0 +1,46 @@
+name: Compiled lock proofs
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/verify-lock-descriptors.ts
+      - scripts/fixtures/lock-descriptor-probe.ts
+      - src/lib/process.ts
+      - .github/workflows/lock-proofs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  descriptors:
+    name: Lock proof (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin/arm64
+            target: bun-darwin-arm64
+          - runner: macos-15-intel
+            platform: darwin/x64
+            target: bun-darwin-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: bun-linux-arm64
+          - runner: ubuntu-24.04
+            platform: linux/x64
+            target: bun-linux-x64-baseline
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install --frozen-lockfile
+      - run: bun scripts/verify-lock-descriptors.ts
+        env:
+          ONYX_LOCK_PROBE_PLATFORM: ${{ matrix.platform }}
+          ONYX_LOCK_PROBE_TARGET: ${{ matrix.target }}
+          ONYX_TELEMETRY_DISABLED: "1"
