@@ -60,6 +60,7 @@ onyx listen
 ```
 
 Once you have a research session running, continue using your main-thread coding agent that you ran `/onyx` from to steer the research.
+
 ```bash
 # Using same /onyx coding agent thread from earlier
 Can you stop researching the PID controller, and instead build on the MPC controller more?
@@ -102,12 +103,12 @@ gracefully with `onyx research stop`.
 
 ## Supported agents
 
-| Agent | Support |
-| --- | --- |
-| [Claude Code](https://claude.com/claude-code) | Built-in launcher (`--agent claude`) + auto-installed `/onyx` skill |
-| [Codex](https://openai.com/codex/) | Built-in launcher (`--agent codex`) + auto-installed `/onyx` skill |
-| [OpenCode](https://opencode.ai) | Built-in launcher (`--agent opencode`) + auto-installed `/onyx` skill |
-| Custom harness | Bring your own worker with `--worker-command` (see [CONTRIBUTING.md](CONTRIBUTING.md)) |
+| Agent                                         | Support                                                                                |
+| --------------------------------------------- | -------------------------------------------------------------------------------------- |
+| [Claude Code](https://claude.com/claude-code) | Built-in launcher (`--agent claude`) + auto-installed `/onyx` skill                    |
+| [Codex](https://openai.com/codex/)            | Built-in launcher (`--agent codex`) + auto-installed `/onyx` skill                     |
+| [OpenCode](https://opencode.ai)               | Built-in launcher (`--agent opencode`) + auto-installed `/onyx` skill                  |
+| Custom harness                                | Bring your own worker with `--worker-command` (see [CONTRIBUTING.md](CONTRIBUTING.md)) |
 
 Built-in launchers spawn provider CLIs directly in non-interactive mode — no
 extra configuration beyond having the provider CLI installed and
@@ -139,3 +140,17 @@ and the custom harness contract.
 ## License
 
 [Apache-2.0](LICENSE)
+
+### Failed delivery and resource recovery
+
+`onyx research recover --dry-run --json` inspects pending reports; omit `--dry-run`
+to attempt bounded delivery. Supervisors recover every 30 seconds while running.
+Frozen report bodies and immutable local refs survive network failures and cleanup.
+Unsupported old records are retained for inspection, not converted automatically.
+`research clean` refuses active or pending execution state and preserves recovery evidence.
+
+Locks never expire under a holder. After stopping all users of a resource, use
+`onyx research locks reset --resource <name> --confirm-idle [--dry-run]`.
+Internal push and report locks are `onyx-result-ref-push` and `onyx-report-delivery`.
+A missing PID alone does not prove its descendants stopped. Kernel-lock activation
+remains gated on compiled tests on every release target.

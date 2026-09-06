@@ -1,7 +1,17 @@
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import {
+  mkdir,
+  readFile,
+  readdir,
+  unlink,
+  writeFile,
+  link,
+} from "node:fs/promises"
 import { join } from "node:path"
 
 import { onyxStateDir } from "./runtime-state"
+
+export class ResourceLockContentionError extends Error {}
 
 type ResourceLockRecord = {
   ownerId: string
@@ -24,8 +34,8 @@ function pidIsAlive(pid: number) {
   try {
     process.kill(pid, 0)
     return true
-  } catch {
-    return false
+  } catch (error) {
+    return errorCode(error) !== "ESRCH"
   }
 }
 
@@ -39,28 +49,50 @@ async function resourceLockDir(root: string, resourceName: string) {
   return dir
 }
 
-async function readLock(path: string) {
+function errorCode(error: unknown) {
+  return (error as NodeJS.ErrnoException).code
+}
+
+async function readLock(
+  path: string
+): Promise<Partial<ResourceLockRecord> | null> {
   try {
     return JSON.parse(
       await readFile(path, "utf8")
     ) as Partial<ResourceLockRecord>
-  } catch {
-    return null
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return null
+    throw new Error(`Resource lock is unreadable or malformed: ${path}`, {
+      cause: error,
+    })
   }
 }
 
-async function removeStaleLock(path: string, nowMs: number) {
-  const lock = await readLock(path)
-  if (!lock) {
-    await unlink(path).catch(() => {})
-    return
+/** Requires a quiescent repository: PID absence alone cannot prove children stopped. */
+export async function resetResourceLocks(
+  root: string,
+  resourceName: string,
+  dryRun = false
+) {
+  const dir = await resourceLockDir(root, resourceName)
+  const paths = (await readdir(dir))
+    .filter((name) => /^\d+\.json$/.test(name))
+    .map((name) => join(dir, name))
+  for (const path of paths) {
+    const record = await readLock(path).catch((error) => {
+      if (error.cause instanceof SyntaxError) return null
+      throw error
+    })
+    if (record?.pid && pidIsAlive(record.pid))
+      throw new Error(`Resource owner is live or inaccessible: ${path}`)
   }
-  const expiresAt =
-    typeof lock.expiresAt === "string" ? Date.parse(lock.expiresAt) : 0
-  const pid = typeof lock.pid === "number" ? lock.pid : 0
-  if (expiresAt <= nowMs || !pidIsAlive(pid)) {
-    await unlink(path).catch(() => {})
+  if (!dryRun) {
+    for (const path of paths) await unlink(path)
+    await unlink(join(dir, "capacity")).catch((error) => {
+      if (errorCode(error) !== "ENOENT") throw error
+    })
   }
+  return paths
 }
 
 export async function acquireFileResourceLease({
@@ -82,11 +114,24 @@ export async function acquireFileResourceLease({
 }) {
   const dir = await resourceLockDir(root, resourceName)
   const slotCount = Math.max(1, Math.floor(slots))
+  const capacityPath = join(dir, "capacity")
+  const temporaryCapacity = join(dir, `.capacity-${randomUUID()}`)
+  await writeFile(temporaryCapacity, String(slotCount), { flag: "wx" })
+  try {
+    await link(temporaryCapacity, capacityPath)
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") throw error
+  } finally {
+    await unlink(temporaryCapacity)
+  }
+  if ((await readFile(capacityPath, "utf8")) !== String(slotCount))
+    throw new Error(
+      `Resource slot configuration changed or is incomplete: ${dir}. Drain holders and reset before changing capacity.`
+    )
   const deadline = Date.now() + timeoutMs
-  while (Date.now() <= deadline) {
+  do {
     for (let slot = 0; slot < slotCount; slot += 1) {
       const path = join(dir, `${slot}.json`)
-      await removeStaleLock(path, Date.now())
       const record: ResourceLockRecord = {
         ownerId,
         pid: process.pid,
@@ -98,15 +143,24 @@ export async function acquireFileResourceLease({
         await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, {
           flag: "wx",
         })
+        let released = false
         return async () => {
+          if (released) return
+          released = true
           const current = await readLock(path)
-          if (current?.ownerId === ownerId) await unlink(path).catch(() => {})
+          if (current?.ownerId === ownerId)
+            await unlink(path).catch((error) => {
+              if (errorCode(error) !== "ENOENT") throw error
+            })
         }
-      } catch {
-        // Slot is already held by another live process.
+      } catch (error) {
+        if (errorCode(error) !== "EEXIST") throw error
       }
     }
-    await sleep(100)
-  }
-  throw new Error(`Timed out waiting for tool resource ${resourceName}`)
+    if (Date.now() >= deadline) break
+    await sleep(Math.min(100, deadline - Date.now()))
+  } while (Date.now() <= deadline)
+  throw new ResourceLockContentionError(
+    `Timed out waiting for tool resource ${resourceName}; locks: ${dir}. Stop all resource users before research locks reset --resource ${resourceName} --confirm-idle.`
+  )
 }

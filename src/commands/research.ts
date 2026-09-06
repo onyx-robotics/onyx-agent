@@ -1,3 +1,11 @@
+import {
+  assertAttemptRefsPreserved,
+  deliveryDestination,
+  pendingReportSummary,
+  recoverReports,
+  saveCleanupReceipt,
+} from "../lib/report-delivery"
+import { resetResourceLocks } from "../lib/resource-locks"
 import { randomBytes, randomUUID } from "node:crypto"
 import { closeSync, openSync } from "node:fs"
 import {
@@ -129,12 +137,11 @@ import { resolveOpenCodeModelId } from "../lib/opencode-models"
 import { collectLocalResearchStopReasons } from "../lib/research-stop"
 import {
   abandonNonterminalWorkflowRunsForWorker,
-  clearLocalAttempt,
   cacheLocalCampaign,
   cacheResearchSessionState,
-  applyRemoteProjectionDeltas,
   getLocalSessionState,
   listLocalAttempts,
+  writeLocalAttempt,
   listWorkflowRuns,
   recordLocalWorkerHeartbeat,
   registerLocalWorker,
@@ -1044,6 +1051,7 @@ function createPresenceSupervisor({
   }
 
   let cleanupStartedAt: string | null = null
+  let cleanupRevision = 0
 
   const normalizeSnapshotOptions = (
     options: boolean | PresenceSnapshotOptions = {}
@@ -1233,6 +1241,7 @@ function createPresenceSupervisor({
           sequence,
           sessionId,
           site: {
+            cleanupRevision,
             runtimeStatus,
             cleanupStartedAt:
               runtimeStatus === "draining" || terminal
@@ -1267,6 +1276,7 @@ function createPresenceSupervisor({
         },
         args
       )
+      cleanupRevision = response.cleanupRevision ?? cleanupRevision
       responses.push(response)
       for (const worker of chunk) {
         lastSent.set(worker.snapshot.id, worker.signature)
@@ -1458,6 +1468,9 @@ async function computeSessionCleanupStatus({
   sessionId: string
 }): Promise<SessionCleanupComputation> {
   const cleanupFailures: string[] = []
+  const pending = await pendingReportSummary(root)
+  if (pending.pending)
+    cleanupFailures.push(`${pending.pending} reports remain pending`)
   const [manifests] = await Promise.all([
     readWorkerLaunchManifests(root, sessionId).catch(() => []),
   ])
@@ -1933,12 +1946,14 @@ export async function teardownHypothesisAttempt({
     if (attempts.length > 1) {
       manifest.attemptDelivery = "ambiguous_discarded"
       manifest.reasonCode = "worker_protocol_violation"
-      manifest.error = `Worker produced ${attempts.length} terminal attempt manifests; none were delivered.`
-      await Promise.all(
-        attempts.map((attempt) =>
-          clearLocalAttempt(root, { runRef: attempt.runRef })
-        )
-      )
+      manifest.error = `Worker produced ${attempts.length} terminal attempt manifests; retained for inspection.`
+      for (const attempt of attempts) {
+        if (attempt.delivery) {
+          attempt.delivery.state = "rejected"
+          attempt.delivery.reason = "Ambiguous multiple terminal attempts"
+          await writeLocalAttempt({ root, record: attempt })
+        }
+      }
       return manifest
     }
     const attempt = attempts[0]
@@ -1980,9 +1995,6 @@ export async function teardownHypothesisAttempt({
       manifest.resultRefPushError = error.resultRefPushError
         ? boundedText(error.resultRefPushError, 1000)
         : null
-    }
-    if (manifest.runRef) {
-      await clearLocalAttempt(root, { runRef: manifest.runRef }).catch(() => {})
     }
     return manifest
   }
@@ -2063,7 +2075,11 @@ async function writeWorkerPrompt({
   const shutdownDeadlineMs = Math.max(nowMs, endTimeMs)
   const markdown = await readHypothesisWorkerPrompt()
 
-  await writeFile(path, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8")
+  await writeFile(
+    path,
+    markdown.endsWith("\n") ? markdown : `${markdown}\n`,
+    "utf8"
+  )
   return {
     path,
     markdown,
@@ -3133,6 +3149,11 @@ async function runHypothesisOnce({
       paths: runtimePaths,
       context: {
         schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
+        deliveryDestination: {
+          ...(await deliveryDestination(campaign.id, campaign.projectId, args)),
+          siteId: await getResearchSiteId(root),
+          supervisorRunId,
+        },
         campaignId: campaign.id,
         campaignName: campaign.name,
         sessionId,
@@ -3718,6 +3739,7 @@ async function runHypothesisOnce({
       }
 
       try {
+        await assertAttemptRefsPreserved(root, workerId)
         await removeWorkerWorktree({ root, sessionId, workerId })
         teardown.worktreeCleanup = "removed"
       } catch (cleanupError) {
@@ -4012,7 +4034,6 @@ export async function commandResearchHypothesisAdd(args: Args) {
         createdHypothesis,
       ],
       workers: before.workers,
-      experiments: before.latestExperiments,
       knowledge: before.knowledge,
     }).catch(() => {})
   }
@@ -4163,14 +4184,70 @@ export async function commandResearchScale(args: Args) {
   )
 }
 
+export async function commandResearchRecover(args: Args) {
+  const result = await recoverReports(
+    await repoRoot(args.options.cwd),
+    args,
+    args.options["dry-run"] === "true"
+  )
+  console.log(
+    args.options.json === "true"
+      ? JSON.stringify(result)
+      : [
+          `Pending: ${result.pending}; blocked: ${result.blocked}; rejected: ${result.rejected}; oldest: ${result.oldestPendingAt ?? "none"}`,
+          ...result.diagnostics.map(
+            (entry) =>
+              `${entry.runRef}: ${entry.reason}${entry.destination ? ` (team ${entry.destination.teamId}, ${entry.destination.apiUrl})` : ""}`
+          ),
+          ...(result.invalidRecords
+            ? [
+                `${result.invalidRecords} unreadable records retained under .git/onyx/attempts; inspect before cleanup.`,
+              ]
+            : []),
+        ].join("\n")
+  )
+}
+
+export async function commandResearchLocksReset(args: Args) {
+  const resource = args.options.resource
+  if (!resource || args.options["confirm-idle"] !== "true") {
+    throw new Error(
+      "Stop all launches and resource users, then pass --resource <name> --confirm-idle. PID absence does not establish that children stopped."
+    )
+  }
+  const paths = await resetResourceLocks(
+    await repoRoot(args.options.cwd),
+    resource,
+    args.options["dry-run"] === "true"
+  )
+  console.log(paths.join("\n"))
+}
+
 export async function commandResearchClean(args: Args) {
   const root = await repoRoot(args.options.cwd)
+  const state = await readState(root)
+  if (
+    Object.values(state.sessions ?? {}).some(
+      (session) =>
+        !["completed", "failed", "stopped", "ended"].includes(
+          session.status ?? ""
+        )
+    )
+  ) {
+    throw new Error(
+      "Stop and finalize local research sessions before cleaning execution state."
+    )
+  }
+  const pending = await pendingReportSummary(root)
+  if (pending.pending)
+    throw new Error(
+      `Retaining execution artifacts for ${pending.pending} pending attempts. Run onyx research recover first.`
+    )
   const stateDir = await onyxStateDir(root)
   const targets = [
     join(stateDir, "worker-runtime"),
     join(stateDir, "worker-logs"),
     join(stateDir, "workflow-runs"),
-    join(stateDir, "attempts"),
     join(stateDir, "worktrees"),
     join(stateDir, SUPERVISOR_LOG_DIR),
   ]
@@ -4188,7 +4265,7 @@ export async function commandResearchClean(args: Args) {
     }
   })
   console.log(
-    "Removed local Onyx research runtime, attempt, worktree, and log artifacts."
+    "Removed idle research runtime, worktree, and log artifacts; pending reports and immutable refs are preserved."
   )
 }
 
@@ -4330,6 +4407,7 @@ async function commandResearchStatusSummary({
   )
   const activeProcesses = supervisor?.activeProcessCount ?? 0
   const summary = {
+    outbox: await pendingReportSummary(root),
     campaign: {
       id: campaignId,
       name: fallbackCampaign?.name ?? campaignName,
@@ -4373,6 +4451,9 @@ async function commandResearchStatusSummary({
     return
   }
   console.log(`campaign: ${summary.campaign.name}`)
+  console.log(
+    `pending reports: ${summary.outbox.pending}; blocked=${summary.outbox.blocked}; rejected=${summary.outbox.rejected}; oldest=${summary.outbox.oldestPendingAt ?? "none"}`
+  )
   if (!summary.session) {
     console.log("session: none")
     return
@@ -4704,10 +4785,12 @@ export async function commandResearchStatus(args: Args) {
       })
     : []
 
+  const outbox = await pendingReportSummary(root)
   if (args.options.json === "true") {
     console.log(
       JSON.stringify(
         {
+          outbox,
           campaign: statusCampaign,
           sessions: freshOverview.sessions,
           locallyOwnedOpenSessions,
@@ -4762,6 +4845,9 @@ export async function commandResearchStatus(args: Args) {
   }
 
   console.log(`campaign: ${campaign.name}`)
+  console.log(
+    `pending reports: ${outbox.pending}; blocked=${outbox.blocked}; rejected=${outbox.rejected}; oldest=${outbox.oldestPendingAt ?? "none"}`
+  )
   console.log(`setup: local onyx/setup.json`)
   console.log(
     `sessions: ${freshOverview.sessions.length} recent remote, ${locallyOwnedOpenSessions.length} locally owned open`
@@ -5106,17 +5192,6 @@ async function reconcileCampaignIntoLocalState({
     projectPath,
     setup: state?.campaigns?.[key]?.setup ?? {},
   }).catch(() => {})
-  await applyRemoteProjectionDeltas({
-    root,
-    deltas: {
-      campaigns: [response.campaign],
-      sessions: [],
-      hypotheses: response.hypotheses,
-      workers: response.workers,
-      experiments: response.experiments,
-      knowledge: [],
-    },
-  }).catch(() => {})
   return response
 }
 
@@ -5290,7 +5365,7 @@ export async function commandResearchStop(args: Args) {
     state.sessions?.[sessionId]?.campaignId ??
     (args.options.campaign
       ? (await campaignForName(root, args)).campaign.id
-      : undefined)
+      : (await getResearchSessionState(sessionId, args)).campaign.id)
   state.sessions = state.sessions ?? {}
   state.sessions[sessionId] = {
     ...(state.sessions[sessionId] ?? {}),
@@ -5890,21 +5965,24 @@ async function discardOrphanWorkerWorkspace({
   if (attempts.length > 0) {
     teardown.warnings = [
       boundedText(
-        `Orphan cleanup discarded ${attempts.length} terminal attempt manifest(s) without delivery.`,
+        `Orphan cleanup retained ${attempts.length} terminal attempt manifest(s) without delivery.`,
         500
       ),
     ]
     if (attempts.length > 1) {
       teardown.attemptDelivery = "ambiguous_discarded"
       teardown.reasonCode = "worker_protocol_violation"
+      for (const attempt of attempts) {
+        if (attempt.delivery) {
+          attempt.delivery.state = "rejected"
+          attempt.delivery.reason = "Ambiguous multiple terminal attempts"
+          await writeLocalAttempt({ root, record: attempt })
+        }
+      }
     }
-    await Promise.all(
-      attempts.map((attempt) =>
-        clearLocalAttempt(root, { runRef: attempt.runRef }).catch(() => {})
-      )
-    )
   }
   try {
+    await assertAttemptRefsPreserved(root, manifest.workerId)
     await removeWorkerWorktree({
       root,
       sessionId,
@@ -6574,6 +6652,7 @@ async function commandResearchRunImplementation(
         cwd: root,
         env: providerRuntimeEnvironment(process.env),
       })
+  await deliveryDestination(campaign.id, campaign.projectId, args)
   let result: {
     session: ApiSession
     hypotheses: ApiHypothesis[]
@@ -6888,7 +6967,14 @@ async function commandResearchRunImplementation(
   console.log(`Presence: every ${presenceIntervalMs / 1000}s`)
 
   try {
+    let lastRecoveryAt = 0
     while (Date.now() < hardEndTimeMs) {
+      if (Date.now() - lastRecoveryAt >= 30_000) {
+        lastRecoveryAt = Date.now()
+        await recoverReports(root, args).catch((error) =>
+          console.warn(String(error))
+        )
+      }
       const loopNow = Date.now()
       void sessionStateBriefRefresher.refresh().catch(() => {})
       await persistRuntimeTelemetry({ activeProcessCount: activeRuns.size })
@@ -7422,6 +7508,9 @@ async function commandResearchRunImplementation(
     }
   } finally {
     presenceSupervisor.request()
+    await recoverReports(root, args).catch((error) =>
+      console.warn(String(error))
+    )
     await presenceSupervisor.stop({ runtimeStatus: "draining" })
   }
 
@@ -7577,6 +7666,19 @@ async function commandResearchRunImplementation(
     providerBackoff: null,
     activeProcessCount: 0,
   })
+  await saveCleanupReceipt(root, {
+    destination: await deliveryDestination(
+      campaign.id,
+      campaign.projectId,
+      args
+    ),
+    sessionId,
+    siteId: schedulerSiteId,
+    supervisorRunId,
+    readyExceptDelivery: cleanup.reasons.every((reason) =>
+      /reports remain pending$/.test(reason)
+    ),
+  })
   await Promise.race([
     presenceSupervisor.flush({
       terminal: true,
@@ -7585,6 +7687,7 @@ async function commandResearchRunImplementation(
     sleep(5000),
   ]).catch(() => {})
 
+  await recoverReports(root, args).catch((error) => console.warn(String(error)))
   console.log(
     `Research run ${finalStatus}: launched=${launched} completed=${completed} failed=${failed} stopped=${stopped}; cleanup=${reportedCleanupStatus}.`
   )

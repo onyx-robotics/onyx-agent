@@ -11,6 +11,7 @@ export const ONYX_WORKER_CONTEXT = "ONYX_WORKER_CONTEXT"
 
 export type WorkerRuntimeContext = {
   schemaVersion: typeof ONYX_WORKER_CONTEXT_SCHEMA_VERSION
+  deliveryDestination?: import("./report-delivery").DeliveryDestination
   campaignId: string
   campaignName: string
   sessionId: string
@@ -145,6 +146,8 @@ export async function parseWorkerRuntimeContext(path: string) {
 
   const context: WorkerRuntimeContext = {
     schemaVersion: ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
+    deliveryDestination:
+      record.deliveryDestination as WorkerRuntimeContext["deliveryDestination"],
     campaignId: stringField(record, "campaignId") ?? "",
     campaignName: stringField(record, "campaignName") ?? "",
     sessionId: stringField(record, "sessionId") ?? "",

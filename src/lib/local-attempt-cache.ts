@@ -17,6 +17,7 @@ export type CachedAttemptRecord = Omit<
   LocalResearchCampaignExperimentLoggedRecord,
   "type" | "schemaVersion" | "createdAt" | "name" | "description"
 > & {
+  delivery?: import("./report-delivery").PendingDelivery
   schemaVersion: 1
   createdAt: string
 }

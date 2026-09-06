@@ -103,6 +103,7 @@ export const researchSiteRuntimeStatusSchema = z.enum([
   "failed",
 ])
 export const researchSessionCleanupStatusSchema = z.enum([
+  "unknown",
   "running",
   "draining",
   "complete",
@@ -768,6 +769,7 @@ const researchSessionAssignmentInputSchema = z.object({
 
 export const createResearchSessionRequestSchema = z
   .object({
+    requestId: z.uuid(),
     name: z.string().trim().min(1).max(160),
     baseCommitSha: gitShaSchema,
     setupHash: sha256Schema,
@@ -988,6 +990,7 @@ export const researchPresenceWorkerSnapshotSchema = z.object({
 })
 
 export const researchPresenceSiteSnapshotSchema = z.object({
+  cleanupRevision: z.number().int().nonnegative().optional(),
   runtimeStatus: researchSiteRuntimeStatusSchema.default("active"),
   cleanupStartedAt: z.iso.datetime().nullable().optional(),
   cleanupCompletedAt: z.iso.datetime().nullable().optional(),
@@ -1057,6 +1060,7 @@ export const upsertResearchPresenceResponseSchema = z.object({
     deferredStartupTelemetryCount: z.number().int().nonnegative().default(0),
     splitCount: z.number().int().nonnegative().default(1),
     siteAccepted: z.boolean(),
+    cleanupRevision: z.number().int().nonnegative().optional(),
   }),
 })
 
@@ -1510,6 +1514,11 @@ export const researchProjectGraphEdgeSchema = z.object({
 
 export const researchProjectGraphResponseSchema = z.object({
   data: z.object({
+    window: z.object({
+      limit: z.number().int().positive(),
+      totalCampaigns: z.number().int().nonnegative(),
+      truncated: z.boolean(),
+    }),
     project: researchProjectSchema,
     nodes: z.array(researchProjectGraphNodeSchema),
     edges: z.array(researchProjectGraphEdgeSchema),
@@ -1525,6 +1534,11 @@ export const researchProjectOutlineCampaignSchema =
 
 export const researchProjectTreeResponseSchema = z.object({
   data: z.object({
+    window: z.object({
+      limit: z.number().int().positive(),
+      totalCampaigns: z.number().int().nonnegative(),
+      truncated: z.boolean(),
+    }),
     project: researchProjectSchema,
     campaigns: z.array(researchProjectOutlineCampaignSchema),
   }),
@@ -1562,6 +1576,7 @@ export const researchSessionBriefQuerySchema = z.object({
 })
 
 export const researchSessionSiteSchema = z.object({
+  cleanupRevision: z.number().int().nonnegative().default(0),
   id: z.uuid(),
   campaignId: z.uuid(),
   sessionId: z.uuid(),
@@ -2049,6 +2064,8 @@ export const researchCampaignGraphEdgeSchema = z.object({
 })
 
 export const researchCampaignGraphQuerySchema = z.object({
+  maxWorkers: z.coerce.number().int().min(1).max(250).default(100),
+  maxHypotheses: z.coerce.number().int().min(1).max(250).default(100),
   // Bounded window over the campaign's most recent accepted experiments; the
   // graph is a review surface, not a full-history browser.
   maxNodes: z.coerce.number().int().min(10).max(2000).default(500),
@@ -2061,6 +2078,9 @@ export const researchCampaignGraphResponseSchema = z.object({
     edges: z.array(researchCampaignGraphEdgeSchema),
     window: z.object({
       maxNodes: z.number().int().positive(),
+      totalWorkers: z.number().int().nonnegative(),
+      totalHypotheses: z.number().int().nonnegative(),
+      totalLinks: z.number().int().nonnegative(),
       totalExperiments: z.number().int().nonnegative(),
       truncated: z.boolean(),
     }),
@@ -2601,3 +2621,14 @@ export type ResearchSessionLiveChangedEvent = z.infer<
   typeof researchSessionLiveChangedEventSchema
 >
 export type ResearchEvent = z.infer<typeof researchEventSchema>
+
+export const updateResearchSiteCleanupRequestSchema = z.object({
+  siteId: z.uuid(),
+  supervisorRunId: z.string().min(1).max(120),
+  expectedRevision: z.number().int().nonnegative(),
+  status: z.enum(["complete", "failed", "draining"]),
+  summary: metadataSchema,
+})
+export const updateResearchSiteCleanupResponseSchema = z.object({
+  data: researchSessionSiteSchema,
+})

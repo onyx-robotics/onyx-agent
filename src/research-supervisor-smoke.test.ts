@@ -415,6 +415,25 @@ function installSupervisorApi({
     let data: unknown
     if (
       method === "GET" &&
+      url.pathname === `/api/v1/research/projects/${PROJECT_ID}`
+    ) {
+      return Response.json({
+        data: {
+          id: PROJECT_ID,
+          teamId: "70000000-0000-4000-8000-000000000001",
+          name: "Smoke project",
+          repositoryUrl: "https://github.com/onyx/smoke",
+          projectPath: "",
+        },
+      })
+    }
+    if (
+      method === "GET" &&
+      url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}`
+    )
+      return Response.json({ data: currentCampaign })
+    if (
+      method === "GET" &&
       url.pathname === `/api/v1/research/campaigns/${CAMPAIGN_ID}/overview`
     ) {
       data = {
@@ -464,8 +483,7 @@ function installSupervisorApi({
       }
     } else if (
       method === "POST" &&
-      url.pathname ===
-        `/api/v1/research/sessions/${SESSION_ID}/settlement-tick`
+      url.pathname === `/api/v1/research/sessions/${SESSION_ID}/settlement-tick`
     ) {
       if (receivedExperimentCount > 0) {
         acceptedExperimentCount = 1
@@ -1066,57 +1084,53 @@ describe("remote-first research supervisor smoke", () => {
     }, 60_000)
   }
 
-  test(
-    "renders a bounded summary status without full campaign detail",
-    async () => {
-      const { root, origin, baseCommitSha } = await createSmokeRepo()
-      installSupervisorApi({ baseCommitSha, workerTarget: 1 })
-      try {
-        await withMutedConsole(() =>
-          commandResearchRun({
-            positional: ["research", "run"],
-            options: {
-              cwd: root,
-              campaign: "smoke",
-              workers: "1",
-              experiments: "1",
-              foreground: "true",
-              quiet: "true",
-              "worker-command": FAKE_WORKER_COMMAND,
-              "presence-interval": "0.1",
-              "launch-interval-seconds": "0.01",
-              "startup-timeout": "5",
-              "heartbeat-sample-interval": "0",
-              "first-attempt-warning-seconds": "0",
-            },
-          })
-        )
-        const output = await captureConsole(() =>
-          commandResearchStatus({
-            positional: ["research", "status"],
-            options: {
-              cwd: root,
-              campaign: "smoke",
-              summary: "true",
-              json: "true",
-            },
-          })
-        )
-        const summary = JSON.parse(output) as Record<string, unknown>
-        expect(summary).toHaveProperty("campaign")
-        expect(summary).toHaveProperty("session")
-        expect(summary).toHaveProperty("campaign.status", "active")
-        expect(summary).toHaveProperty("session.outcome")
-        expect(summary).toHaveProperty("session.cleanup")
-        expect(summary).not.toHaveProperty("hypotheses")
-        expect(summary).not.toHaveProperty("workers")
-      } finally {
-        await rm(root, { recursive: true, force: true })
-        await rm(origin, { recursive: true, force: true })
-      }
-    },
-    60_000
-  )
+  test("renders a bounded summary status without full campaign detail", async () => {
+    const { root, origin, baseCommitSha } = await createSmokeRepo()
+    installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "worker-command": FAKE_WORKER_COMMAND,
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "5",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+          },
+        })
+      )
+      const output = await captureConsole(() =>
+        commandResearchStatus({
+          positional: ["research", "status"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            summary: "true",
+            json: "true",
+          },
+        })
+      )
+      const summary = JSON.parse(output) as Record<string, unknown>
+      expect(summary).toHaveProperty("campaign")
+      expect(summary).toHaveProperty("session")
+      expect(summary).toHaveProperty("campaign.status", "active")
+      expect(summary).toHaveProperty("session.outcome")
+      expect(summary).toHaveProperty("session.cleanup")
+      expect(summary).not.toHaveProperty("hypotheses")
+      expect(summary).not.toHaveProperty("workers")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(origin, { recursive: true, force: true })
+    }
+  }, 60_000)
 
   test("treats settled discarded experiment reports as clean logged outcomes", async () => {
     const { root, origin, baseCommitSha } = await createSmokeRepo()
@@ -1222,8 +1236,7 @@ describe("remote-first research supervisor smoke", () => {
         calls.some(
           (call) =>
             call.method === "POST" &&
-            call.path ===
-              "/api/v1/research/worker/experiments"
+            call.path === "/api/v1/research/worker/experiments"
         )
       ).toBe(false)
       expect(await pathExists(join(root, ".git", "onyx", "research.db"))).toBe(
@@ -1341,7 +1354,7 @@ describe("remote-first research supervisor smoke", () => {
     }
   }, 60_000)
 
-  test("drops local delivery state when API report fails after push", async () => {
+  test("retains the frozen report and local immutable ref when delivery fails after push", async () => {
     const { root, origin, baseCommitSha } = await createSmokeRepo()
     const calls = installSupervisorApi({
       baseCommitSha,
@@ -1374,8 +1387,7 @@ describe("remote-first research supervisor smoke", () => {
         calls.some(
           (call) =>
             call.method === "POST" &&
-            call.path ===
-              "/api/v1/research/worker/experiments"
+            call.path === "/api/v1/research/worker/experiments"
         )
       ).toBe(true)
       const refs = await git(
@@ -1383,6 +1395,21 @@ describe("remote-first research supervisor smoke", () => {
         root
       )
       expect(refs.trim()).not.toBe("")
+      const pendingFiles = (
+        await readdir(join(root, ".git", "onyx", "attempts"))
+      ).filter((name) => name.endsWith(".json"))
+      expect(pendingFiles.length).toBeGreaterThan(0)
+      const pending = JSON.parse(
+        await readFile(
+          join(root, ".git", "onyx", "attempts", pendingFiles[0]!),
+          "utf8"
+        )
+      )
+      expect(pending.delivery.sealed).toBe(true)
+      expect(pending.delivery.body.runRef).toBe(pending.runRef)
+      expect(await git(["rev-parse", pending.resultRef], root)).toBe(
+        pending.resultCommitSha
+      )
       const workerLogRoot = join(
         root,
         ".git",

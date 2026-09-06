@@ -15,6 +15,8 @@ import { commandProfile } from "./commands/profile"
 import {
   commandResearchBrief,
   commandResearchClean,
+  commandResearchLocksReset,
+  commandResearchRecover,
   commandResearchHypothesisAdd,
   commandResearchHypothesisClose,
   commandResearchHypothesisList,
@@ -81,7 +83,9 @@ Usage:
   onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--quiet]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research scale --workers <n> [--session <id>]
+  onyx research recover [--dry-run] [--json]
   onyx research clean [--dry-run]
+  onyx research locks reset --resource <name> --confirm-idle [--dry-run]
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]
   onyx research status [--campaign <name>] [--all-sessions] [--summary] [--json] [--reconcile]
   onyx knowledge add [--campaign <name>] --kind insight|dead_end|promising_direction|risk|transfer_note --title <text> --body <text> [--require-online]
@@ -208,6 +212,14 @@ async function runMainCommand(argv: string[]) {
   if (command === "research" && sub === "stop") return commandResearchStop(args)
   if (command === "research" && sub === "scale")
     return commandResearchScale(args)
+  if (
+    command === "research" &&
+    sub === "locks" &&
+    args.positional[2] === "reset"
+  )
+    return commandResearchLocksReset(args)
+  if (command === "research" && sub === "recover")
+    return commandResearchRecover(args)
   if (command === "research" && sub === "clean")
     return commandResearchClean(args)
   if (command === "research" && sub === "brief")

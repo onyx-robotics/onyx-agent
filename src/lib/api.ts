@@ -1,3 +1,5 @@
+import { setTimeout as sleepWithSignal } from "node:timers/promises"
+import { randomUUID } from "node:crypto"
 import type {
   AcquireResearchWorkerLeaseBatchResponse,
   AcquireResearchWorkerLeaseResponse,
@@ -6,8 +8,6 @@ import type {
   ResearchEvaluationManifest,
   ResearchSessionHypothesisAssignment,
   ResearchHypothesisPlan,
-  ResearchSetupCompliance,
-  ResearchWorker,
 } from "../protocol"
 
 import type { Args } from "./args"
@@ -17,265 +17,150 @@ import { readState, updateState } from "./runtime-state"
 import { resolveProjectPath } from "./project"
 import { getWorkerRuntimeContextCached } from "./worker-context"
 
-export type ApiProject = {
-  id: string
-  name: string
-  repositoryUrl: string
-  repositoryAccessMode: "local_reported" | "github_public" | "github_app"
-  repositoryFullName: string | null
-  defaultBranch: string
-  projectPath: string
-}
+export type ApiProject = Pick<
+  import("../protocol").ResearchProject,
+  | "id"
+  | "name"
+  | "repositoryUrl"
+  | "repositoryAccessMode"
+  | "repositoryFullName"
+  | "defaultBranch"
+  | "projectPath"
+>
 
-export type ApiGitStatus =
-  | "local_reported"
-  | "pending"
-  | "verified"
-  | "missing"
-  | "mismatch"
-  | "unreachable"
+export type ApiGitStatus = import("../protocol").ResearchExperimentGitStatus
 
-export type ApiCampaign = {
-  id: string
-  projectId: string
-  parentCampaignId?: string | null
-  name: string
-  description: string | null
-  createdFromCommitSha: string | null
-  currentEvaluationRevisionId: string | null
-  currentEvaluationRevision: ApiEvaluationRevision | null
-  /** Derived locally for legacy display/runtime helpers; not part of the API contract. */
-  baseCommitSha: string
-  bestExperimentId: string | null
-  bestMetricValue: number | null
-  bestCommitSha: string | null
-  status: "active" | "archived" | "completed"
-  metricName: string
-  metricUnit: string | null
-  metricDirection: "maximize" | "minimize"
-  experimentCount: number
-  lastExperimentAt?: string | null
-  promotionRefName: string | null
-  createdAt?: string
-  updatedAt?: string
-}
-
-export type ApiEvaluationRevision = {
-  id: string
-  campaignId: string
-  fingerprint: string
-  setupHash: string
-  manifest: ResearchEvaluationManifest
-  firstSeenCommitSha: string
-  gitStatus: ApiGitStatus
-  gitVerifiedAt: string | null
-  gitStatusReason: string | null
-  bestExperimentId: string | null
-  bestMetricValue: number | null
-  bestCommitSha: string | null
-  experimentCount: number
-  lastExperimentAt: string | null
-  createdAt: string
-  updatedAt: string
-}
-
-export type ApiCampaignGitVerificationSummary = {
-  repositoryAccessMode: ApiProject["repositoryAccessMode"]
-  baseGitStatus: ApiGitStatus
-  baseGitVerifiedAt: string | null
-  baseGitStatusReason: string | null
-  acceptedExperimentGitStatusCounts: Record<ApiGitStatus, number>
-  discardedExperimentGitStatusCounts: Record<ApiGitStatus, number>
-  needsVerificationCount: number
-  hardFailureCount: number
-  lastVerifiedAt: string | null
-  recommendedAction:
-    | "connect_github"
-    | "resolve_ref_mismatch"
-    | "push_refs"
-    | "verify_git"
-    | "retry_later"
-    | "none"
-  message: string
-}
-
-export type ApiCampaignGitVerificationResult = {
-  checkedCount: number
-  updatedCount: number
-  remainingCount: number
-  limit: number
-  hasMore: boolean
-  rateLimit: {
-    limited: boolean
-    retryAfterSeconds: number | null
-    remaining: number | null
-    limit: number | null
-    resetAt: string | null
-  } | null
-  base: {
-    checked: boolean
-    updated: boolean
-    previousStatus: ApiGitStatus | null
-    status: ApiGitStatus
-    verifiedAt: string | null
-    statusReason: string | null
+export type ApiCampaign = Pick<
+  import("../protocol").ResearchCampaign,
+  | "id"
+  | "projectId"
+  | "name"
+  | "description"
+  | "createdFromCommitSha"
+  | "currentEvaluationRevisionId"
+  | "currentEvaluationRevision"
+  | "status"
+  | "metricName"
+  | "metricUnit"
+  | "metricDirection"
+  | "experimentCount"
+  | "promotionRefName"
+> &
+  Partial<
+    Pick<
+      import("../protocol").ResearchCampaign,
+      "parentCampaignId" | "lastExperimentAt" | "createdAt" | "updatedAt"
+    >
+  > & {
+    baseCommitSha: string
+    bestExperimentId: string | null
+    bestMetricValue: number | null
+    bestCommitSha: string | null
   }
-  summary: ApiCampaignGitVerificationSummary
-}
 
-export type ApiCampaignExperiment = {
-  id: string
-  campaignId: string
-  sessionId: string
-  evaluationRevisionId: string
-  assignmentId: string
-  hypothesisId: string
-  workerId: string | null
-  acceptedIndex: number | null
-  runRef: string
-  name: string
-  description: string | null
-  baseCommitSha: string
-  resultCommitSha: string
-  resultRef: string
-  status: string
-  setupCompliance: ResearchSetupCompliance | null
-  gitStatus: string
-  gitVerifiedAt: string | null
-  gitStatusReason: string | null
-  resultRefPushStatus: "pushed" | "failed" | "skipped" | null
-  resultRefPushedAt: string | null
-  resultRefPushError: string | null
-  disposition: "received" | "accepted" | "discarded"
-  dispositionReason: string | null
-  settledAt: string | null
-  primaryMetricName: string
-  primaryMetricValue: number | null
-  secondaryMetrics: Record<string, unknown>
-  artifactRefs: Record<string, unknown>
-  agentNotes: Record<string, unknown>
-  checks: {
-    status: "passed" | "failed" | "timed_out"
-    durationMs: number | null
-    outputSummary: string | null
-  } | null
-  durationMs: number | null
-  outputSummary: string | null
-  startedAt: string | null
-  completedAt: string | null
-  createdAt: string
-  updatedAt: string
-}
+export type ApiEvaluationRevision =
+  import("../protocol").ResearchEvaluationRevision
 
-export type ApiSession = {
-  id: string
-  campaignId: string
-  name: string
-  evaluationRevisionId: string
-  baseCommitSha: string
-  setupHash: string
-  baseGitStatus: ApiGitStatus
-  baseGitVerifiedAt: string | null
-  baseGitStatusReason: string | null
-  runtimeState: "starting" | "active" | "stale" | "abandoned" | "ended"
-  /** Derived locally from endedAt/endReason. */
-  status: "running" | "completed" | "failed" | "stopped"
-  cleanupStatus: "running" | "draining" | "complete" | "failed" | "abandoned"
-  terminalReason: ApiSession["endReason"]
-  workerTarget: number
-  experimentTarget: number | null
-  acceptedExperimentCount: number
-  remainingExperimentCount: number | null
-  deadlineAt: string | null
-  endedAt: string | null
-  endReason:
-    | "experiment_target_reached"
-    | "deadline_reached"
-    | "user_stopped"
-    | "provider_capacity_exhausted"
-    | "all_hypotheses_closed"
-    | "supervisor_failed"
-    | "failed"
-    | "abandoned"
-    | null
-  schedulerSiteId: string | null
-  assignments: ResearchSessionHypothesisAssignment[]
-  metadata: Record<string, unknown>
-  startedAt?: string
-  completedAt?: string | null
-  createdAt?: string
-  updatedAt?: string
-}
+export type ApiCampaignGitVerificationSummary =
+  import("../protocol").ResearchCampaignGitVerificationSummary
 
-export type ApiWorker = {
-  id: string
-  campaignId: string
-  sessionId: string | null
-  assignmentId?: string
-  hypothesisId: string
-  workerName: string
-  agentKind: string
-  runtime: "local" | "hosted"
-  status: "registered" | "running" | "completed" | "failed" | "stopped"
-  liveness?: "active" | "stale" | "lost" | "unknown" | "terminal"
-  currentExperimentId: string | null
-  phase: string | null
-  progressMessage: string | null
-  gitLabel: string | null
-  siteId?: string | null
-  supervisorRunId?: string | null
-  workerRef?: string | null
-  leaseExpiresAt?: string | null
-  leaseReleasedAt?: string | null
-  terminalOutcome?: ResearchWorker["terminalOutcome"]
-  lastSeenAt: string
-  startedAt: string
-  metadata: Record<string, unknown>
-  createdAt: string
-  updatedAt: string
-}
+export type ApiCampaignGitVerificationResult =
+  import("../protocol").VerifyResearchCampaignGitResponse["data"]
 
-export type ApiHypothesis = {
-  id: string
-  campaignId: string
-  createdBySessionId: string | null
-  name: string
-  description: string | null
-  status: "active" | "closed"
-  /** Assignment bases supersede this local-only fallback. */
-  baseCommitSha: string
-  summaryEvaluationRevisionId: string | null
-  bestExperimentId: string | null
-  bestMetricValue: number | null
-  bestCommitSha: string | null
-  experimentCount: number
-  lastWorkedAt: string | null
-  plan: ResearchHypothesisPlan
-  metadata: Record<string, unknown>
-  createdAt: string
-  updatedAt: string
-}
+export type ApiCampaignExperiment =
+  import("../protocol").ResearchCampaignExperiment
 
-export type ApiKnowledge = {
-  id: string
-  campaignId: string
-  sessionId: string | null
-  hypothesisId: string | null
-  authoredByWorkerId: string | null
-  experimentId: string | null
-  kind:
-    | "insight"
-    | "dead_end"
-    | "promising_direction"
-    | "risk"
-    | "transfer_note"
-  title: string
-  body: string
-  confidence: number | null
-  metadata: Record<string, unknown>
-  createdAt: string
-  updatedAt: string
-}
+export type ApiSession = Pick<
+  import("../protocol").ResearchSession,
+  | "id"
+  | "campaignId"
+  | "name"
+  | "evaluationRevisionId"
+  | "baseCommitSha"
+  | "setupHash"
+  | "baseGitStatus"
+  | "baseGitVerifiedAt"
+  | "baseGitStatusReason"
+  | "runtimeState"
+  | "workerTarget"
+  | "experimentTarget"
+  | "acceptedExperimentCount"
+  | "remainingExperimentCount"
+  | "deadlineAt"
+  | "endedAt"
+  | "endReason"
+  | "schedulerSiteId"
+  | "assignments"
+  | "metadata"
+> &
+  Partial<
+    Pick<
+      import("../protocol").ResearchSession,
+      "startedAt" | "createdAt" | "updatedAt"
+    >
+  > & {
+    status: "running" | "completed" | "failed" | "stopped"
+    cleanupStatus: import("../protocol").ResearchSessionControlStateResponse["data"]["cleanup"]["status"]
+    terminalReason: import("../protocol").ResearchSession["endReason"]
+    completedAt?: string | null
+  }
+
+export type ApiWorker = Pick<
+  import("../protocol").ResearchWorker,
+  | "id"
+  | "campaignId"
+  | "workerName"
+  | "agentKind"
+  | "runtime"
+  | "status"
+  | "currentExperimentId"
+  | "phase"
+  | "progressMessage"
+  | "gitLabel"
+  | "lastSeenAt"
+  | "startedAt"
+  | "metadata"
+  | "createdAt"
+  | "updatedAt"
+> &
+  Partial<
+    Pick<
+      import("../protocol").ResearchWorker,
+      | "assignmentId"
+      | "liveness"
+      | "siteId"
+      | "supervisorRunId"
+      | "workerRef"
+      | "leaseExpiresAt"
+      | "leaseReleasedAt"
+      | "terminalOutcome"
+    >
+  > & {
+    sessionId: import("../protocol").ResearchSessionLiveResponse["data"]["workers"][number]["sessionId"]
+    hypothesisId: import("../protocol").ResearchSessionLiveResponse["data"]["workers"][number]["hypothesisId"]
+  }
+
+export type ApiHypothesis = Pick<
+  import("../protocol").ResearchHypothesis,
+  | "id"
+  | "campaignId"
+  | "createdBySessionId"
+  | "name"
+  | "description"
+  | "status"
+  | "summaryEvaluationRevisionId"
+  | "bestExperimentId"
+  | "bestMetricValue"
+  | "bestCommitSha"
+  | "experimentCount"
+  | "lastWorkedAt"
+  | "plan"
+  | "metadata"
+  | "createdAt"
+  | "updatedAt"
+> & { baseCommitSha: string }
+
+export type ApiKnowledge = import("../protocol").ResearchKnowledge
 
 export type ApiCampaignTimeline = {
   campaign: ApiCampaign
@@ -285,238 +170,58 @@ export type ApiCampaignTimeline = {
   knowledge: ApiKnowledge[]
 }
 
-export type ApiCampaignOverview = ApiCampaignTimeline & {
-  bestExperiment: ApiCampaignExperiment | null
-  latestExperiments: ApiCampaignExperiment[]
+export type ApiCampaignOverview = Omit<
+  import("../protocol").ResearchCampaignOverviewResponse["data"],
+  "campaign" | "sessions" | "workers" | "hypotheses"
+> & {
+  campaign: ApiCampaign
   sessions: ApiSession[]
-  counts: {
-    experiments: number
-    hypothesisCount: number
-    activeWorkers: number
-  }
+  workers: ApiWorker[]
+  hypotheses: ApiHypothesis[]
 }
 
-export type ApiSessionState = {
+export type ApiSessionState = Omit<
+  import("../protocol").ResearchSessionStateResponse["data"],
+  "session" | "campaign" | "hypotheses" | "workers"
+> & {
   session: ApiSession
   campaign: ApiCampaign
-  latestExperiments: ApiCampaignExperiment[]
-  bestExperiment: ApiCampaignExperiment | null
   hypotheses: ApiHypothesis[]
   workers: ApiWorker[]
-  knowledge: ApiKnowledge[]
-  updatedAt: string
 }
 
-export type ApiSessionLive = {
-  session: ApiSession
-  campaign: ApiCampaign
-  progress: {
-    experimentTarget: number | null
-    acceptedExperimentCount: number
-    receivedExperimentCount: number
-    remainingExperimentCount: number | null
-    deadlineAt: string | null
-    endedAt: string | null
-    endReason: ApiSession["endReason"]
-    warning?: string | null
-  }
-  livenessCounts: Record<string, number>
-  phaseCounts: Record<string, number>
-  workers: Array<{
-    id: string
-    campaignId?: string
-    sessionId?: string | null
-    hypothesisId?: string | null
-    workerName?: string | null
-    agentKind?: string | null
-    runtime?: ApiWorker["runtime"] | null
-    status: ApiWorker["status"]
-    liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
-    phase: string | null
-    progressMessage: string | null
-    gitLabel: string | null
-    currentExperimentId: string | null
-    lastOutputAt: string | null
-    activitySummary: Record<string, unknown>
-    observedAt?: string | null
-    receivedAt: string
-    matched: boolean
-  }>
-  sites: Array<{
-    siteId: string
-    supervisorRunId: string | null
-    liveness?: "active" | "stale" | "lost"
-    status?: "active" | "stale" | "inactive"
-    runtimeStatus?: "starting" | "active" | "draining" | "complete" | "failed"
-    cleanupStartedAt?: string | null
-    cleanupCompletedAt?: string | null
-    cleanupSummary?: Record<string, unknown>
-    lastSequence: number
-    activeWorkerCount: number
-    launchedWorkerCount: number
-    failedLaunchCount: number
-    uploadedWorkerCount?: number
-    unchangedWorkerCount?: number
-    droppedOrDeferredWorkerCount?: number
-    providerBackoff: Record<string, unknown> | null
-    ignoredPresence: Record<string, unknown>
-    lastUploadAt: string | null
-    receivedAt: string
-  }>
-  unmatchedPresenceCount: number
-  ignoredPresence: Record<string, unknown>
-  providerBackoff: Record<string, unknown> | null
-  recentExperiments: ApiCampaignExperiment[]
-  recentTerminalWorkers: Array<{
-    id: string
-    campaignId?: string
-    sessionId?: string | null
-    hypothesisId?: string | null
-    workerName?: string | null
-    agentKind?: string | null
-    runtime?: ApiWorker["runtime"] | null
-    status: ApiWorker["status"]
-    liveness: "active" | "stale" | "lost" | "unknown" | "terminal"
-    phase: string | null
-    progressMessage: string | null
-    gitLabel: string | null
-    currentExperimentId: string | null
-    lastOutputAt: string | null
-    activitySummary: Record<string, unknown>
-    observedAt?: string | null
-    receivedAt: string
-    matched: boolean
-  }>
-  liveWatermark: string
-  updatedAt: string
-}
+export type ApiSessionLive = Omit<
+  import("../protocol").ResearchSessionLiveResponse["data"],
+  "session" | "campaign"
+> & { session: ApiSession; campaign: ApiCampaign }
 
-export type ApiSessionControlState = {
-  sessionId: string
-  campaignStatus: ApiCampaign["status"]
-  runtimeState: ApiSession["runtimeState"]
-  status: ApiSession["status"]
-  outcome: {
-    status: ApiSession["status"]
-    endedAt: string | null
-    endReason: ApiSession["endReason"]
-  }
-  cleanup: {
-    status: "running" | "draining" | "complete" | "failed" | "abandoned"
-    startedAt: string | null
-    completedAt: string | null
-    summary: Record<string, unknown>
-  }
-  progress: {
-    experimentTarget: number | null
-    acceptedExperimentCount: number
-    receivedExperimentCount: number
-    remainingExperimentCount: number | null
-    deadlineAt: string | null
-    endedAt: string | null
-    endReason: ApiSession["endReason"]
+export type ApiSessionControlState = Omit<
+  import("../protocol").ResearchSessionControlStateResponse["data"],
+  "progress"
+> & {
+  progress: import("../protocol").ResearchSessionControlStateResponse["data"]["progress"] & {
     terminalReason: ApiSession["terminalReason"]
   }
-  launch: {
-    activeWorkerCount: number
-    workerTarget: number
-    openWorkerSlotCount: number
-    activeHypothesisCount: number
-    acceptingExperiments: boolean
-  }
-  canceledAssignmentIds: string[]
-  updatedAt: string
 }
 
-export type ApiSessionBrief = {
+export type ApiSessionBrief = Omit<
+  import("../protocol").ResearchSessionBriefResponse["data"],
+  "session" | "campaign" | "hypothesis" | "activeHypotheses"
+> & {
   session: ApiSession
   campaign: ApiCampaign
-  project: ApiProject
   hypothesis: ApiHypothesis | null
-  latestExperiments: ApiCampaignExperiment[]
-  bestExperiment: ApiCampaignExperiment | null
   activeHypotheses: ApiHypothesis[]
-  knowledge: ApiKnowledge[]
-  updatedAt: string
 }
 
-export type ApiSessionStateBrief = {
-  generatedAt: string
-  session: Pick<
-    ApiSession,
-    | "id"
-    | "name"
-    | "runtimeState"
-    | "status"
-    | "workerTarget"
-    | "deadlineAt"
-    | "endedAt"
-    | "endReason"
-  > & {
-    outcome: ApiSessionControlState["outcome"]
-    cleanup: ApiSessionControlState["cleanup"]
+export type ApiSessionStateBrief = Omit<
+  import("../protocol").ResearchSessionStateBriefResponse["data"],
+  "session" | "progress"
+> & {
+  session: import("../protocol").ResearchSessionStateBriefResponse["data"]["session"] & {
+    status: ApiSession["status"]
   }
-  campaign: Pick<
-    ApiCampaign,
-    "id" | "name" | "status" | "metricName" | "metricUnit" | "metricDirection"
-  >
   progress: ApiSessionControlState["progress"]
-  peerHypothesisCount: number
-  peerHypotheses: Array<
-    Pick<
-      ApiHypothesis,
-      | "id"
-      | "name"
-      | "status"
-      | "bestMetricValue"
-      | "bestCommitSha"
-      | "experimentCount"
-      | "lastWorkedAt"
-    >
-  >
-  results: {
-    latest: Array<
-      Pick<
-        ApiCampaignExperiment,
-        | "id"
-        | "hypothesisId"
-        | "acceptedIndex"
-        | "name"
-        | "resultCommitSha"
-        | "primaryMetricName"
-        | "primaryMetricValue"
-        | "createdAt"
-      >
-    >
-    best: Pick<
-      ApiCampaignExperiment,
-      | "id"
-      | "hypothesisId"
-      | "acceptedIndex"
-      | "name"
-      | "resultCommitSha"
-      | "primaryMetricName"
-      | "primaryMetricValue"
-      | "createdAt"
-    > | null
-  }
-  knowledge: {
-    items: Array<
-      Pick<
-        ApiKnowledge,
-        | "id"
-        | "hypothesisId"
-        | "experimentId"
-        | "kind"
-        | "title"
-        | "body"
-        | "confidence"
-        | "createdAt"
-      >
-    >
-    hasMore: boolean
-  }
-  updatedAt: string
 }
 
 export type ApiCampaignUpsertResult = {
@@ -524,11 +229,10 @@ export type ApiCampaignUpsertResult = {
   campaign: ApiCampaign
 }
 
-export type ApiExperimentReportResult = {
-  outcome: "recorded" | "duplicate"
-  experiment: ApiCampaignExperiment
-  session: ApiSession | null
-}
+export type ApiExperimentReportResult =
+  import("../protocol").CreateResearchCampaignExperimentResponse["data"] & {
+    session?: ApiSession | null
+  }
 
 type ApiWorkerLeaseWire = AcquireResearchWorkerLeaseResponse["data"]
 
@@ -558,25 +262,10 @@ function hypothesisFromWorkerLease({
   }
 }
 
-export type ApiWorkerHeartbeatResponse = {
-  worker: ApiWorker
-  heartbeat: {
-    id: string
-    workerId: string
-    campaignId: string
-    sessionId: string | null
-    hypothesisId: string
-    experimentId: string | null
-    status: ApiWorker["status"]
-    phase: string | null
-    event: string | null
-    progressMessage: string | null
-    gitLabel: string | null
-    resourceStats: Record<string, unknown>
-    metadata: Record<string, unknown>
-    createdAt: string
-  }
-}
+export type ApiWorkerHeartbeatResponse = Omit<
+  import("../protocol").ResearchWorkerHeartbeatResponse["data"],
+  "worker"
+> & { worker: ApiWorker }
 
 export type ApiWorkerHeartbeatBatchResponse = {
   results: Array<
@@ -594,36 +283,8 @@ export type ApiWorkerHeartbeatBatchResponse = {
   >
 }
 
-export type ApiResearchPresenceResponse = {
-  ignoredWorkers: Array<{
-    id: string
-    reason:
-      | "not_found"
-      | "session_mismatch"
-      | "stale_sequence"
-      | "unmatched_cap"
-      | "update_failed"
-      | "session_not_found"
-    message: string
-  }>
-  ignoredByReason: {
-    notFound: number
-    sessionMismatch: number
-    staleSequence: number
-    unmatchedCap: number
-    updateFailed: number
-    sessionNotFound: number
-  }
-  acceptedCount: number
-  ignoredCount: number
-  unmatchedCount: number
-  uploadedWorkerCount: number
-  unchangedWorkerCount: number
-  droppedOrDeferredWorkerCount: number
-  deferredStartupTelemetryCount: number
-  splitCount: number
-  siteAccepted: boolean
-}
+export type ApiResearchPresenceResponse =
+  import("../protocol").UpsertResearchPresenceResponse["data"]
 
 export type ApiReconcileCampaignResponse = {
   campaign: ApiCampaign
@@ -762,10 +423,7 @@ function emitApiTiming(
   console.error(`[onyx-api] ${metadata.join(" ")}`)
 }
 
-// Transient failures worth one bounded retry: connection resets and
-// gateway/overload statuses. Every Onyx write is idempotent by design
-// (runRef/workerRef keys, presence sequence guards), so retrying POSTs is
-// safe. Timeouts (AbortError) are not retried — the overall budget is spent.
+// Only explicitly idempotent writes may retry after an uncertain response.
 const RETRYABLE_API_STATUSES = new Set([429, 502, 503, 504])
 const API_RETRY_ATTEMPTS = 3
 // Typed CLI session failures the server returns with 401. None of them are
@@ -777,7 +435,9 @@ const CLI_SESSION_ERROR_CODES = new Set([
 ])
 
 function apiRetryDelayMs(attempt: number) {
-  return 250 * attempt + Math.floor(Math.random() * 100)
+  return (
+    Math.min(5000, 250 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 100)
+  )
 }
 
 export async function callApi(
@@ -785,9 +445,17 @@ export async function callApi(
   path: string,
   body?: unknown,
   args?: Args,
-  credentialOverride?: string
+  credentialOverride?: string,
+  retry = method === "GET" || method === "HEAD"
 ) {
-  const timeoutMs = Number(args?.options["api-timeout"] ?? 120_000)
+  const maxAttempts = retry ? API_RETRY_ATTEMPTS : 1
+  const requestedTimeout = Number(args?.options["api-timeout"] ?? 120_000)
+  const timeoutMs = Math.min(
+    requestedTimeout,
+    args?.options["api-deadline"]
+      ? Math.max(1, Number(args.options["api-deadline"]) - Date.now())
+      : requestedTimeout
+  )
   const signal =
     Number.isFinite(timeoutMs) && timeoutMs > 0
       ? AbortSignal.timeout(timeoutMs)
@@ -801,9 +469,10 @@ export async function callApi(
     const { accessTokenForProfile } = await import("./oauth-credentials")
     return accessTokenForProfile({ name, profile, forceRefresh: true })
   }
-  const usesProfileCredential =
-    !credentialOverride && !process.env.ONYX_API_KEY
-  const resolveCliSessionHeaders = async (): Promise<Record<string, string>> => {
+  const usesProfileCredential = !credentialOverride && !process.env.ONYX_API_KEY
+  const resolveCliSessionHeaders = async (): Promise<
+    Record<string, string>
+  > => {
     if (!usesProfileCredential) return {}
     const { profile } = await selectedProfileWithName(args)
     return { "x-onyx-cli-session-id": profile.cliSessionId }
@@ -837,7 +506,7 @@ export async function callApi(
   try {
     let response: Response | null = null
     let refreshedAfterUnauthorized = false
-    for (let attempt = 1; attempt <= API_RETRY_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         response = await requestOnce()
       } catch (error) {
@@ -846,10 +515,8 @@ export async function callApi(
         const aborted =
           signal?.aborted ||
           (error instanceof Error && error.name === "AbortError")
-        if (aborted || attempt === API_RETRY_ATTEMPTS) throw error
-        await new Promise((resolve) =>
-          setTimeout(resolve, apiRetryDelayMs(attempt))
-        )
+        if (aborted || attempt === maxAttempts) throw error
+        await sleepWithSignal(apiRetryDelayMs(attempt), undefined, { signal })
         continue
       }
       if (
@@ -864,14 +531,20 @@ export async function callApi(
         }
       }
       if (
-        attempt === API_RETRY_ATTEMPTS ||
+        attempt === maxAttempts ||
         !RETRYABLE_API_STATUSES.has(response.status)
       ) {
         break
       }
-      await new Promise((resolve) =>
-        setTimeout(resolve, apiRetryDelayMs(attempt))
-      )
+      const retryAfter = response.headers.get("retry-after")
+      const providerDelay = retryAfter
+        ? /^\d+(\.\d+)?$/.test(retryAfter)
+          ? Number(retryAfter) * 1000
+          : Math.max(0, Date.parse(retryAfter) - Date.now())
+        : 0
+      const delay = Math.max(apiRetryDelayMs(attempt), providerDelay || 0)
+      if (Date.now() + delay - startedAt >= timeoutMs) break
+      await sleepWithSignal(delay, undefined, { signal })
       if (signal?.aborted) break
     }
     if (!response) {
@@ -931,10 +604,19 @@ export async function callApi(
           "Onyx could not reach its identity provider; try again shortly. Your login is intact."
         )
       }
-      throw new ApiError(method, path, response.status, payload)
+      const apiError = new ApiError(method, path, response.status, payload)
+      const retryAfter = response.headers.get("retry-after")
+      apiError.retryAfterMs = retryAfter
+        ? /^\d+(\.\d+)?$/.test(retryAfter)
+          ? Number(retryAfter) * 1000
+          : Math.max(0, Date.parse(retryAfter) - Date.now())
+        : null
+      throw apiError
     }
 
-    return payload
+    return path.startsWith("/api/v1/research/")
+      ? adaptResearchApiPayload(payload, path)
+      : payload
   } catch (error) {
     if (!(error instanceof ApiError)) {
       emitApiTiming(args, {
@@ -966,16 +648,18 @@ export async function callWorkerApi(
   path: string,
   body?: unknown,
   args?: Args,
-  credentialOverride?: string
+  credentialOverride?: string,
+  retry = method === "GET" || method === "HEAD"
 ) {
   const credential = credentialOverride ?? (await workerCredential())
   if (!credential.match(/^owx_worker_v1_[A-Za-z0-9_-]{32,}$/)) {
     throw new Error("Worker API requires a valid scoped worker credential")
   }
-  return callApi(method, path, body, args, credential)
+  return callApi(method, path, body, args, credential, retry)
 }
 
 export class ApiError extends Error {
+  retryAfterMs: number | null = null
   status: number
   payload: unknown
   /** Stable error code from the `{ error: { code } }` envelope, when present. */
@@ -1006,18 +690,13 @@ export function apiData<T>(payload: unknown): T {
   if (!payload || typeof payload !== "object" || !("data" in payload)) {
     throw new Error(`Unexpected API response: ${JSON.stringify(payload)}`)
   }
-  return normalizeResearchResponse((payload as { data: T }).data) as T
+  return (payload as { data: T }).data
 }
 
 function normalizeResearchResponse(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(normalizeResearchResponse)
   if (!value || typeof value !== "object") return value
-  const normalized = Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-      key,
-      normalizeResearchResponse(item),
-    ])
-  ) as Record<string, unknown>
+  const normalized = { ...(value as Record<string, unknown>) }
 
   if (typeof normalized.runtimeState === "string") {
     const ended = normalized.runtimeState === "ended"
@@ -1045,7 +724,10 @@ function normalizeResearchResponse(value: unknown): unknown {
     normalized.completedAt = normalized.endedAt ?? null
     if (normalized.progress && typeof normalized.progress === "object") {
       const progress = normalized.progress as Record<string, unknown>
-      progress.terminalReason = progress.endReason ?? null
+      normalized.progress = {
+        ...progress,
+        terminalReason: progress.endReason ?? null,
+      }
     }
   }
   if (
@@ -1076,6 +758,36 @@ function normalizeResearchResponse(value: unknown): unknown {
     normalized.lastWorkedAt ??= null
   }
   return normalized
+}
+
+/** Only traverse declared DTO positions. Metadata, plans and research prose are opaque. */
+export function adaptResearchApiPayload(
+  payload: unknown,
+  path: string
+): unknown {
+  if (!payload || typeof payload !== "object" || !("data" in payload))
+    return payload
+  const envelope = payload as { data: unknown }
+  const adapt = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(adapt)
+    if (!value || typeof value !== "object") return value
+    const result = { ...(value as Record<string, unknown>) }
+    for (const field of [
+      "campaign",
+      "campaigns",
+      "session",
+      "sessions",
+      "hypothesis",
+      "hypotheses",
+      "grants",
+    ]) {
+      if (field in result) result[field] = adapt(result[field])
+    }
+    return normalizeResearchResponse(result)
+  }
+  // Knowledge and experiment payloads carry no runtime-derived compatibility fields.
+  if (/\/(knowledge|experiments)(\?|$)/.test(path)) return payload
+  return { ...envelope, data: adapt(envelope.data) }
 }
 
 export async function resolveProject(
@@ -1276,7 +988,9 @@ export async function reportCampaignExperiment(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/experiments`,
       body,
-      args
+      args,
+      undefined,
+      true
     )
   )
 }
@@ -1303,7 +1017,8 @@ export async function reportWorkerExperiment(
       "/api/v1/research/worker/experiments",
       workerBody,
       args,
-      credentialOverride
+      credentialOverride,
+      true
     )
   )
 }
@@ -1375,8 +1090,10 @@ export async function createCampaignSession(
     await callApi(
       "POST",
       `/api/v1/research/campaigns/${campaignId}/sessions`,
-      body,
-      args
+      { ...body, requestId: randomUUID() },
+      args,
+      undefined,
+      true
     )
   )
 }
@@ -1908,6 +1625,7 @@ export async function upsertResearchPresence(
     sequence: number
     sessionId: string
     site?: {
+      cleanupRevision?: number
       runtimeStatus?: "starting" | "active" | "draining" | "complete" | "failed"
       cleanupStartedAt?: string | null
       cleanupCompletedAt?: string | null
