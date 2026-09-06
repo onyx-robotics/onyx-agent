@@ -160,3 +160,25 @@ Per-attempt locks use `onyx-report-attempt-<sha256 of runRef>`; errors identify 
 specific resource and lock path.
 A missing PID alone does not prove its descendants stopped. Kernel-lock activation
 remains gated on compiled tests on every release target.
+
+Run `bun scripts/verify-lock-descriptors.ts` to compile and execute the descriptor
+feasibility checks on the current host. The `Compiled lock proofs` workflow runs
+them on macOS and Linux, each on ARM64 and x64. The checks cover launcher death,
+shell and Git descendants, explicit descriptor closure, timeout escalation, spawn
+failure, and final release. Passing these probes does not enable kernel locks;
+the production adapter and its integration tests still require a separate change.
+
+### macOS Keychain after changing executables
+
+macOS can require separate Keychain approval when switching from source execution
+through Bun to a downloaded CLI, or when the executable identity changes. A
+keyring timeout means access is unavailable; it does not mean the login was revoked.
+Onyx retains the profile in this case.
+
+Use the same execution mode that created the login, or run `onyx login` using the
+intended CLI to complete a fresh browser/device login. Login creates a new
+credential entry and only replaces the profile after storing it successfully.
+If you intentionally switch from a linked source checkout to the release, run
+`onyx developer use release` first. Do not delete Keychain entries or copy refresh
+tokens as a workaround. See Apple's
+[Keychain access guidance](https://support.apple.com/guide/keychain-access/if-youre-asked-for-access-to-your-keychain-kyca1243/mac).
