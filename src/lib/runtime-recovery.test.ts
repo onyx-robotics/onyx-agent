@@ -22,7 +22,9 @@ import { recoverReports } from "./report-delivery"
 
 const roots: string[] = []
 const initialHome = process.env.ONYX_HOME
+const initialExitCode = process.exitCode
 afterEach(async () => {
+  process.exitCode = initialExitCode ?? 0
   if (initialHome === undefined) delete process.env.ONYX_HOME
   else process.env.ONYX_HOME = initialHome
   for (const root of roots.splice(0))
@@ -236,11 +238,13 @@ test("explicit recovery removes real abandoned credentials and Git worktree regi
     }
   }
   // No credentials or remote service is needed for local reconciliation. The
-  // scoped cleanup receipt remains pending for a later authenticated pass.
+  // scoped cleanup receipt remains unready, and runtime reports a blocker until
+  // a later authenticated runtime pass can update the exact remote site/run.
   await commandResearchRecover({
     positional: ["research", "recover"],
     options: { cwd: root, runtime: "true", json: "true" },
   })
+  expect(process.exitCode).toBe(1)
   expect(await readdir(join(base, "worker-runtime", "session"))).not.toContain(
     "worker"
   )
@@ -253,6 +257,14 @@ test("explicit recovery removes real abandoned credentials and Git worktree regi
   expect(
     await readFile(join(base, "delivery-cleanup", "session.site.json"), "utf8")
   ).toContain('"supervisorRunId":"run"')
+  expect(
+    JSON.parse(
+      await readFile(
+        join(base, "delivery-cleanup", "session.site.json"),
+        "utf8"
+      )
+    ).readyExceptDelivery
+  ).toBe(false)
   await commandResearchRecover({
     positional: ["research", "recover"],
     options: { cwd: root, runtime: "true", json: "true" },

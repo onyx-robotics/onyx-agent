@@ -1,4 +1,5 @@
 import { reconcileManagedProcessGroups } from "../lib/managed-process-groups"
+import { publishRecoveredRuntime } from "../lib/recovery-presence"
 import {
   acquireRuntimeOwnership,
   reconcileRuntime,
@@ -13,6 +14,7 @@ import { assertWslResearchEnvironment, gitCommonDir } from "../lib/git"
 import {
   assertAttemptRefsPreserved,
   deliveryDestination,
+  matchingDeliveryArgs,
   pendingReportSummary,
   recoverReports,
   saveCleanupReceipt,
@@ -4266,7 +4268,7 @@ async function reconcileLocalRuntime(
         sessionId: id,
         siteId: local.schedulerSiteId,
         supervisorRunId: local.supervisor.supervisorRunId,
-        readyExceptDelivery: true,
+        readyExceptDelivery: false,
       })
       await updateState(root, (state) => {
         const current = state.sessions?.[id]
@@ -4284,6 +4286,21 @@ async function reconcileLocalRuntime(
           current.status = "failed"
         current.cleanupStatus = "draining"
         if (current.supervisor) current.supervisor.activeProcessCount = 0
+      })
+      await publishRecoveredRuntime({
+        sessionId: id,
+        campaignId: local.campaignId,
+        siteId: local.schedulerSiteId,
+        supervisorRunId: local.supervisor.supervisorRunId,
+        manifests: await readWorkerLaunchManifests(root, id),
+        args: await matchingDeliveryArgs(destination, args),
+      })
+      await saveCleanupReceipt(root, {
+        destination,
+        sessionId: id,
+        siteId: local.schedulerSiteId,
+        supervisorRunId: local.supervisor.supervisorRunId,
+        readyExceptDelivery: true,
       })
     },
   })

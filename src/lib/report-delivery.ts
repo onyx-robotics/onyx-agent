@@ -313,7 +313,7 @@ export async function pendingReportSummary(root: string) {
   }
 }
 
-async function matchingDeliveryArgs(
+export async function matchingDeliveryArgs(
   destination: DeliveryDestination,
   args: Args
 ): Promise<Args> {
