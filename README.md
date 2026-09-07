@@ -183,16 +183,18 @@ If you intentionally switch from a linked source checkout to the release, run
 tokens as a workaround. See Apple's
 [Keychain access guidance](https://support.apple.com/guide/keychain-access/if-youre-asked-for-access-to-your-keychain-kyca1243/mac).
 
-### Windows via WSL2 qualification
+### Windows via WSL2
 
-Qualification is pending for Windows 11 x64, WSL2 and Ubuntu 24.04. Use Linux-local
+See the [Windows guide](https://onyxresearch.ai/docs/tutorials/windows-wsl2) for
+release availability and qualification of Windows 11 x64, WSL2 and Ubuntu 24.04.
+Use Linux-local
 repositories, common Git directories, credentials and providers. Automatic login
 uses device authorization under WSL; explicit browser/device flags still override.
 The main `/onyx` agent must execute commands inside the same Linux distribution.
 Windows-native tools, WSL1, Windows ARM64 and Windows/network-mounted research
 storage are outside this target. Compiled Linux releases do not require Bun.
-The WSL guards and runtime recovery described here belong to the implementation
-candidate; an older published release may not include them. A successful install
+The WSL guards and runtime recovery described here require version 0.1.20 or newer;
+an older published release does not include them. A successful install
 alone does not qualify Windows support. Distribution termination can leave the
 Linux boot ID unchanged, so recovery also verifies process start identity.
 
@@ -206,7 +208,9 @@ returns a nonzero status; pending report delivery is reported separately.
 Recovery verifies site/run ownership and boot/process identity, skips healthy
 supervisors, and retains artifacts when descendant termination is uncertain.
 It preserves terminal refs before removing disposable worktrees and credential
-homes. Explicit recovery never changes the remote session cutoff; stop an open
+homes, then acknowledges terminal worker leases and site cleanup for the matching
+site/run. Missing authentication leaves an incomplete receipt for a later runtime
+recovery pass. Explicit recovery never changes the remote session cutoff; stop an open
 session explicitly. Occupied resource slots require the existing idle reset,
 including `onyx-runtime-reconciliation` after an interrupted launch/recovery.
 Malformed evidence is retained. Repeated recovery never measures scratch work or

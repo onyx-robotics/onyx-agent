@@ -129,7 +129,15 @@ export async function assertWslStorage(
     )
   }
   for (const path of paths) {
-    const resolved = await resolveStoragePath(path)
+    let resolved: string
+    try {
+      resolved = await resolveStoragePath(path)
+    } catch (error) {
+      throw new Error(
+        `${purpose} cannot resolve storage path ${path}. Repair dangling or inaccessible symlinks and choose Linux-local storage before retrying.`,
+        { cause: error }
+      )
+    }
     const mount = storageMount(resolved, mounts)
     if (!isLinuxLocalMount(mount)) {
       throw new Error(

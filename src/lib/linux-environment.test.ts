@@ -70,6 +70,9 @@ test("storage checks resolve symlinks and nonexistent descendants without creati
   await expect(
     resolveStoragePath(join(root, "dangling", "new"))
   ).rejects.toThrow()
+  await expect(
+    assertWslStorage([join(root, "dangling", "new")], "Credentials", inspection)
+  ).rejects.toThrow("Repair dangling or inaccessible symlinks")
 })
 
 test("WSL device login preserves explicit flow overrides and native TTY behavior", () => {
