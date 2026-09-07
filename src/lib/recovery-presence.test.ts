@@ -1,6 +1,10 @@
 import { expect, test } from "bun:test"
 import { publishRecoveredRuntime } from "./recovery-presence"
-import type { ApiSessionLive, ApiResearchPresenceResponse } from "./api"
+import type {
+  ApiSessionLive,
+  ApiResearchPresenceResponse,
+  ApiWorkerHeartbeatBatchResponse,
+} from "./api"
 import type { WorkerLaunchManifest } from "./worker-launcher"
 
 function fixture() {
@@ -22,7 +26,9 @@ function fixture() {
   const sent: Parameters<
     NonNullable<Parameters<typeof publishRecoveredRuntime>[0]["api"]>["publish"]
   >[0][] = []
-  const input = {
+  const input: Parameters<typeof publishRecoveredRuntime>[0] & {
+    api: NonNullable<Parameters<typeof publishRecoveredRuntime>[0]["api"]>
+  } = {
     sessionId: "session",
     campaignId: "campaign",
     siteId: "site",
@@ -39,6 +45,12 @@ function fixture() {
     args: { positional: [], options: {} },
     api: {
       getLive: async () => live,
+      releaseWorkers: async () =>
+        ({
+          results: [
+            { workerId: "worker", ok: true, worker: { status: "failed" } },
+          ],
+        }) as ApiWorkerHeartbeatBatchResponse,
       publish: async (body: (typeof sent)[number]) => {
         sent.push(body)
         return {
@@ -93,4 +105,39 @@ test("recovery refuses foreign ownership, unfinished cleanup, and revision confl
   input.api.publish = async () =>
     ({ siteAccepted: false, ignoredCount: 1 }) as ApiResearchPresenceResponse
   await expect(publishRecoveredRuntime(input)).rejects.toThrow("conflicted")
+})
+
+test("lease release is required even for a previously completed site and never publishes active heartbeats", async () => {
+  const { input, site, sent } = fixture()
+  site.runtimeStatus = "complete"
+  let requests = 0
+  input.api.releaseWorkers = async (
+    ...args: Parameters<
+      NonNullable<
+        Parameters<typeof publishRecoveredRuntime>[0]["api"]
+      >["releaseWorkers"]
+    >
+  ) => {
+    requests += 1
+    expect(args[0]).toMatchObject({
+      sessionId: "session",
+      siteId: "site",
+      supervisorRunId: "run",
+      heartbeats: [{ workerId: "worker", status: "failed" }],
+    })
+    return {
+      results: [
+        {
+          workerId: "worker",
+          ok: false,
+          error: { code: "not_found", message: "mismatch" },
+        },
+      ],
+    }
+  }
+  await expect(publishRecoveredRuntime(input)).rejects.toThrow(
+    "lease release was not acknowledged"
+  )
+  expect(requests).toBe(1)
+  expect(sent).toHaveLength(0)
 })

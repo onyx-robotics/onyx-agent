@@ -1,5 +1,6 @@
 import {
   getResearchSessionLive,
+  heartbeatWorkersBatch,
   upsertResearchPresence,
   type ApiSessionLive,
 } from "./api"
@@ -15,7 +16,11 @@ export async function publishRecoveredRuntime({
   supervisorRunId,
   manifests,
   args,
-  api = { getLive: getResearchSessionLive, publish: upsertResearchPresence },
+  api = {
+    getLive: getResearchSessionLive,
+    publish: upsertResearchPresence,
+    releaseWorkers: heartbeatWorkersBatch,
+  },
 }: {
   sessionId: string
   campaignId: string
@@ -29,6 +34,7 @@ export async function publishRecoveredRuntime({
       args: Args
     ) => Promise<Pick<ApiSessionLive, "session" | "sites">>
     publish: typeof upsertResearchPresence
+    releaseWorkers: typeof heartbeatWorkersBatch
   }
 }) {
   if (
@@ -53,6 +59,38 @@ export async function publishRecoveredRuntime({
     throw new Error(
       "Matching remote site/run is unavailable; retain recovery evidence"
     )
+  if (manifests.length) {
+    const terminal = await api.releaseWorkers(
+      {
+        sessionId,
+        siteId,
+        supervisorRunId,
+        heartbeats: manifests.map((manifest) => ({
+          workerId: manifest.workerId,
+          status: manifest.status as "completed" | "failed" | "stopped",
+          phase: manifest.status,
+          metadata: { teardown: manifest.teardown },
+        })),
+      },
+      args
+    )
+    if (
+      terminal.results.length !== manifests.length ||
+      manifests.some((manifest) => {
+        const matches = terminal.results.filter(
+          (entry) => entry.workerId === manifest.workerId
+        )
+        return (
+          matches.length !== 1 ||
+          !matches[0]?.ok ||
+          !["completed", "failed", "stopped"].includes(matches[0].worker.status)
+        )
+      })
+    )
+      throw new Error(
+        "Recovered worker lease release was not acknowledged; retain evidence and retry runtime recovery"
+      )
+  }
   if (site.runtimeStatus === "complete") return
   const observedAt = new Date().toISOString()
   const response = await api.publish(
