@@ -90,6 +90,23 @@ afterEach(async () => {
 })
 
 describe("CLI telemetry", () => {
+  test("dry-run neither writes a first-run notice nor captures an event", async () => {
+    const before = JSON.stringify(await readConfig())
+    let captured = false
+    setTelemetryClientFactoryForTests(() => ({
+      capture() {
+        captured = true
+      },
+      async shutdown() {},
+    }))
+    const argv = ["research", "recover", "--runtime", "--dry-run", "--json"]
+    const args = parseArgs(argv)
+    expect(await maybeShowFirstRunNotice(args)).toBe(false)
+    await recordCliCommand({ argv, args, startedAt: Date.now() })
+    expect(captured).toBe(false)
+    expect(JSON.stringify(await readConfig())).toBe(before)
+  })
+
   test("maps only allowlisted command names", () => {
     expect(
       cliCommandName(["setup", "validate", "--project-path", "/secret"])

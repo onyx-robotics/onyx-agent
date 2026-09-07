@@ -1,3 +1,4 @@
+import { assertWslResearchEnvironment } from "../lib/git"
 import {
   deliveryDestination,
   initialReportBody,
@@ -1331,6 +1332,7 @@ export async function commandExpRun(args: Args) {
     )
   }
   const root = await repoRoot(args.options.cwd)
+  await assertWslResearchEnvironment(root)
   const projectPath = await resolveProjectPath(root, args)
   const mode = workflowMode(args)
 

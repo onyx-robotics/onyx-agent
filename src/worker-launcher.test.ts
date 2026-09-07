@@ -13,7 +13,10 @@ import { describe, expect, test } from "bun:test"
 
 import { writeConfig } from "./lib/config"
 import { currentCommit, pushRefs } from "./lib/git"
-import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "./lib/version"
+import {
+  ONYX_AGENT_PROTOCOL_VERSION,
+  ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
+} from "./lib/version"
 import {
   runProcess,
   runStreamingProcess,
@@ -68,7 +71,7 @@ async function writeFakeOnyx(path: string) {
       "  exit 0",
       "fi",
       'if [[ "${1:-}" == "diagnostics" && "${2:-}" == "handshake" ]]; then',
-      `  echo "{\\"protocolVersion\\":5,\\"workerContextSchemas\\":[${ONYX_WORKER_CONTEXT_SCHEMA_VERSION}],\\"capabilities\\":[]}"`,
+      `  echo "{\\"protocolVersion\\":${ONYX_AGENT_PROTOCOL_VERSION},\\"workerContextSchemas\\":[${ONYX_WORKER_CONTEXT_SCHEMA_VERSION}],\\"capabilities\\":[]}"`,
       "  exit 0",
       "fi",
       'if [[ "${1:-}" == "research" && "${2:-}" == "session-state-brief" ]]; then',
@@ -511,13 +514,13 @@ describe("worker launchers", () => {
     await runProcess("git", ["init"], { cwd: worktree })
     await writeFakeAgent(join(bin, "codex"), "codex fake 1.0")
     await writeFakeOnyx(join(bin, "onyx-worker"))
-    // A stale install answering an old worker-context schema, resolved ahead
+    // A stale install answering an old protocol with the current context schema, resolved ahead
     // of the wrapper the way a profile-prepended ~/.local/bin would be.
     await writeFile(
       join(staleBin, "onyx-worker"),
       [
         "#!/usr/bin/env bash",
-        'echo "{\\"protocolVersion\\":5,\\"workerContextSchemas\\":[5],\\"capabilities\\":[]}"',
+        `echo "{\\"protocolVersion\\":5,\\"workerContextSchemas\\":[${ONYX_WORKER_CONTEXT_SCHEMA_VERSION}],\\"capabilities\\":[]}"`,
         "",
       ].join("\n"),
       "utf8"
@@ -563,6 +566,7 @@ describe("worker launchers", () => {
       "utf8"
     )
     await chmod(join(bin, "opencode"), 0o755)
+    await writeFakeOnyx(join(bin, "onyx-worker"))
 
     const invocation = buildWorkerInvocation({
       agentKind: "opencode",

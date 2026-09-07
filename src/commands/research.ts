@@ -1,3 +1,15 @@
+import { reconcileManagedProcessGroups } from "../lib/managed-process-groups"
+import {
+  acquireRuntimeOwnership,
+  reconcileRuntime,
+  readRuntimeState,
+} from "../lib/runtime-recovery"
+import {
+  inspectProcessIdentity,
+  processOwnership,
+} from "../lib/process-identity"
+import { linuxBootId } from "../lib/linux-environment"
+import { assertWslResearchEnvironment, gitCommonDir } from "../lib/git"
 import {
   assertAttemptRefsPreserved,
   deliveryDestination,
@@ -12,6 +24,7 @@ import {
   appendFile,
   mkdir,
   readFile,
+  readdir,
   rm,
   rmdir,
   writeFile,
@@ -1785,9 +1798,15 @@ async function removeWorkerWorktree({
   sessionId: string
   workerId: string
 }) {
+  await reconcileManagedProcessGroups(
+    join(await onyxStateDir(root), "worker-runtime", sessionId, workerId)
+  )
   const sessionDir = join(await onyxStateDir(root), "worktrees", sessionId)
   const dir = join(sessionDir, workerId)
-  if (!(await pathExists(dir))) return
+  const registered = (await git(["worktree", "list", "--porcelain"], root))
+    .split("\n")
+    .includes(`worktree ${dir}`)
+  if (!(await pathExists(dir)) && !registered) return
   await withOnyxLock(root, "git-worktree", async () => {
     await git(["worktree", "remove", "--force", dir], root)
     await git(["worktree", "prune"], root).catch(() => {})
@@ -3082,6 +3101,10 @@ async function runHypothesisOnce({
       : (agentKind as WorkerAgentKind)
     const initialManifest: WorkerLaunchManifest = {
       schemaVersion: 2,
+      ...(process.platform === "linux"
+        ? { managedProcessGroupsVersion: 1 as const }
+        : {}),
+      stopGraceMs,
       agentKind: initialAgentKind,
       workerModel,
       command: workerCommand ?? agentKind,
@@ -3104,6 +3127,7 @@ async function runHypothesisOnce({
       workerName: worker.workerName,
       supervisorRunId,
       pid: null,
+      bootId: linuxBootId(),
       processStartedAt: null,
       commandIdentity: null,
       slotIndex,
@@ -3439,6 +3463,8 @@ async function runHypothesisOnce({
                 ...launchManifest,
                 pid,
                 supervisorRunId,
+                bootId: identity?.bootId ?? linuxBootId(),
+                processStartTicks: identity?.processStartTicks ?? null,
                 processStartedAt: identity?.startedAt ?? null,
                 commandIdentity: identity?.command ?? null,
               }
@@ -3637,6 +3663,7 @@ async function runHypothesisOnce({
             workerName: workerName ?? hypothesis.name,
             supervisorRunId,
             pid: null,
+            bootId: linuxBootId(),
             processStartedAt: null,
             commandIdentity: null,
             slotIndex,
@@ -3775,8 +3802,9 @@ async function runHypothesisOnce({
         )
       }
 
-      let runtimeCleanup: "removed" | "failed" = "removed"
-      if (runtimePaths) {
+      let runtimeCleanup: "removed" | "failed" =
+        teardown.worktreeCleanup === "removed" ? "removed" : "failed"
+      if (runtimePaths && teardown.worktreeCleanup === "removed") {
         try {
           await rm(runtimePaths.dir, { recursive: true, force: true })
         } catch (runtimeCleanupError) {
@@ -4192,28 +4220,121 @@ export async function commandResearchScale(args: Args) {
   )
 }
 
+async function reconcileLocalRuntime(
+  root: string,
+  args: Args,
+  sessionId?: string,
+  dryRun = false
+) {
+  return reconcileRuntime({
+    root,
+    sessionId,
+    dryRun,
+    cleanup: (id, manifest) =>
+      discardOrphanWorkerWorkspace({
+        root,
+        sessionId: id,
+        manifest,
+        reason: "Identity-verified runtime reconciliation",
+      }),
+    complete: async (id) => {
+      const local = (await readRuntimeState(root)).sessions?.[id]
+      if (
+        !local?.supervisor?.supervisorRunId ||
+        !local.schedulerSiteId ||
+        !local.campaignId
+      )
+        throw new Error("Local cleanup ownership is incomplete")
+      const manifest = await readSupervisorProcessManifest(root, id)
+      let destination = manifest?.destination
+      if (!destination) {
+        const live = await getResearchSessionState(id, args)
+        if (live.session.campaignId !== local.campaignId)
+          throw new Error("Remote campaign identity differs from local runtime")
+        destination = await deliveryDestination(
+          live.campaign.id,
+          live.campaign.projectId,
+          args
+        )
+      }
+      if (destination.campaignId !== local.campaignId)
+        throw new Error(
+          "Saved delivery destination differs from local campaign"
+        )
+      await saveCleanupReceipt(root, {
+        destination,
+        sessionId: id,
+        siteId: local.schedulerSiteId,
+        supervisorRunId: local.supervisor.supervisorRunId,
+        readyExceptDelivery: true,
+      })
+      await updateState(root, (state) => {
+        const current = state.sessions?.[id]
+        if (
+          !current ||
+          current.supervisor?.supervisorRunId !==
+            local.supervisor?.supervisorRunId
+        )
+          throw new Error("Supervisor ownership changed during cleanup")
+        if (
+          !["completed", "failed", "stopped", "ended"].includes(
+            current.status ?? ""
+          )
+        )
+          current.status = "failed"
+        current.cleanupStatus = "draining"
+        if (current.supervisor) current.supervisor.activeProcessCount = 0
+      })
+    },
+  })
+}
+
 export async function commandResearchRecover(args: Args) {
-  const result = await recoverReports(
-    await repoRoot(args.options.cwd),
-    args,
-    args.options["dry-run"] === "true"
-  )
-  console.log(
-    args.options.json === "true"
-      ? JSON.stringify(result)
-      : [
-          `Pending: ${result.pending}; blocked: ${result.blocked}; rejected: ${result.rejected}; oldest: ${result.oldestPendingAt ?? "none"}`,
-          ...result.diagnostics.map(
-            (entry) =>
-              `${entry.runRef}: ${entry.reason}${entry.destination ? ` (team ${entry.destination.teamId}, ${entry.destination.apiUrl})` : ""}`
-          ),
-          ...(result.invalidRecords
-            ? [
-                `${result.invalidRecords} unreadable records retained under .git/onyx/attempts; inspect before cleanup.`,
-              ]
-            : []),
-        ].join("\n")
-  )
+  const root = await repoRoot(args.options.cwd)
+  const dryRun = args.options["dry-run"] === "true"
+  const runtimeRequested = args.options.runtime === "true"
+  if (args.options.session && !runtimeRequested)
+    throw new Error("--session requires --runtime")
+  if (!dryRun && runtimeRequested) await assertWslResearchEnvironment(root)
+  const release =
+    runtimeRequested && !dryRun ? await acquireRuntimeOwnership(root) : null
+  try {
+    const runtime = runtimeRequested
+      ? await reconcileLocalRuntime(root, args, args.options.session, dryRun)
+      : undefined
+    const result = {
+      ...(await recoverReports(root, args, dryRun)),
+      ...(runtime ? { runtime } : {}),
+    }
+    console.log(
+      args.options.json === "true"
+        ? JSON.stringify(result)
+        : [
+            `Pending: ${result.pending}; blocked: ${result.blocked}; rejected: ${result.rejected}; oldest: ${result.oldestPendingAt ?? "none"}`,
+            ...result.diagnostics.map(
+              (entry) => `${entry.runRef}: ${entry.reason}`
+            ),
+            ...(result.invalidRecords
+              ? [
+                  `${result.invalidRecords} unreadable records retained; inspect before cleanup.`,
+                ]
+              : []),
+            ...(runtime
+              ? [
+                  `Runtime: recovered=${runtime.recovered}; skipped-active=${runtime.skippedActive}; blocked=${runtime.blocked}`,
+                  ...runtime.sessions.flatMap((entry) => [
+                    `${entry.sessionId}: ${entry.status}`,
+                    ...entry.actions,
+                    ...entry.reasons,
+                  ]),
+                ]
+              : []),
+          ].join("\n")
+    )
+    if (runtime?.blocked) process.exitCode = 1
+  } finally {
+    await release?.()
+  }
 }
 
 export async function commandResearchLocksReset(args: Args) {
@@ -4231,9 +4352,14 @@ export async function commandResearchLocksReset(args: Args) {
   console.log(paths.join("\n"))
 }
 
-export async function commandResearchClean(args: Args) {
+async function cleanResearchRuntime(args: Args) {
   const root = await repoRoot(args.options.cwd)
-  const state = await readState(root)
+  const state = await readRuntimeState(root)
+  const inspection = await reconcileLocalRuntime(root, args, undefined, true)
+  if (inspection.blocked || inspection.skippedActive)
+    throw new Error(
+      `Runtime cleanup is unresolved; run onyx research recover --runtime --dry-run --json first. ${inspection.sessions.flatMap((entry) => entry.reasons).join("; ")}`
+    )
   if (
     Object.values(state.sessions ?? {}).some(
       (session) =>
@@ -4246,12 +4372,20 @@ export async function commandResearchClean(args: Args) {
       "Stop and finalize local research sessions before cleaning execution state."
     )
   }
+  if (
+    Object.values(state.sessions ?? {}).some(
+      (session) => session.cleanupStatus !== "complete"
+    )
+  )
+    throw new Error(
+      "Local recovery or cleanup acknowledgement is incomplete; run onyx research recover --runtime before cleaning."
+    )
   const pending = await pendingReportSummary(root)
   if (pending.pending)
     throw new Error(
       `Retaining execution artifacts for ${pending.pending} pending attempts. Run onyx research recover first.`
     )
-  const stateDir = await onyxStateDir(root)
+  const stateDir = join(await gitCommonDir(root), "onyx")
   const targets = [
     join(stateDir, "worker-runtime"),
     join(stateDir, "worker-logs"),
@@ -4262,6 +4396,19 @@ export async function commandResearchClean(args: Args) {
   if (args.options["dry-run"] === "true") {
     console.log(targets.join("\n"))
     return
+  }
+  for (const session of inspection.sessions) {
+    const sessionDir = join(stateDir, "worktrees", session.sessionId)
+    for (const workerId of await readdir(sessionDir).catch((error) => {
+      if (error.code === "ENOENT") return [] as string[]
+      throw error
+    })) {
+      await removeWorkerWorktree({
+        root,
+        sessionId: session.sessionId,
+        workerId,
+      })
+    }
   }
   for (const target of targets) {
     await rm(target, { recursive: true, force: true })
@@ -4275,6 +4422,18 @@ export async function commandResearchClean(args: Args) {
   console.log(
     "Removed idle research runtime, worktree, and log artifacts; pending reports and immutable refs are preserved."
   )
+}
+
+export async function commandResearchClean(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  if (args.options["dry-run"] === "true") return cleanResearchRuntime(args)
+  await assertWslResearchEnvironment(root)
+  const release = await acquireRuntimeOwnership(root)
+  try {
+    return await cleanResearchRuntime(args)
+  } finally {
+    await release()
+  }
 }
 
 export async function commandResearchBrief(args: Args) {
@@ -5838,19 +5997,10 @@ function freshSupervisorTelemetry(
   return supervisor
 }
 
-function inspectProcessIdentity(pid: number) {
-  const inspect = (field: "lstart" | "command") => {
-    const result = spawnSync("ps", ["-p", String(pid), "-o", `${field}=`], {
-      encoding: "utf8",
-    })
-    return typeof result?.stdout === "string" ? result.stdout.trim() : ""
-  }
-  const startedAt = inspect("lstart")
-  const command = inspect("command")
-  return startedAt && command ? { startedAt, command } : null
-}
-
 type SupervisorProcessManifest = {
+  destination?: import("../lib/report-delivery").DeliveryDestination
+  bootId?: string | null
+  processStartTicks?: string | null
   schemaVersion: 1
   sessionId: string
   pid: number
@@ -5920,6 +6070,7 @@ function supervisorProcessIdentityMatches({
 }) {
   return Boolean(
     manifest &&
+    processOwnership(manifest) === "active" &&
     identity &&
     runtime.pid === manifest.pid &&
     runtime.supervisorRunId === manifest.supervisorRunId &&
@@ -5996,6 +6147,12 @@ async function discardOrphanWorkerWorkspace({
       sessionId,
       workerId: manifest.workerId,
     })
+    const runtime = await workerRuntimePaths({
+      root,
+      sessionId,
+      workerId: manifest.workerId,
+    })
+    await rm(runtime.dir, { recursive: true, force: true })
     teardown.worktreeCleanup = "removed"
   } catch (error) {
     teardown.worktreeCleanup = "failed"
@@ -6009,98 +6166,8 @@ async function discardOrphanWorkerWorkspace({
     status: teardown.worktreeCleanup === "failed" ? "failed" : phase,
     error: boundedText(manifest.error ?? reason, 1000),
     teardown,
-  }).catch(() => {})
+  })
   return teardown.worktreeCleanup === "removed"
-}
-
-async function cleanupIdentityVerifiedOrphanWorkers({
-  root,
-  sessionId,
-  supervisorRunId,
-}: {
-  root: string
-  sessionId: string
-  supervisorRunId: string | null | undefined
-}) {
-  if (!supervisorRunId) return 0
-  const manifests = await readWorkerLaunchManifests(root, sessionId).catch(
-    () => []
-  )
-  let stopped = 0
-  for (const manifest of manifests) {
-    let identity = manifest.pid ? inspectProcessIdentity(manifest.pid) : null
-    let matchingLiveProcess = Boolean(
-      identity &&
-      manifest.processStartedAt &&
-      manifest.commandIdentity &&
-      identity.startedAt === manifest.processStartedAt &&
-      identity.command === manifest.commandIdentity
-    )
-    if (!matchingLiveProcess) {
-      await discardOrphanWorkerWorkspace({
-        root,
-        sessionId,
-        manifest,
-        reason: "No matching provider process remained during orphan cleanup",
-      })
-    }
-    if (
-      manifestIsTerminal(manifest) ||
-      manifest.supervisorRunId !== supervisorRunId ||
-      !manifest.pid ||
-      !manifest.processStartedAt ||
-      !manifest.commandIdentity
-    ) {
-      continue
-    }
-    if (!matchingLiveProcess) {
-      console.warn(
-        `Worker ${manifest.workerId} process identity could not be verified; no orphan signal was sent.`
-      )
-      continue
-    }
-    try {
-      process.kill(-manifest.pid, "SIGTERM")
-    } catch {
-      try {
-        process.kill(manifest.pid, "SIGTERM")
-      } catch {
-        continue
-      }
-    }
-    stopped += 1
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      await sleep(250)
-      identity = inspectProcessIdentity(manifest.pid)
-      matchingLiveProcess = Boolean(
-        identity &&
-        identity.startedAt === manifest.processStartedAt &&
-        identity.command === manifest.commandIdentity
-      )
-      if (!matchingLiveProcess) break
-    }
-    if (!matchingLiveProcess) {
-      await discardOrphanWorkerWorkspace({
-        root,
-        sessionId,
-        manifest: {
-          ...manifest,
-          status: "stopped",
-          completedAt: new Date().toISOString(),
-          signal: "SIGTERM",
-          error:
-            "Identity-verified orphan process stopped after supervisor failure",
-        },
-        reason:
-          "Identity-verified orphan process stopped after supervisor failure",
-      })
-    } else {
-      console.warn(
-        `Worker ${manifest.workerId} remained live after orphan stop grace; its worktree was retained.`
-      )
-    }
-  }
-  return stopped
 }
 
 async function persistSupervisorTelemetry({
@@ -6269,9 +6336,16 @@ async function launchDetachedResearchSupervisor({
       root,
       manifest: {
         schemaVersion: 1,
+        destination: await deliveryDestination(
+          campaign.id,
+          campaign.projectId,
+          args
+        ),
         sessionId,
         pid,
         supervisorRunId,
+        bootId: processIdentity.bootId,
+        processStartTicks: processIdentity.processStartTicks,
         processStartedAt: processIdentity.startedAt,
         commandIdentity: processIdentity.command,
         mode: "detached",
@@ -6288,6 +6362,8 @@ async function launchDetachedResearchSupervisor({
     telemetry: {
       pid,
       supervisorRunId,
+      bootId: processIdentity?.bootId ?? linuxBootId(),
+      processStartTicks: processIdentity?.processStartTicks ?? null,
       processStartedAt: processIdentity?.startedAt ?? null,
       commandIdentity: processIdentity?.command ?? null,
       logPath,
@@ -6322,9 +6398,11 @@ async function launchDetachedResearchSupervisor({
 
 async function commandResearchRunImplementation(
   args: Args,
-  markSessionCreated: () => void
+  markSessionCreated: () => void,
+  releaseLaunch: () => Promise<void>
 ) {
   const root = await repoRoot(args.options.cwd)
+  await assertWslResearchEnvironment(root)
   const internalSessionId =
     process.env.ONYX_LAUNCHER_BYPASS === "1"
       ? args.options["supervise-session"]
@@ -6375,11 +6453,12 @@ async function commandResearchRunImplementation(
         identity: inspectProcessIdentity(local.supervisor.pid),
       })
       if (supervisorAlive) continue
-      await cleanupIdentityVerifiedOrphanWorkers({
-        root,
-        sessionId: cachedSessionId,
-        supervisorRunId: local.supervisor.supervisorRunId,
-      })
+      const recovery = await reconcileLocalRuntime(root, args, cachedSessionId)
+      if (recovery.blocked)
+        throw new Error(
+          `Previous runtime cannot be reconciled: ${recovery.sessions.flatMap((entry) => entry.reasons).join("; ")}`
+        )
+      if (!recovery.recovered) continue
       await stopCampaignSession(
         cachedSessionId,
         {
@@ -6848,9 +6927,16 @@ async function commandResearchRunImplementation(
       root,
       manifest: {
         schemaVersion: 1,
+        destination: await deliveryDestination(
+          campaign.id,
+          campaign.projectId,
+          args
+        ),
         sessionId,
         pid: supervisorPid,
         supervisorRunId,
+        bootId: supervisorProcessIdentity.bootId,
+        processStartTicks: supervisorProcessIdentity.processStartTicks,
         processStartedAt: supervisorProcessIdentity.startedAt,
         commandIdentity: supervisorProcessIdentity.command,
         mode: "foreground",
@@ -6933,6 +7019,8 @@ async function commandResearchRunImplementation(
       telemetry: {
         pid: supervisorPid,
         supervisorRunId,
+        bootId: supervisorProcessIdentity?.bootId ?? linuxBootId(),
+        processStartTicks: supervisorProcessIdentity?.processStartTicks ?? null,
         processStartedAt: supervisorProcessIdentity?.startedAt ?? null,
         commandIdentity: supervisorProcessIdentity?.command ?? null,
         logPath: supervisorLogPath,
@@ -6958,6 +7046,7 @@ async function commandResearchRunImplementation(
   }
 
   await persistRuntimeTelemetry({ force: true, activeProcessCount: 0 })
+  await releaseLaunch()
 
   console.log(`Research supervisor: ${sessionId}`)
   console.log(`Campaign: ${campaign.name}`)
@@ -7708,13 +7797,27 @@ async function commandResearchRunImplementation(
 
 export async function commandResearchRun(args: Args) {
   let sessionCreated = false
+  const root = await repoRoot(args.options.cwd)
+  await assertWslResearchEnvironment(root)
+  const internal =
+    process.env.ONYX_LAUNCHER_BYPASS === "1" &&
+    args.options["supervise-session"]
+  const release = internal
+    ? async () => {}
+    : await acquireRuntimeOwnership(root)
   try {
-    return await commandResearchRunImplementation(args, () => {
-      sessionCreated = true
-    })
+    return await commandResearchRunImplementation(
+      args,
+      () => {
+        sessionCreated = true
+      },
+      release
+    )
   } catch (error) {
     if (!sessionCreated) markResearchPreflightFailure(error)
     throw error
+  } finally {
+    await release()
   }
 }
 

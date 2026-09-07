@@ -83,7 +83,7 @@ Usage:
   onyx worker run --session <id> [--hypothesis <id>] [--agent codex|claude|opencode] [--model <model>] [--worker-command "<cmd>"] [--max-minutes <n>] [--worker-timeout <seconds>] [--startup-timeout <seconds>] [--stop-grace-seconds <n>] [--quiet]
   onyx research stop [--session <id>] [--reason <text>]
   onyx research scale --workers <n> [--session <id>]
-  onyx research recover [--dry-run] [--json]
+  onyx research recover [--runtime [--session <id>]] [--dry-run] [--json]
   onyx research clean [--dry-run]
   onyx research locks reset --resource <name> --confirm-idle [--dry-run]
   onyx research brief [--campaign <name>] [--session <id>] [--hypothesis <id>] [--json]

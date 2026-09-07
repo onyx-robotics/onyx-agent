@@ -453,7 +453,9 @@ cleanup() {
   rm -rf "$tmp"
   rm -f "$install_stage" "$worker_install_stage"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 download() {
   curl -fsSL \

@@ -1,3 +1,4 @@
+import { assertWslStorage } from "./linux-environment"
 import { randomUUID } from "node:crypto"
 import {
   chmod,
@@ -366,6 +367,7 @@ export async function readConfig(): Promise<Config> {
 }
 
 export async function writeConfig(config: ConfigInput) {
+  await assertWslStorage([configDir(), configPath()], "Onyx configuration")
   await mkdir(configDir(), { recursive: true, mode: 0o700 })
   await chmod(configDir(), 0o700)
   const developer =

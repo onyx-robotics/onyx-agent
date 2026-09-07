@@ -3,7 +3,8 @@ import { execFileSync } from "node:child_process"
 import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 
-export const ONYX_AGENT_PROTOCOL_VERSION = 5
+// Protocol 6 workers persist evaluator process-group ownership for crash recovery.
+export const ONYX_AGENT_PROTOCOL_VERSION = 6
 export const ONYX_WORKER_CONTEXT_SCHEMA_VERSION = 7
 
 function sourceBuildSha() {

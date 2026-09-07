@@ -140,6 +140,7 @@ const FIRST_RUN_NOTICE = `Onyx collects anonymous usage telemetry: command name,
 Opt out anytime with \`onyx telemetry disable\`, ONYX_TELEMETRY_DISABLED=1, or DO_NOT_TRACK=1. Details: https://onyxresearch.ai/privacy`
 
 export async function maybeShowFirstRunNotice(args: Args) {
+  if (args.options["dry-run"] === "true") return false
   try {
     const config = await readConfig()
     if (config.telemetry.noticeShownAt) return false
@@ -323,6 +324,7 @@ async function deliverMany({
   }>
   args?: Args
 }) {
+  if (args?.options["dry-run"] === "true") return false
   let config = await readConfig()
   if (
     !internalId(config.telemetry.anonymousId) &&

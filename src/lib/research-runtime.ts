@@ -1,3 +1,4 @@
+import { gitCommonDir } from "./git"
 import { open } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import {
@@ -1073,7 +1074,7 @@ export async function listLocalAttempts(
   selector: CachedAttemptSelector = {}
 ) {
   const attempts = await listJsonFiles<CachedAttemptRecord>(
-    await attemptsDir(root)
+    join(await gitCommonDir(root), "onyx", "attempts")
   )
   return attempts
     .filter(
