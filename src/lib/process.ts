@@ -1,3 +1,4 @@
+import { trackManagedProcessGroup } from "./managed-process-groups"
 import { spawn } from "node:child_process"
 import { createWriteStream } from "node:fs"
 import { mkdir, stat } from "node:fs/promises"
@@ -307,6 +308,12 @@ export function runProcess(
   } = {}
 ): Promise<ProcessResult> {
   return new Promise((resolveProcess, reject) => {
+    const tracked =
+      options.timeoutMs !== undefined
+        ? trackManagedProcessGroup(
+            options.env?.ONYX_WORKER_CONTEXT ?? process.env.ONYX_WORKER_CONTEXT
+          )
+        : null
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
@@ -318,6 +325,7 @@ export function runProcess(
         ...(options.inheritedFds ?? []),
       ],
     })
+    if (child.pid) tracked?.started(child.pid)
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let timedOut = false
@@ -355,6 +363,7 @@ export function runProcess(
     child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk))
     child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk))
     child.on("error", (error) => {
+      if (!child.pid) tracked?.failedToSpawn()
       if (timeout) clearTimeout(timeout)
       if (escalation) clearTimeout(escalation)
       reject(error)
@@ -391,6 +400,11 @@ export function runProcess(
       }
       if (escalation) clearTimeout(escalation)
       if (timeout) clearTimeout(timeout)
+      try {
+        tracked?.finished()
+      } catch {
+        protectionUncertain = true
+      }
       resolveProcess({
         code,
         stdout: Buffer.concat(stdout).toString("utf8"),

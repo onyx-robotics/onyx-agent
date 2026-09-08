@@ -1,3 +1,6 @@
+import { assertWslStorage, wslVersion } from "../lib/linux-environment"
+import { configDir } from "../lib/config"
+import { join } from "node:path"
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { hostname, platform, release } from "node:os"
 
@@ -97,17 +100,21 @@ function base64Url(bytes: Uint8Array) {
   return Buffer.from(bytes).toString("base64url")
 }
 
-export function shouldUseDeviceFlow(args: Args) {
+export function shouldUseDeviceFlow(
+  args: Args,
+  environment = {
+    wsl: wslVersion(),
+    ssh: Boolean(process.env.SSH_CONNECTION || process.env.SSH_TTY),
+    tty: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+  }
+) {
   if (optionalFlag(args, "browser") && optionalFlag(args, "device")) {
     throw new Error("Pass either --browser or --device, not both.")
   }
   if (optionalFlag(args, "browser")) return false
   if (optionalFlag(args, "device")) return true
   return Boolean(
-    process.env.SSH_CONNECTION ||
-    process.env.SSH_TTY ||
-    !process.stdin.isTTY ||
-    !process.stdout.isTTY
+    environment.wsl !== "none" || environment.ssh || !environment.tty
   )
 }
 
@@ -364,6 +371,14 @@ async function removeStaleLegacyCredentials(
 }
 
 export async function commandLogin(args: Args) {
+  await assertWslStorage(
+    [
+      configDir(),
+      join(configDir(), "credentials"),
+      join(configDir(), "config.json"),
+    ],
+    "Login"
+  )
   for (const removed of ["refresh", "print-url", "port"]) {
     if (args.options[removed] !== undefined) {
       throw new Error(

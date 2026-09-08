@@ -1,3 +1,5 @@
+import { assertWslExecutable } from "./linux-environment"
+import { assertWslResearchEnvironment } from "./git"
 import { resolve } from "node:path"
 
 import type { Args } from "./args"
@@ -185,6 +187,9 @@ export async function runToolCommand({
     throw new Error(`Tool command "${name}" is not declared in onyx/setup.json`)
   }
 
+  await assertWslResearchEnvironment(root, [
+    resolveCwd(root, projectPath, command.cwd),
+  ])
   const release = await acquireResources({ root, api, command })
   let protectionUncertain = false
   try {
@@ -200,6 +205,11 @@ export async function runToolCommand({
       ONYX_SETUP_FILE: setupPath(root, projectPath),
       ONYX_VALIDATION_FILE: validationPath(root, projectPath),
     }
+    await assertWslExecutable(
+      command.shell === false ? command.command : "sh",
+      toolEnv,
+      cwd
+    )
     const timeoutMs = (timeoutSeconds ?? command.timeoutSeconds) * 1000
     const result =
       command.shell === false

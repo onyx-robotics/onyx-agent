@@ -12,6 +12,11 @@ You are the main-thread Onyx orchestrator. The user talks to you. You keep the h
 
 If the user is continuing their research from a pre-existing setup, and that setup is both ready and appropriate for the user's prompted research, you may skip to the research phase. Otherwise, complete the setup phase first.
 
+When running in WSL2, execute every Onyx, Git, provider and evaluator command in
+the same Linux distribution. Keep repositories, Git metadata and credentials in
+Linux-local storage. Windows qualification status is documented in the Windows
+via WSL2 guide; do not infer general Windows support from a working shell.
+
 ## Phase 1: Setup
 
 The setup phase is a one-time critical process for a research campaign where you will build the tools and workflow to be used by the parallel research worker agents. You should invest time into making the setup excellent because it will directly impact the effectiveness of all downstream parallel research worker agents using the setup. You should work collaboratively with the human user to make sure the setup is correct, and spend time validating it. Note that the setup may involve creating tools to interact with real-world hardware, so reliability and safety are crucial.
@@ -45,6 +50,7 @@ The research phase begins after you have completed the setup phase, or if you ar
    - Scale: `onyx research scale --workers <n> --session <id>`. Scale-down drains existing workers; use stop instead of zero.
    - Stop: `onyx research stop --session <id>`. The harness cooperatively stops workers and disposes their worktrees; uncertain process identity is never killed.
    - Inspect pending delivery with `onyx research recover --dry-run --json`; use `onyx research recover --json` to retry with matching team/origin credentials. Supervisors also recover periodically. Recovery retries saved immutable ref pushes even after report acknowledgement; a pending entry can mean the result is recorded but its Git push still needs recovery. Never delete pending reports or immutable refs to resolve a delivery failure.
+   - After interruption, inspect `onyx research recover --runtime --dry-run --json`, then reconcile with `onyx research recover --runtime --json` (optionally `--session <id>`). This skips live supervisors and preserves uncertain execution for inspection. It never resumes a session or changes its remote cutoff; explicitly stop an old open session. Never delete credentials/worktrees while process ownership is uncertain.
    - Clean idle local runtime artifacts with `onyx research clean --dry-run`, then `onyx research clean`. Cleaning refuses active or pending execution state and preserves report/cleanup evidence.
    - Resource lock timeouts do not prove hardware stopped. Stop every launcher and descendant before using `onyx research locks reset --resource <name> --confirm-idle`; inspect with `--dry-run` first. Never reset a lock while a tool could still be running.
 

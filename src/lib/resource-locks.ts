@@ -1,3 +1,4 @@
+import { linuxBootId } from "./linux-environment"
 import { randomUUID } from "node:crypto"
 import {
   mkdir,
@@ -14,6 +15,7 @@ import { onyxStateDir } from "./runtime-state"
 export class ResourceLockContentionError extends Error {}
 
 type ResourceLockRecord = {
+  bootId?: string | null
   ownerId: string
   pid: number
   acquiredAt: string
@@ -83,7 +85,11 @@ export async function resetResourceLocks(
       if (error.cause instanceof SyntaxError) return null
       throw error
     })
-    if (record?.pid && pidIsAlive(record.pid))
+    if (
+      record?.pid &&
+      !(record.bootId && linuxBootId() && record.bootId !== linuxBootId()) &&
+      pidIsAlive(record.pid)
+    )
       throw new Error(`Resource owner is live or inaccessible: ${path}`)
   }
   if (!dryRun) {
@@ -134,6 +140,7 @@ export async function acquireFileResourceLease({
       const path = join(dir, `${slot}.json`)
       const record: ResourceLockRecord = {
         ownerId,
+        bootId: linuxBootId(),
         pid: process.pid,
         acquiredAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + leaseMs).toISOString(),
