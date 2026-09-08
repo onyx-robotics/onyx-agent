@@ -1,3 +1,9 @@
+import { homedir } from "node:os"
+import {
+  assertWslExecutable,
+  assertWslStorage,
+  wslVersion,
+} from "./linux-environment"
 import {
   chmod,
   mkdir,
@@ -84,6 +90,7 @@ export async function resolveProviderExecutable(
   command: string,
   env: NodeJS.ProcessEnv = process.env
 ) {
+  await assertWslExecutable(command, env)
   if (command.includes("/")) return realpath(command)
   const result = await runProcess("which", [command], {
     env,
@@ -94,6 +101,28 @@ export async function resolveProviderExecutable(
     throw new Error(`Provider executable ${command} was not found on PATH.`)
   }
   return realpath(resolved)
+}
+
+async function assertProviderStorage(
+  kind: WorkerAgentKind,
+  env: NodeJS.ProcessEnv = process.env
+) {
+  if (wslVersion() === "none") return
+  const home = env.HOME ?? homedir()
+  const config = env.XDG_CONFIG_HOME ?? join(home, ".config")
+  const paths =
+    kind === "codex"
+      ? [env.CODEX_HOME ?? join(home, ".codex")]
+      : kind === "claude"
+        ? [env.CLAUDE_CONFIG_DIR ?? join(home, ".claude")]
+        : kind === "opencode"
+          ? [
+              env.OPENCODE_CONFIG_DIR ?? join(config, "opencode"),
+              join(home, ".local", "share", "opencode"),
+              env.XDG_CACHE_HOME ?? join(home, ".cache"),
+            ]
+          : []
+  await assertWslStorage(paths, "Provider configuration and credentials")
 }
 
 export async function preflightProviderModel({
@@ -110,6 +139,7 @@ export async function preflightProviderModel({
   if (invocation.agentKind === "custom") {
     return { skipped: true, version: null, marker: null }
   }
+  await assertProviderStorage(invocation.agentKind, env)
   const marker = `ONYX_PREFLIGHT_READY_${randomUUID()}`
   const probe = buildWorkerInvocation({
     agentKind: invocation.agentKind,
@@ -183,7 +213,12 @@ export async function preflightWorkerProtocol({ root }: { root: string }) {
         `expected protocol ${ONYX_AGENT_PROTOCOL_VERSION}/context ${ONYX_WORKER_CONTEXT_SCHEMA_VERSION}, received ${compactPreflightOutput(result.stdout)}`
       )
     }
-    return { ...payload, workerPath: wrapper.workerPath, mode: wrapper.mode }
+    return {
+      ...payload,
+      workerPath: wrapper.workerPath,
+      workerTarget: wrapper.target,
+      mode: wrapper.mode,
+    }
   } finally {
     await rm(paths.dir, { recursive: true, force: true }).catch(() => {})
   }
@@ -245,6 +280,8 @@ export type WorkerTeardownManifest = {
 }
 
 export type WorkerLaunchManifest = {
+  managedProcessGroupsVersion?: 1
+  stopGraceMs?: number
   schemaVersion: 2
   agentKind: WorkerAgentKind
   workerModel: string | null
@@ -268,6 +305,8 @@ export type WorkerLaunchManifest = {
   workerName: string
   supervisorRunId?: string | null
   pid?: number | null
+  bootId?: string | null
+  processStartTicks?: string | null
   processStartedAt?: string | null
   commandIdentity?: string | null
   /** Stable 1-based supervisor capacity slot; null on manifests written
@@ -474,7 +513,9 @@ export async function writeWorkerCliWrapper({
     } else {
       const resolved = await runProcess(
         "sh",
-        ["-lc", "command -v onyx-worker"],
+        // Resolve against the caller's effective PATH before pinning the
+        // wrapper. Login profiles can put an older installation ahead of it.
+        ["-c", "command -v onyx-worker"],
         {
           timeoutMs: 5000,
         }
@@ -809,6 +850,15 @@ export async function preflightWorkerInvocation(
     onyxWorkerPath: string
   }
 ): Promise<WorkerPreflightResult> {
+  await assertProviderStorage(invocation.agentKind, options.env)
+  for (const command of [
+    invocation.command,
+    "git",
+    "sh",
+    options.onyxWorkerPath,
+  ]) {
+    await assertWslExecutable(command, options.env, options.cwd)
+  }
   let version: string | null = null
   if (invocation.agentKind !== "custom") {
     try {
@@ -946,6 +996,41 @@ export async function preflightWorkerInvocation(
   // entrypoint re-execs the pinned wrapper inside a worker runtime). Verify
   // the effective binary through a login shell, since provider shells may
   // source profile files that reorder PATH in front of the wrapper.
+  if (wslVersion() !== "none") {
+    for (const command of ["git", "onyx-worker"]) {
+      const resolution = await runProcess(
+        "sh",
+        [
+          "-lc",
+          'printf "%s\\n" "$PATH"; command -v "$1"',
+          "onyx-wsl-preflight",
+          command,
+        ],
+        {
+          cwd: options.cwd,
+          env: options.env,
+          timeoutMs: options.timeoutMs ?? 10_000,
+        }
+      )
+      const lines = resolution.stdout.trim().split("\n")
+      const executable = lines.at(-1)
+      const effectivePath = lines.at(-2)
+      if (
+        resolution.code !== 0 ||
+        resolution.timedOut ||
+        !executable?.startsWith("/") ||
+        !effectivePath
+      )
+        throw new Error(
+          `Cannot establish Linux ${command} resolution in the worker login shell`
+        )
+      await assertWslExecutable(
+        executable,
+        { ...options.env, PATH: effectivePath },
+        options.cwd
+      )
+    }
+  }
   const bareResolution = await runProcess(
     "sh",
     ["-lc", "onyx-worker diagnostics handshake --json"],

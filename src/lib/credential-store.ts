@@ -1,3 +1,4 @@
+import { assertWslStorage } from "./linux-environment"
 import { randomUUID } from "node:crypto"
 import {
   chmod,
@@ -131,6 +132,10 @@ function credentialFilePath(credentialId: string) {
 }
 
 async function ensureCredentialDirectory() {
+  await assertWslStorage(
+    [configDir(), join(configDir(), CREDENTIALS_DIRECTORY)],
+    "Credential storage"
+  )
   await mkdir(configDir(), { recursive: true, mode: 0o700 })
   await chmod(configDir(), 0o700)
   const directory = join(configDir(), CREDENTIALS_DIRECTORY)
@@ -142,6 +147,10 @@ async function writeCredentialFile(
   credentialId: string,
   credential: OAuthCredential
 ) {
+  await assertWslStorage(
+    [credentialFilePath(credentialId)],
+    "Credential storage"
+  )
   await ensureCredentialDirectory()
   const path = credentialFilePath(credentialId)
   const temporary = `${path}.${randomUUID()}.tmp`
@@ -239,6 +248,10 @@ export async function writeCredential(
 ): Promise<CredentialStoreKind> {
   invalidateCachedCredential(credentialId)
   if (preferredStore !== "file") {
+    await assertWslStorage(
+      [configDir(), credentialFilePath(credentialId)],
+      "Credential storage"
+    )
     if (await writeKeyringCredential(credentialId, credential)) {
       await unlink(credentialFilePath(credentialId)).catch(() => undefined)
       return "keyring"
@@ -322,6 +335,10 @@ export async function withCredentialLock<T>(
   credentialId: string,
   work: () => Promise<T>
 ): Promise<T> {
+  await assertWslStorage(
+    [configDir(), credentialFilePath(credentialId)],
+    "Credential refresh"
+  )
   const release = await acquireCredentialLock(credentialId)
   try {
     return await work()

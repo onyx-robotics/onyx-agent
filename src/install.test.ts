@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   writeFile,
 } from "node:fs/promises"
@@ -362,6 +363,28 @@ describe("install script", () => {
       expect(await readFile(workerPath, "utf8")).toBe("old worker\n")
     })
   })
+
+  for (const [signal, exitCode] of [["INT", 130], ["TERM", 143]] as const) {
+    test(`installer exits and cleans temporary files on SIG${signal}`, async () => {
+      await withFixture(async (fixture) => {
+        await writeExecutable(
+          join(fixture.fakeBin, "curl"),
+          `#!/bin/sh\nkill -${signal} "$PPID"\nexit 0\n`
+        )
+        const result = await runInstall(fixture, {
+          TMPDIR: fixture.root,
+          ONYX_INSTALL_AUTH: "skip",
+        })
+        expect(result.code).toBe(exitCode)
+        expect(result.stdout).not.toContain("Onyx is ready.")
+        expect(
+          (await readdir(fixture.root)).filter((name) =>
+            name.startsWith("onyx-install.")
+          )
+        ).toEqual([])
+      })
+    })
+  }
 
   test("a headless install skips login instead of starting a long ceremony", async () => {
     await withFixture(async (fixture) => {

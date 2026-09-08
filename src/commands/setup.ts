@@ -1,3 +1,4 @@
+import { assertWslResearchEnvironment } from "../lib/git"
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises"
 
 import type { Args } from "../lib/args"
@@ -641,6 +642,7 @@ async function validateAndWrite({
 
 export async function commandSetupInit(args: Args) {
   const root = await repoRoot()
+  await assertWslResearchEnvironment(root)
   const projectPath = await resolveProjectPath(root, args)
   const dir = onyxPath(root, projectPath)
   await mkdir(onyxPath(root, projectPath, "tools", "evaluation"), {
@@ -698,6 +700,7 @@ export async function commandSetupValidate(args: Args) {
     )
   }
   const root = await repoRoot()
+  await assertWslResearchEnvironment(root)
   const projectPath = await resolveProjectPath(root, args)
   const validationResult = await validateAndWrite({
     root,

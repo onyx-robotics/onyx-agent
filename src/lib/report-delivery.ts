@@ -17,9 +17,9 @@ import type { Args } from "./args"
 import type { CachedAttemptRecord } from "./local-attempt-cache"
 import { ApiError, apiData, callApi, reportCampaignExperiment } from "./api"
 import { apiBaseUrl, readConfig, selectedProfileWithName } from "./config"
-import { git, gitResult } from "./git"
+import { git, gitResult, gitCommonDir } from "./git"
 import { runProcess } from "./process"
-import { onyxStateDir } from "./runtime-state"
+import { onyxStateDir, updateState } from "./runtime-state"
 import {
   clearLocalAttempt,
   listLocalAttempts,
@@ -269,12 +269,12 @@ export async function withDeliveryOwner<T>(
 
 export async function pendingReportSummary(root: string) {
   const records = await listLocalAttempts(root)
-  const files = await readdir(join(await onyxStateDir(root), "attempts")).catch(
-    (error) => {
-      if (error.code === "ENOENT") return []
-      throw error
-    }
-  )
+  const files = await readdir(
+    join(await gitCommonDir(root), "onyx", "attempts")
+  ).catch((error) => {
+    if (error.code === "ENOENT") return []
+    throw error
+  })
   const invalid = Math.max(
     0,
     files.filter((name) => name.endsWith(".json")).length - records.length
@@ -313,7 +313,7 @@ export async function pendingReportSummary(root: string) {
   }
 }
 
-async function matchingDeliveryArgs(
+export async function matchingDeliveryArgs(
   destination: DeliveryDestination,
   args: Args
 ): Promise<Args> {
@@ -523,7 +523,7 @@ export async function assertAttemptRefsPreserved(
       "Retaining worktree while malformed pending attempts require inspection"
     )
   for (const attempt of await listLocalAttempts(root, { workerId })) {
-    if (!attempt.delivery)
+    if (!attempt.delivery || attempt.delivery.version !== 1)
       throw new Error("Retaining worktree for unsupported pending attempt")
     await preserveResultRef(root, attempt.resultCommitSha, attempt.resultRef)
   }
@@ -647,6 +647,14 @@ async function recoverCleanupReceipts(
             },
           }
         )
+      await updateState(root, (state) => {
+        const local = state.sessions?.[receipt.sessionId]
+        if (
+          local?.schedulerSiteId === receipt.siteId &&
+          local.supervisor?.supervisorRunId === receipt.supervisorRunId
+        )
+          local.cleanupStatus = "complete"
+      })
       await unlink(join(dir, name))
     } catch {
       /* Retain the receipt until its authenticated remote update is acknowledged. */

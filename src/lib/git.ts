@@ -1,3 +1,10 @@
+import { configDir } from "./config"
+import {
+  assertWslExecutable,
+  assertWslStorage,
+  wslVersion,
+} from "./linux-environment"
+import { join } from "node:path"
 import { commandOutput, runProcess } from "./process"
 
 export async function git(args: string[], cwd?: string) {
@@ -85,4 +92,31 @@ export async function repositoryUrl(
   if (explicitUrl) return normalizeRepositoryUrl(explicitUrl)
   const origin = await git(["remote", "get-url", "origin"], root)
   return normalizeRepositoryUrl(origin)
+}
+
+/** Only execution entrypoints call this; remote reads remain available. */
+export async function assertWslResearchEnvironment(
+  root: string,
+  extraPaths: string[] = []
+) {
+  if (wslVersion() === "none") return
+  await assertWslExecutable("git", process.env, root)
+  const common = await git(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    root
+  )
+  await assertWslStorage(
+    [
+      root,
+      configDir(),
+      join(configDir(), "credentials"),
+      await gitDir(root),
+      common,
+      join(common, "onyx"),
+      join(common, "onyx", "worktrees"),
+      join(common, "onyx", "worker-runtime"),
+      ...extraPaths,
+    ],
+    "Research execution"
+  )
 }
