@@ -4,7 +4,7 @@ import path from "node:path"
 import type { ResearchEvaluationManifest, ResearchSetupFile } from "../protocol"
 
 import { sortedJson } from "./contract"
-import { git } from "./git"
+import { git, hardenedGitArgs } from "./git"
 
 function sha256(value: Uint8Array | string) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`
@@ -31,11 +31,14 @@ async function committedBlob(
   commitSha: string,
   repoPath: string
 ) {
-  const child = Bun.spawn(["git", "show", `${commitSha}:${repoPath}`], {
-    cwd: root,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
+  const child = Bun.spawn(
+    ["git", ...hardenedGitArgs(["show", `${commitSha}:${repoPath}`])],
+    {
+      cwd: root,
+      stdout: "pipe",
+      stderr: "pipe",
+    }
+  )
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(child.stdout).arrayBuffer(),
     new Response(child.stderr).text(),

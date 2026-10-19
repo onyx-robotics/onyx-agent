@@ -1,5 +1,6 @@
 import { assertWslExecutable } from "./linux-environment"
 import { assertWslResearchEnvironment } from "./git"
+import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
 import type { Args } from "./args"
@@ -13,6 +14,21 @@ import {
 import { onyxPath, resolveProjectPath, scopedRoot } from "./project"
 import { runProcess, type ProcessResult } from "./process"
 import { acquireFileResourceLease } from "./resource-locks"
+import { sandboxCommand, type ResolvedSandboxPolicy } from "./sandbox"
+
+export const ONYX_WORKER_SANDBOX_POLICY = "ONYX_WORKER_SANDBOX_POLICY"
+
+async function toolSandboxPolicy(env: NodeJS.ProcessEnv) {
+  const path = env[ONYX_WORKER_SANDBOX_POLICY]?.trim()
+  if (!path) return null
+  const policy = JSON.parse(
+    await readFile(path, "utf8")
+  ) as ResolvedSandboxPolicy
+  if (policy?.schemaVersion !== 1 || policy.role !== "tool") {
+    throw new Error(`Invalid worker tool sandbox policy at ${path}`)
+  }
+  return policy
+}
 
 export type ToolCommand = ResearchSetupTool
 export type ToolApi = Pick<
@@ -35,6 +51,7 @@ export function defaultProtectedToolPaths(projectPath: string) {
     `${prefix}onyx/onyx.md`,
     `${prefix}onyx/setup.json`,
     `${prefix}onyx/validation.json`,
+    `${prefix}onyx/sandbox.json`,
     `${prefix}onyx/tools`,
   ]
 }
@@ -194,7 +211,7 @@ export async function runToolCommand({
   let protectionUncertain = false
   try {
     const cwd = resolveCwd(root, projectPath, command.cwd)
-    const toolEnv = {
+    const toolEnv: NodeJS.ProcessEnv = {
       ...process.env,
       ...command.env,
       ...env,
@@ -211,16 +228,12 @@ export async function runToolCommand({
       cwd
     )
     const timeoutMs = (timeoutSeconds ?? command.timeoutSeconds) * 1000
-    const result =
+    const invocation =
       command.shell === false
-        ? await runProcess(command.command, [...command.args, ...extraArgs], {
-            cwd,
-            env: toolEnv,
-            timeoutMs,
-          })
-        : await runProcess(
-            "sh",
-            [
+        ? { command: command.command, args: [...command.args, ...extraArgs] }
+        : {
+            command: "sh",
+            args: [
               "-lc",
               [
                 command.command,
@@ -228,12 +241,17 @@ export async function runToolCommand({
                 ...extraArgs.map(quoteShellArg),
               ].join(" "),
             ],
-            {
-              cwd,
-              env: toolEnv,
-              timeoutMs,
-            }
-          )
+          }
+    const sandbox = await toolSandboxPolicy(process.env)
+    if (sandbox) delete toolEnv[ONYX_WORKER_SANDBOX_POLICY]
+    const launched = sandbox
+      ? await sandboxCommand(sandbox, { ...invocation, cwd }, toolEnv)
+      : invocation
+    const result = await runProcess(launched.command, launched.args, {
+      cwd,
+      env: toolEnv,
+      timeoutMs,
+    })
     protectionUncertain = result.protectionUncertain ?? false
     if (protectionUncertain)
       throw new Error(

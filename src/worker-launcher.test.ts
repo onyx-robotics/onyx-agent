@@ -248,6 +248,20 @@ describe("worker launchers", () => {
     expect(JSON.stringify(opencode.args)).not.toContain(prompt)
   })
 
+  test("Codex defers to the Onyx sandbox instead of nesting its own", () => {
+    const codex = buildWorkerInvocation({
+      agentKind: "codex",
+      worktree: "/tmp/worktree",
+      prompt: "prompt",
+      externalSandbox: true,
+    })
+    expect(codex.args).toContain("danger-full-access")
+    expect(codex.args).not.toContain("workspace-write")
+    expect(codex.args).not.toContain(
+      "sandbox_workspace_write.network_access=true"
+    )
+  })
+
   test("model preflight invokes the resolved executable despite a hostile PATH", async () => {
     const root = await mkdtemp(join(tmpdir(), "onyx-exact-provider-"))
     const hostileBin = join(root, "hostile")

@@ -116,6 +116,11 @@ and may still change:
   one commit, `onyx-worker exp run --resume`, then `onyx-worker exp log`.
 - The legacy per-value `ONYX_*` identity, path, and deadline variables were
   removed deliberately and will not return.
+- When `onyx/sandbox.json` exists (and `--no-sandbox` is not passed), the custom
+  command runs inside the same bubblewrap/Seatbelt sandbox as built-in
+  providers. Inside it, `onyx-worker` is a thin client of a supervisor-side
+  broker (`ONYX_WORKER_BROKER_SOCKET`); the runtime context and `.git/onyx`
+  are not visible, so the harness must go through `onyx-worker`.
 
 ## Pull Requests
 

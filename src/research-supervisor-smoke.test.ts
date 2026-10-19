@@ -42,6 +42,17 @@ const FAKE_WORKER_COMMAND = [
   "onyx-worker exp log",
 ].join(" && ")
 
+function sessionSandboxMetadata(calls: ApiCall[]) {
+  const create = calls.find((call) =>
+    call.path.endsWith(`/campaigns/${CAMPAIGN_ID}/sessions`)
+  )
+  return (
+    create?.body as {
+      metadata?: { preflight?: { sandbox?: Record<string, unknown> } }
+    } | null
+  )?.metadata?.preflight?.sandbox
+}
+
 function nowIso() {
   return new Date().toISOString()
 }
@@ -141,7 +152,10 @@ function setupFile(): ResearchSetupFile {
   }
 }
 
-async function createSmokeRepo() {
+async function createSmokeRepo({
+  evaluation = "printf 'METRIC score=1\\n'",
+  sandboxConfig,
+}: { evaluation?: string; sandboxConfig?: string } = {}) {
   const root = await mkdtemp(join(tmpdir(), "onyx-supervisor-smoke-"))
   const origin = await mkdtemp(join(tmpdir(), "onyx-supervisor-origin-"))
   await git(["init", "--bare"], origin)
@@ -170,7 +184,7 @@ async function createSmokeRepo() {
     "utf8"
   )
   const evalScript = join(root, "onyx", "tools", "evaluation", "run.sh")
-  await writeFile(evalScript, "#!/bin/sh\nprintf 'METRIC score=1\\n'\n", "utf8")
+  await writeFile(evalScript, `#!/bin/sh\n${evaluation}\n`, "utf8")
   await chmod(evalScript, 0o755)
   await writeFile(
     join(root, "onyx", "validation.json"),
@@ -195,6 +209,9 @@ async function createSmokeRepo() {
     )}\n`,
     "utf8"
   )
+  if (sandboxConfig !== undefined) {
+    await writeFile(join(root, "onyx", "sandbox.json"), sandboxConfig, "utf8")
+  }
   await git(["add", "."], root)
   await git(["commit", "-m", "Add smoke setup"], root)
   await git(["push", "-u", "origin", "HEAD"], root)
@@ -1442,4 +1459,145 @@ describe("remote-first research supervisor smoke", () => {
       await rm(origin, { recursive: true, force: true })
     }
   }, 60_000)
+})
+
+const bwrapAvailable =
+  process.platform === "linux" &&
+  (Bun.spawnSync(["bwrap", "--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "--dev", "/dev", "true"]).exitCode ?? 1) === 0
+const seatbeltAvailable =
+  process.platform === "darwin" &&
+  Bun.spawnSync(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"]).exitCode === 0
+
+describe.skipIf(!bwrapAvailable && !seatbeltAvailable)(
+  "sandboxed research supervisor smoke",
+  () => {
+    test("a present sandbox.json confines the worker and its evaluation but still reports", async () => {
+      const home = process.env.HOME!
+      await writeFile(join(home, "secret.txt"), "home-secret\n", "utf8")
+      const { root, origin, baseCommitSha } = await createSmokeRepo({
+        // The evaluator runs agent-edited code, so it must be confined too:
+        // it only scores 1 when the home secret is unreadable.
+        // Presence alone enables the sandbox; {} applies the default policy.
+        sandboxConfig: "{}\n",
+        evaluation: `if cat "$HOME/secret.txt" >/dev/null 2>&1; then printf 'METRIC score=0\\n'; else printf 'METRIC score=1\\n'; fi`,
+      })
+      const calls = installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+      const escapes = [
+        'cat "$HOME/secret.txt" 2>/dev/null || echo NO_HOME_SECRET',
+        `cat ${root}/.git/onyx/state.json >/dev/null 2>&1 || echo NO_SUPERVISOR_STATE`,
+        `cat ${root}/onyx/onyx.md >/dev/null 2>&1 || echo NO_MAIN_CHECKOUT`,
+        `(echo x >> ${root}/.git/config) 2>/dev/null || echo NO_GIT_CONFIG_WRITE`,
+        "(echo x > onyx/setup.json) 2>/dev/null || echo NO_PROTECTED_WRITE",
+        '(test -r "$ONYX_WORKER_CONTEXT" && echo CONTEXT_READABLE) || echo NO_WORKER_CONTEXT',
+      ].join("; ")
+      try {
+        await withMutedConsole(() =>
+          commandResearchRun({
+            positional: ["research", "run"],
+            options: {
+              cwd: root,
+              campaign: "smoke",
+              workers: "1",
+              "max-concurrency": "1",
+              experiments: "1",
+              foreground: "true",
+              quiet: "true",
+              "worker-command": `${escapes}; ${FAKE_WORKER_COMMAND}`,
+              "presence-interval": "0.1",
+              "launch-interval-seconds": "0.01",
+              "startup-timeout": "10",
+              "heartbeat-sample-interval": "0",
+              "first-attempt-warning-seconds": "0",
+            },
+          })
+        )
+        const report = requireExperimentReport(calls)
+        expect(report.body).toMatchObject({
+          status: "succeeded",
+          primaryMetricValue: 1,
+        })
+        const logDir = join(root, ".git", "onyx", "worker-logs", SESSION_ID)
+        const logs = await Promise.all(
+          (await readdir(logDir))
+            .filter((file) => file.endsWith(".log") && !file.endsWith(".activity.log"))
+            .map((file) => readFile(join(logDir, file), "utf8"))
+        )
+        const log = logs.join("\n")
+        for (const marker of [
+          "NO_HOME_SECRET",
+          "NO_SUPERVISOR_STATE",
+          "NO_MAIN_CHECKOUT",
+          "NO_GIT_CONFIG_WRITE",
+          "NO_PROTECTED_WRITE",
+          "NO_WORKER_CONTEXT",
+        ]) {
+          expect(log).toContain(marker)
+        }
+        expect(log).not.toContain("home-secret")
+        const manifests = (await readdir(logDir)).filter((file) =>
+          file.endsWith(".manifest.json")
+        )
+        const manifest = JSON.parse(
+          await readFile(join(logDir, manifests[0]!), "utf8")
+        ) as { sandbox?: { backend: string } }
+        expect(manifest.sandbox?.backend).toBe(
+          process.platform === "darwin" ? "seatbelt" : "bubblewrap"
+        )
+        expect(sessionSandboxMetadata(calls)).toMatchObject({
+          enabled: true,
+          probe: "passed",
+        })
+      } finally {
+        await rm(root, { recursive: true, force: true })
+        await rm(origin, { recursive: true, force: true })
+      }
+    }, 90_000)
+  }
+)
+
+describe("git hardening smoke", () => {
+  test("supervisor-side git never runs hooks an unconfined worker plants", async () => {
+    // --no-sandbox overrides a present policy, so the worker is unconfined
+    // and can plant the hook; the override is recorded on the session.
+    const { root, origin, baseCommitSha } = await createSmokeRepo({
+      sandboxConfig: "{}\n",
+    })
+    const calls = installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+    const marker = join(root, "hook-ran")
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            "max-concurrency": "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "no-sandbox": "true",
+            "worker-command": `printf '#!/bin/sh\\ntouch ${marker}\\n' > ${root}/.git/hooks/pre-push && chmod +x ${root}/.git/hooks/pre-push && ${FAKE_WORKER_COMMAND}`,
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "10",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+          },
+        })
+      )
+      requireExperimentReport(calls)
+      // The supervisor pushed the result ref; without hardened git config
+      // that push would have executed the planted pre-push hook.
+      expect(await pathExists(marker)).toBe(false)
+      expect(sessionSandboxMetadata(calls)).toEqual({
+        enabled: false,
+        configPresent: true,
+        disabledByFlag: true,
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(origin, { recursive: true, force: true })
+    }
+  }, 90_000)
 })

@@ -27,6 +27,7 @@ const PROTECTED_SETUP_PATHS = [
   "onyx/setup.json",
   "onyx/validation.json",
   "onyx/onyx.md",
+  "onyx/sandbox.json",
   "onyx/tools/",
 ]
 

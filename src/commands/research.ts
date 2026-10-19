@@ -172,6 +172,12 @@ import {
   type WorkerLatestState,
   writeWorkerLatestState,
 } from "../lib/worker-activity"
+import { assertNoRemovedSandboxFlag, selectSandbox } from "../lib/sandbox-config"
+import {
+  preflightSessionSandbox,
+  prepareWorkerSandbox,
+  type WorkerSandbox,
+} from "../lib/worker-sandbox"
 import {
   buildWorkerInvocation,
   classifyProviderFailure,
@@ -3018,6 +3024,7 @@ async function runHypothesisOnce({
   }
   let workerCliWrapper: WorkerCliWrapper | null = null
   let runtimePaths: WorkerRuntimePaths | null = null
+  let workerSandbox: WorkerSandbox | null = null
 
   try {
     const effectiveAgentKind = workerCommand ? "custom" : agentKind
@@ -3249,6 +3256,7 @@ async function runHypothesisOnce({
     const addedWritableRoots = workerCommand
       ? []
       : await workerGitWritableRoots(worktree)
+    const sandboxSelection = await selectSandbox({ root, projectPath, args })
     const preparedInvocation = buildWorkerInvocation({
       agentKind,
       workerCommand,
@@ -3259,7 +3267,21 @@ async function runHypothesisOnce({
       workerModel,
       workerTitle: worker.id,
       providerExecutable,
+      externalSandbox: sandboxSelection.enabled,
     })
+    if (sandboxSelection.enabled) {
+      workerSandbox = await prepareWorkerSandbox({
+        config: sandboxSelection.config,
+        setup,
+        worktree,
+        projectRoot,
+        runtimePaths,
+        wrapper: workerCliWrapper,
+        workerEnv: workerRunEnv,
+        agentKind: preparedInvocation.agentKind,
+        providerExecutable: workerCommand ? null : preparedInvocation.command,
+      })
+    }
     const preparedLaunchPaths = await workerLaunchPaths({
       root,
       sessionId,
@@ -3290,6 +3312,7 @@ async function runHypothesisOnce({
       hypothesisName: hypothesis.name,
       workerId: worker.id,
       workerName: worker.workerName,
+      sandbox: workerSandbox ? { backend: workerSandbox.backend } : null,
     }
     launchManifest = readyManifest
     await persistLaunchManifest(readyManifest)
@@ -3308,7 +3331,7 @@ async function runHypothesisOnce({
         },
         args
       )
-    const preflight = await preflightWorkerInvocation(preparedInvocation, {
+    const preflightOptions = {
       cwd: projectRoot,
       env: workerRunEnv,
       campaignName: campaign.name,
@@ -3316,7 +3339,17 @@ async function runHypothesisOnce({
       assignmentId: lease.assignment.id,
       workerId: worker.id,
       onyxWorkerPath: workerCliWrapper.workerPath,
-    })
+    }
+    const preflight = await preflightWorkerInvocation(
+      preparedInvocation,
+      workerSandbox
+        ? {
+            ...preflightOptions,
+            env: workerSandbox.agentEnv,
+            sandbox: workerSandbox.wrap,
+          }
+        : preflightOptions
+    )
     const preflightManifest: WorkerLaunchManifest = {
       ...readyManifest,
       version: preflight.version,
@@ -3402,6 +3435,14 @@ async function runHypothesisOnce({
       args,
       preferLocalSupervisorControl: true,
     })
+    const providerEnv = workerSandbox?.agentEnv ?? workerRunEnv
+    const providerLaunch = workerSandbox
+      ? await workerSandbox.wrap({
+          command: preparedInvocation.command,
+          args: preparedInvocation.args,
+          cwd: projectRoot,
+        })
+      : { command: preparedInvocation.command, args: preparedInvocation.args }
     const workerResult = await withWorkerHeartbeat({
       root,
       args,
@@ -3427,8 +3468,8 @@ async function runHypothesisOnce({
           : {},
       run: () =>
         runStreamingProcess(
-          preparedInvocation.command,
-          preparedInvocation.args,
+          providerLaunch.command,
+          providerLaunch.args,
           {
             cwd: projectRoot,
             timeoutMs: Math.max(
@@ -3446,10 +3487,10 @@ async function runHypothesisOnce({
               `# hypothesis: ${hypothesis.id}`,
             ].join("\n"),
             stdin: preparedInvocation.stdin,
-            env: workerRunEnv,
+            env: providerEnv,
             redactValues: [
               ...(workerCredential ? [workerCredential] : []),
-              ...Object.entries(workerRunEnv)
+              ...Object.entries(providerEnv)
                 .filter(([name, value]) =>
                   Boolean(
                     value &&
@@ -3610,6 +3651,18 @@ async function runHypothesisOnce({
     }
   } finally {
     if (firstAttemptWarningTimer) clearTimeout(firstAttemptWarningTimer)
+    const sandboxCleanupError = workerSandbox
+      ? await workerSandbox.close().then(
+          () => null,
+          (error) => `sandbox cleanup failed: ${errorMessage(error)}`
+        )
+      : null
+    if (sandboxCleanupError && launchManifest) {
+      launchManifest = {
+        ...launchManifest,
+        warnings: [...(launchManifest.warnings ?? []), sandboxCleanupError],
+      }
+    }
     if (workerId) {
       const terminalOutcome =
         outcome ??
@@ -6567,6 +6620,7 @@ async function commandResearchRunImplementation(
   if (args.options["max-experiments"] !== undefined) {
     throw new Error("--max-experiments was removed. Use --experiments.")
   }
+  assertNoRemovedSandboxFlag(args)
   if (args.options["max-worker-iterations"] !== undefined) {
     throw new Error(
       "--max-worker-iterations is no longer a research session option."
@@ -6749,13 +6803,51 @@ async function commandResearchRunImplementation(
     providerInvocation.command = providerExecutable
     resolvedWorkerArgs.options["provider-executable"] = providerExecutable
   }
+  const sessionSandbox = await selectSandbox({
+    root,
+    projectPath: effectiveProjectPath,
+    args,
+  })
+  let sandboxedProviderPreflight: Awaited<
+    ReturnType<typeof preflightProviderModel>
+  > | null = null
+  const sandboxPreflight = !sessionSandbox.enabled
+    ? {
+        enabled: false,
+        configPresent: sessionSandbox.configPresent,
+        disabledByFlag: sessionSandbox.disabledByFlag,
+      }
+    : internalSession
+      ? { enabled: true, skipped: true }
+      : {
+          enabled: true,
+          ...(await preflightSessionSandbox({
+            config: sessionSandbox.config,
+        env: providerRuntimeEnvironment(process.env),
+        agentKind: providerInvocation.agentKind,
+        providerExecutable: providerExecutable ?? null,
+        runProviderProbe:
+          providerInvocation.agentKind === "custom"
+            ? undefined
+            : async ({ cwd, sandbox }) => {
+                sandboxedProviderPreflight = await preflightProviderModel({
+                  invocation: providerInvocation,
+                  cwd,
+                  env: providerRuntimeEnvironment(process.env),
+                  sandbox,
+                })
+              },
+          })),
+        }
   const providerPreflight = internalSession
     ? { skipped: true, version: null, marker: null }
-    : await preflightProviderModel({
-        invocation: providerInvocation,
-        cwd: root,
-        env: providerRuntimeEnvironment(process.env),
-      })
+    : sandboxedProviderPreflight
+      ? sandboxedProviderPreflight
+      : await preflightProviderModel({
+          invocation: providerInvocation,
+          cwd: root,
+          env: providerRuntimeEnvironment(process.env),
+        })
   await deliveryDestination(campaign.id, campaign.projectId, args)
   let result: {
     session: ApiSession
@@ -6796,6 +6888,7 @@ async function commandResearchRunImplementation(
               workerProtocol: workerProtocolPreflight,
               provider: providerPreflight,
               providerExecutable: providerExecutable ?? null,
+              sandbox: sandboxPreflight,
             },
           },
         },

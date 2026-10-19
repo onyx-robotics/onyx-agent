@@ -204,6 +204,7 @@ function setupCompliance({
     "onyx/onyx.md",
     "onyx/setup.json",
     "onyx/validation.json",
+    "onyx/sandbox.json",
     "onyx/tools",
   ]
   const protectedPaths = [...defaultProtected, ...setup.scope.protected]
