@@ -220,6 +220,22 @@ async function darwinUserCacheDir() {
   return value || null
 }
 
+/** The active Xcode/CLT developer dir. /usr/bin shims (git, clang, make)
+ * load libxcrun from it, and runners often install Xcode as Xcode_N.app. */
+async function darwinDeveloperRoots(env: NodeJS.ProcessEnv) {
+  let dir = env.DEVELOPER_DIR?.trim() || ""
+  if (!dir) {
+    const result = await runProcess("xcode-select", ["-p"], {
+      timeoutMs: 5_000,
+    }).catch(() => null)
+    dir = result?.code === 0 ? result.stdout.trim() : ""
+  }
+  if (!dir) return []
+  // Allow the whole bundle: the toolchain reaches outside Contents/Developer.
+  const app = dir.match(/^(.*?\.app)(\/|$)/)
+  return [app ? app[1] : dir]
+}
+
 export async function resolveSandboxPolicy(
   input: SandboxPolicyInput
 ): Promise<ResolvedSandboxPolicy> {
@@ -236,6 +252,8 @@ export async function resolveSandboxPolicy(
   const system = platform === "linux" ? LINUX_SYSTEM_READ : DARWIN_SYSTEM_READ
   const systemExec =
     platform === "linux" ? LINUX_SYSTEM_EXEC : DARWIN_SYSTEM_EXEC
+  const developerRoots =
+    platform === "darwin" ? await darwinDeveloperRoots(input.env) : []
   const providerInstall = await providerInstallDirs(
     input.role === "agent" ? (input.providerExecutable ?? null) : null
   )
@@ -252,6 +270,7 @@ export async function resolveSandboxPolicy(
     // Often a symlink into /run (systemd-resolved, NetworkManager, resolvconf).
     ...(platform === "linux" ? ["/etc/resolv.conf"] : []),
     ...(await pathEntries(input.env, home)),
+    ...developerRoots,
     join(home, ".gitconfig"),
     join(input.env.XDG_CONFIG_HOME ?? join(home, ".config"), "git"),
     input.env.GIT_CONFIG_GLOBAL,
@@ -308,6 +327,7 @@ export async function resolveSandboxPolicy(
       ? null
       : await canonicalAll([
           ...systemExec,
+          ...developerRoots,
           ...providerInstall,
           ...clientPaths,
           ...binDir,

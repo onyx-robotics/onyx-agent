@@ -1463,6 +1463,7 @@ describe("remote-first research supervisor smoke", () => {
 
 const bwrapAvailable =
   process.platform === "linux" &&
+  Bun.which("bwrap") !== null &&
   (Bun.spawnSync(["bwrap", "--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "--dev", "/dev", "true"]).exitCode ?? 1) === 0
 const seatbeltAvailable =
   process.platform === "darwin" &&
