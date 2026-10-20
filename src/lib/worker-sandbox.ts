@@ -5,6 +5,7 @@ import { join } from "node:path"
 import type { ResearchSetupFile } from "./contract"
 import { gitCommonDir, gitDir } from "./git"
 import type { SandboxConfig } from "./sandbox-config"
+import type { SimConfig } from "./sim-config"
 import {
   probeSandbox,
   resolveSandboxPolicy,
@@ -40,11 +41,20 @@ export function sandboxBackend(platform: NodeJS.Platform = process.platform) {
   return platform === "darwin" ? ("seatbelt" as const) : ("bubblewrap" as const)
 }
 
-function projectProtectedPaths(setup: ResearchSetupFile) {
+function projectProtectedPaths(
+  setup: ResearchSetupFile,
+  sim: SimConfig | null = null
+) {
   return [
     ...defaultProtectedToolPaths(""),
     ...setup.scope.protected.map((path) => path.replace(/\/+$/, "")),
+    ...(sim?.paths ?? []),
   ]
+}
+
+/** With a hardware queue, only the supervisor's hardware jobs get devices. */
+function withoutDevices(config: SandboxConfig): SandboxConfig {
+  return { ...config, devices: [] }
 }
 
 /**
@@ -62,9 +72,13 @@ export async function prepareWorkerSandbox({
   workerEnv,
   agentKind,
   providerExecutable,
+  sim = null,
 }: {
   config: SandboxConfig
   setup: ResearchSetupFile
+  /** Set when the session runs a hardware queue: device access is removed
+   * from the worker and its tools, and simulator sources are read-only. */
+  sim?: SimConfig | null
   worktree: string
   projectRoot: string
   runtimePaths: WorkerRuntimePaths
@@ -85,14 +99,14 @@ export async function prepareWorkerSandbox({
   })
   try {
     const shared = {
-      config,
+      config: sim ? withoutDevices(config) : config,
       env: workerEnv,
       worktreeRoot: worktree,
       projectRoot,
       gitDir: workerGitDir,
       gitCommonDir: commonDir,
       tempDir: runtimePaths.tempDir,
-      protectedPaths: projectProtectedPaths(setup),
+      protectedPaths: projectProtectedPaths(setup, sim),
       editablePaths: setup.scope.editable,
     }
     const agentPolicy = await resolveSandboxPolicy({
@@ -178,4 +192,51 @@ export async function preflightSessionSandbox({
   } finally {
     await rm(scratch, { recursive: true, force: true }).catch(() => {})
   }
+}
+
+/**
+ * Tool policy for one supervisor hardware job: the same confinement a
+ * worker's tools get, rooted at the job's own worktree, and the only policy
+ * that passes the configured devices through.
+ */
+export async function writeHardwareToolPolicy({
+  config,
+  setup,
+  sim,
+  worktree,
+  projectRoot,
+  tempDir,
+  env,
+  path,
+}: {
+  config: SandboxConfig
+  setup: ResearchSetupFile
+  sim: SimConfig | null
+  worktree: string
+  projectRoot: string
+  tempDir: string
+  env: NodeJS.ProcessEnv
+  path: string
+}) {
+  const [jobGitDir, commonDir] = await Promise.all([
+    gitDir(worktree),
+    gitCommonDir(worktree),
+  ])
+  const policy = await resolveSandboxPolicy({
+    config,
+    env,
+    role: "tool",
+    worktreeRoot: worktree,
+    projectRoot,
+    gitDir: jobGitDir,
+    gitCommonDir: commonDir,
+    tempDir,
+    protectedPaths: projectProtectedPaths(setup, sim),
+    editablePaths: setup.scope.editable,
+  })
+  await writeFile(path, `${JSON.stringify(policy, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+  return policy
 }

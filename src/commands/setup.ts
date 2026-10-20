@@ -1,5 +1,6 @@
 import { assertWslResearchEnvironment } from "../lib/git"
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 
 import type { Args } from "../lib/args"
 import {
@@ -18,10 +19,16 @@ import {
   recordSetupValidation,
 } from "../lib/telemetry"
 import { repoRoot } from "../lib/git"
-import { onyxPath, resolveProjectPath } from "../lib/project"
+import { onyxPath, resolveProjectPath, scopedRoot } from "../lib/project"
 import { pathExists } from "../lib/process"
 import { parseWorkflowMetricLines, summarizeOutput } from "../lib/metrics"
 import { runToolCommand, type ToolRunResult } from "../lib/tools"
+import {
+  readSimConfig,
+  simConfigProblems,
+  workflowHardwareResources,
+  type SimConfig,
+} from "../lib/sim-config"
 
 const PROTECTED_SETUP_PATHS = [
   "onyx/setup.json",
@@ -305,6 +312,123 @@ function defaultInstructions(setup: ResearchSetupFile, args: Args) {
   ].join("\n")
 }
 
+/**
+ * Checks for onyx/sim.json, the simulator that gates the hardware queue.
+ * Without the file there is no queue and nothing to check.
+ */
+async function simulatorChecks({
+  root,
+  projectPath,
+  setup,
+  executeMetricTool,
+}: {
+  root: string
+  projectPath: string
+  setup: ResearchSetupFile
+  executeMetricTool: boolean
+}): Promise<ResearchSetupValidationCheck[]> {
+  let sim: SimConfig | null
+  try {
+    sim = await readSimConfig(root, projectPath)
+  } catch (error) {
+    return [
+      check(
+        "sim_config",
+        "failed",
+        error instanceof Error ? error.message : String(error)
+      ),
+    ]
+  }
+  if (!sim) return []
+  const checks: ResearchSetupValidationCheck[] = []
+  const problems = simConfigProblems(setup, sim)
+  checks.push(
+    problems.length > 0
+      ? check("sim_config", "failed", problems.join(" ").slice(0, 1000), {
+          tool: sim.tool,
+          paths: sim.paths,
+        })
+      : check(
+          "sim_config",
+          "passed",
+          `Simulator ${sim.tool} gates the hardware queue (${sim.source === "user" ? "user-provided" : "built during setup"}).`,
+          { tool: sim.tool, paths: sim.paths, source: sim.source }
+        )
+  )
+  const missing: string[] = []
+  for (const path of sim.paths) {
+    if (!(await pathExists(join(scopedRoot(root, projectPath), path)))) {
+      missing.push(path)
+    }
+  }
+  if (missing.length > 0) {
+    checks.push(
+      check(
+        "sim_paths",
+        "failed",
+        `Simulator path${missing.length === 1 ? "" : "s"} ${missing.join(", ")} missing.`,
+        { missing }
+      )
+    )
+  }
+  if (workflowHardwareResources(setup).length === 0) {
+    checks.push(
+      check(
+        "sim_hardware_resources",
+        "warning",
+        "onyx/sim.json is present but no workflow tool declares a resource. Declare the hardware in `resources` and list it on every tool that touches it, so each experiment holds the hardware for its whole workflow."
+      )
+    )
+  }
+  if (problems.length > 0 || !setup.tools[sim.tool]) return checks
+  if (!executeMetricTool) {
+    checks.push(
+      check(
+        "sim_tool_readiness",
+        "failed",
+        `Run \`onyx setup validate\` to execute simulator ${sim.tool}; it must pass on the current code before research can start.`
+      )
+    )
+    return checks
+  }
+  try {
+    const result = await runToolCommand({ root, projectPath, name: sim.tool })
+    const parsed = parseWorkflowMetricLines(result.stdout, setup.metric.name)
+    const evidence = {
+      toolId: sim.tool,
+      exitCode: result.code,
+      timedOut: result.timedOut,
+      metrics: parsed.metrics,
+      outputSummary: summarizeOutput(result.stdout, result.stderr),
+      checkedAt: new Date().toISOString(),
+    }
+    checks.push(
+      result.timedOut || result.code !== 0
+        ? check(
+            "sim_tool_readiness",
+            "failed",
+            `Simulator ${sim.tool} ${result.timedOut ? "timed out" : `exited with code ${result.code}`} on the current code. It must pass here, or no experiment can reach hardware.`,
+            evidence
+          )
+        : check(
+            "sim_tool_readiness",
+            "passed",
+            `Simulator ${sim.tool} passed on the current code.`,
+            evidence
+          )
+    )
+  } catch (error) {
+    checks.push(
+      check(
+        "sim_tool_readiness",
+        "failed",
+        `Simulator ${sim.tool} could not be executed: ${error instanceof Error ? error.message : String(error)}`
+      )
+    )
+  }
+  return checks
+}
+
 async function buildValidation({
   root,
   projectPath,
@@ -531,6 +655,10 @@ async function buildValidation({
           )
     )
   }
+
+  checks.push(
+    ...(await simulatorChecks({ root, projectPath, setup, executeMetricTool }))
+  )
 
   const declaredCapabilityText = [
     setup.goal,

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import {
   chmod,
   mkdir,
@@ -155,7 +156,8 @@ function setupFile(): ResearchSetupFile {
 async function createSmokeRepo({
   evaluation = "printf 'METRIC score=1\\n'",
   sandboxConfig,
-}: { evaluation?: string; sandboxConfig?: string } = {}) {
+  withSim = false,
+}: { evaluation?: string; sandboxConfig?: string; withSim?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "onyx-supervisor-smoke-"))
   const origin = await mkdtemp(join(tmpdir(), "onyx-supervisor-origin-"))
   await git(["init", "--bare"], origin)
@@ -165,6 +167,30 @@ async function createSmokeRepo({
   await git(["remote", "add", "origin", origin], root)
 
   const setup = setupFile()
+  if (withSim) {
+    // The evaluation runs on a shared rig behind a simulator gate.
+    setup.resources = { rig: { slots: 1, description: "Smoke rig" } }
+    setup.tools["evaluation.run"]!.resources = ["rig"]
+    setup.tools["sim.run"] = {
+      ...setup.tools["evaluation.run"]!,
+      description: "Simulate the smoke metric.",
+      args: ["sim/run.sh"],
+      resources: [],
+      fingerprintPaths: [],
+    }
+    await mkdir(join(root, "sim"), { recursive: true })
+    await writeFile(
+      join(root, "sim", "run.sh"),
+      "#!/bin/sh\nprintf 'METRIC score=0.5\\n'\n",
+      "utf8"
+    )
+    await mkdir(join(root, "onyx"), { recursive: true })
+    await writeFile(
+      join(root, "onyx", "sim.json"),
+      `${JSON.stringify({ tool: "sim.run", paths: ["sim"] })}\n`,
+      "utf8"
+    )
+  }
   await mkdir(join(root, "onyx", "tools", "evaluation"), { recursive: true })
   await mkdir(join(root, "src"), { recursive: true })
   await writeFile(join(root, "src", "smoke.txt"), "base\n", "utf8")
@@ -1469,6 +1495,74 @@ const seatbeltAvailable =
   process.platform === "darwin" &&
   Bun.spawnSync(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"]).exitCode === 0
 
+describe.skipIf(!bwrapAvailable || !existsSync("/dev/kmsg"))(
+  "sandboxed hardware queue smoke",
+  () => {
+    test("only the supervisor's hardware job sees the configured device", async () => {
+      const { root, origin, baseCommitSha } = await createSmokeRepo({
+        withSim: true,
+        sandboxConfig: `${JSON.stringify({ devices: ["/dev/kmsg"] })}\n`,
+        // Scores 1 only when the device is passed through to the job.
+        evaluation:
+          "if test -e /dev/kmsg; then printf 'METRIC score=1\\n'; else printf 'METRIC score=0\\n'; fi",
+      })
+      const calls = installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+      try {
+        await withMutedConsole(() =>
+          commandResearchRun({
+            positional: ["research", "run"],
+            options: {
+              cwd: root,
+              campaign: "smoke",
+              workers: "1",
+              "max-concurrency": "1",
+              experiments: "1",
+              foreground: "true",
+              quiet: "true",
+              "worker-command": [
+                // Quotes keep the markers out of the logged command line.
+                `(test -e /dev/kmsg && echo WORKER_SEES"_"DEVICE) || echo WORKER_NO"_"DEVICE`,
+                "onyx-worker exp run --auto",
+                "printf 'result\\n' > src/result.txt",
+                "git add src/result.txt",
+                "git commit -m 'fake worker result'",
+                "onyx-worker exp run --resume --auto",
+                "onyx-worker exp queue --wait --timeout 60",
+              ].join(" && "),
+              "presence-interval": "0.1",
+              "launch-interval-seconds": "0.01",
+              "startup-timeout": "10",
+              "heartbeat-sample-interval": "0",
+              "first-attempt-warning-seconds": "0",
+            },
+          })
+        )
+        const report = requireExperimentReport(calls)
+        expect(report.body).toMatchObject({
+          status: "succeeded",
+          primaryMetricValue: 1,
+        })
+        const logDir = join(root, ".git", "onyx", "worker-logs", SESSION_ID)
+        const log = (
+          await Promise.all(
+            (await readdir(logDir))
+              .filter(
+                (file) =>
+                  file.endsWith(".log") && !file.endsWith(".activity.log")
+              )
+              .map((file) => readFile(join(logDir, file), "utf8"))
+          )
+        ).join("\n")
+        expect(log).toContain("WORKER_NO_DEVICE")
+        expect(log).not.toContain("WORKER_SEES_DEVICE")
+      } finally {
+        await rm(root, { recursive: true, force: true })
+        await rm(origin, { recursive: true, force: true })
+      }
+    }, 60_000)
+  }
+)
+
 describe.skipIf(!bwrapAvailable && !seatbeltAvailable)(
   "sandboxed research supervisor smoke",
   () => {
@@ -1555,6 +1649,69 @@ describe.skipIf(!bwrapAvailable && !seatbeltAvailable)(
     }, 90_000)
   }
 )
+
+describe("hardware queue smoke", () => {
+  test("a sim-passed commit is measured by the supervisor's hardware queue and reported for the worker", async () => {
+    const { root, origin, baseCommitSha } = await createSmokeRepo({
+      withSim: true,
+      evaluation:
+        "printf '%s\\n' \"$ONYX_REPO_ROOT\" > \"$(git rev-parse --git-common-dir)/../eval-root.txt\"\nprintf 'METRIC score=1\\n'",
+    })
+    const calls = installSupervisorApi({ baseCommitSha, workerTarget: 1 })
+    try {
+      await withMutedConsole(() =>
+        commandResearchRun({
+          positional: ["research", "run"],
+          options: {
+            cwd: root,
+            campaign: "smoke",
+            workers: "1",
+            "max-concurrency": "1",
+            experiments: "1",
+            foreground: "true",
+            quiet: "true",
+            "worker-command": [
+              "onyx-worker exp run --auto",
+              "printf 'result\\n' > src/result.txt",
+              "git add src/result.txt",
+              "git commit -m 'fake worker result'",
+              "onyx-worker exp run --resume --auto --description 'sim gated change'",
+              "onyx-worker exp queue --wait --timeout 60",
+            ].join(" && "),
+            "presence-interval": "0.1",
+            "launch-interval-seconds": "0.01",
+            "startup-timeout": "5",
+            "heartbeat-sample-interval": "0",
+            "first-attempt-warning-seconds": "0",
+          },
+        })
+      )
+      const report = requireExperimentReport(calls)
+      expect(report.body).toMatchObject({
+        status: "succeeded",
+        primaryMetricName: "score",
+        primaryMetricValue: 1,
+        description: "sim gated change",
+      })
+      // Measured in the supervisor's own worktree, not the worker's.
+      const evalRoot = (
+        await readFile(join(root, "eval-root.txt"), "utf8")
+      ).trim()
+      expect(evalRoot).toContain(`/worktrees/${SESSION_ID}/hw-`)
+      expect(
+        await pathExists(join(root, ".git", "onyx", "worktrees", SESSION_ID))
+      ).toBe(false)
+      expect(
+        await pathExists(
+          join(root, ".git", "onyx", "resource-locks", "rig", "0.json")
+        )
+      ).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(origin, { recursive: true, force: true })
+    }
+  }, 60_000)
+})
 
 describe("git hardening smoke", () => {
   test("supervisor-side git never runs hooks an unconfined worker plants", async () => {

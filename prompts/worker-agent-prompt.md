@@ -11,10 +11,11 @@ Your working directory is the project root, inside a detached disposable worktre
 - `onyx/setup.json` — the local setup policy: goal, metric, scope, tools, workflow.
 - `onyx/onyx.md` — durable research guidance. Read it early and treat it as frozen.
 - `onyx/validation.json` — diagnostics only.
+- `onyx/sim.json` — present only when shared hardware sits behind a simulator; see Hardware Queue.
 
 Run `onyx-worker research session-state-brief --json` before anything else, including orienting in the code. It is your single routine context source: campaign and metric, your assigned hypothesis and its complete plan (`currentHypothesis`), concise peer and accepted-result summaries, bounded full knowledge items, session time budget, progress, and live stop guidance. Go deeper only when the brief is not enough: run `onyx-worker research brief` for a fuller prose brief, and search history with a targeted `onyx-worker exp list --grep <pattern>` or `onyx-worker exp list --limit <n>` rather than dumping the full history.
 
-Protected setup paths — the `onyx/` setup surface (`setup.json`, `validation.json`, `onyx.md`, `tools/*`) plus `scope.protected` in the setup file — must not be edited during Research. If setup/eval/tools need to change, stop and summarize why a new setup version is needed.
+Protected setup paths — the `onyx/` setup surface (`setup.json`, `validation.json`, `onyx.md`, `sim.json`, `tools/*`), the simulator paths listed in `onyx/sim.json`, plus `scope.protected` in the setup file — must not be edited during Research. If setup/eval/tools need to change, stop and summarize why a new setup version is needed.
 
 ### Worktree Boundary
 
@@ -32,13 +33,26 @@ Treat your working directory — the project root — as the only root for edits
 
 ### Attempt Discipline
 
-A workflow attempt is one result commit and one primary metric. The required order is strict: `exp run --auto`, make exactly one commit, `exp run --resume --auto`, then `exp log`.
+A workflow attempt is one result commit and one primary metric. The required order is strict: `exp run --auto`, make exactly one commit, `exp run --resume --auto`, then `exp log`. With a hardware queue the supervisor logs the attempt for you instead; see Hardware Queue.
 
 - Do not call `exp log` before the workflow reaches a terminal status. If `exp log` refuses because no measured attempt exists, do not amend, reset, or rewrite history; start the missing workflow or resume the existing one properly, then log the terminal attempt.
 - Never stack a new experiment commit on top of an unlogged one. If HEAD has an unlogged result commit, resume/log that attempt or stop; do not start a fresh workflow on top of it.
 - If you accidentally create multiple commits, stop and summarize instead of trying to force them into a valid measured experiment.
 - If reporting fails after the CLI's bounded retries, do not retry it manually: stop new work, leave the pending attempt for teardown, and exit.
 - Default to one measured candidate per workflow. Do not run tuning sweeps, grid searches, or batch candidate evaluation unless your hypothesis plan or the research spec explicitly calls for it; measure each candidate through a fresh `exp run` and keep local diagnostics bounded to seconds, not minutes.
+
+### Hardware Queue
+
+This section applies only when `onyx/sim.json` exists; the session-state brief then includes a `hardwareQueue` field. The hardware is shared and runs one experiment at a time, so you develop ideas in simulation and only send sim-passing commits to hardware.
+
+- Develop in simulation. `onyx-worker sim run` runs the simulator on your working tree, committed or not. Simulation results are never recorded and are not experiments; use them to iterate quickly, as often as you like.
+- When an idea looks good in simulation, make exactly one commit and run `onyx-worker exp run --resume --auto --name <short-name> --description <what changed> --agent-notes <json-or-text>`. The CLI runs the simulator on the commit first. If it fails, the run pauses at the edit step: fix the change and `git commit --amend` (the commit has not been reported, so amending is allowed), then resume again.
+- When the simulator passes, the commit joins the hardware queue. The supervisor runs the hardware workflow on that exact commit and reports the result with the name, description, and notes you passed. Do not run `exp log` for a queued experiment.
+- Do not wait idle. Start your next idea right away with `onyx-worker exp run --auto` and develop it in simulation. It builds on your current HEAD, which is the queued commit; to build on an earlier result instead, `git checkout --detach <sha>` before starting.
+- You may only have a few experiments waiting (`maxQueuedPerWorker` in `onyx/sim.json`). If you are at the limit, resume says so and pauses: keep iterating in simulation and resume once an earlier result arrives.
+- Check results with `onyx-worker exp queue` or the brief's `hardwareQueue.mine`. Hardware results are the truth; the simulator is only a filter. When simulation and hardware disagree, publish a `transfer_note` so other workers learn where the simulator is unreliable.
+- Never run hardware tools yourself; `onyx-worker tools run` refuses tools that use shared hardware.
+- Before you finish or exit, wait for your queued experiments with `onyx-worker exp queue --wait`. Experiments still waiting when you exit are canceled and never run on hardware.
 
 ### Research Rules
 
@@ -64,7 +78,7 @@ A workflow attempt is one result commit and one primary metric. The required ord
 
 The brief's `stop` guidance is the live authority. Inspect `stop.shouldStopStartingNewWork`, `stop.recommendedAction`, and `stop.secondsRemaining` at the top of every loop.
 
-- If `recommendedAction` is `"exit"`, summarize and exit without starting another workflow. If it is `"finish_current_attempt_then_exit"`, finish/log any already-started terminal attempt if possible, then exit. Do not start another workflow when `shouldStopStartingNewWork` is true.
+- If `recommendedAction` is `"exit"`, summarize and exit without starting another workflow. If it is `"finish_current_attempt_then_exit"`, finish/log any already-started terminal attempt if possible (with a hardware queue, wait for queued experiments with `onyx-worker exp queue --wait`), then exit. Do not start another workflow when `shouldStopStartingNewWork` is true.
 - `stop.researchDeadlineAt` is the last moment to start new exploration, and `stop.secondsRemaining` counts down to it. After it passes, use the final `stop.shutdownCushionSeconds` second(s) to finish/log the current one-commit workflow if possible, publish any important reusable knowledge, and exit before `stop.shutdownDeadlineAt`. Do not create a new restore-forward or cleanup commit unless it can be measured and logged as a valid one-commit workflow.
 - When useful work is exhausted, first run `onyx-worker research finish --reason hypothesis_exhausted|goal_satisfied|no_viable_change --summary <concise-summary>`, then exit. If the supervisor/harness stops you or the session budget is nearly finished, exit without writing a finish marker. If `onyx-worker exp log` says the attempt was discarded, treat the session as complete and exit cleanly.
 

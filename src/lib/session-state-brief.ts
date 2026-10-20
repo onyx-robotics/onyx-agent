@@ -52,6 +52,25 @@ export type WorkerSessionStateBrief = {
   knowledge: ApiSessionStateBrief["knowledge"] & { moreCommand: string | null }
   updatedAt: string | null
   stop: WorkerSessionStopGuidance
+  /** Present when the session gates hardware behind a simulator. */
+  hardwareQueue?: WorkerHardwareQueueBrief | null
+}
+
+export type WorkerHardwareQueueBrief = {
+  /** Experiments waiting in line across the whole session. */
+  waiting: number
+  running: number
+  /** This worker's sim-passed experiments, newest first (at most 10). */
+  mine: Array<{
+    runRef: string
+    resultCommitSha: string | null
+    status: string
+    position: number | null
+    metrics: Record<string, number>
+    simMetrics: Record<string, number>
+    report: string | null
+    note: string | null
+  }>
 }
 
 export type WorkerSessionStopGuidance = {

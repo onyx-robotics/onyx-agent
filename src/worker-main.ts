@@ -1,4 +1,10 @@
-import { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
+import {
+  commandExpList,
+  commandExpLog,
+  commandExpQueue,
+  commandExpRun,
+} from "./commands/exp"
+import { commandSimRun } from "./commands/sim"
 import {
   commandKnowledgeAdd,
   commandKnowledgeList,
@@ -21,7 +27,11 @@ Usage:
   onyx-worker research session-state-brief [--json]
   onyx-worker research finish --reason hypothesis_exhausted|goal_satisfied|no_viable_change --summary <text>
   onyx-worker tools run <name> [args...] [--project-path <path>] [--timeout <seconds>]
-  onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--project-path <path>]
+  onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next] [--timeout <seconds>] [--checks-timeout <seconds>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--project-path <path>]
+      (with onyx/sim.json, --resume runs the simulator gate and queues a passing commit for hardware;
+      --name/--description/--agent-notes become that experiment's report)
+  onyx-worker exp queue [--wait [--timeout <seconds>]] [--json]
+  onyx-worker sim run [args...] [--timeout <seconds>]
   onyx-worker workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
   onyx-worker exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx-worker exp list [--campaign <name>] [--status <status>] [--grep <regex>] [--limit <n>] [--json]
@@ -78,6 +88,7 @@ export async function workerMain(argv = process.argv.slice(2)) {
               "knowledge",
               "heartbeat",
               "finish-marker",
+              "hardware-queue",
             ],
           },
           null,
@@ -101,6 +112,8 @@ export async function workerMain(argv = process.argv.slice(2)) {
       return commandWorkflowStatus(args)
     if (command === "exp" && sub === "log") return commandExpLog(args)
     if (command === "exp" && sub === "list") return commandExpList(args)
+    if (command === "exp" && sub === "queue") return commandExpQueue(args)
+    if (command === "sim" && sub === "run") return commandSimRun(args)
     if (command === "knowledge" && sub === "add")
       return commandKnowledgeAdd(args)
     if (command === "knowledge" && sub === "list")

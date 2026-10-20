@@ -131,4 +131,74 @@ describe("setup validation", () => {
       process.chdir(previousCwd)
     }
   })
+
+  test("validates the simulator gate and requires it to pass on the current code", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onyx-setup-sim-"))
+    await git(["init"], root)
+    await mkdir(join(root, "onyx", "tools"), { recursive: true })
+    await mkdir(join(root, "sim"), { recursive: true })
+    const tool = (path: string, resources: string[] = []) => ({
+      command: "sh",
+      args: [path],
+      shell: false,
+      cwd: "project",
+      env: {},
+      resources,
+      timeoutSeconds: 30,
+      leaseTimeoutSeconds: 30,
+      outputLimitBytes: 4000,
+      fingerprintPaths: ["onyx/tools"],
+    })
+    await writeFile(
+      join(root, "onyx", "setup.json"),
+      JSON.stringify({
+        schemaVersion: 2,
+        goal: "Lower rig error.",
+        projectPath: "",
+        scope: { editable: ["src"], protected: [] },
+        metric: { name: "error", unit: null, direction: "minimize" },
+        resources: { rig: { slots: 1, description: "hardware rig" } },
+        tools: {
+          "hw.eval": tool("onyx/tools/eval.sh", ["rig"]),
+          "sim.run": tool("sim/run.sh"),
+        },
+        workflow: [
+          { id: "edit", agent: "Make one change.", optional: false },
+          { id: "evaluate", run: "hw.eval", metric: true, optional: false },
+        ],
+      })
+    )
+    await writeFile(
+      join(root, "onyx", "onyx.md"),
+      "# Research\n\nMetric: error. Evaluation on the rig. Editable scope: src.\n"
+    )
+    await writeFile(join(root, "onyx", "tools", "eval.sh"), "echo 'METRIC error=1'\n")
+    await writeFile(
+      join(root, "onyx", "sim.json"),
+      JSON.stringify({ tool: "sim.run", paths: ["sim"], source: "user" })
+    )
+    const checksFor = async (simBody: string) => {
+      await writeFile(join(root, "sim", "run.sh"), simBody)
+      await withMutedConsole(() => commandSetupValidate(args()))
+      const validation = JSON.parse(
+        await readFile(join(root, "onyx", "validation.json"), "utf8")
+      ) as { checks: Array<{ id: string; status: string }> }
+      return Object.fromEntries(
+        validation.checks.map((check) => [check.id, check.status])
+      )
+    }
+
+    const previousCwd = process.cwd()
+    process.chdir(root)
+    try {
+      const passing = await checksFor("echo 'METRIC error=1.1'\n")
+      expect(passing.sim_config).toBe("passed")
+      expect(passing.sim_tool_readiness).toBe("passed")
+      const failing = await checksFor("exit 3\n")
+      expect(failing.sim_tool_readiness).toBe("failed")
+    } finally {
+      process.chdir(previousCwd)
+      process.exitCode = 0
+    }
+  })
 })

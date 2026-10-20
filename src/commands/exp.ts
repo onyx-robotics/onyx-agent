@@ -44,12 +44,18 @@ import {
   type CachedAttemptRecord,
   type CachedAttemptSelector,
 } from "../lib/local-attempt-cache"
-import { onyxStateDir, readState, writeState } from "../lib/runtime-state"
+import {
+  onyxStateDir,
+  readState,
+  withOnyxLock,
+  writeState,
+} from "../lib/runtime-state"
 import { campaignStateKey, resolveProjectPath } from "../lib/project"
 import { getWorkerRuntimeContextCached } from "../lib/worker-context"
 import { recordWorkerReportedExperiment } from "../lib/worker-reports"
 import {
   abandonBlockedWorkflowRunsForSession,
+  isHardwareQueueRun,
   listWorkflowSteps,
   listLocalAttempts,
   listWorkflowRuns,
@@ -57,12 +63,20 @@ import {
   upsertWorkflowRun,
   upsertWorkflowStep,
   writeLocalAttempt,
+  type LocalHardwareJob,
   type LocalWorkflowRun,
   type LocalWorkflowRunStatus,
+  type LocalWorkflowSimResult,
   type LocalWorkflowStep,
 } from "../lib/research-runtime"
+import { readSimConfigFromCommit, type SimConfig } from "../lib/sim-config"
 import { renderExperimentTable } from "../lib/tui"
-import { runToolCommand, type ToolRunResult } from "../lib/tools"
+import {
+  acquireNamedResources,
+  runToolCommand,
+  ToolProtectionUncertainError,
+  type ToolRunResult,
+} from "../lib/tools"
 import {
   resolveCampaignNameFromContext,
   resolveWorkerWorkflowContext,
@@ -196,18 +210,26 @@ async function changedProjectPaths({
 function setupCompliance({
   setup,
   changedPaths,
+  sim = null,
 }: {
   setup: ResearchSetupFile
   changedPaths: string[]
+  /** Simulator sources are protected like the setup surface. */
+  sim?: SimConfig | null
 }): LocalResearchCampaignExperimentLoggedRecord["setupCompliance"] {
   const defaultProtected = [
     "onyx/onyx.md",
     "onyx/setup.json",
     "onyx/validation.json",
     "onyx/sandbox.json",
+    "onyx/sim.json",
     "onyx/tools",
   ]
-  const protectedPaths = [...defaultProtected, ...setup.scope.protected]
+  const protectedPaths = [
+    ...defaultProtected,
+    ...setup.scope.protected,
+    ...(sim?.paths ?? []),
+  ]
   const protectedPathsChanged = changedPaths.filter((path) =>
     protectedPaths.some((scope) => pathMatchesScope(path, scope))
   )
@@ -389,15 +411,17 @@ async function resolveAutoResumeWorkflowRun({
 }) {
   const context = await resolveWorkerWorkflowContext(args)
   const campaignName = await resolveCampaignName(root, args)
-  const candidates = await listWorkflowRuns(
-    root,
-    workerWorkflowSelector({
-      campaignName,
-      projectPath,
-      context,
-      statuses: ACTIVE_WORKFLOW_STATUSES,
-    })
-  )
+  const candidates = (
+    await listWorkflowRuns(
+      root,
+      workerWorkflowSelector({
+        campaignName,
+        projectPath,
+        context,
+        statuses: ACTIVE_WORKFLOW_STATUSES,
+      })
+    )
+  ).filter((candidate) => !isHardwareQueueRun(candidate))
   if (candidates.length !== 1) {
     throw new Error(
       [
@@ -505,13 +529,17 @@ async function assertWorkerCanStartFreshWorkflow({
       )
     }
   }
-  const active = await listWorkflowRuns(root, {
-    campaignName,
-    projectPath,
-    sessionId: context.sessionId,
-    workerId: context.workerId,
-    statuses: ACTIVE_WORKFLOW_STATUSES,
-  })
+  // Runs handed to the hardware queue belong to the supervisor now; the
+  // worker may start its next idea while they wait.
+  const active = (
+    await listWorkflowRuns(root, {
+      campaignName,
+      projectPath,
+      sessionId: context.sessionId,
+      workerId: context.workerId,
+      statuses: ACTIVE_WORKFLOW_STATUSES,
+    })
+  ).filter((run) => !isHardwareQueueRun(run))
   if (active.length > 0) {
     throw new Error(
       [
@@ -521,12 +549,14 @@ async function assertWorkerCanStartFreshWorkflow({
     )
   }
 
-  const attempts = await listLocalAttempts(root, {
-    campaignName,
-    projectPath,
-    sessionId: context.sessionId,
-    workerId: context.workerId,
-  })
+  const attempts = (
+    await listLocalAttempts(root, {
+      campaignName,
+      projectPath,
+      sessionId: context.sessionId,
+      workerId: context.workerId,
+    })
+  ).filter((attempt) => !attempt.hardwareJob)
   if (attempts.length > 0) {
     throw new Error(
       [
@@ -559,13 +589,16 @@ async function resolveLocalAttemptForLog({
   }
 
   if (context.workerId) {
-    const candidates = await listLocalAttempts(root, {
-      campaignName,
-      projectPath,
-      sessionId: context.sessionId,
-      workerId: context.workerId,
-      hypothesisId: context.hypothesisId,
-    })
+    // Hardware-queue attempts are reported by the supervisor.
+    const candidates = (
+      await listLocalAttempts(root, {
+        campaignName,
+        projectPath,
+        sessionId: context.sessionId,
+        workerId: context.workerId,
+        hypothesisId: context.hypothesisId,
+      })
+    ).filter((attempt) => !attempt.hardwareJob)
     if (candidates.length !== 1) {
       throw new Error(
         [
@@ -764,6 +797,7 @@ async function writeTerminalAttempt({
   status,
   outputSummary,
   checks,
+  sim = null,
 }: {
   root: string
   run: LocalWorkflowRun
@@ -771,6 +805,7 @@ async function writeTerminalAttempt({
   status: ExperimentStatus
   outputSummary: string | null
   checks: ChecksRecord | null
+  sim?: SimConfig | null
 }) {
   const resultCommitSha = run.resultCommitSha
   if (!resultCommitSha) {
@@ -781,6 +816,7 @@ async function writeTerminalAttempt({
   const completed = new Date()
   const compliance = setupCompliance({
     setup,
+    sim,
     changedPaths: await changedProjectPaths({
       root,
       projectPath: run.projectPath,
@@ -813,6 +849,7 @@ async function writeTerminalAttempt({
     sessionId: run.sessionId,
     workerId: run.workerId,
     hypothesisId: run.hypothesisId,
+    ...(run.hardware ? { hardwareJob: true } : {}),
   }
   const workerContext = await getWorkerRuntimeContextCached()
   const destination =
@@ -853,9 +890,10 @@ async function writeTerminalAttempt({
   console.log(
     `Workflow complete: ${finalStatus} (${setup.metric.name}=${record.primaryMetricValue ?? "null"})`
   )
-  console.log(
-    `Run \`onyx exp log --campaign ${run.campaignName} --description <text>\` to record this result.`
-  )
+  if (!run.hardware)
+    console.log(
+      `Run \`onyx exp log --campaign ${run.campaignName} --description <text>\` to record this result.`
+    )
   if (finalStatus !== "succeeded") process.exitCode = 1
   return {
     workflowRunId: run.id,
@@ -955,13 +993,293 @@ async function createWorkflowRun({
   return run
 }
 
-async function executeWorkflow({
+/**
+ * One lease over every shared resource the rest of the workflow uses. It is
+ * taken before the first step that needs hardware and held until the
+ * experiment ends, so no other experiment can touch the hardware between
+ * this experiment's reset, measurement, and guardrail steps.
+ */
+type WorkflowLease = {
+  release: (() => Promise<void>) | null
+  resources: string[]
+  /** A tool could not be proven stopped: keep the lease for idle reset. */
+  uncertain: boolean
+}
+
+type WorkflowExecutionOptions = {
+  /** Simulation gate in front of the command steps (from onyx/sim.json). */
+  sim?: SimConfig | null
+  /** Sim-passed runs queue for the supervisor's hardware queue instead of
+   * running their command steps in this process. */
+  queueMode?: boolean
+  /** This process is the supervisor's hardware job for a queued run. */
+  hardwareJob?: boolean
+  /** Tool sandbox policy for this job (the hardware job's own policy). */
+  sandboxPolicyPath?: string | null
+  /** Extra environment for workflow tools. */
+  toolEnv?: NodeJS.ProcessEnv
+  /** Report fields to attach when the run queues for hardware. */
+  report?: Pick<LocalHardwareJob, "name" | "description" | "agentNotes">
+  lease?: WorkflowLease
+}
+
+async function executeWorkflow(input: {
+  root: string
+  projectPath: string
+  setup: ResearchSetupFile
+  run: LocalWorkflowRun
+  args: Args
+  mode: "auto" | "next"
+  options?: WorkflowExecutionOptions
+}) {
+  const lease: WorkflowLease = input.options?.lease ?? {
+    release: null,
+    resources: [],
+    uncertain: false,
+  }
+  try {
+    return await executeWorkflowSteps({
+      ...input,
+      options: { ...input.options, lease },
+    })
+  } catch (error) {
+    if (error instanceof ToolProtectionUncertainError) lease.uncertain = true
+    throw error
+  } finally {
+    if (!input.options?.lease && lease.release && !lease.uncertain) {
+      await lease.release()
+    }
+  }
+}
+
+async function holdWorkflowLease({
+  root,
+  setup,
+  stepIndex,
+  lease,
+}: {
+  root: string
+  setup: ResearchSetupFile
+  stepIndex: number
+  lease: WorkflowLease
+}) {
+  const step = setup.workflow[stepIndex]
+  const needed = step?.run ? (setup.tools[step.run]?.resources ?? []) : []
+  if (needed.every((resource) => lease.resources.includes(resource))) return
+  const remainingTools = setup.workflow
+    .slice(stepIndex)
+    .flatMap((item) => (item.run && setup.tools[item.run] ? [item.run] : []))
+    .map((id) => setup.tools[id]!)
+    .filter((tool) => tool.resources.length > 0)
+  const wanted = [
+    ...new Set(remainingTools.flatMap((tool) => tool.resources)),
+  ].filter((resource) => !lease.resources.includes(resource))
+  const timeoutMs =
+    Math.max(...remainingTools.map((tool) => tool.leaseTimeoutSeconds)) * 1000
+  const release = await acquireNamedResources({
+    root,
+    resources: setup.resources,
+    resourceNames: wanted,
+    timeoutMs,
+  })
+  const previous = lease.release
+  lease.release = previous
+    ? async () => {
+        await release()
+        await previous()
+      }
+    : release
+  lease.resources = [...lease.resources, ...wanted].sort()
+}
+
+async function writeSimLog({
+  root,
+  run,
+  result,
+}: {
+  root: string
+  run: LocalWorkflowRun
+  result: ToolRunResult
+}) {
+  const dir = join(await onyxStateDir(root), "workflow-runs", run.id)
+  await mkdir(dir, { recursive: true })
+  const path = join(dir, "sim.log")
+  await writeFile(
+    path,
+    [
+      `# workflow run: ${run.id}`,
+      `# sim tool: ${result.commandName}`,
+      `# exitCode: ${result.code ?? "null"}`,
+      `# timedOut: ${result.timedOut}`,
+      "",
+      "## stdout",
+      result.stdout,
+      "",
+      "## stderr",
+      result.stderr,
+      "",
+    ].join("\n"),
+    "utf8"
+  )
+  return path
+}
+
+/** Runs the simulator on the result commit. Results stay local. */
+async function runSimGate({
+  root,
+  projectPath,
+  setup,
+  sim,
+  run,
+  head,
+  sandboxPolicyPath,
+}: {
+  root: string
+  projectPath: string
+  setup: ResearchSetupFile
+  sim: SimConfig
+  run: LocalWorkflowRun
+  head: string
+  sandboxPolicyPath?: string | null
+}): Promise<LocalWorkflowSimResult> {
+  const checkedAt = new Date().toISOString()
+  let result: ToolRunResult
+  try {
+    result = await runToolCommand({
+      root,
+      projectPath,
+      name: sim.tool,
+      sandboxPolicyPath,
+    })
+  } catch (error) {
+    return {
+      commitSha: head,
+      status: "failed",
+      exitCode: null,
+      timedOut: false,
+      metrics: {},
+      outputSummary: `Simulator ${sim.tool} could not run: ${errorMessage(error)}`,
+      logPath: null,
+      checkedAt,
+    }
+  }
+  const logPath = await writeSimLog({ root, run, result })
+  const parsed = parseWorkflowMetricLines(result.stdout, setup.metric.name)
+  const passed = !result.timedOut && result.code === 0
+  return {
+    commitSha: head,
+    status: passed ? "passed" : "failed",
+    exitCode: result.code,
+    timedOut: result.timedOut,
+    metrics: parsed.metrics,
+    outputSummary:
+      [
+        result.timedOut ? "Simulator timed out." : "",
+        result.outputSummary ?? summarizeOutput(result.stdout, result.stderr),
+      ]
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, 4000) || null,
+    logPath,
+    checkedAt,
+  }
+}
+
+function simMetricsLine(sim: LocalWorkflowSimResult) {
+  const entries = Object.entries(sim.metrics)
+  return entries.length > 0
+    ? `Sim metrics: ${entries.map(([name, value]) => `${name}=${value}`).join(", ")}`
+    : null
+}
+
+/** This worker's runs that are waiting for or running on hardware. */
+async function workerHardwareRuns(
+  root: string,
+  run: Pick<LocalWorkflowRun, "sessionId" | "workerId">
+) {
+  if (!run.sessionId || !run.workerId) return []
+  return (
+    await listWorkflowRuns(root, {
+      sessionId: run.sessionId,
+      workerId: run.workerId,
+      statuses: ["queued", "running"],
+    })
+  ).filter(isHardwareQueueRun)
+}
+
+/** Every run waiting for hardware in a session, oldest first. */
+export async function listHardwareQueue(root: string, sessionId: string) {
+  return (
+    await listWorkflowRuns(root, { sessionId, statuses: ["queued"] })
+  )
+    .filter((run) => run.hardware && !run.hardware.startedAt)
+    .sort(
+      (left, right) =>
+        left.hardware!.queuedAt.localeCompare(right.hardware!.queuedAt) ||
+        left.id.localeCompare(right.id)
+    )
+}
+
+/**
+ * Puts a sim-passed run in line for hardware, unless this worker already has
+ * its limit of experiments waiting. The result commit gets its immutable ref
+ * now, so the worker can move on to its next idea right away.
+ */
+async function enqueueForHardware({
+  root,
+  run,
+  sim,
+  report,
+}: {
+  root: string
+  run: LocalWorkflowRun
+  sim: SimConfig
+  report?: WorkflowExecutionOptions["report"]
+}) {
+  return withOnyxLock(root, "hardware-queue", async () => {
+    const mine = (await workerHardwareRuns(root, run)).filter(
+      (item) => item.id !== run.id
+    )
+    if (mine.length >= sim.maxQueuedPerWorker) {
+      return { queued: false as const, waiting: mine.length }
+    }
+    await preserveResultRef(root, run.resultCommitSha!, run.resultRef)
+    const queued: LocalWorkflowRun = {
+      ...run,
+      status: "queued",
+      blockReason: null,
+      hardware: {
+        queuedAt: new Date().toISOString(),
+        startedAt: null,
+        finishedAt: null,
+        name: report?.name ?? null,
+        description: report?.description ?? null,
+        agentNotes: report?.agentNotes ?? {},
+        delivery: null,
+        deliveryError: null,
+        cancelReason: null,
+      },
+    }
+    await upsertWorkflowRun({ root, run: queued })
+    const line = run.sessionId ? await listHardwareQueue(root, run.sessionId) : []
+    const position = line.findIndex((item) => item.id === run.id) + 1
+    return {
+      queued: true as const,
+      run: queued,
+      position,
+      depth: line.length,
+    }
+  })
+}
+
+async function executeWorkflowSteps({
   root,
   projectPath,
   setup,
   run,
   args,
   mode,
+  options,
 }: {
   root: string
   projectPath: string
@@ -969,7 +1287,8 @@ async function executeWorkflow({
   run: LocalWorkflowRun
   args: Args
   mode: "auto" | "next"
-}) {
+  options: WorkflowExecutionOptions & { lease: WorkflowLease }
+}): Promise<unknown> {
   let currentRun = run
   let advanced = false
   const firstCommandStepIndex = setup.workflow.findIndex((step) =>
@@ -1082,6 +1401,7 @@ async function executeWorkflow({
 
     const compliance = setupCompliance({
       setup,
+      sim: options.sim,
       changedPaths: await changedProjectPaths({
         root,
         projectPath,
@@ -1103,6 +1423,122 @@ async function executeWorkflow({
         status: "setup_violation",
         outputSummary: compliance.notes,
         checks: null,
+        sim: options.sim,
+      })
+    }
+
+    if (options.sim && !options.hardwareJob) {
+      if (
+        currentRun.sim?.commitSha !== head ||
+        currentRun.sim.status !== "passed"
+      ) {
+        const simResult = await runSimGate({
+          root,
+          projectPath,
+          setup,
+          sim: options.sim,
+          run: currentRun,
+          head,
+          sandboxPolicyPath: options.sandboxPolicyPath,
+        })
+        currentRun = { ...currentRun, sim: simResult }
+        await upsertWorkflowRun({ root, run: currentRun })
+        await emitEvent(root, {
+          type: "checks_finished",
+          campaignName: currentRun.campaignName,
+          campaignId: currentRun.campaignId ?? undefined,
+          runRef: currentRun.runRef,
+          commitSha: head,
+          resultRef: currentRun.resultRef,
+          message: `sim ${simResult.status}`,
+        })
+      }
+      const simResult = currentRun.sim!
+      if (simResult.status === "failed") {
+        const agentIndex = setup.workflow.findIndex((item) => item.agent)
+        const reason = [
+          "Simulation failed; this commit cannot go to hardware. Simulation results are not campaign experiments.",
+          simResult.outputSummary ? `Sim output:\n${simResult.outputSummary}` : null,
+          simMetricsLine(simResult),
+          simResult.logPath ? `Sim log: ${simResult.logPath}` : null,
+          "Fix the change and `git commit --amend` (keep exactly one commit), or reset to the base and try another idea, then resume.",
+        ]
+          .filter(Boolean)
+          .join("\n")
+        const paused = {
+          ...currentRun,
+          status: "paused" as const,
+          currentStepIndex: Math.max(0, agentIndex),
+          blockReason: reason,
+        }
+        await upsertWorkflowRun({ root, run: paused })
+        const agentStep = setup.workflow[Math.max(0, agentIndex)]
+        if (agentStep) {
+          await upsertWorkflowStep({
+            root,
+            step: stepRecord({
+              run: paused,
+              step: agentStep,
+              index: Math.max(0, agentIndex),
+              status: "paused",
+            }),
+          })
+        }
+        console.log(reason)
+        process.exitCode = 1
+        return paused
+      }
+      if (options.queueMode) {
+        const queued = await enqueueForHardware({
+          root,
+          run: currentRun,
+          sim: options.sim,
+          report: options.report,
+        })
+        if (!queued.queued) {
+          const reason = [
+            `Simulation passed, but you already have ${queued.waiting} experiment(s) waiting for hardware (limit ${options.sim.maxQueuedPerWorker}).`,
+            simMetricsLine(simResult),
+            "Keep developing in simulation (`onyx-worker sim run` works on uncommitted changes), check `onyx-worker exp queue`, and resume this run once your earlier hardware result arrives.",
+          ]
+            .filter(Boolean)
+            .join("\n")
+          const paused = {
+            ...currentRun,
+            status: "paused" as const,
+            blockReason: reason,
+          }
+          await upsertWorkflowRun({ root, run: paused })
+          console.log(reason)
+          return paused
+        }
+        console.log(
+          [
+            `Simulation passed. Queued for hardware: position ${queued.position} of ${queued.depth}.`,
+            simMetricsLine(simResult),
+            "The supervisor runs the hardware workflow and reports the result; do not run `exp log` for it.",
+            "Start your next idea now with `onyx-worker exp run --auto` and develop it in simulation. Check `onyx-worker exp queue` for hardware results.",
+          ]
+            .filter(Boolean)
+            .join("\n")
+        )
+        return {
+          workflowRunId: queued.run.id,
+          runRef: queued.run.runRef,
+          status: "queued",
+          queuePosition: queued.position,
+          queueDepth: queued.depth,
+          sim: simResult,
+        }
+      }
+    }
+
+    if ((setup.tools[step.run!]?.resources.length ?? 0) > 0) {
+      await holdWorkflowLease({
+        root,
+        setup,
+        stepIndex: index,
+        lease: options.lease,
       })
     }
 
@@ -1128,6 +1564,11 @@ async function executeWorkflow({
       projectPath,
       name: step.run!,
       timeoutSeconds,
+      resourcesHeld: (setup.tools[step.run!]?.resources ?? []).every(
+        (resource) => options.lease.resources.includes(resource)
+      ),
+      sandboxPolicyPath: options.sandboxPolicyPath,
+      env: options.toolEnv,
     })
     const logPath = await writeWorkflowStepLog({
       root,
@@ -1201,6 +1642,7 @@ async function executeWorkflow({
         status: terminalStatus,
         outputSummary,
         checks,
+        sim: options.sim,
       })
     }
 
@@ -1303,13 +1745,14 @@ async function executeWorkflow({
         }
       }
       if (mode === "next") return currentRun
-      return executeWorkflow({
+      return executeWorkflowSteps({
         root,
         projectPath,
         setup,
         run: currentRun,
         args,
         mode,
+        options,
       })
     }
   }
@@ -1323,6 +1766,7 @@ async function executeWorkflow({
     status: "succeeded",
     outputSummary: "Workflow completed successfully.",
     checks: checksRecordForSteps(setup, steps),
+    sim: options.sim,
   })
 }
 
@@ -1418,9 +1862,90 @@ export async function commandExpRun(args: Args) {
     })
   }
 
+  if (isHardwareQueueRun(run)) {
+    throw new Error(
+      `Workflow run ${run.id} is ${run.status === "queued" ? "waiting for" : "running on"} hardware; the supervisor finishes it. Check \`exp queue\` for its result.`
+    )
+  }
+  const sim = await readSimConfigFromCommit({
+    root,
+    projectPath,
+    commitSha: run.baseCommitSha,
+  })
+  // With a simulator, a supervised worker hands sim-passed runs to the
+  // supervisor's hardware queue. Outside a supervisor the hardware steps
+  // run right here, after the sim gate.
+  const queueMode = Boolean(sim && (await getWorkerRuntimeContextCached()))
+
   console.log(`Workflow run: ${run.id}`)
   console.log(`Run ref: ${run.runRef}`)
-  return executeWorkflow({ root, projectPath, setup, run, args, mode })
+  return executeWorkflow({
+    root,
+    projectPath,
+    setup,
+    run,
+    args,
+    mode,
+    options: {
+      sim,
+      queueMode,
+      report: {
+        name: args.options.name ?? null,
+        description: descriptionOption(args),
+        agentNotes: parseAgentNotes(args.options["agent-notes"]),
+      },
+    },
+  })
+}
+
+/**
+ * Runs the measured workflow for a queued run inside `root`, a disposable
+ * worktree the supervisor checked out at the run's result commit. Writes
+ * the terminal attempt; the caller delivers it.
+ */
+export async function runHardwareJob({
+  root,
+  projectPath,
+  runId,
+  sandboxPolicyPath = null,
+  toolEnv,
+}: {
+  root: string
+  projectPath: string
+  runId: string
+  sandboxPolicyPath?: string | null
+  toolEnv?: NodeJS.ProcessEnv
+}) {
+  const run = await readWorkflowRun(root, runId)
+  if (!run?.hardware?.startedAt || run.status !== "running") {
+    throw new Error(`Workflow run ${runId} is not a started hardware job.`)
+  }
+  const head = await currentCommit(root)
+  if (head !== run.resultCommitSha) {
+    throw new Error(
+      `Hardware worktree is at ${head}, not the queued result commit ${run.resultCommitSha}.`
+    )
+  }
+  const setup = await readSetupFileFromCommit({
+    root,
+    projectPath,
+    commitSha: run.baseCommitSha,
+  })
+  const sim = await readSimConfigFromCommit({
+    root,
+    projectPath,
+    commitSha: run.baseCommitSha,
+  })
+  return executeWorkflow({
+    root,
+    projectPath,
+    setup,
+    run,
+    args: { positional: [], options: {} },
+    mode: "auto",
+    // The gate already passed; sim is passed only to protect its sources.
+    options: { sim, hardwareJob: true, sandboxPolicyPath, toolEnv },
+  })
 }
 
 export type FrozenExperimentDeliveryContext = {
@@ -1434,6 +1959,10 @@ export type FrozenExperimentDeliveryContext = {
   hypothesisId: string
   workerId: string
   workerCredential: string
+  /** Report fields a worker attached when it queued a hardware run. */
+  name?: string | null
+  description?: string | null
+  agentNotes?: Record<string, unknown>
 }
 
 export class ExperimentDeliveryError extends Error {
@@ -1652,9 +2181,11 @@ async function logExperimentOwned(
     runRef,
     campaignName,
     name:
-      (frozen ? undefined : args.options.name) ??
+      (frozen ? frozen.name : args.options.name) ??
       `experiment-${resultCommitSha.slice(0, 7)}`,
-    description: frozen ? null : descriptionOption(args),
+    description: frozen
+      ? (frozen.description ?? null)
+      : descriptionOption(args),
     projectPath,
     baseCommitSha,
     resultCommitSha,
@@ -1665,7 +2196,9 @@ async function logExperimentOwned(
     primaryMetricValue: metricValue,
     metrics,
     agentNotes: frozen
-      ? (usableAttempt?.agentNotes ?? {})
+      ? frozen.agentNotes && Object.keys(frozen.agentNotes).length > 0
+        ? frozen.agentNotes
+        : (usableAttempt?.agentNotes ?? {})
       : parseAgentNotes(args.options["agent-notes"]),
     checks,
     durationMs: usableAttempt?.durationMs ?? null,
@@ -2003,5 +2536,148 @@ export async function commandExpList(args: Args) {
     console.log(
       `… ${filtered.length - limited.length} more; raise --limit to see all.`
     )
+  }
+}
+
+function hardwareRunLine(
+  run: LocalWorkflowRun,
+  metricName: string,
+  position: number | null
+) {
+  const ref = run.runRef.split("/").pop()?.slice(0, 8) ?? run.runRef
+  const commit = run.resultCommitSha?.slice(0, 7) ?? "none"
+  const sim = run.sim
+    ? ` sim ${run.sim.status}${
+        Object.keys(run.sim.metrics).length > 0
+          ? ` (${Object.entries(run.sim.metrics)
+              .map(([name, value]) => `${name}=${value}`)
+              .join(", ")})`
+          : ""
+      }`
+    : ""
+  const label =
+    run.status === "queued"
+      ? `queued${position ? ` #${position}` : ""}`
+      : run.status === "running"
+        ? `on hardware since ${run.hardware?.startedAt ?? "?"}`
+        : run.status
+  const metric =
+    run.metrics[metricName] === undefined
+      ? ""
+      : ` ${metricName}=${run.metrics[metricName]}`
+  const delivery = run.hardware?.delivery
+    ? ` [report ${run.hardware.delivery}${
+        run.hardware.deliveryError ? `: ${run.hardware.deliveryError}` : ""
+      }]`
+    : ""
+  const reason =
+    run.hardware?.cancelReason ??
+    (run.status !== "succeeded" && run.status !== "queued" && run.blockReason
+      ? run.blockReason.split("\n")[0]
+      : null)
+  return `- ${ref} ${commit}: ${label}${metric}${sim}${delivery}${
+    reason ? ` (${reason})` : ""
+  }`
+}
+
+/**
+ * Hardware queue status. Inside a supervised worker it shows the session's
+ * line and this worker's own experiments, including finished hardware
+ * results; `--wait` blocks until none of them is still queued or running.
+ */
+export async function commandExpQueue(args: Args) {
+  const root = await repoRoot(args.options.cwd)
+  const context = await getWorkerRuntimeContextCached()
+  const sessionId = context?.sessionId ?? args.options.session
+  const workerId = context?.workerId ?? args.options.worker
+  const metricName =
+    context?.campaign.metricName ??
+    (await readSetupFile(root, await resolveProjectPath(root, args))
+      .then((setup) => setup.metric.name)
+      .catch(() => "metric"))
+
+  const snapshot = async () => {
+    const all = (
+      await listWorkflowRuns(root, sessionId ? { sessionId } : {})
+    ).filter((run) => run.hardware)
+    const line = all
+      .filter((run) => run.status === "queued" && !run.hardware!.startedAt)
+      .sort((left, right) =>
+        left.hardware!.queuedAt.localeCompare(right.hardware!.queuedAt)
+      )
+    const running = all.filter(isHardwareQueueRun).filter(
+      (run) => run.status === "running"
+    )
+    const mine = workerId
+      ? all
+          .filter((run) => run.workerId === workerId)
+          .sort((left, right) =>
+            right.hardware!.queuedAt.localeCompare(left.hardware!.queuedAt)
+          )
+      : all
+          .sort((left, right) =>
+            right.hardware!.queuedAt.localeCompare(left.hardware!.queuedAt)
+          )
+          .slice(0, 20)
+    return { line, running, mine }
+  }
+
+  let view = await snapshot()
+  if (optionalFlag(args, "wait")) {
+    const timeoutMs = numberOption(args, "timeout", 600) * 1000
+    const deadline = Date.now() + timeoutMs
+    while (
+      view.mine.some(isHardwareQueueRun) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      view = await snapshot()
+    }
+  }
+
+  const positionOf = (run: LocalWorkflowRun) => {
+    const index = view.line.findIndex((item) => item.id === run.id)
+    return index === -1 ? null : index + 1
+  }
+  if (optionalFlag(args, "json")) {
+    console.log(
+      JSON.stringify(
+        {
+          sessionId: sessionId ?? null,
+          workerId: workerId ?? null,
+          waiting: view.line.length,
+          running: view.running.length,
+          experiments: view.mine.map((run) => ({
+            workflowRunId: run.id,
+            runRef: run.runRef,
+            resultCommitSha: run.resultCommitSha,
+            status: run.status,
+            position: positionOf(run),
+            metrics: run.metrics,
+            sim: run.sim ?? null,
+            hardware: run.hardware,
+            blockReason: run.blockReason,
+          })),
+        },
+        null,
+        2
+      )
+    )
+    return
+  }
+  console.log(
+    `Hardware queue: ${view.line.length} waiting, ${view.running.length} running`
+  )
+  if (view.mine.length === 0) {
+    console.log(
+      workerId
+        ? "You have no experiments in the hardware queue."
+        : "No hardware experiments recorded."
+    )
+    return
+  }
+  console.log(workerId ? "Your hardware experiments:" : "Hardware experiments:")
+  for (const run of view.mine) {
+    console.log(hardwareRunLine(run, metricName, positionOf(run)))
   }
 }

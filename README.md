@@ -160,6 +160,44 @@ If the sandbox cannot be set up, the session does not start. To debug, `onyx
 research run --no-sandbox` runs one session unconfined even though the file
 exists. The override is recorded in the session's metadata.
 
+## Hardware queue
+
+Shared hardware can only run one experiment at a time, while workers can
+produce ideas much faster. Committing an `onyx/sim.json` puts a simulator in
+front of the hardware:
+
+```jsonc
+{
+  "tool": "sim.run",          // a tool in onyx/setup.json; must not use resources
+  "paths": ["sim/"],          // simulator sources; protected from workers
+  "source": "user",           // "user" for a pre-made simulator, "agent" if /onyx built it
+  "maxQueuedPerWorker": 1     // sim-passed commits one worker may have waiting
+}
+```
+
+- Workers develop in simulation with `onyx-worker sim run`. Simulation results
+  are never recorded and never count as campaign experiments.
+- `onyx-worker exp run --resume --auto` runs the simulator on the worker's
+  commit. A failing commit cannot go to hardware. A passing commit joins the
+  hardware queue and the worker moves on to its next idea.
+- The supervisor runs queued commits first come, first served, each in its
+  own worktree, and reports each result for the worker that queued it. An
+  experiment holds every resource its workflow uses from the first hardware
+  step to the end, so no other experiment can touch the hardware between its
+  reset, measurement, and guardrail steps.
+- With `onyx/sandbox.json`, only these hardware jobs get the listed `devices`.
+  Workers and their own tool runs do not, and `onyx-worker tools run`
+  refuses tools that declare a resource.
+- `onyx exp queue` and `onyx research status --summary` show the line. Workers
+  see their results with `onyx-worker exp queue` and in the session-state
+  brief.
+
+The `/onyx` skill sets this up during setup. It either uses a simulator
+directory you point it to, or builds one itself before research starts.
+`onyx setup validate` checks that the simulator passes on the current code.
+Without `onyx/sim.json`, experiments run as before, but each one still holds
+its hardware for its whole workflow.
+
 
 ## Documentation
 

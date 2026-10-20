@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  stat,
   unlink,
   writeFile,
   link,
@@ -134,8 +135,7 @@ export async function acquireFileResourceLease({
     throw new Error(
       `Resource slot configuration changed or is incomplete: ${dir}. Drain holders and reset before changing capacity.`
     )
-  const deadline = Date.now() + timeoutMs
-  do {
+  const tryClaimSlot = async () => {
     for (let slot = 0; slot < slotCount; slot += 1) {
       const path = join(dir, `${slot}.json`)
       const record: ResourceLockRecord = {
@@ -164,10 +164,121 @@ export async function acquireFileResourceLease({
         if (errorCode(error) !== "EEXIST") throw error
       }
     }
-    if (Date.now() >= deadline) break
-    await sleep(Math.min(100, deadline - Date.now()))
-  } while (Date.now() <= deadline)
-  throw new ResourceLockContentionError(
+    return null
+  }
+
+  // A zero timeout is a single non-blocking probe and never joins the line.
+  if (timeoutMs <= 0) {
+    const release = await tryClaimSlot()
+    if (release) return release
+    throw contentionError(resourceName, dir)
+  }
+
+  // Waiters line up first come, first served: only the oldest `slotCount`
+  // live tickets may claim a free slot, so no waiter can be starved.
+  const ticket = await joinQueue(dir, ownerId)
+  const deadline = Date.now() + timeoutMs
+  try {
+    do {
+      if ((await queuePosition(dir, ticket)) < slotCount) {
+        const release = await tryClaimSlot()
+        if (release) return release
+      }
+      if (Date.now() >= deadline) break
+      await sleep(Math.min(100, deadline - Date.now()))
+    } while (Date.now() <= deadline)
+  } finally {
+    await unlink(ticket).catch((error) => {
+      if (errorCode(error) !== "ENOENT") throw error
+    })
+  }
+  throw contentionError(resourceName, dir)
+}
+
+function contentionError(resourceName: string, dir: string) {
+  return new ResourceLockContentionError(
     `Timed out waiting for tool resource ${resourceName}; locks: ${dir}. Stop all resource users before research locks reset --resource ${resourceName} --confirm-idle.`
   )
+}
+
+type QueueTicket = {
+  ownerId: string
+  pid: number
+  bootId?: string | null
+  queuedAt: string
+}
+
+let ticketCounter = 0
+
+async function joinQueue(dir: string, ownerId: string) {
+  const queueDir = join(dir, "queue")
+  await mkdir(queueDir, { recursive: true })
+  ticketCounter = (ticketCounter + 1) % 1_000_000
+  // Names sort by arrival time; the counter orders tickets created by one
+  // process within the same millisecond.
+  const name = `${String(Date.now()).padStart(15, "0")}-${String(ticketCounter).padStart(6, "0")}-${randomUUID()}.json`
+  const path = join(queueDir, name)
+  const ticket: QueueTicket = {
+    ownerId,
+    pid: process.pid,
+    bootId: linuxBootId(),
+    queuedAt: new Date().toISOString(),
+  }
+  await writeFile(path, `${JSON.stringify(ticket)}\n`, { flag: "wx" })
+  return path
+}
+
+function ticketIsLive(ticket: Partial<QueueTicket> | null) {
+  if (!ticket?.pid) return false
+  const bootId = linuxBootId()
+  if (ticket.bootId && bootId && ticket.bootId !== bootId) return false
+  return pidIsAlive(ticket.pid)
+}
+
+async function liveTickets(queueDir: string) {
+  const names = (await readdir(queueDir).catch(() => []))
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+  const live: string[] = []
+  for (const name of names) {
+    const path = join(queueDir, name)
+    let ticket: Partial<QueueTicket> | null = null
+    try {
+      ticket = JSON.parse(await readFile(path, "utf8")) as Partial<QueueTicket>
+    } catch (error) {
+      // A ticket being written right now is briefly empty; leave it alone.
+      if (errorCode(error) === "ENOENT") continue
+      if (!(error instanceof SyntaxError)) throw error
+      const age = await stat(path).then(
+        (info) => Date.now() - info.mtimeMs,
+        () => Number.POSITIVE_INFINITY
+      )
+      if (age < 5_000) live.push(path)
+      else await unlink(path).catch(() => {})
+      continue
+    }
+    if (ticketIsLive(ticket)) {
+      live.push(path)
+    } else {
+      // The waiter died without leaving the line; drop its ticket.
+      await unlink(path).catch(() => {})
+    }
+  }
+  return live
+}
+
+async function queuePosition(dir: string, ticket: string) {
+  const live = await liveTickets(join(dir, "queue"))
+  const index = live.indexOf(ticket)
+  return index === -1 ? live.length : index
+}
+
+/** Holders and waiters for one resource, for status displays. */
+export async function resourceLockOccupancy(root: string, resourceName: string) {
+  const dir = await resourceLockDir(root, resourceName)
+  const held = (await readdir(dir).catch(() => [])).filter((name) =>
+    /^\d+\.json$/.test(name)
+  ).length
+  const waiting = (await liveTickets(join(dir, "queue"))).length
+  return { held, waiting }
 }

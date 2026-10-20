@@ -44,7 +44,20 @@ import { optionValues, type Args } from "../lib/args"
 import {
   deliverTerminalExperimentAttempt,
   ExperimentDeliveryError,
+  runHardwareJob,
 } from "./exp"
+import {
+  createHardwareDispatcher,
+  type HardwareDispatcher,
+} from "../lib/hardware-dispatcher"
+import {
+  hardwareConcurrency,
+  readSimConfigFromCommit,
+  simConfigProblems,
+  workflowHardwareResources,
+  type SimConfig,
+} from "../lib/sim-config"
+import { ToolProtectionUncertainError } from "../lib/tools"
 import {
   ApiError,
   closeCampaignHypothesis,
@@ -124,6 +137,7 @@ import {
   workerSessionStateBriefFromSnapshot,
   writeSessionStateBriefSnapshot,
   type SessionStateBriefSnapshot,
+  type WorkerHardwareQueueBrief,
   type WorkerSessionStopGuidance,
 } from "../lib/session-state-brief"
 import {
@@ -134,14 +148,23 @@ import {
 import {
   getWorkerRuntimeContextCached,
   readWorkerRuntimeContext,
+  type WorkerRuntimeContext,
 } from "../lib/worker-context"
 import { ONYX_WORKER_CONTEXT_SCHEMA_VERSION } from "../lib/version"
 import {
   readWorkerFinishMarker,
   type WorkerFinishMarker,
 } from "../lib/worker-finish"
-import { readWorkerReportMarker } from "../lib/worker-reports"
-import { campaignStateKey, onyxPath, resolveProjectPath } from "../lib/project"
+import {
+  readWorkerReportMarker,
+  recordWorkerReportedExperiment,
+} from "../lib/worker-reports"
+import {
+  campaignStateKey,
+  onyxPath,
+  resolveProjectPath,
+  scopedRoot,
+} from "../lib/project"
 import {
   pathExists,
   runStreamingProcess,
@@ -176,6 +199,7 @@ import { assertNoRemovedSandboxFlag, selectSandbox } from "../lib/sandbox-config
 import {
   preflightSessionSandbox,
   prepareWorkerSandbox,
+  writeHardwareToolPolicy,
   type WorkerSandbox,
 } from "../lib/worker-sandbox"
 import {
@@ -1973,11 +1997,15 @@ export async function teardownHypothesisAttempt({
         `Could not abandon nonterminal workflow runs: ${boundedText(errorMessage(error), 500)}`,
       ]
     })
-    const attempts = await listLocalAttempts(root, {
-      sessionId,
-      workerId,
-      hypothesisId: hypothesis.id,
-    })
+    // Hardware-queue attempts are delivered by the supervisor's queue and,
+    // if that failed, by report recovery; only the worker's own count here.
+    const attempts = (
+      await listLocalAttempts(root, {
+        sessionId,
+        workerId,
+        hypothesisId: hypothesis.id,
+      })
+    ).filter((attempt) => !attempt.hardwareJob)
     if (attempts.length > 1) {
       manifest.attemptDelivery = "ambiguous_discarded"
       manifest.reasonCode = "worker_protocol_violation"
@@ -2960,6 +2988,8 @@ async function runHypothesisOnce({
   onRegistered,
   lifecycleHeartbeats,
   providerExecutable,
+  hardwareQueue = null,
+  sim = null,
   args,
 }: {
   root: string
@@ -2988,6 +3018,9 @@ async function runHypothesisOnce({
   }) => void
   lifecycleHeartbeats?: ReturnType<typeof createLifecycleHeartbeatPublisher>
   providerExecutable?: string
+  /** Session hardware queue; set when the session has onyx/sim.json. */
+  hardwareQueue?: HardwareDispatcher | null
+  sim?: SimConfig | null
   args: Args
 }): Promise<HypothesisRunResult> {
   let workerId: string | undefined
@@ -3240,6 +3273,13 @@ async function runHypothesisOnce({
         shutdownCushionSeconds: Math.ceil(prompt.shutdownCushionMs / 1000),
       },
     })
+    hardwareQueue?.registerWorker({
+      workerId: worker.id,
+      hypothesisId: hypothesis.id,
+      assignmentId: lease.assignment.id,
+      workerCredential,
+      contextPath: runtimePaths.contextPath,
+    })
     const workerBaseEnv = workerRuntimeEnvironment({
       baseEnv: process.env,
       wrapper: workerCliWrapper,
@@ -3273,6 +3313,7 @@ async function runHypothesisOnce({
       workerSandbox = await prepareWorkerSandbox({
         config: sandboxSelection.config,
         setup,
+        sim,
         worktree,
         projectRoot,
         runtimePaths,
@@ -3761,6 +3802,13 @@ async function runHypothesisOnce({
         }).catch(() => {})
       }
 
+      // Finish this worker's hardware job (and cancel its queued ones) while
+      // its credential can still report the result.
+      await hardwareQueue?.drainWorker(workerId).catch((error) => {
+        console.warn(
+          `Hardware queue drain for ${workerId} failed: ${errorMessage(error)}`
+        )
+      })
       if (
         hasWorktree &&
         assignmentId &&
@@ -4678,6 +4726,7 @@ async function commandResearchStatusSummary({
       runtime?.providerBackoff?.recentFailures ??
       [],
     noProgressBreaker: supervisor?.noProgressBreaker ?? null,
+    hardwareQueue: supervisor?.hardwareQueue ?? null,
     failures,
     localTeardownFailures: { count: teardownFailureCount },
     workerWarnings: { count: warningCount },
@@ -4711,6 +4760,11 @@ async function commandResearchStatusSummary({
   console.log(
     `workers: active=${summary.session.activeWorkers}/${summary.session.workerTarget ?? "?"} processes=${summary.session.activeProcessCount}`
   )
+  if (summary.hardwareQueue) {
+    console.log(
+      `hardware queue: waiting=${summary.hardwareQueue.waiting} running=${summary.hardwareQueue.running}/${summary.hardwareQueue.concurrency}`
+    )
+  }
   if (summary.providerBackoff) {
     console.log(`provider backoff: ${JSON.stringify(summary.providerBackoff)}`)
   }
@@ -5141,6 +5195,11 @@ export async function commandResearchStatus(args: Args) {
       `no-progress breaker: tripped ${supervisorTelemetry.noProgressBreaker.count}/${supervisorTelemetry.noProgressBreaker.threshold}`
     )
   }
+  if (supervisorTelemetry?.hardwareQueue) {
+    console.log(
+      `hardware queue: waiting=${supervisorTelemetry.hardwareQueue.waiting} running=${supervisorTelemetry.hardwareQueue.running}/${supervisorTelemetry.hardwareQueue.concurrency}`
+    )
+  }
   if (ignoredPresence && ignoredPresence.total > 0) {
     console.log(
       `presence ignored: ${ignoredPresence.total} (${formatPresenceReasonCounts(
@@ -5471,7 +5530,8 @@ async function workerSessionStopGuidance({
         sessionId: context.sessionId,
         workerId: context.workerId,
         hypothesisId: context.hypothesisId,
-        statuses: ["running", "paused"],
+        // Experiments waiting for hardware are unfinished work too.
+        statuses: ["running", "paused", "queued"],
       }),
       listLocalAttempts(root, {
         campaignName: context.campaignName,
@@ -5482,7 +5542,9 @@ async function workerSessionStopGuidance({
       }),
     ])
     activeWorkflowCount = activeWorkflows.length
-    unloggedAttemptCount = unloggedAttempts.length
+    unloggedAttemptCount = unloggedAttempts.filter(
+      (attempt) => !attempt.hardwareJob
+    ).length
   }
   const hasWorkToFinish = activeWorkflowCount > 0 || unloggedAttemptCount > 0
   const researchDeadlineMs = context.researchDeadlineAt
@@ -5505,6 +5567,59 @@ async function workerSessionStopGuidance({
     secondsRemaining: Number.isFinite(researchDeadlineMs)
       ? Math.max(0, Math.round((researchDeadlineMs - Date.now()) / 1000))
       : null,
+  }
+}
+
+async function workerHardwareQueueBrief(
+  context: WorkerRuntimeContext
+): Promise<WorkerHardwareQueueBrief | null> {
+  const root = context.worktreeRoot
+  const sim = await readSimConfigFromCommit({
+    root,
+    projectPath: context.projectPath,
+    commitSha: context.assignment.startingCommitSha,
+  })
+  if (!sim) return null
+  const runs = (
+    await listWorkflowRuns(root, { sessionId: context.sessionId })
+  ).filter((run) => run.hardware)
+  const line = runs
+    .filter((run) => run.status === "queued" && !run.hardware!.startedAt)
+    .sort((left, right) =>
+      left.hardware!.queuedAt.localeCompare(right.hardware!.queuedAt)
+    )
+  const mine = runs
+    .filter((run) => run.workerId === context.workerId)
+    .sort((left, right) =>
+      right.hardware!.queuedAt.localeCompare(left.hardware!.queuedAt)
+    )
+    .slice(0, 10)
+  return {
+    waiting: line.length,
+    running: runs.filter(
+      (run) => run.status === "running" && run.hardware!.startedAt
+    ).length,
+    mine: mine.map((run) => {
+      const index = line.findIndex((item) => item.id === run.id)
+      return {
+        runRef: run.runRef,
+        resultCommitSha: run.resultCommitSha,
+        status:
+          run.status === "running" && run.hardware!.startedAt
+            ? "on_hardware"
+            : run.status,
+        position: index === -1 ? null : index + 1,
+        metrics: run.metrics,
+        simMetrics: run.sim?.metrics ?? {},
+        report: run.hardware!.delivery,
+        note:
+          run.hardware!.cancelReason ??
+          run.hardware!.deliveryError ??
+          (run.status === "succeeded" || run.status === "queued"
+            ? null
+            : (run.blockReason?.split("\n")[0] ?? null)),
+      }
+    }),
   }
 }
 
@@ -5541,6 +5656,12 @@ export async function commandResearchSessionStateBrief(args: Args) {
     stop,
     warnings,
   })
+  stateBrief.hardwareQueue = await workerHardwareQueueBrief(context).catch(
+    (error) => {
+      stateBrief.warnings.push(`Hardware queue unavailable: ${errorMessage(error)}`)
+      return null
+    }
+  )
   if (args.options.json === "true") {
     console.log(JSON.stringify(stateBrief, null, 2))
     return
@@ -5567,6 +5688,15 @@ export async function commandResearchSessionStateBrief(args: Args) {
           : ""
       }`,
       `Hypothesis: ${stateBrief.worker.hypothesisName}`,
+      stateBrief.hardwareQueue
+        ? `Hardware queue: ${stateBrief.hardwareQueue.waiting} waiting, ${stateBrief.hardwareQueue.running} running; yours: ${
+            stateBrief.hardwareQueue.mine
+              .map((item) =>
+                item.position ? `queued #${item.position}` : item.status
+              )
+              .join(", ") || "none"
+          }`
+        : null,
       `Generated: ${stateBrief.generatedAt}`,
       stateBrief.warnings.length > 0
         ? `Warnings: ${stateBrief.warnings.join("; ")}`
@@ -6186,11 +6316,13 @@ async function discardOrphanWorkerWorkspace({
     }).catch(() => null)
     if (diagnostics) teardown = { ...teardown, ...diagnostics }
   }
-  const attempts = await listLocalAttempts(root, {
-    sessionId,
-    workerId: manifest.workerId,
-    hypothesisId: manifest.hypothesisId,
-  }).catch(() => [])
+  const attempts = (
+    await listLocalAttempts(root, {
+      sessionId,
+      workerId: manifest.workerId,
+      hypothesisId: manifest.hypothesisId,
+    }).catch(() => [])
+  ).filter((attempt) => !attempt.hardwareJob)
   if (attempts.length > 0) {
     teardown.warnings = [
       boundedText(
@@ -6728,6 +6860,22 @@ async function commandResearchRunImplementation(
       `Committed setup metric does not match immutable campaign metric ${campaign.metricName}. Create a new campaign for a different metric contract.`
     )
   }
+  const sessionSim = await readSimConfigFromCommit({
+    root,
+    projectPath: effectiveProjectPath,
+    commitSha: sessionBaseCommitSha,
+  })
+  if (sessionSim) {
+    const problems = simConfigProblems(sessionEvaluation.setup, sessionSim)
+    if (problems.length > 0) {
+      throw new Error(`onyx/sim.json cannot be used: ${problems.join(" ")}`)
+    }
+    if (workflowHardwareResources(sessionEvaluation.setup).length === 0) {
+      console.warn(
+        "onyx/sim.json is present but no workflow tool declares a resource; experiments still pass the sim gate, but nothing marks which steps use hardware."
+      )
+    }
+  }
   const overrides = internalSession
     ? new Map<string, { ref: string; sourceExperimentId?: string }>(
         internalSession.session.assignments.map((assignment) => [
@@ -6769,6 +6917,16 @@ async function commandResearchRunImplementation(
     ) {
       throw new Error(
         `Hypothesis ${hypothesis.name} base ${startingCommitSha} does not contain the session setup/evaluation snapshot. Rebase or cherry-pick the code onto a commit containing the current setup.`
+      )
+    }
+    const assignmentSim = await readSimConfigFromCommit({
+      root,
+      projectPath: effectiveProjectPath,
+      commitSha: startingCommitSha,
+    })
+    if (JSON.stringify(assignmentSim) !== JSON.stringify(sessionSim)) {
+      throw new Error(
+        `Hypothesis ${hypothesis.name} base ${startingCommitSha} has a different onyx/sim.json than the session base. Rebase or cherry-pick the code onto a commit containing the current simulator setup.`
       )
     }
     assignments.push({
@@ -6950,6 +7108,87 @@ async function commandResearchRunImplementation(
   }
 
   const workerCredentialsByWorkerId = new Map<string, string>()
+  const hardwareQueue: HardwareDispatcher | null = sessionSim
+    ? createHardwareDispatcher({
+        root,
+        sessionId,
+        concurrency: hardwareConcurrency(sessionEvaluation.setup),
+        deps: {
+          runJob: async ({ worktree, run, worker, sandboxPolicyPath }) => {
+            await withoutProcessExitCode(() =>
+              runHardwareJob({
+                root: worktree,
+                projectPath: effectiveProjectPath,
+                runId: run.id,
+                sandboxPolicyPath,
+                toolEnv: worker.contextPath
+                  ? { ONYX_WORKER_CONTEXT: worker.contextPath }
+                  : undefined,
+              })
+            )
+          },
+          deliver: async ({ worktree, run, worker }) => {
+            const record = await withoutProcessExitCode(() =>
+              deliverTerminalExperimentAttempt({
+                args,
+                context: {
+                  root: worktree,
+                  projectPath: effectiveProjectPath,
+                  campaign,
+                  setup: sessionEvaluation.setup,
+                  runRef: run.runRef,
+                  sessionId,
+                  assignmentId: run.assignmentId ?? worker.assignmentId,
+                  hypothesisId: worker.hypothesisId,
+                  workerId: worker.workerId,
+                  workerCredential: worker.workerCredential,
+                  name: run.hardware?.name ?? null,
+                  description: run.hardware?.description ?? null,
+                  agentNotes: run.hardware?.agentNotes ?? {},
+                },
+              })
+            )
+            if (worker.contextPath) {
+              await recordWorkerReportedExperiment({
+                contextPath: worker.contextPath,
+                workerId: worker.workerId,
+                sessionId,
+                hypothesisId: worker.hypothesisId,
+                runRef: run.runRef,
+              }).catch(() => {})
+            }
+            return record.deliveryOutcome === "duplicate"
+              ? "duplicate"
+              : "delivered"
+          },
+          preparePolicy: sessionSandbox.enabled
+            ? async ({ worktree, jobDir }) => {
+                const tempDir = join(jobDir, "tmp")
+                await mkdir(tempDir, { recursive: true })
+                const path = join(jobDir, "tool-policy.json")
+                await writeHardwareToolPolicy({
+                  config: sessionSandbox.config,
+                  setup: sessionEvaluation.setup,
+                  sim: sessionSim,
+                  worktree,
+                  projectRoot: scopedRoot(worktree, effectiveProjectPath),
+                  tempDir,
+                  env: process.env,
+                  path,
+                })
+                return path
+              }
+            : undefined,
+          isUncertain: (error) => error instanceof ToolProtectionUncertainError,
+          log: (message) => console.log(message),
+        },
+      })
+    : null
+  if (hardwareQueue) {
+    console.log(
+      `Hardware queue: on (simulator ${sessionSim!.tool}, ${hardwareConcurrency(sessionEvaluation.setup)} at a time)`
+    )
+  }
   resetApiTimingSummary()
   try {
     await waitForStartupSessionReady({
@@ -7021,6 +7260,11 @@ async function commandResearchRunImplementation(
   let noProgressWorkerExitCount = 0
   let recentNoProgressExits: NoProgressWorkerExit[] = []
   let noProgressBreakerTripped = false
+  let hardwareQueueStatus: {
+    waiting: number
+    running: number
+    concurrency: number
+  } | null = null
   let terminalReason: SessionTerminalReason | null = null
   let lastStopCheck: ResearchStopCheck | null = null
   let drainingPresenceSent = false
@@ -7141,6 +7385,7 @@ async function commandResearchRunImplementation(
             ? currentProviderBackoff()
             : options.providerBackoff,
         recentFailedLaunches: recentProviderFailures,
+        hardwareQueue: hardwareQueueStatus,
         noProgressBreaker:
           options.noProgressBreaker === undefined
             ? {
@@ -7181,6 +7426,15 @@ async function commandResearchRunImplementation(
         await recoverReports(root, args).catch((error) =>
           console.warn(String(error))
         )
+      }
+      if (hardwareQueue) {
+        // Once a stop is requested, no new experiment starts on hardware.
+        if (stopLogged) await hardwareQueue.stopAccepting()
+        else await hardwareQueue.tick()
+        hardwareQueueStatus = {
+          ...(await hardwareQueue.status()),
+          concurrency: hardwareConcurrency(sessionEvaluation.setup),
+        }
       }
       const loopNow = Date.now()
       void sessionStateBriefRefresher.refresh().catch(() => {})
@@ -7466,6 +7720,8 @@ async function commandResearchRunImplementation(
             },
             lifecycleHeartbeats,
             providerExecutable,
+            hardwareQueue,
+            sim: sessionSim,
             args,
           })
             .then(async (result) => {
@@ -7709,11 +7965,15 @@ async function commandResearchRunImplementation(
         .catch(() => {})
       drainingPresenceSent = true
     }
+    await hardwareQueue?.stopAccepting()
     if (activeRuns.size > 0) {
       console.log(`Waiting for ${activeRuns.size} active worker(s) to finish.`)
       await Promise.allSettled(activeRuns.values())
     }
   } finally {
+    await hardwareQueue?.close().catch((error) =>
+      console.warn(`Hardware queue shutdown: ${errorMessage(error)}`)
+    )
     presenceSupervisor.request()
     await recoverReports(root, args).catch((error) =>
       console.warn(String(error))

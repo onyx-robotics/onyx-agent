@@ -20,6 +20,9 @@ export type CachedAttemptRecord = Omit<
   delivery?: import("./report-delivery").PendingDelivery
   schemaVersion: 1
   createdAt: string
+  /** Measured by the supervisor's hardware queue and delivered by it, not by
+   * the worker that queued it. */
+  hardwareJob?: boolean
 }
 
 export type CachedAttemptSelector = {

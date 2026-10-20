@@ -7,7 +7,13 @@ import {
   commandCampaignStatus,
   commandCampaignUse,
 } from "./commands/campaign"
-import { commandExpList, commandExpLog, commandExpRun } from "./commands/exp"
+import {
+  commandExpList,
+  commandExpLog,
+  commandExpQueue,
+  commandExpRun,
+} from "./commands/exp"
+import { commandSimRun } from "./commands/sim"
 import { commandListen } from "./commands/listen"
 import { commandLogin } from "./commands/login"
 import { commandLogout } from "./commands/logout"
@@ -94,6 +100,10 @@ Usage:
   onyx workflow status [--run <workflowRunId>] [--campaign <name>] [--active] [--blocked] [--project-path <path>] [--json]
   onyx exp log [--campaign <name>] [--run-ref <ref>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>] [--commit <sha>] [--base <sha>] [--result-ref <ref>] [--metric <value>] [--metric-name <name>] [--status succeeded|failed|checks_failed|setup_violation|running|queued] [--allow-unmeasured] [--project-path <path>]
   onyx exp list [--campaign <name>] [--status <status>] [--disposition all|received|accepted|discarded] [--grep <regex>] [--limit <n>] [--json]
+  onyx exp queue [--session <id>] [--worker <id>] [--wait [--timeout <seconds>]] [--json]
+      (hardware queue: experiments that passed the simulator and wait for, or ran on, hardware)
+  onyx sim run [args...] [--project-path <path>] [--timeout <seconds>]
+      (runs the onyx/sim.json simulator on the working tree; results are never recorded)
   onyx listen
   onyx status [--json]
 
@@ -102,6 +112,8 @@ Worker primitives are exposed through the separate worker-safe entrypoint:
   onyx-worker research session-state-brief [--json]
   onyx-worker exp run (--campaign <name> [--base <sha>] | --resume [workflowRunId]) [--auto|--next]
   onyx-worker exp log [--campaign <name>] [--name <name>] [--description <text>] [--agent-notes <json-or-text>]
+  onyx-worker exp queue [--wait] [--json]
+  onyx-worker sim run [args...]
   onyx-worker tools run <name> [args...]
 
 Research control-plane state is remote-first through /api/v1. Local files under
@@ -233,6 +245,8 @@ async function runMainCommand(argv: string[]) {
   if (command === "exp" && sub === "run") return commandExpRun(args)
   if (command === "exp" && sub === "log") return commandExpLog(args)
   if (command === "exp" && sub === "list") return commandExpList(args)
+  if (command === "exp" && sub === "queue") return commandExpQueue(args)
+  if (command === "sim" && sub === "run") return commandSimRun(args)
   if (command === "workflow" && sub === "status")
     return commandWorkflowStatus(args)
   if (command === "listen") return commandListen(args)

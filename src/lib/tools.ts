@@ -18,8 +18,11 @@ import { sandboxCommand, type ResolvedSandboxPolicy } from "./sandbox"
 
 export const ONYX_WORKER_SANDBOX_POLICY = "ONYX_WORKER_SANDBOX_POLICY"
 
-async function toolSandboxPolicy(env: NodeJS.ProcessEnv) {
-  const path = env[ONYX_WORKER_SANDBOX_POLICY]?.trim()
+async function toolSandboxPolicy(
+  env: NodeJS.ProcessEnv,
+  override?: string | null
+) {
+  const path = (override ?? env[ONYX_WORKER_SANDBOX_POLICY])?.trim()
   if (!path) return null
   const policy = JSON.parse(
     await readFile(path, "utf8")
@@ -28,6 +31,17 @@ async function toolSandboxPolicy(env: NodeJS.ProcessEnv) {
     throw new Error(`Invalid worker tool sandbox policy at ${path}`)
   }
   return policy
+}
+
+/** A tool's processes could not be proven stopped; its resource locks are
+ * deliberately kept until an explicit idle reset. */
+export class ToolProtectionUncertainError extends Error {
+  constructor() {
+    super(
+      "Tool process termination is uncertain; retaining resource locks for explicit idle reset"
+    )
+    this.name = "ToolProtectionUncertainError"
+  }
 }
 
 export type ToolCommand = ResearchSetupTool
@@ -52,6 +66,7 @@ export function defaultProtectedToolPaths(projectPath: string) {
     `${prefix}onyx/setup.json`,
     `${prefix}onyx/validation.json`,
     `${prefix}onyx/sandbox.json`,
+    `${prefix}onyx/sim.json`,
     `${prefix}onyx/tools`,
   ]
 }
@@ -140,26 +155,31 @@ async function acquireResourceSlot({
   })
 }
 
-async function acquireResources({
+/**
+ * Leases every named resource, in sorted order so two holders can never
+ * deadlock, and returns one release for all of them.
+ */
+export async function acquireNamedResources({
   root,
-  api,
-  command,
+  resources,
+  resourceNames,
+  timeoutMs,
 }: {
   root: string
-  api: ToolApi
-  command: ToolCommand
+  resources: ResearchSetupFile["resources"]
+  resourceNames: string[]
+  timeoutMs: number
 }) {
   const releases: Array<() => Promise<void>> = []
   try {
-    for (const resourceName of [...new Set(command.resources)].sort()) {
-      const resource = api.resources[resourceName]
+    for (const resourceName of [...new Set(resourceNames)].sort()) {
       releases.push(
         await acquireResourceSlot({
           root,
           resourceName,
-          slots: resource?.slots ?? 1,
-          timeoutMs: command.leaseTimeoutSeconds * 1000,
-          leaseMs: command.leaseTimeoutSeconds * 1000,
+          slots: resources[resourceName]?.slots ?? 1,
+          timeoutMs,
+          leaseMs: timeoutMs,
         })
       )
     }
@@ -170,6 +190,23 @@ async function acquireResources({
     for (const release of releases.reverse()) await release().catch(() => {})
     throw error
   }
+}
+
+async function acquireResources({
+  root,
+  api,
+  command,
+}: {
+  root: string
+  api: ToolApi
+  command: ToolCommand
+}) {
+  return acquireNamedResources({
+    root,
+    resources: api.resources,
+    resourceNames: command.resources,
+    timeoutMs: command.leaseTimeoutSeconds * 1000,
+  })
 }
 
 function summarizeToolOutput(
@@ -190,6 +227,8 @@ export async function runToolCommand({
   extraArgs = [],
   env = {},
   timeoutSeconds,
+  resourcesHeld = false,
+  sandboxPolicyPath = null,
 }: {
   root: string
   projectPath: string
@@ -197,6 +236,10 @@ export async function runToolCommand({
   extraArgs?: string[]
   env?: NodeJS.ProcessEnv
   timeoutSeconds?: number
+  /** The caller already leases every resource this tool declares. */
+  resourcesHeld?: boolean
+  /** Tool sandbox policy to use instead of the worker's default one. */
+  sandboxPolicyPath?: string | null
 }): Promise<ToolRunResult> {
   const api = await readCanonicalToolApi(root, projectPath)
   const command = await getToolCommand({ root, projectPath, name })
@@ -207,7 +250,9 @@ export async function runToolCommand({
   await assertWslResearchEnvironment(root, [
     resolveCwd(root, projectPath, command.cwd),
   ])
-  const release = await acquireResources({ root, api, command })
+  const release = resourcesHeld
+    ? async () => {}
+    : await acquireResources({ root, api, command })
   let protectionUncertain = false
   try {
     const cwd = resolveCwd(root, projectPath, command.cwd)
@@ -242,7 +287,7 @@ export async function runToolCommand({
               ].join(" "),
             ],
           }
-    const sandbox = await toolSandboxPolicy(process.env)
+    const sandbox = await toolSandboxPolicy(process.env, sandboxPolicyPath)
     if (sandbox) delete toolEnv[ONYX_WORKER_SANDBOX_POLICY]
     const launched = sandbox
       ? await sandboxCommand(sandbox, { ...invocation, cwd }, toolEnv)
@@ -253,10 +298,7 @@ export async function runToolCommand({
       timeoutMs,
     })
     protectionUncertain = result.protectionUncertain ?? false
-    if (protectionUncertain)
-      throw new Error(
-        "Tool process termination is uncertain; retaining resource locks for explicit idle reset"
-      )
+    if (protectionUncertain) throw new ToolProtectionUncertainError()
     return {
       ...result,
       commandName: name,

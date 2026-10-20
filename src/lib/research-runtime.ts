@@ -51,6 +51,8 @@ export type LocalCampaign = ApiCampaign & {
 export type LocalWorkflowRunStatus =
   | "running"
   | "paused"
+  /** Passed simulation and waiting in line for the hardware queue. */
+  | "queued"
   | "blocked"
   | "abandoned"
   | "superseded"
@@ -90,6 +92,49 @@ export type LocalWorkflowRun = {
   sessionId?: string
   workerId?: string
   hypothesisId?: string
+  /** Latest simulation gate result (hardware queue mode only). */
+  sim?: LocalWorkflowSimResult | null
+  /** Hardware queue bookkeeping, set when the run passes sim and queues. */
+  hardware?: LocalHardwareJob | null
+}
+
+export type LocalWorkflowSimResult = {
+  commitSha: string
+  status: "passed" | "failed"
+  exitCode: number | null
+  timedOut: boolean
+  metrics: Record<string, number>
+  outputSummary: string | null
+  logPath: string | null
+  checkedAt: string
+}
+
+export type LocalHardwareJob = {
+  queuedAt: string
+  startedAt: string | null
+  finishedAt: string | null
+  /** Report fields the worker supplied when it queued the experiment. */
+  name: string | null
+  description: string | null
+  agentNotes: Record<string, unknown>
+  delivery:
+    | "pending"
+    | "delivered"
+    | "duplicate"
+    | "failed"
+    | "canceled"
+    | null
+  deliveryError: string | null
+  cancelReason: string | null
+}
+
+/** True for a run that is waiting for or running on the hardware queue. */
+export function isHardwareQueueRun(run: LocalWorkflowRun) {
+  return (
+    Boolean(run.hardware) &&
+    (run.status === "queued" ||
+      (run.status === "running" && Boolean(run.hardware?.startedAt)))
+  )
 }
 
 export type WorkflowRunSelector = {
@@ -1238,7 +1283,7 @@ export async function abandonNonterminalWorkflowRunsForWorker({
     sessionId,
     workerId,
     ...(hypothesisId ? { hypothesisId } : {}),
-    statuses: ["running", "paused", "blocked"],
+    statuses: ["running", "paused", "blocked", "queued"],
   })
   for (const run of runs) {
     await upsertWorkflowRun({

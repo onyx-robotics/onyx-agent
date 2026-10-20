@@ -138,6 +138,12 @@ export type CliState = {
             errorSummary: string | null
           }>
         } | null
+        /** Simulation-gated hardware queue, when the session runs one. */
+        hardwareQueue?: {
+          waiting: number
+          running: number
+          concurrency: number
+        } | null
         status?: string
         updatedAt?: string
       }

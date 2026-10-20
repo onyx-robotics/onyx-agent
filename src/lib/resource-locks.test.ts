@@ -81,3 +81,27 @@ test("concurrent contenders never acquire more than capacity", async () => {
   )
   expect(maximum).toBe(1)
 })
+test("waiters acquire in arrival order, and dead waiters leave the line", async () => {
+  const root = await fixture()
+  const holder = await acquire(root, "holder")
+  // A ticket from a process that no longer exists sits at the front.
+  const queueDir = join(root, ".git/onyx/resource-locks/rig/queue")
+  await mkdir(queueDir, { recursive: true })
+  await writeFile(
+    join(queueDir, "000000000000001-000000-dead.json"),
+    JSON.stringify({ ownerId: "dead", pid: 2 ** 22 + 12345, queuedAt: "" })
+  )
+  const order: string[] = []
+  const waiters = ["first", "second", "third"].map(async (ownerId, index) => {
+    // Stagger arrival so each waiter's ticket is strictly later.
+    await new Promise((resolve) => setTimeout(resolve, index * 20))
+    const release = await acquire(root, ownerId, 5000)
+    order.push(ownerId)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await release()
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  await holder()
+  await Promise.all(waiters)
+  expect(order).toEqual(["first", "second", "third"])
+})
