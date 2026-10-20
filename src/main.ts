@@ -73,7 +73,7 @@ Usage:
   onyx campaign use --name <name> [--project-path <path>]
   onyx campaign status [--name <name>] [--project-path <path>]
   onyx campaign delete --name <name> [--project-path <path>]
-  onyx research run --campaign <name> [--workers <n>] [--hypothesis <name-or-id>]... [--base <ref>] [--hypothesis-base <hypothesis>=<ref|experiment:id>]... [--new] [--experiments <n>] [--max-minutes <n>] [--agent codex|claude|opencode] [--model <model>] [--foreground] [--json]
+  onyx research run --campaign <name> [--workers <n>] [--hypothesis <name-or-id>]... [--base <ref>] [--hypothesis-base <hypothesis>=<ref|experiment:id>]... [--new] [--experiments <n>] [--max-minutes <n>] [--agent codex|claude|opencode] [--model <model>] [--no-sandbox] [--foreground] [--json]
       (always creates a new bounded session; starts its local supervisor detached by default)
   onyx research hypotheses --example
   onyx research hypothesis list --campaign <name> [--json]

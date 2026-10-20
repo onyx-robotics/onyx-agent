@@ -114,6 +114,53 @@ Built-in launchers spawn provider CLIs directly in non-interactive mode — no
 extra configuration beyond having the provider CLI installed and
 authenticated.
 
+## Worker sandboxing
+
+`scope.editable` and `scope.protected` in `onyx/setup.json` tell workers what
+to change, and Onyx checks each result commit against them. On their own they do
+not stop a worker from reading, writing, or running anything else. To have the
+OS enforce boundaries, commit an `onyx/sandbox.json` to the project. If the file
+exists, every session is sandboxed. An example `onyx/sandbox.json` is below:
+
+```jsonc
+{
+  "worktreeWrites": "all",    // all | editable (only scope.editable + write)
+  "read": ["~/.rustup", "/opt/ros"],
+  "write": [],
+  "exec": null,               // null = anything can execute; a list restricts execution
+  "devices": ["/dev/ttyUSB0"]
+}
+```
+### Additional Details
+Every worker and every evaluation tool it triggers then runs under
+[bubblewrap](https://github.com/containers/bubblewrap) on Linux or Seatbelt
+(`sandbox-exec`) on macOS:
+
+- The worker's own worktree is writable (or only `scope.editable` with
+  `worktreeWrites: "editable"`). Protected setup paths, `onyx/sandbox.json`,
+  `.git/config`, `.git/hooks`, and the files that point git at a repository are
+  read-only.
+- System directories, `PATH` entries, git config, the provider's install
+  directory, and the paths you list are readable. The rest of your home
+  directory, the main checkout, other workers' worktrees, and `.git/onyx`
+  supervisor state are not visible. The provider's own config directory
+  (`~/.claude`, `~/.codex`, …) stays writable because it holds the provider
+  login.
+- `onyx-worker` inside the sandbox forwards to the supervisor, which runs the
+  real CLI with the worker credential outside the sandbox. Evaluation tools run
+  agent-edited code, so they get the same confinement. Codex's own sandbox is
+  turned off in favour of this one.
+- With an `exec` list, only those paths, system directories, the provider, and
+  `onyx/tools` can be executed (Landlock via util-linux `setpriv` 2.40+ on
+  Linux). An allowed interpreter can still run any script it can read, e.g.
+  `python script.py`.
+- Network access is not restricted, general cybersecurity infrastructure is up to the user
+
+If the sandbox cannot be set up, the session does not start. To debug, `onyx
+research run --no-sandbox` runs one session unconfined even though the file
+exists. The override is recorded in the session's metadata.
+
+
 ## Documentation
 
 - [Installation](https://onyxresearch.ai/docs/installation) and

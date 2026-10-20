@@ -5,6 +5,7 @@ import type { DeveloperCheckout } from "./config"
 
 import { validateDeveloperCheckout } from "../commands/developer"
 import { readConfig } from "./config"
+import { ONYX_WORKER_BROKER_SOCKET, runWorkerBrokerClient } from "./worker-broker"
 import { parseWorkerRuntimeContext } from "./worker-context"
 
 export const ONYX_LAUNCHER_BYPASS = "ONYX_LAUNCHER_BYPASS"
@@ -111,6 +112,12 @@ export async function runLauncherCore({
   runMain: (argv?: string[]) => Promise<unknown>
   runDeveloperCommand?: (argv: string[]) => Promise<void>
 }) {
+  // Sandboxed workers cannot read their runtime context or `.git/onyx`; every
+  // worker command is forwarded to the supervisor-side broker instead.
+  if (entrypoint === "onyx-worker" && env[ONYX_WORKER_BROKER_SOCKET]) {
+    return runWorkerBrokerClient(argv, env)
+  }
+
   if (
     entrypoint === "onyx" &&
     argv[0] === "developer" &&

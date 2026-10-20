@@ -25,7 +25,7 @@ import {
   ONYX_AGENT_PROTOCOL_VERSION,
   ONYX_WORKER_CONTEXT_SCHEMA_VERSION,
 } from "./version"
-import { gitCommonDir, gitDir } from "./git"
+import { gitCommonDir, gitDir, hardenedGitArgs } from "./git"
 import { activityLinesForOutput, pathExists, runProcess } from "./process"
 import type { WorkerRuntimeContext } from "./worker-context"
 
@@ -54,7 +54,18 @@ type WorkerInvocationOptions = {
   workerModel: string | null
   workerTitle?: string
   providerExecutable?: string
+  /** Onyx confines the provider itself (sandbox.json mode enforce), so the
+   * provider's own sandbox is disabled instead of nested: Seatbelt profiles
+   * cannot nest on macOS, and one policy keeps all providers equivalent. */
+  externalSandbox?: boolean
 }
+
+/** Rewrites a command so it runs inside the worker sandbox. */
+export type SandboxWrapper = (invocation: {
+  command: string
+  args: string[]
+  cwd: string
+}) => Promise<{ command: string; args: string[] }>
 
 export type ProviderFailureClass =
   | "auth"
@@ -130,11 +141,13 @@ export async function preflightProviderModel({
   cwd,
   env,
   timeoutMs = 90_000,
+  sandbox,
 }: {
   invocation: WorkerInvocation
   cwd: string
   env?: NodeJS.ProcessEnv
   timeoutMs?: number
+  sandbox?: SandboxWrapper
 }) {
   if (invocation.agentKind === "custom") {
     return { skipped: true, version: null, marker: null }
@@ -147,14 +160,19 @@ export async function preflightProviderModel({
     prompt: `This is a capability probe. Do not use tools. Respond with exactly: ${marker}`,
     workerModel: invocation.workerModel ?? null,
     providerExecutable: invocation.command,
+    externalSandbox: Boolean(sandbox),
   })
+  const wrap = async (command: string, args: string[]) =>
+    sandbox ? sandbox({ command, args, cwd }) : { command, args }
+  const versionCommand = await wrap(invocation.command, ["--version"])
+  const probeCommand = await wrap(probe.command, probe.args)
   const [versionResult, probeResult] = await Promise.all([
-    runProcess(invocation.command, ["--version"], {
+    runProcess(versionCommand.command, versionCommand.args, {
       cwd,
       env,
       timeoutMs: 10_000,
     }),
-    runProcess(probe.command, probe.args, {
+    runProcess(probeCommand.command, probeCommand.args, {
       cwd,
       env,
       stdin: probe.stdin,
@@ -325,6 +343,8 @@ export type WorkerLaunchManifest = {
   warnings?: string[]
   preflight: WorkerPreflightResult | null
   teardown: WorkerTeardownManifest | null
+  /** OS confinement applied to this worker; null or absent when off. */
+  sandbox?: { backend: "bubblewrap" | "seatbelt" } | null
 }
 
 /** Smallest 1-based slot index not currently in use. */
@@ -542,6 +562,23 @@ export async function writeWorkerCliWrapper({
   return { binDir: paths.binDir, workerPath, mode, target }
 }
 
+/**
+ * Files the in-sandbox `onyx-worker` broker client needs to start: the pinned
+ * release binary, or Bun plus the linked/source checkout.
+ */
+export async function workerClientSandboxPaths(
+  wrapper: WorkerCliWrapper,
+  env: NodeJS.ProcessEnv = process.env
+) {
+  if (wrapper.mode === "release") return [wrapper.target]
+  const bun = await runProcess("sh", ["-c", "command -v bun"], {
+    env,
+    timeoutMs: 5_000,
+  }).catch(() => null)
+  const bunPath = bun?.code === 0 ? bun.stdout.trim().split("\n")[0] : ""
+  return [dirname(dirname(wrapper.target)), ...(bunPath ? [bunPath] : [])]
+}
+
 const PROVIDER_ENV_ALLOWLIST = [
   "PATH",
   "HOME",
@@ -617,6 +654,7 @@ export function buildWorkerInvocation({
   workerModel = null,
   workerTitle,
   providerExecutable,
+  externalSandbox = false,
 }: {
   agentKind: string
   workerCommand?: string
@@ -627,6 +665,7 @@ export function buildWorkerInvocation({
   workerModel?: string | null
   workerTitle?: string
   providerExecutable?: string
+  externalSandbox?: boolean
 }): WorkerInvocation {
   if (workerCommand) {
     return {
@@ -647,6 +686,7 @@ export function buildWorkerInvocation({
     workerModel,
     workerTitle,
     providerExecutable,
+    externalSandbox,
   })
 }
 
@@ -697,8 +737,17 @@ const providerAdapters: Record<BuiltInWorkerAgent, ProviderAdapter> = {
       addedWritableRoots,
       workerModel,
       providerExecutable,
+      externalSandbox,
     }) {
       const modelArgs = workerModel ? ["--model", workerModel] : []
+      const sandboxArgs = externalSandbox
+        ? ["--sandbox", "danger-full-access"]
+        : [
+            "--config",
+            "sandbox_workspace_write.network_access=true",
+            "--sandbox",
+            "workspace-write",
+          ]
       // The workspace-write sandbox scopes writes to the --cd directory, so
       // the worktree root must stay writable when launching from a project
       // subdirectory.
@@ -713,10 +762,7 @@ const providerAdapters: Record<BuiltInWorkerAgent, ProviderAdapter> = {
         "--ignore-user-config",
         "--ignore-rules",
         "--strict-config",
-        "--config",
-        "sandbox_workspace_write.network_access=true",
-        "--sandbox",
-        "workspace-write",
+        ...sandboxArgs,
         ...modelArgs,
         "--cd",
         launchDir ?? worktree,
@@ -848,9 +894,22 @@ export async function preflightWorkerInvocation(
     assignmentId?: string
     workerId?: string
     onyxWorkerPath: string
+    /** Runs every check inside the worker sandbox, so preflight proves the
+     * provider, the broker, and git all work under the real policy. */
+    sandbox?: SandboxWrapper
   }
 ): Promise<WorkerPreflightResult> {
   await assertProviderStorage(invocation.agentKind, options.env)
+  const run = async (
+    command: string,
+    args: string[],
+    runOptions: Parameters<typeof runProcess>[2]
+  ) => {
+    const wrapped = options.sandbox
+      ? await options.sandbox({ command, args, cwd: options.cwd })
+      : { command, args }
+    return runProcess(wrapped.command, wrapped.args, runOptions)
+  }
   for (const command of [
     invocation.command,
     "git",
@@ -862,7 +921,7 @@ export async function preflightWorkerInvocation(
   let version: string | null = null
   if (invocation.agentKind !== "custom") {
     try {
-      const versionResult = await runProcess(
+      const versionResult = await run(
         invocation.command,
         ["--version"],
         {
@@ -902,7 +961,7 @@ export async function preflightWorkerInvocation(
   const checks: WorkerPreflightCheck[] = []
 
   if (invocation.agentKind === "opencode" && invocation.workerModel) {
-    const modelsResult = await runProcess(invocation.command, ["models"], {
+    const modelsResult = await run(invocation.command, ["models"], {
       cwd: options.cwd,
       env: options.env,
       timeoutMs: options.timeoutMs ?? 10_000,
@@ -935,7 +994,7 @@ export async function preflightWorkerInvocation(
   }
 
   if (invocation.preflightArgs) {
-    const result = await runProcess(
+    const result = await run(
       invocation.command,
       invocation.preflightArgs,
       {
@@ -962,7 +1021,7 @@ export async function preflightWorkerInvocation(
     args: string[],
     optionsOverride: { allowExitCodes?: number[] } = {}
   ) => {
-    const result = await runProcess(command, args, {
+    const result = await run(command, args, {
       cwd: options.cwd,
       env: options.env,
       timeoutMs: options.timeoutMs ?? 10_000,
@@ -998,7 +1057,7 @@ export async function preflightWorkerInvocation(
   // source profile files that reorder PATH in front of the wrapper.
   if (wslVersion() !== "none") {
     for (const command of ["git", "onyx-worker"]) {
-      const resolution = await runProcess(
+      const resolution = await run(
         "sh",
         [
           "-lc",
@@ -1031,7 +1090,7 @@ export async function preflightWorkerInvocation(
       )
     }
   }
-  const bareResolution = await runProcess(
+  const bareResolution = await run(
     "sh",
     ["-lc", "onyx-worker diagnostics handshake --json"],
     {
@@ -1138,11 +1197,11 @@ export async function preflightWorkerInvocation(
     )
   }
 
-  await runCheck("git metadata write", "git", [
-    "update-index",
-    "-q",
-    "--refresh",
-  ])
+  await runCheck(
+    "git metadata write",
+    "git",
+    hardenedGitArgs(["update-index", "-q", "--refresh"])
+  )
 
   return { version, onyxVersion, checks }
 }

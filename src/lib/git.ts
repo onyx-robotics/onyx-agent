@@ -7,12 +7,24 @@ import {
 import { join } from "node:path"
 import { commandOutput, runProcess } from "./process"
 
+/** Config overrides for every git process Onyx spawns.*/
+export const HARDENED_GIT_CONFIG_ARGS = [
+  "-c",
+  "core.hooksPath=/dev/null",
+  "-c",
+  "core.fsmonitor=false",
+] as const
+
+export function hardenedGitArgs(args: string[]) {
+  return [...HARDENED_GIT_CONFIG_ARGS, ...args]
+}
+
 export async function git(args: string[], cwd?: string) {
-  return commandOutput("git", args, cwd)
+  return commandOutput("git", hardenedGitArgs(args), cwd)
 }
 
 export async function gitResult(args: string[], cwd?: string) {
-  return runProcess("git", args, { cwd })
+  return runProcess("git", hardenedGitArgs(args), { cwd })
 }
 
 export async function repoRoot(cwd = process.cwd()) {

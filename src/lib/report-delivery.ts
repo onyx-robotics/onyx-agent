@@ -17,7 +17,7 @@ import type { Args } from "./args"
 import type { CachedAttemptRecord } from "./local-attempt-cache"
 import { ApiError, apiData, callApi, reportCampaignExperiment } from "./api"
 import { apiBaseUrl, readConfig, selectedProfileWithName } from "./config"
-import { git, gitResult, gitCommonDir } from "./git"
+import { git, gitResult, gitCommonDir, hardenedGitArgs } from "./git"
 import { runProcess } from "./process"
 import { onyxStateDir, updateState } from "./runtime-state"
 import {
@@ -98,7 +98,11 @@ export async function pushAttemptRef(
       throw new Error("Recovery push deferred to the next pass")
     const result = await runProcess(
       "git",
-      ["push", "origin", `${record.resultCommitSha}:${record.resultRef}`],
+      hardenedGitArgs([
+        "push",
+        "origin",
+        `${record.resultCommitSha}:${record.resultRef}`,
+      ]),
       {
         cwd: root,
         timeoutMs: deadline
