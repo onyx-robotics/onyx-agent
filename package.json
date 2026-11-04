@@ -25,7 +25,7 @@
     "node": ">=22.11.0"
   },
   "bin": {
-    "onyx": "./src/cli/main.ts"
+    "onyx": "src/cli/main.ts"
   },
   "exports": {
     ".": {

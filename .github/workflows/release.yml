@@ -1,0 +1,124 @@
+name: Release
+
+# On a push to main: when package.json's version isn't on npm yet, it's published there, and when
+# it has no GitHub release yet, the onyx binaries (linux and macOS, x64 and arm64) are built and
+# attached to one, tagged v<version>. Each half checks for itself, so a run that failed partway
+# is finished by running it again. Versions come from Changesets (.changeset/README.md).
+#
+# npm publishing is trusted publishing (OpenID Connect: no token is kept here), with provenance.
+# On npmjs.com, the package's Settings -> Trusted publishing names this repository and this
+# workflow file, release.yml.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      npm: ${{ steps.plan.outputs.npm }}
+      release: ${{ steps.plan.outputs.release }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: What this version still needs
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          published=$(npm view "@onyx-robotics/agent@$version" version 2>/dev/null || true)
+          if [ "$published" = "$version" ]; then npm=false; else npm=true; fi
+          if gh release view "v$version" >/dev/null 2>&1; then release=false; else release=true; fi
+          echo "npm=$npm" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "v$version: publish to npm: $npm, GitHub release: $release"
+
+  npm:
+    needs: plan
+    if: needs.plan.outputs.npm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      # Node 24 comes with npm 11.5.1 or later, which trusted publishing needs
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint, typecheck, unit tests
+        run: bun run lint && bun run typecheck && bun run test
+
+      - name: Publish (its prepack builds dist/)
+        run: npm publish --provenance --access public
+
+  release:
+    needs: [plan, npm]
+    if: ${{ !cancelled() && needs.plan.outputs.release == 'true' && needs.npm.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build for linux and macOS, x64 and arm64
+        run: bun run compile -- --all
+
+      - name: The linux binary runs
+        run: ./dist/onyx-linux-x64 help
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum onyx-* > SHA256SUMS
+
+      - name: Attach them to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # this version's section of the changelog
+          awk -v v="## $VERSION" '$0 == v { on = 1; next } /^## / && on { exit } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ -s "$RUNNER_TEMP/notes.md" ]; then notes=(--notes-file "$RUNNER_TEMP/notes.md"); else notes=(--generate-notes); fi
+          gh release create "v$VERSION" dist/onyx-* dist/SHA256SUMS \
+            --title "v$VERSION" --target "$GITHUB_SHA" "${notes[@]}"
