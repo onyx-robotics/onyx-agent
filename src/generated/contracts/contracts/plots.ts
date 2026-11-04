@@ -115,6 +115,19 @@ export const plotGridQuery = z
   )
 export type PlotGridQueryInput = z.input<typeof plotGridQuery>
 
+/** Each lane's best so far of a metric over a scope, whole: the records that set it. */
+export const plotBestQuery = z.strictObject({
+  scope: plotScope,
+  /** the time or order the plot runs along (an item with no such time isn't on the line) */
+  x: fieldKey,
+  /** the metric */
+  y: fieldKey,
+  scale: scaleKind.default("linear"),
+  /** past this many a row shape, about this many of its records, evenly */
+  max: z.number().int().min(2).max(10_000).default(2_000),
+})
+export type PlotBestQueryInput = z.input<typeof plotBestQuery>
+
 export const plotPickQuery = z.strictObject({
   spec: viewSpec,
   shown: z.array(z.string().min(1)).max(5000),

@@ -11,6 +11,8 @@ import {
   axisRange as range,
   axisScales as scales,
   field,
+  onlyFromSolo,
+  onlyLanes,
   timeOf,
   type Field,
   type FieldInput,
@@ -53,13 +55,17 @@ export type PickWhat = z.output<typeof pickWhat>
  * What's picked in a plot (the view's `pick` field): a brush, a lasso (in the axes' transformed
  * units: log₁₀ on a log scale) or ids, of the items of the series it was made in (its scope: the
  * focus it was made in, a series, one of its lanes, or an older link's lane by its conditions; and
- * its solo lane), wherever they're drawn.
+ * the lanes drawn alone, an older link's one lane alone as those), wherever they're drawn.
  */
-export const pickState = z.strictObject({
-  scope: seriesFocus.nullable(),
-  solo: z.guid().nullable().default(null),
-  what: pickWhat,
-})
+export const pickState = z.preprocess(
+  (raw) =>
+    typeof raw === "object" && raw !== null ? onlyFromSolo(raw as Record<string, unknown>) : raw,
+  z.strictObject({
+    scope: seriesFocus.nullable(),
+    only: onlyLanes,
+    what: pickWhat,
+  })
+)
 export type PickState = z.output<typeof pickState>
 
 /** A field as a key (maps, columns, query keys, the API). */
@@ -75,8 +81,6 @@ export function fieldKey(f: FieldInput): string {
       return `m:${f.key}:${f.context ?? "-"}`
     case "prop":
       return `p:${f.key}`
-    case "lane":
-      return "lane"
   }
 }
 
@@ -86,7 +90,6 @@ const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 export function parseFieldKey(key: string): Field | null {
   if (key === "t" || key === "ended" || key === "recorded") return { k: "time", of: key }
   if (key === "duration") return { k: "duration" }
-  if (key === "lane") return { k: "lane" }
   if (key.startsWith("order:")) {
     const of = timeOf.safeParse(key.slice(6))
     return of.success ? { k: "order", of: of.data } : null
@@ -476,6 +479,16 @@ export interface GridResult extends PlotMeta {
   extent: { x: [number, number] | null; y: [number, number] | null }
   outliers: OutlierRows
   truncated: boolean
+}
+
+/**
+ * Each lane's best so far of a metric, whole: the items that set a record in a lane, in order along
+ * x (its time, in epoch ms; y on its scale), and where each lane's values end along x (lanes with
+ * no value left out; a metric with no direction: none).
+ */
+export interface BestResult extends PlotMeta {
+  records: OutlierRows
+  ends: { key: string; end: number }[]
 }
 
 /** Picked items per lane and bucket. */

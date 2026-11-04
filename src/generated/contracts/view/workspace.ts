@@ -260,19 +260,18 @@ const namesTree = (raw: Fields): boolean =>
 
 /**
  * A view with an older address's plot (the view's, of its focus) where a plot is now: on the
- * series its focus names (its lane, if it named one, soloed), or every item's when it named none
- * (an older address lists it: `viewFromV2`), expanded (it took the table). One whose series isn't
- * shown is dropped.
+ * series its focus names (its lane, if it named one, alone), or every item's when it named none
+ * (an older address lists it: `viewFromV2`). One whose series isn't shown is dropped.
  */
 export function liftPlot(view: WorkspaceView): WorkspaceView {
   if (!view.plot) return view
-  const plot = { ...view.plot, expanded: true }
+  const plot = view.plot
   const f = view.focus
   const id = f ? ("series" in f ? f.series : null) : allItemsSeries().id
   if (!id || !view.series.some((s) => s.id === id)) return { ...view, plot: null }
   if (!f || !("series" in f)) return { ...view, plot: null, series: setPlot(view.series, id, plot) }
-  const solo = f.lane && f.lane !== "total" ? f.lane.value : plot.solo
-  return { ...view, plot: null, series: setPlot(view.series, id, { ...plot, solo }) }
+  const only = f.lane && f.lane !== "total" ? [f.lane.value] : plot.only
+  return { ...view, plot: null, series: setPlot(view.series, id, { ...plot, only }) }
 }
 
 /** A workspace's view in its page's URL: the fields that differ from what's saved, each whole. */
