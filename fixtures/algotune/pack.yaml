@@ -1,0 +1,42 @@
+# AlgoTune's own pack: its endpoints and what they measure (docs/research.md, "Setup").
+key: algotune
+version: 1
+label: AlgoTune
+description: AlgoTune benchmark tasks as research endpoints.
+requires: [research]
+
+types:
+  - key: algotune.bench
+    kind: asset
+    parent: research_endpoint
+    label: AlgoTune bench
+    description: Times a solver.py on an AlgoTune task's instances against its reference, single-threaded.
+  - key: algotune.svm_bench
+    kind: asset
+    parent: algotune.bench
+    label: AlgoTune SVM bench
+    description: The bench, for the svm task only (the first runs').
+
+properties:
+  - key: algotune.speedup
+    label: Speedup
+    type: number
+    metric: true
+    better: higher
+    description: Mean over instances of reference time / solver time (AlgoTune's own measure).
+  - key: algotune.peak_mem_mb
+    label: Peak memory
+    type: number
+    unit: MB
+    metric: true
+    better: lower
+  - key: algotune.code_lines
+    label: Code lines
+    type: number
+    metric: true
+    better: lower
+  - key: algotune.valid_fraction
+    label: Valid fraction
+    type: number
+    metric: true
+    better: higher
