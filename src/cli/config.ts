@@ -14,7 +14,7 @@ import { dirname, join } from "node:path"
 import { envVar, type Io } from "./io"
 import { CliError, EXIT, UsageError } from "./output"
 
-/** Where `onyx login` signs in when nothing names a server (--url, ONYX_URL, the current profile). */
+/** Where `onyx login` signs in when nothing names a server (--url, ONYX_URL, the profile). */
 export const DEFAULT_URL = "https://app.onyxresearch.ai"
 
 export interface Profile {

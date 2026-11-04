@@ -50,8 +50,8 @@ function help(out: Out, name?: string): number {
   const width = Math.max(...Object.keys(COMMANDS).map((k) => k.length))
   for (const [k, c] of Object.entries(COMMANDS)) out.line(`  ${k.padEnd(width)}  ${c.summary}`)
   out.line(
-    "\nFlags for every command but research: --json (JSON output; the default when not at a terminal), " +
-      "--human, --profile <slug>.\nonyx help <command> shows its flags."
+    "\nFlags for every command but research: --json (JSON output; the default when not at a " +
+      "terminal), --human, --profile <slug>.\nonyx help <command> shows its flags."
   )
   return EXIT.ok
 }
