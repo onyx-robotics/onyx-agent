@@ -7,14 +7,56 @@ description: How well an arm calibration from AprilTags fits, and how sure it is
 requires: [research]
 
 properties:
-  - { key: calib.joint_err_deg, label: Joint error, type: number, unit: deg, metric: true, better: lower,
-      description: "Sim only: root mean square of the joint offsets' errors against the arm's hidden truth." }
-  - { key: calib.camera_err_mm, label: Camera mount error, type: number, unit: mm, metric: true, better: lower,
-      description: "Sim only: the camera mount's position error against the arm's hidden truth." }
-  - { key: calib.camera_rot_err_deg, label: Camera rotation error, type: number, unit: deg, metric: true, better: lower,
-      description: "Sim only: the camera mount's rotation error against the arm's hidden truth." }
-  - { key: calib.reprojection_px, label: Reprojection error, type: number, unit: px, metric: true, better: lower }
-  - { key: calib.joint_sigma_deg, label: Joint uncertainty, type: number, unit: deg, metric: true, better: lower }
-  - { key: calib.camera_sigma_mm, label: Camera uncertainty, type: number, unit: mm, metric: true, better: lower }
+  - {
+      key: calib.joint_err_deg,
+      label: Joint error,
+      type: number,
+      unit: deg,
+      metric: true,
+      better: lower,
+      description: "Sim only: root mean square of the joint offsets' errors against the arm's hidden truth.",
+    }
+  - {
+      key: calib.camera_err_mm,
+      label: Camera mount error,
+      type: number,
+      unit: mm,
+      metric: true,
+      better: lower,
+      description: "Sim only: the camera mount's position error against the arm's hidden truth.",
+    }
+  - {
+      key: calib.camera_rot_err_deg,
+      label: Camera rotation error,
+      type: number,
+      unit: deg,
+      metric: true,
+      better: lower,
+      description: "Sim only: the camera mount's rotation error against the arm's hidden truth.",
+    }
+  - {
+      key: calib.reprojection_px,
+      label: Reprojection error,
+      type: number,
+      unit: px,
+      metric: true,
+      better: lower,
+    }
+  - {
+      key: calib.joint_sigma_deg,
+      label: Joint uncertainty,
+      type: number,
+      unit: deg,
+      metric: true,
+      better: lower,
+    }
+  - {
+      key: calib.camera_sigma_mm,
+      label: Camera uncertainty,
+      type: number,
+      unit: mm,
+      metric: true,
+      better: lower,
+    }
   - { key: calib.views, label: Views, type: number, metric: true, better: higher }
   - { key: calib.tags_seen, label: Tags seen, type: number, metric: true, better: higher }
