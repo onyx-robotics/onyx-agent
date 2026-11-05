@@ -1,0 +1,646 @@
+<?xml version="1.0"?>
+<robot name="onyx_arm">
+  <link name="Rigid_Group_1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_1_ak60_39_v3_0_kv80_3d_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_1_ak60_39_v3_0_kv80_3d_1_material">
+        <color rgba="0.537254902 0.537254902 0.537254902 0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_1_ak60_39_v3_0_kv80_3d_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_1_base_plate_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_1_base_plate_1_material">
+        <color rgba="0.62745098 0.62745098 0.62745098 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_1_base_plate_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="4.63986268e-05 -7.51852372e-05 -0.022364178" rpy="0 0 0"/>
+      <mass value="1.20231002"/>
+      <inertia ixx="0.00119601597" ixy="-2.05518173e-06" ixz="-3.55613545e-07" iyy="0.0019525963" iyz="-2.03108206e-06" izz="0.00213532665"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_3">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_3_ak60_39_v3_0_kv80_3d_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_3_ak60_39_v3_0_kv80_3d_2_material">
+        <color rgba="0.537254902 0.537254902 0.537254902 0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_3_ak60_39_v3_0_kv80_3d_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_3_component1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_3_component1_1_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_3_component1_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_3_component2_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_3_component2_1_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_3_component2_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="9.14304394e-05 0.00119280678 0.0592278786" rpy="0 0 0"/>
+      <mass value="0.988570455"/>
+      <inertia ixx="0.000954491506" ixy="-1.41393989e-06" ixz="1.66444059e-06" iyy="0.000992736862" iyz="9.3253737e-06" izz="0.000806531656"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_4">
+    <visual>
+      <origin xyz="0 0.028 -0.0635" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_4_ak60_39_v3_0_kv80_3d_3.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_4_ak60_39_v3_0_kv80_3d_3_material">
+        <color rgba="0.537254902 0.537254902 0.537254902 0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.0635" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_4_ak60_39_v3_0_kv80_3d_3.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0.028 -0.0635" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_4_component1_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_4_component1_2_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.0635" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_4_component1_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0.028 -0.0635" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_4_component3_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_4_component3_1_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.0635" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_4_component3_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="5.04980609e-05 0.0201724602 0.115678417" rpy="0 0 0"/>
+      <mass value="1.10449787"/>
+      <inertia ixx="0.00235991515" ixy="-2.48797789e-06" ixz="-1.41289697e-06" iyy="0.00211546566" iyz="-0.000442018512" izz="0.0011179618"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_5">
+    <visual>
+      <origin xyz="0 0 -0.2205" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_5_component2_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_5_component2_2_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.2205" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_5_component2_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 -0.2205" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_5_component1_3.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_5_component1_3_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.2205" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_5_component1_3.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 -0.2205" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_5_ak60_39_v3_0_kv80_3d_4.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_5_ak60_39_v3_0_kv80_3d_4_material">
+        <color rgba="0.537254902 0.537254902 0.537254902 0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.2205" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_5_ak60_39_v3_0_kv80_3d_4.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="5.64198539e-05 0.00119280678 0.059080007" rpy="0 0 0"/>
+      <mass value="0.988570455"/>
+      <inertia ixx="0.000961662786" ixy="7.36413926e-07" ixz="-2.29792196e-06" iyy="0.000991471353" iyz="1.0002623e-05" izz="0.000798094867"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_6">
+    <visual>
+      <origin xyz="0 0.028 -0.284" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_6_ak60_6_kv80_v3_0_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_6_ak60_6_kv80_v3_0_1_material">
+        <color rgba="0.62745098 0.62745098 0.62745098 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.284" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_6_ak60_6_kv80_v3_0_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0.028 -0.284" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_6_component5_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_6_component5_1_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.284" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_6_component5_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0.028 -0.284" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_6_component7_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_6_component7_1_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.284" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_6_component7_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-3.20414968e-08 -0.00536067324 0.0790402735" rpy="0 0 0"/>
+      <mass value="0.257653626"/>
+      <inertia ixx="0.000992636657" ixy="-4.05710174e-11" ixz="4.13210338e-10" iyy="0.000974534447" iyz="-0.000121775552" izz="0.000189363165"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_7">
+    <visual>
+      <origin xyz="0 0 -0.4405" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_7_ak60_6_kv80_v3_0_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_7_ak60_6_kv80_v3_0_2_material">
+        <color rgba="0.62745098 0.62745098 0.62745098 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.4405" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_7_ak60_6_kv80_v3_0_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 -0.4405" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_7_component6_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_7_component6_1_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.4405" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_7_component6_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 -0.4405" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_7_component5_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_7_component5_2_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.4405" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_7_component5_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-6.30093854e-08 -0.00555982763 0.0363962085" rpy="0 0 0"/>
+      <mass value="0.127495249"/>
+      <inertia ixx="0.000129587312" ixy="3.10027113e-11" ixz="-8.05652839e-11" iyy="0.000155187422" iyz="2.70527587e-05" izz="9.3746509e-05"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_8">
+    <visual>
+      <origin xyz="0 0.028 -0.5045" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_8_ak60_6_kv80_v3_0_3.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_8_ak60_6_kv80_v3_0_3_material">
+        <color rgba="0.62745098 0.62745098 0.62745098 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.5045" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_8_ak60_6_kv80_v3_0_3.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0.028 -0.5045" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_8_component8_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_8_component8_1_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.5045" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_8_component8_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0.028 -0.5045" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_8_component5_4.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_8_component5_4_material">
+        <color rgba="0.960784314 0.960784314 0.964705882 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0.028 -0.5045" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_8_component5_4.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-3.20487653e-08 -0.00565261292 0.0775096692" rpy="0 0 0"/>
+      <mass value="0.257593589"/>
+      <inertia ixx="0.00103205863" ixy="-3.8160689e-11" ixz="4.25850255e-10" iyy="0.00101071477" iyz="-0.000127413969" izz="0.000187288928"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_13">
+    <visual>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_finger_motor_lower_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_13_finger_motor_lower_1_material">
+        <color rgba="0.301960784 0.301960784 0.301960784 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_finger_motor_lower_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_thumb_motor_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_13_thumb_motor_base_1_material">
+        <color rgba="0.301960784 0.301960784 0.301960784 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_thumb_motor_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_bracket_finger_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_13_bracket_finger_base_1_material">
+        <color rgba="0.756862745 0.462745098 0.109803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_bracket_finger_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_gripper_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_13_gripper_base_1_material">
+        <color rgba="0.756862745 0.462745098 0.109803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.6615" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_13_gripper_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0134124534 -0.00662261355 0.0276061023" rpy="0 0 0"/>
+      <mass value="1.69968047"/>
+      <inertia ixx="0.00147555323" ixy="-0.000181125847" ixz="0.000270217094" iyy="0.00233921762" iyz="0.000340447744" izz="0.00253451896"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_16">
+    <visual>
+      <origin xyz="7.40532657e-11 -0.01209 -0.7067" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_16_thumb_motor_lower_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_16_thumb_motor_lower_1_material">
+        <color rgba="0.301960784 0.301960784 0.301960784 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="7.40532657e-11 -0.01209 -0.7067" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_16_thumb_motor_lower_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="7.40532657e-11 -0.01209 -0.7067" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_16_bracket_thumb_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_16_bracket_thumb_base_1_material">
+        <color rgba="0.756862745 0.462745098 0.109803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="7.40532657e-11 -0.01209 -0.7067" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_16_bracket_thumb_base_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.000811325219 0.0130392232 0.015390255" rpy="0 0 0"/>
+      <mass value="0.321295666"/>
+      <inertia ixx="8.09557185e-05" ixy="1.44029882e-06" ixz="-1.21311187e-07" iyy="5.26995906e-05" iyz="-1.50733326e-06" izz="9.37128533e-05"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_14">
+    <visual>
+      <origin xyz="-0.0194 0.0464052609 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_14_finger_motor_upper_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_14_finger_motor_upper_1_material">
+        <color rgba="0.301960784 0.301960784 0.301960784 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0194 0.0464052609 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_14_finger_motor_upper_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.0194 0.0464052609 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_14_bracket_finger_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_14_bracket_finger_1_material">
+        <color rgba="0.756862745 0.462745098 0.109803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0194 0.0464052609 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_14_bracket_finger_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0185310267 -0.000755697726 0.033489651" rpy="0 0 0"/>
+      <mass value="0.317072359"/>
+      <inertia ixx="9.70728984e-05" ixy="-3.09441504e-07" ixz="6.16061175e-07" iyy="0.000116807629" iyz="-4.65948758e-06" izz="5.64293244e-05"/>
+    </inertial>
+  </link>
+  <link name="Rigid_Group_15">
+    <visual>
+      <origin xyz="-0.0189190028 -0.040728878 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_15_thumb_motor_upper_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_15_thumb_motor_upper_1_material">
+        <color rgba="0.301960784 0.301960784 0.301960784 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0189190028 -0.040728878 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_15_thumb_motor_upper_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.0189190028 -0.040728878 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_15_bracket_thumb_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="rigid_group_15_bracket_thumb_1_material">
+        <color rgba="0.756862745 0.462745098 0.109803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0189190028 -0.040728878 -0.722805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/rigid_group_15_bracket_thumb_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0185411427 0.000442540042 0.0334896517" rpy="0 0 0"/>
+      <mass value="0.317072575"/>
+      <inertia ixx="9.7070036e-05" ixy="-2.35420409e-08" ixz="5.3731858e-07" iyy="0.000116812571" iyz="4.66720688e-06" izz="5.64313069e-05"/>
+    </inertial>
+  </link>
+  <link name="finger_tip_left_1">
+    <visual>
+      <origin xyz="-0.0194 0.0464052609 -0.772805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/finger_tip_left_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="finger_tip_left_1_material">
+        <color rgba="0.756862745 0.462745098 0.109803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0194 0.0464052609 -0.772805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/finger_tip_left_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.01875 0.0189777583 0.0266808097" rpy="0 0 0"/>
+      <mass value="0.183069549"/>
+      <inertia ixx="5.44549996e-05" ixy="0" ixz="0" iyy="6.02129855e-05" iyz="-2.34846703e-05" izz="4.57824085e-05"/>
+    </inertial>
+  </link>
+  <link name="finger_tip_right_1">
+    <visual>
+      <origin xyz="-0.0189190028 -0.040728878 -0.772805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/finger_tip_right_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="finger_tip_right_1_material">
+        <color rgba="0.756862745 0.462745098 0.109803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0189190028 -0.040728878 -0.772805852" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/finger_tip_right_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0182690028 -0.0193013754 0.0266808097" rpy="0 0 0"/>
+      <mass value="0.183069549"/>
+      <inertia ixx="5.44549996e-05" ixy="0" ixz="0" iyy="6.02129855e-05" iyz="2.34846703e-05" izz="4.57824084e-05"/>
+    </inertial>
+  </link>
+  <joint name="Revolute_18" type="continuous">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="Rigid_Group_1"/>
+    <child link="Rigid_Group_3"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+  <joint name="Revolute_19" type="continuous">
+    <origin xyz="0 -0.028 0.0635" rpy="0 0 0"/>
+    <parent link="Rigid_Group_3"/>
+    <child link="Rigid_Group_4"/>
+    <axis xyz="0 -1 0"/>
+  </joint>
+  <joint name="Revolute_17" type="continuous">
+    <origin xyz="0 0.028 0.157" rpy="0 0 0"/>
+    <parent link="Rigid_Group_4"/>
+    <child link="Rigid_Group_5"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+  <joint name="Revolute_20" type="continuous">
+    <origin xyz="0 -0.028 0.0635" rpy="0 0 0"/>
+    <parent link="Rigid_Group_5"/>
+    <child link="Rigid_Group_6"/>
+    <axis xyz="0 -1 0"/>
+  </joint>
+  <joint name="Revolute_24" type="continuous">
+    <origin xyz="0 0.028 0.1565" rpy="0 0 0"/>
+    <parent link="Rigid_Group_6"/>
+    <child link="Rigid_Group_7"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+  <joint name="Revolute_22" type="continuous">
+    <origin xyz="0 -0.028 0.064" rpy="0 0 0"/>
+    <parent link="Rigid_Group_7"/>
+    <child link="Rigid_Group_8"/>
+    <axis xyz="0 -1 0"/>
+  </joint>
+  <joint name="Revolute_23" type="continuous">
+    <origin xyz="0 0.028 0.157" rpy="0 0 0"/>
+    <parent link="Rigid_Group_8"/>
+    <child link="Rigid_Group_13"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+  <joint name="Revolute_21" type="continuous">
+    <origin xyz="-7.40532657e-11 0.01209 0.0452" rpy="0 0 0"/>
+    <parent link="Rigid_Group_13"/>
+    <child link="Rigid_Group_16"/>
+    <axis xyz="-2.19077125e-12 -2.19144126e-12 1"/>
+  </joint>
+  <joint name="Revolute_24_2" type="continuous">
+    <origin xyz="0.0194 -0.0464052609 0.061305852" rpy="0 0 0"/>
+    <parent link="Rigid_Group_13"/>
+    <child link="Rigid_Group_14"/>
+    <axis xyz="1 0 0"/>
+  </joint>
+  <joint name="Revolute_22_2" type="continuous">
+    <origin xyz="0.0189190029 0.028638878 0.016105852" rpy="0 0 0"/>
+    <parent link="Rigid_Group_16"/>
+    <child link="Rigid_Group_15"/>
+    <axis xyz="0.999857363 0.01688948 0"/>
+  </joint>
+  <joint name="Revolute_25" type="continuous">
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <parent link="Rigid_Group_14"/>
+    <child link="finger_tip_left_1"/>
+    <axis xyz="1 -1.33437652e-12 0"/>
+  </joint>
+  <joint name="Revolute_23_2" type="continuous">
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <parent link="Rigid_Group_15"/>
+    <child link="finger_tip_right_1"/>
+    <axis xyz="-0.999857363 -0.01688948 0"/>
+  </joint>
+</robot>

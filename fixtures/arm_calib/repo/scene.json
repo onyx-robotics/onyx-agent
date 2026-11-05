@@ -1,0 +1,9 @@
+{
+  "note": "Rough guesses, to be found: where the three tags are, in the arm's base frame (metres; the base is mounted upside down, so its +z points down to the floor). Tags 0 and 1 lie on the floor about under the arm, faces up; tag 2 stands nearby, facing the arm. Size is the black square's edge.",
+  "tags": [
+    { "id": 0, "family": "36h11", "size": 0.1651, "pos": [-0.16, 0.0, 1.045], "rpy": [3.14159, 0, 0] },
+    { "id": 1, "family": "36h11", "size": 0.1651, "pos": [0.05, 0.0, 1.045], "rpy": [3.14159, 0, 0] },
+    { "id": 2, "family": "36h11", "size": 0.1651, "pos": [-0.06, -0.4, 0.85], "rpy": [-1.5708, 0, 0] }
+  ],
+  "camera": { "width": 640, "height": 480, "fovy_deg": 42 }
+}
