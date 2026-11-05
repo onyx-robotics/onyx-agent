@@ -5,9 +5,17 @@
  * the project's endpoints, which runs experiments. Between them it wakes the var-op and resumes
  * workers whose experiments have ended.
  */
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { hostname } from "node:os"
-import { join } from "node:path"
+import { dirname, join, normalize } from "node:path"
 
 import type { RunnerAssignment } from "../generated/contracts/contracts"
 import type { OnyxClient } from "../sdk"
@@ -44,6 +52,11 @@ const LOG_TAIL = 6_000
 /** how often a site's experiments are looked up, and how many looks an end gets for its metrics */
 const SITE_POLL_MS = 3_000
 const SITE_METRIC_LOOKS = 5
+/** a site's experiment's files are downloaded for its worker up to these sizes (bytes) */
+const SITE_FILE_MAX = 20 * 1024 * 1024
+const SITE_FILES_MAX = 100 * 1024 * 1024
+/** the log a site's driver keeps beside a job's own files */
+const SITE_LOG = "_onyx/driver.log"
 
 export function runDirFor(cfg: LoadedConfig) {
   return new RunDir(join(cfg.root, ".onyx-research", slug(cfg.name)))
@@ -162,6 +175,12 @@ export class Supervisor {
   private readonly journal = new Map<string, HeldJob>()
   private outbox: Record<string, unknown>[] = []
   private readonly running = new Map<string, number>()
+  /** worker slots in use: slot -> the task whose turn runs in it. A worker waiting on its
+   * experiments holds none: its slot goes to the next task, and it takes one again to resume */
+  private readonly slots = new Map<string, string>()
+  /** tasks waiting for a slot for their turn: workers with results first, then new tasks, each
+   * in the order they asked */
+  private readonly line: { task: string; first: boolean }[] = []
   private varopBusy = false
   private stopping = false
   private readonly instance = `research-${hostname()}`
@@ -328,16 +347,28 @@ export class Supervisor {
 
   // ------------------------------------------------------------ runner
 
-  /** Each worker slot is a unit of its own (worker-1 …), so a task's slot shows where it ran. */
+  private slotKeys() {
+    return Array.from({ length: this.cfg.workers }, (_, i) => `worker-${i + 1}`)
+  }
+
+  /**
+   * Each worker slot is a unit of its own (worker-1 …), so a task's slot shows where it started.
+   * A slot is free while no worker's turn runs in it, so a worker waiting on an experiment
+   * doesn't keep one; a slot a waiting worker will resume in isn't offered.
+   */
   private units(): { key: string; type: string; name: string; capacity: number; free: number }[] {
     const busy = (k: string) => this.running.get(k) ?? 0
+    const open = this.slotKeys().filter((k) => !this.slots.has(k))
+    const offered = new Set(
+      this.past() ? [] : open.slice(0, Math.max(0, open.length - this.line.length))
+    )
     return [
-      ...Array.from({ length: this.cfg.workers }, (_, i) => ({
-        key: `worker-${i + 1}`,
+      ...this.slotKeys().map((key, i) => ({
+        key,
         type: "agent_worker",
         name: `${hostname()} worker ${i + 1}`,
         capacity: 1,
-        free: this.past() ? 0 : Math.max(0, 1 - busy(`worker-${i + 1}`)),
+        free: offered.has(key) ? 1 : 0,
       })),
       // a site's endpoints are the site's to offer
       ...this.cfg.endpoints
@@ -412,8 +443,12 @@ export class Supervisor {
             unit: a.unit,
             ...(kind === "experiment" ? { props: a.props } : {}),
           })
+          // a task has its slot from now: setting its worker up takes seconds, and a slot still
+          // offered meanwhile would be given a second task (and the platform would show both there)
+          if (kind === "task") this.slots.set(a.unit, a.id)
           const work = kind === "task" ? this.startWorker(a) : this.runExperiment(a)
           void work.catch((e: Error) => {
+            if (this.slots.get(a.unit) === a.id) this.slots.delete(a.unit)
             this.log(`${kind} ${short(a.id)} failed: ${e.message}`)
             this.end(a.id, "failed", { failure: "infra", reason: e.message.slice(0, 900) })
           })
@@ -518,28 +553,67 @@ export class Supervisor {
     w.prompt = await this.firstPrompt(w, h.summary ?? a.summary ?? undefined)
     this.save()
     this.log(`worker ${short(task)} starts: ${h.name ?? a.name}`)
-    await this.workerTurn(task, w.prompt, true)
+    await this.workerTurn(task, w.prompt, true, a.unit)
   }
 
-  private async workerTurn(task: string, prompt: string, fork = false) {
+  /**
+   * A slot for one turn of a task's worker: a new task's is the one it was assigned (held for it
+   * since); a worker under way takes the first free one. A worker already under way (back with its results, nudged, or carrying on after a
+   * restart) goes ahead of every new task in line; and units() offers no slot to the queue while
+   * anyone is in line, so new tasks never take a slot a worker with results is waiting for.
+   */
+  private async takeSlot(task: string, first: boolean, prefer?: string): Promise<string> {
+    // a new task's slot was its own from when it was assigned
+    if (prefer && this.slots.get(prefer) === task) return prefer
+    const at = first ? this.line.findIndex((e) => !e.first) : -1
+    this.line.splice(at < 0 ? this.line.length : at, 0, { task, first })
+    for (;;) {
+      if (this.line[0]?.task === task) {
+        const open = this.slotKeys().filter((k) => !this.slots.has(k))
+        const slot = prefer && open.includes(prefer) ? prefer : open[0]
+        if (slot) {
+          this.line.shift()
+          this.slots.set(slot, task)
+          return slot
+        }
+      }
+      await sleep(500)
+    }
+  }
+
+  private async workerTurn(task: string, prompt: string, fork = false, prefer?: string) {
     const w = this.state.workers[task]!
     w.phase = "running"
     this.save()
-    const r = await runAgent({
-      prompt,
-      model: this.cfg.models.worker,
-      cwd: w.worktree,
-      env: agentEnv(this.run, this.cfg, w.agent, task),
-      resume: fork ? this.state.base.session! : w.session!,
-      fork,
-      addDirs: [w.worktree],
-      log: join(this.run.workerDir(task), "agent.log"),
-      timeoutMs: TURN_MS,
-    })
+    // a new worker is a fork of the base agent; any other turn is a worker under way
+    const slot = await this.takeSlot(task, !fork, prefer)
+    let r: Awaited<ReturnType<typeof runAgent>>
+    try {
+      r = await runAgent({
+        prompt,
+        model: this.cfg.models.worker,
+        cwd: w.worktree,
+        env: agentEnv(this.run, this.cfg, w.agent, task),
+        resume: fork ? this.state.base.session! : w.session!,
+        fork,
+        addDirs: [w.worktree, this.experimentsDir(task)],
+        log: join(this.run.workerDir(task), "agent.log"),
+        timeoutMs: TURN_MS,
+      })
+    } finally {
+      this.slots.delete(slot)
+    }
     if (r.session) w.session = r.session
     w.costUsd += r.costUsd
     this.save()
     await this.afterTurn(task, r.ok ? null : r.text)
+  }
+
+  /** where a worker's site experiments' files are downloaded, one folder per experiment */
+  private experimentsDir(task: string) {
+    const dir = join(this.run.workerDir(task), "experiments")
+    mkdirSync(dir, { recursive: true })
+    return dir
   }
 
   private pendingOf(task: string): string[] {
@@ -553,6 +627,7 @@ export class Supervisor {
     if (this.pendingOf(task).length) {
       w.phase = "waiting"
       this.save()
+      this.log(`worker ${short(task)} waits on its experiment; its slot is free`)
       return
     }
     if (w.nudges < 2 && w.session) {
@@ -609,7 +684,12 @@ export class Supervisor {
     const m = Object.entries(r.metrics)
       .map(([k, v]) => `${k}=${v}`)
       .join(", ")
-    return `Experiment ${r.id} at ${r.commit.slice(0, 10)} on ${r.endpoint}: ${r.outcome}${m ? `; ${m}` : ""}.\nLog (its end):\n${r.logTail}`
+    const files = r.filesDir
+      ? r.files?.length
+        ? `\nIts files (its log is ${SITE_LOG}), downloaded to ${r.filesDir}:\n${r.files.map((f) => `- ${f}`).join("\n")}`
+        : `\nIt left no files.`
+      : ""
+    return `Experiment ${r.id} at ${r.commit.slice(0, 10)} on ${r.endpoint}: ${r.outcome}${m ? `; ${m}` : ""}.${files}\nLog (its end):\n${r.logTail}`
   }
 
   // ------------------------------------------------------------ endpoints
@@ -724,7 +804,7 @@ export class Supervisor {
     const props = item.props ?? {}
     // what the site reported goes back to the worker: its metrics, and, from a driver that sends
     // them as props, numbers the registry doesn't declare (`results`) and its log's end
-    // (`log_tail`). The job's files, its full log included, stay on the site for now
+    // (`log_tail`); and its files, downloaded from the site for the worker to read, its log among them
     const metrics: Record<string, number> = {}
     const results = props.results
     if (results && typeof results === "object")
@@ -735,10 +815,24 @@ export class Supervisor {
     // the end can be visible a moment before the fold records its results: look again a few times
     const looks = (seen.get(id) ?? 0) + 1
     seen.set(id, looks)
-    if (ok && !Object.keys(metrics).length && !props.log_tail && looks < SITE_METRIC_LOOKS) return
+    const listed = await this.onyx.jobFiles(id).catch((e: Error) => {
+      this.log(`experiment ${short(id)}: its files: ${e.message}`)
+      return { files: [] }
+    })
+    if (
+      ok &&
+      !Object.keys(metrics).length &&
+      !props.log_tail &&
+      !listed.files.length &&
+      looks < SITE_METRIC_LOOKS
+    )
+      return
     seen.delete(id)
     const why = ok ? "" : `${job.failure ?? "failed"}: ${job.reason ?? "no reason given"}`
-    const tail = typeof props.log_tail === "string" ? props.log_tail : ""
+    const filesDir = join(this.experimentsDir(task), short(id))
+    const files = await this.download(id, listed.files, filesDir)
+    const log = files.includes(SITE_LOG) ? readFileSync(join(filesDir, SITE_LOG), "utf8") : ""
+    const tail = typeof props.log_tail === "string" && props.log_tail ? props.log_tail : log
     this.state.results[id] = {
       id,
       task,
@@ -748,10 +842,49 @@ export class Supervisor {
       outcome: job.outcome,
       metrics,
       logTail: (why ? `${why}\n` : "") + tail.slice(-LOG_TAIL),
+      filesDir,
+      files,
       endedAt: Date.now(),
     }
     this.save()
-    this.log(`experiment ${short(id)} ended on a site: ${job.outcome} ${JSON.stringify(metrics)}`)
+    this.log(
+      `experiment ${short(id)} ended on a site: ${job.outcome} ${JSON.stringify(metrics)}, ${files.length} files`
+    )
+  }
+
+  /**
+   * A site's experiment's files, from the site's file server through the links the platform signs,
+   * into dir: what it downloaded, by path. A file too large, or past the total, is left on the site
+   * and listed as such.
+   */
+  private async download(
+    id: string,
+    list: { path: string; sizeBytes: number | null; url: string }[],
+    dir: string
+  ): Promise<string[]> {
+    const got: string[] = []
+    let total = 0
+    for (const f of list) {
+      const path = normalize(f.path)
+      if (path.startsWith("..") || path.startsWith("/")) continue
+      const size = f.sizeBytes ?? 0
+      if (size > SITE_FILE_MAX || total + size > SITE_FILES_MAX) {
+        got.push(`${path} (${Math.round(size / 1024)} KB: left on the site, too large)`)
+        continue
+      }
+      try {
+        const res = await fetch(f.url)
+        if (!res.ok) throw new Error(`the site answered ${res.status}`)
+        const body = Buffer.from(await res.arrayBuffer())
+        mkdirSync(dirname(join(dir, path)), { recursive: true })
+        writeFileSync(join(dir, path), body)
+        total += body.length
+        got.push(path)
+      } catch (e) {
+        this.log(`experiment ${short(id)}: couldn't download ${path}: ${(e as Error).message}`)
+      }
+    }
+    return got
   }
 
   // ------------------------------------------------------------ the var-op
@@ -765,7 +898,15 @@ export class Supervisor {
       this.log(`board.json: ${(e as Error).message}`)
       return 0
     }
-    return b.hypotheses.filter((h) => this.state.workers[h.task]?.phase !== "done").length
+    // the ones that want a slot: queued, or a worker working. One waiting on its experiments has none
+    return b.hypotheses.filter((h) => {
+      const phase = this.state.workers[h.task]?.phase
+      return phase !== "done" && phase !== "waiting"
+    }).length
+  }
+
+  private waitingWorkers(): number {
+    return Object.values(this.state.workers).filter((w) => w.phase === "waiting").length
   }
 
   private async varopLoop() {
@@ -803,7 +944,7 @@ export class Supervisor {
       prompt = varopPrompt(this.cfg, Math.round((this.state.deadline - Date.now()) / 60_000))
     } else {
       const parts: string[] = [
-        `${Math.max(0, Math.round((this.state.deadline - Date.now()) / 60_000))} minutes of proposing left; ${this.activeHypotheses()} hypotheses queued or running for ${this.cfg.workers} slots.`,
+        `${Math.max(0, Math.round((this.state.deadline - Date.now()) / 60_000))} minutes of proposing left; ${this.activeHypotheses()} hypotheses queued or being worked on for ${this.cfg.workers} slots, and ${this.waitingWorkers()} workers waiting on experiments (a waiting worker gives up its slot, and takes one again when its results come).`,
       ]
       for (const task of seen) {
         const w = this.state.workers[task]

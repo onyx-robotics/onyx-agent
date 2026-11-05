@@ -36,6 +36,9 @@ export interface ExperimentResult {
   outcome: string | null
   metrics: Record<string, number>
   logTail: string
+  /** a site's experiment: where its files were downloaded to, and their paths in it */
+  filesDir?: string
+  files?: string[]
   endedAt: number
 }
 
