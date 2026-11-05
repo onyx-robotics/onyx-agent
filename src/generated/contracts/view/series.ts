@@ -93,48 +93,61 @@ export const seriesText = z
   )
 export type SeriesText = z.output<typeof seriesText>
 
-export const laneSeries = z.strictObject({
-  /** stable in the workspace: pins and the list beside the lanes name it */
-  id: seriesKey,
-  /** its name; none: its conditions and dimension in words */
-  label: z.string().trim().min(1).max(80).optional(),
-  /** its conditions: every `all` ref, and one of each `any` group */
-  where: viewWhere
-    .refine((w) => refCount(w) <= MAX_LANE_REFS, `a series has at most ${MAX_LANE_REFS} conditions`)
-    .default({ all: [], any: [] }),
-  /** split by: a lane per value; none: its total lane alone */
-  by: dim.optional(),
-  /** each value split again by another dim (pairs); `closed`: values whose pairs are folded */
-  then: z.strictObject({ dim, closed: z.array(uuid).max(500).default([]) }).optional(),
-  /** hierarchy values of `by` opened in place: their children's lanes under them */
-  expanded: z.array(uuid).max(EXPANDED_MAX).default([]),
-  /** its busiest values shown */
-  limit: z.number().int().min(1).max(500).default(SERIES_LIMIT),
-  /**
-   * what its lanes' bars show (the page's; not counted): volume (absent), on a scale its values
-   * share; shape, each lane on its own; share, each lane's fraction of its whole
-   */
-  mode: z.enum(["shape", "share"]).optional(),
-  /** counted and shown; a closed series is its header */
-  open: z.boolean().default(true),
-  /** what its text bar says (none: it's empty) */
-  text: seriesText.optional(),
-  /**
-   * a plot of its items in place of its lanes (docs/inline-plots-design.md; none: its lanes): in
-   * the URL with the series, and saved with it when it's pinned
-   */
-  plot: plotState.optional(),
-  /**
-   * a graph of its items and their relations in place of its lanes (docs/graph-design.md; none:
-   * its lanes, or its plot): in the URL with the series, saved with it when it's pinned
-   */
-  graph: graphState.optional(),
-  /**
-   * its time axis is synced with every series' of the same key: they show one time window (none:
-   * its own; `windowKeys`)
-   */
-  synced: seriesKey.optional(),
-})
+export const laneSeries = z
+  .strictObject({
+    /** stable in the workspace: pins and the list beside the lanes name it */
+    id: seriesKey,
+    /** its name; none: its conditions and dimension in words */
+    label: z.string().trim().min(1).max(80).optional(),
+    /** its conditions: every `all` ref, and one of each `any` group */
+    where: viewWhere
+      .refine(
+        (w) => refCount(w) <= MAX_LANE_REFS,
+        `a series has at most ${MAX_LANE_REFS} conditions`
+      )
+      .default({ all: [], any: [] }),
+    /** split by: a lane per value; none: its total lane alone */
+    by: dim.optional(),
+    /** each value split again by another dim (pairs); `closed`: values whose pairs are folded */
+    then: z.strictObject({ dim, closed: z.array(uuid).max(500).default([]) }).optional(),
+    /** hierarchy values of `by` opened in place: their children's lanes under them */
+    expanded: z.array(uuid).max(EXPANDED_MAX).default([]),
+    /** its busiest values shown */
+    limit: z.number().int().min(1).max(500).default(SERIES_LIMIT),
+    /**
+     * what its lanes' bars show (the page's; not counted): volume (absent), on a scale its values
+     * share; shape, each lane on its own; share, each lane's fraction of its whole
+     */
+    mode: z.enum(["shape", "share"]).optional(),
+    /** counted and shown; a closed series is its header */
+    open: z.boolean().default(true),
+    /** what its text bar says (none: it's empty) */
+    text: seriesText.optional(),
+    /**
+     * a plot of its items in place of its lanes (docs/inline-plots-design.md; none: its lanes): in
+     * the URL with the series, and saved with it when it's pinned
+     */
+    plot: plotState.optional(),
+    /**
+     * a graph of its items and their relations in place of its lanes (docs/graph-design.md; none:
+     * its lanes, or its plot): in the URL with the series, saved with it when it's pinned
+     */
+    graph: graphState.optional(),
+    /**
+     * an older address' or document's series drawn as tracks: now its graph's tree (read in, never
+     * written: docs/tree-design.md, "Migration")
+     */
+    tracks: z.unknown().optional(),
+    /**
+     * its time axis is synced with every series' of the same key: they show one time window (none:
+     * its own; `windowKeys`)
+     */
+    synced: seriesKey.optional(),
+  })
+  .transform(({ tracks, ...s }) =>
+    // a series once drawn as tracks is graphed as a tree (under a plot, the plot shows)
+    tracks !== undefined && !s.graph && !s.plot ? { ...s, graph: graphState.parse({}) } : s
+  )
 export type Series = z.output<typeof laneSeries>
 export type SeriesInput = z.input<typeof laneSeries>
 
@@ -487,6 +500,12 @@ export function editSeries(
 }
 
 /** A series of conditions, split by `by` (none: its total lane alone). */
+/**
+ * What a new series split by is graphed as a tree by default (docs/tree-design.md: its ideas
+ * branching off each of its values).
+ */
+export const TREE_FIRST = new Set(["goal", "campaign"])
+
 export function makeSeries(
   id: string,
   where: ViewWhereInput = {},
@@ -498,6 +517,7 @@ export function makeSeries(
     where: canonicalWhere(where),
     ...(by ? { by } : {}),
     ...(label ? { label } : {}),
+    ...(by && TREE_FIRST.has(by) ? { graph: {} } : {}),
   })
 }
 
@@ -733,22 +753,26 @@ export const unpinSeries = (pinned: readonly Series[], id: string): Series[] =>
 
 /**
  * What the page lists beside the lanes (none: every item): a series' lanes (its header), its
- * total, one of its lanes; or a lane named by its conditions (an older link's).
+ * total, one of its lanes, or a node of its graph's tree (its values from the origin, one per
+ * split: docs/tree-design.md); or a lane named by its conditions (an older link's).
  */
 export const seriesFocus = z.union([
-  z.strictObject({
-    series: seriesKey,
-    lane: z
-      .union([
-        z.literal("total"),
-        z.strictObject({
-          value: uuid,
-          pair: uuid.optional(),
-          direct: z.literal(true).optional(),
-        }),
-      ])
-      .optional(),
-  }),
+  z
+    .strictObject({
+      series: seriesKey,
+      lane: z
+        .union([
+          z.literal("total"),
+          z.strictObject({
+            value: uuid,
+            pair: uuid.optional(),
+            direct: z.literal(true).optional(),
+          }),
+        ])
+        .optional(),
+      path: z.array(uuid).min(1).max(4).optional(),
+    })
+    .refine((f) => !(f.lane && f.path), "a focus is a lane or a tree's node, not both"),
   z.strictObject({ where: viewWhere }),
 ])
 export type SeriesFocus = z.output<typeof seriesFocus>

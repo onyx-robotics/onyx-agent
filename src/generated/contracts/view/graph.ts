@@ -29,6 +29,18 @@ export const graphState = z.strictObject({
   groupBy: z.string().min(1).max(220).nullable().default(null),
   /** how it's laid out: as a tree growing from the series' split, or by its relations' pull alone */
   layout: z.enum(["branches", "force"]).default("branches"),
+  /**
+   * what its tree splits by, left to right from its origin (docs/tree-design.md; none: what its
+   * lanes are split by, then ideas)
+   */
+  splits: z
+    .array(z.string().min(1).max(100))
+    .min(1)
+    .max(4)
+    .refine((d) => new Set(d).size === d.length, "a tree splits by a dimension once")
+    .optional(),
+  /** its tree as it was at this time (epoch ms; none: as it is now) */
+  asOf: z.number().int().positive().nullable().default(null),
   /** given the table's height (as a plot is); otherwise a row of its card */
   expanded: z.boolean().default(false),
 })

@@ -6,6 +6,7 @@ import { z } from "zod"
 
 import { GRAPH_ITEMS, GRAPH_ITEMS_MAX } from "../view/graph"
 import { nodeRef, viewSpec } from "../view/spec"
+import { TREE_LEVEL_MAX, TREE_MIN_RUNS, TREE_SPLITS_MAX } from "../view/tree-graph"
 import { plotPick, plotScope } from "./plots"
 
 const uuid = z.string().uuid()
@@ -64,6 +65,32 @@ export const flowQuery = z.strictObject({
   done: z.number().int().min(1).max(200).default(100),
 })
 export type FlowQueryInput = z.input<typeof flowQuery>
+
+/**
+ * A series' graph as a tree (docs/tree-design.md): its runs counted at every path of its splits
+ * (`compileTreeGraph`: its counts' spec, its total lane and a group per split, in order).
+ */
+export const treeGraphQuery = z.strictObject({
+  spec: viewSpec,
+  total: z.string().min(1),
+  levels: z.array(z.string().min(1)).min(1).max(TREE_SPLITS_MAX),
+  /** a path's fewest runs to be counted apart (fewer: its parent's other) */
+  min: z.number().int().min(1).max(1000).default(TREE_MIN_RUNS),
+})
+export type TreeGraphQueryInput = z.input<typeof treeGraphQuery>
+
+/** What's in flight at each node of a tree, and what's known of the values its paths name. */
+export const treeGraphQueueQuery = z.strictObject({
+  /** its queue's spec (`compileTreeGraph`), its total lane and a group per split */
+  spec: viewSpec,
+  total: z.string().min(1),
+  levels: z.array(z.string().min(1)).min(1).max(TREE_SPLITS_MAX),
+  /** the values its paths name (entity ids): whether each is closed, and since when */
+  values: z.array(z.guid()).max(TREE_LEVEL_MAX).default([]),
+  /** how many of each one's in flight to name */
+  head: z.number().int().min(1).max(20).default(5),
+})
+export type TreeGraphQueueQueryInput = z.input<typeof treeGraphQueueQuery>
 
 /** What a flow's new items are, past what a delta says. */
 export const flowItemsQuery = z.strictObject({ ids: z.array(z.guid()).min(1).max(200) })
