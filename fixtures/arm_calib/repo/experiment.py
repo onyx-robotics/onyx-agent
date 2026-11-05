@@ -1,6 +1,6 @@
 """The experiment: run calibrate.py on the arm, and record the calibration it finds.
 
-    python3 experiment.py        # with ARM_SOCKET set: by the endpoint, or the quick evaluation
+    python3 experiment.py        # by the endpoint, with ARM_SOCKET set
 
 `calibrate.calibrate(arm, scene)` drives the arm (through arm.py), looks at the AprilTags
 through the gripper's camera, and returns `{"calibration": {...}, "report": {...}}` (README.md,

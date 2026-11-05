@@ -5,7 +5,7 @@ The Onyx arm behind its joint server, run by a site. Two endpoints reach it the 
 - **`arm.sim`**: the arm in MuJoCo behind the real joint server (`joint_server.py --sim`), a fresh one at home for each experiment.
 - **`arm.real`**: the real arm, on its Orin, through its sandbox: your experiment runs in a fresh container whose only way to the arm is the joint server, so only within its limits. The arm is sent home before and after each experiment. One experiment at a time; others queue.
 
-The quick evaluation runs on a sim arm of your own. The sim isn't the real arm (its gravity, friction and timing differ), so treat what it tells you as a check that your code runs, and the endpoint's numbers as the measurement.
+Experiments run only on these endpoints, sent through the queue: don't run the sim, a joint server or `experiment.py` yourself. The quick evaluation only checks that `controller.py` compiles. The sim isn't the real arm either (its gravity, friction and timing differ): compare the two endpoints' numbers, not one with the other's.
 
 - **Packet:** the commit. The site runs `python3 experiment.py` from your commit's root (or the script your experiment's packet names), with `ARM_SOCKET` set: talk to the arm only through `arm.py` (`arm.get`, `arm.post`), the joint server's HTTP API. The standard library and numpy are there; nothing else is.
 - **What comes back:** everything the script prints (the end of it as the log), every number on its `METRICS {json}` lines, and files it writes to `$ONYX_OUT`. The site judges nothing; a script that exits non-zero fails the experiment, with the end of its output as the reason.

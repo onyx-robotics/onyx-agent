@@ -14,6 +14,12 @@ The arm (7 CubeMars joints, mounted upside down under a table, pointing down) ha
 
 `experiment.py` (the experiment), `arm.py` and `docs/` are fixed.
 
+## Where it runs
+
+Only on the endpoints: `arm.sim` (the arm in MuJoCo) and `arm.real` (the real arm), as experiments sent through the queue. Don't run the sim, a joint server or `experiment.py` yourself: a run that isn't an experiment is lost to everyone else, and it slows the site's own sims.
+
+The quick evaluation only checks that `calibrate.py` compiles and `scene.json` parses. Print what you'll want to know from an experiment: its log comes back to you.
+
 ## What a calibration is
 
 ```json

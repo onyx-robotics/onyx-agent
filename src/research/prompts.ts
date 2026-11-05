@@ -25,6 +25,12 @@ export const STATE_TEMPLATE = `## Hypothesis and verdict
 ## Doubts
 (what you didn't check, what could be noise, what you're unsure of)`
 
+/** Experiments run on the endpoints, through the queue, and nowhere else: an agent running an
+ * endpoint's work itself (a simulator, a rig's server, the experiment) measures what no one else
+ * sees, and takes the machine from the site. */
+const ENDPOINTS_ONLY =
+  "Experiments run only on the endpoints, sent through the queue. Never run an endpoint's work yourself: not its simulator, its hardware's server, or the experiment itself. A run that isn't an experiment is lost to the rest of the run, and it takes the machine from the site."
+
 export function basePrompt(c: LoadedConfig): string {
   return `You are the base agent of an autoresearch run on this repository.
 
@@ -37,6 +43,7 @@ After this message, the other agents of the run are made as copies of you: a var
 1. Read the code. Workers may edit only: ${c.editable.join(", ")}. Read what calls it and what it depends on.
 2. Read how results are measured: the quick evaluation (\`${c.evaluate}\`, run from the repository's root; run it once and read its output) and the endpoints, where experiments run:
 ${endpointsList(c)}
+   ${ENDPOINTS_ONLY}
 3. Record the aspects of the system experiments will be about: 3 to 8 parts or properties of it (an algorithm's stage, a data structure, a numerical method, a resource like memory), each with:
    onyx research aspect "<short name>" "<one line: what it is and why it matters for the goal>"
 
@@ -89,8 +96,10 @@ Your worktree is ${w.worktree}, a branch at commit ${w.baseCommit}. Work only th
 ${w.cited ? `It builds on these insights:\n${w.cited}\n\n` : ""}${w.related ? `Related insights from the knowledge graph (yours to use or ignore; \`onyx research ask <id> "<question>"\` asks their author):\n${w.related}\n\n` : ""}Endpoints, where experiments run:
 ${endpointsList(c)}
 
+${ENDPOINTS_ONLY}
+
 How to work:
-1. Implement the hypothesis. Run the quick evaluation in your worktree before you submit: \`cd ${w.worktree} && ${c.evaluate}\`. Fix what it reports.
+1. Implement the hypothesis. Run the quick evaluation in your worktree before you submit: \`cd ${w.worktree} && ${c.evaluate}\`. Fix what it reports. It only checks the commit is ready to send; it doesn't measure it.
 2. Ask for what you'll need to know: print what you want to see from the run (timings of stages, intermediate values); the endpoint's log comes back to you.
 3. Submit: \`onyx research experiment --endpoint <type> -m "<what this experiment tests>"\`. It commits your worktree and queues the experiment. Then END YOUR TURN: you'll be resumed with the result and its log. You have ${c.experimentsPerTask} experiments for this hypothesis.
 4. Don't stop at the first result. A near miss (much faster but invalid on a few instances, or valid but no faster) is the moment to iterate: read the failures in the log, fix them, and submit again. Stop early only when the hypothesis is clearly refuted.

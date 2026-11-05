@@ -14,7 +14,7 @@
 #   with forward slashes: a backslash is an escape in TOML).
 #   joint_server.py must be serving on the Orin's sandbox socket (python/onyx_arm/README.md).
 # - both: the two endpoints in one run; workers choose one for each experiment.
-# Whichever, a worker's quick evaluation runs on a sim arm of its own.
+# Whichever, a worker's quick evaluation only compiles controller.py: experiments run on the endpoints.
 #
 # Needs ONYX_ROOT (the onyx checkout, with python/onyx_arm synced: uv sync --extra sim). Then:
 #   bun run research:dev -- --org <org> --pack onyx-agent/fixtures/arm/pack.yaml \
@@ -99,11 +99,11 @@ cp "$here/task.json" "$dir/arm/onyx/endpoints/task.json"
 cat > "$dir/arm/onyx/research.json" <<JSON
 {
   "name": "arm-poses-$which-$(date +%Y%m%d-%H%M)",
-  "goal": "Make controller.py move the Onyx arm through the task's poses (onyx/endpoints/task.json) as fast as possible, measured as arm.total_time_s on the $measured endpoint (onyx/endpoints/arm.md), reaching every pose, without tripping a motor's current limit. The controller only talks to the arm through arm.py. The quick evaluation runs on a sim arm, which is not the real one: check what it tells you against the endpoint.",
+  "goal": "Make controller.py move the Onyx arm through the task's poses (onyx/endpoints/task.json) as fast as possible, measured as arm.total_time_s on the $measured endpoint (onyx/endpoints/arm.md), reaching every pose, without tripping a motor's current limit. The controller only talks to the arm through arm.py. Every timing is an experiment on an endpoint: never run the sim yourself.",
   "remote": "../remote.git",
   "baseBranch": "main",
   "editable": ["controller.py"],
-  "evaluate": "$uv run --quiet --project $arm --extra sim python -m onyx_arm.sim_run -- python3 experiment.py",
+  "evaluate": "python3 -m py_compile controller.py && echo ok",
   "metrics": [
     { "key": "arm.total_time_s", "better": "lower" },
     { "key": "arm.poses_done", "better": "higher" }

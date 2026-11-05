@@ -63,11 +63,11 @@ fi
 cat > "$dir/calib/onyx/research.json" <<JSON
 {
   "name": "arm-calibration-$(date +%Y%m%d-%H%M)",
-  "goal": "Calibrate the Onyx arm from the three AprilTags its gripper camera can see (README.md): find its camera mount's offset and rotation, each joint's zero offset, and the tags' poses, with as little error and as much confidence as possible. Change calibrate.py (the method) and scene.json (where the tags are believed to be). Some of you should find where the tags really are, on the real arm when it's an endpoint, and put it in scene.json, which is how the sim learns the real world. On the sim, calib.joint_err_deg and calib.camera_err_mm are the honest scores (against a truth no job sees); a calibration's own sigmas should match its errors.",
+  "goal": "Calibrate the Onyx arm from the three AprilTags its gripper camera can see (README.md): find its camera mount's offset and rotation, each joint's zero offset, and the tags' poses, with as little error and as much confidence as possible. Change calibrate.py (the method) and scene.json (where the tags are believed to be). Some of you should find where the tags really are, on the real arm when it's an endpoint, and put it in scene.json, which is how the sim learns the real world. On the sim, calib.joint_err_deg and calib.camera_err_mm are the honest scores (against a truth no job sees); a calibration's own sigmas should match its errors. Every run of calibrate.py on an arm is an experiment on an endpoint: never run the sim yourself.",
   "remote": "../remote.git",
   "baseBranch": "main",
   "editable": ["calibrate.py", "scene.json"],
-  "evaluate": "$uv run --quiet --project $arm --extra sim python -m onyx_arm.sim_run --scene scene.json --camera -- python3 experiment.py",
+  "evaluate": "python3 -m py_compile calibrate.py && python3 -m json.tool scene.json > /dev/null && echo ok",
   "metrics": [
     { "key": "calib.joint_err_deg", "better": "lower" },
     { "key": "calib.camera_err_mm", "better": "lower" },
