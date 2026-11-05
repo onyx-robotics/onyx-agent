@@ -31,6 +31,7 @@ export async function runGreedy(cfgPath: string, argv: string[]) {
   const margin = Number(o.margin ?? 0.03)
   const metric = cfg.metrics[0]!
   const ep = cfg.endpoints[0]!
+  if (ep.site) throw new Error(`greedy runs its endpoint's driver itself; ${ep.type} is a site's`)
   const better = (a: number, b: number) =>
     metric.better === "higher" ? a > b * (1 + margin) : a < b * (1 - margin)
 

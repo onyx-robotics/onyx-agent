@@ -427,6 +427,10 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
             branch: w.branch,
             base_commit: w.baseCommit,
             packet: o.packet ?? null,
+            endpoint: ep.type,
+            // what a site fetches (python/site-runner, "Writing a driver"); the ref for remotes
+            // that refuse fetching by sha
+            git: { url: e.cfg.remote, commit, ref: w.branch },
           },
           links: [
             { rel: "tests", dst: w.hypothesis },

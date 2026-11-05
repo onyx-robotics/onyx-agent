@@ -1,0 +1,34 @@
+# The Onyx arm as research endpoints, each run by a site (docs/research.md, "Setup"): the arm in
+# MuJoCo, and the real one through its Orin's sandbox. A project runs the same experiment on either.
+key: arm
+version: 1
+label: Onyx arm
+description: The Onyx arm behind its joint server, as research endpoints a site runs.
+requires: [research]
+
+types:
+  - key: arm.sim
+    kind: asset
+    parent: research_endpoint
+    label: Sim arm
+    description: The real joint_server.py driving the MuJoCo arm; runs an experiment's script against it.
+  - key: arm.real
+    kind: asset
+    parent: research_endpoint
+    label: Real arm
+    description: The Onyx arm, through its Orin's sandbox (python/onyx_arm, "Agent sandbox"); sent home before and after each experiment.
+
+# What the example project's experiment.py measures (fixtures/arm/repo).
+properties:
+  - key: arm.total_time_s
+    label: Total time
+    type: number
+    unit: s
+    metric: true
+    better: lower
+    description: From the first move until the last pose of the task has held.
+  - key: arm.poses_done
+    label: Poses reached
+    type: number
+    metric: true
+    better: higher
