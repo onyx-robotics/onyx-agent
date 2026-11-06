@@ -125,15 +125,26 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
       const s = e.run.state()
       const lines: string[] = []
       const left = Math.max(0, Math.round((s.deadline - Date.now()) / 60_000))
-      lines.push(`${left} minutes of proposing left. ${e.cfg.workers} worker slots.`)
+      // only a turn running holds a slot: a worker waiting on its experiments holds none
+      const workers = Object.values(s.workers)
+      const inSlots = workers.filter((w) => w.phase === "running" || w.phase === "starting").length
+      const backInLine = workers.filter((w) => w.phase === "queued").length
+      const waiting = workers.filter((w) => w.phase === "waiting").length
+      const queuedNew = b.hypotheses.filter((h) => !s.workers[h.task]).length
+      const free = Math.max(0, e.cfg.workers - inSlots - backInLine - queuedNew)
+      lines.push(
+        `${left} minutes of proposing left. ${e.cfg.workers} worker slots: ${inSlots} running a turn now, ${backInLine} workers back in line for one, ${queuedNew} new hypotheses queued; ${waiting} workers waiting on experiments hold no slot.${free ? ` ${free} slots will sit idle: queue at least ${free} more hypotheses.` : ""}`
+      )
       const taskState = (task: string) => {
         const w = s.workers[task]
         return w
           ? w.phase === "done"
             ? "done"
             : w.phase === "waiting"
-              ? "running (waiting on an experiment)"
-              : "running"
+              ? "waiting on an experiment (holds no slot)"
+              : w.phase === "queued"
+                ? "back in line for a slot, with its results"
+                : "running a turn in a slot"
           : "queued"
       }
       lines.push("\n## Tracks")
@@ -412,7 +423,7 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
       const pending = e.run.read<string[]>(`workers/${task}/pending.json`) ?? []
       const done = w.experiments.length + pending.length
       if (done >= e.cfg.experimentsPerTask)
-        return `You've used all ${e.cfg.experimentsPerTask} experiments for this hypothesis. Record your insights and finish.`
+        return `You've reached the run's ceiling of ${e.cfg.experimentsPerTask} experiments for one hypothesis. Record your insights, including what you'd test next and why, and finish: the var-op can give a follow-up its own hypothesis.`
       const commit = commitAndPush(w.worktree, w.branch, o.m)
       const id = e.onyx.newId()
       await e.onyx.submitJobs([

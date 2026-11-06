@@ -17,6 +17,8 @@ export interface AgentRun {
   fork?: boolean
   addDirs?: string[]
   timeoutMs?: number
+  /** cuts the turn short, as the timeout would (a supervisor stopping) */
+  signal?: AbortSignal
   /** where its output goes, appended */
   log: string
 }
@@ -26,10 +28,14 @@ export interface AgentResult {
   text: string
   costUsd: number
   ok: boolean
+  /** cut short by `signal`: the turn didn't end, it was stopped */
+  aborted: boolean
 }
 
 /** the tools an agent has: the codebase, a shell (its own commands and onyx research), nothing else */
 const TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
+/** after an agent exits, how long its output is read for (a command it started may hold it open) */
+const OUTPUT_GRACE_MS = 3_000
 
 export async function runAgent(a: AgentRun): Promise<AgentResult> {
   const args = [
@@ -58,12 +64,20 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
     stderr: "pipe",
   })
   const timer = a.timeoutMs ? setTimeout(() => proc.kill(), a.timeoutMs) : null
-  const [out, err] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ])
+  const stop = () => proc.kill()
+  if (a.signal?.aborted) stop()
+  else a.signal?.addEventListener("abort", stop, { once: true })
+  const output = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
   await proc.exited
+  // a command the agent started may outlive it and hold its output open: once the agent has
+  // exited, what it wrote is there, so don't wait on the command for more
+  const [out, err] = await Promise.race([
+    output,
+    new Promise<[string, string]>((done) => setTimeout(() => done(["", ""]), OUTPUT_GRACE_MS)),
+  ])
   if (timer) clearTimeout(timer)
+  a.signal?.removeEventListener("abort", stop)
+  const aborted = a.signal?.aborted ?? false
   appendFileSync(a.log, `${out}\n${err ? `stderr: ${err}\n` : ""}`)
   try {
     const r = JSON.parse(out) as {
@@ -77,8 +91,9 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
       text: r.result ?? "",
       costUsd: r.total_cost_usd ?? 0,
       ok: !r.is_error && proc.exitCode === 0,
+      aborted,
     }
   } catch {
-    return { session: null, text: err || out, costUsd: 0, ok: false }
+    return { session: null, text: err || out, costUsd: 0, ok: false, aborted }
   }
 }

@@ -295,6 +295,21 @@ export class OnyxClient {
     return this.request<Record<string, unknown>>("GET", `/jobs/${id}`)
   }
 
+  /** A job's files, on the site that ran it: each with a link to download it (good for minutes). */
+  jobFiles(id: string) {
+    return this.request<{
+      files: {
+        locator: string
+        path: string
+        contentHash: string | null
+        sizeBytes: number | null
+        mediaType: string | null
+        url: string
+        expiresAt: string
+      }[]
+    }>("GET", `/jobs/${id}/files`)
+  }
+
   cancelJobs(ids: string[], reason?: string) {
     return this.request<{ jobs: { id: string; state: string }[] }>("POST", "/jobs/cancel", {
       ids,

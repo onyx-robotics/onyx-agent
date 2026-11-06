@@ -1,6 +1,6 @@
 """The experiment: time controller.py through the task's poses, measured through the arm's API.
 
-    python3 experiment.py        # with ARM_SOCKET set: by the endpoint, or the quick evaluation
+    python3 experiment.py        # by the endpoint, with ARM_SOCKET set
 
 For each pose in onyx/endpoints/task.json, in order, it calls `controller.move_to(pose)`,
 then checks the pose from the arm's status: every joint within `tolerance_deg` of it and

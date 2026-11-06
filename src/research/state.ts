@@ -7,17 +7,33 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { join } from "node:path"
 
 export interface WorkerState {
+  /** the worker's id: the var-op's worker_task, its first turn */
   task: string
   attempt: number
   hypothesis: string
+  /** the hypothesis's title, for its later turns' jobs */
+  title?: string
   /** the worker's ai_agent entity */
   agent: string
   session: string | null
   worktree: string
   branch: string
   baseCommit: string
-  /** running: its session is working; waiting: on experiments; done: reported */
-  phase: "starting" | "running" | "waiting" | "done"
+  /**
+   * running: a turn of its session runs in a slot; waiting: on experiments, holding no slot;
+   * queued: its experiments have ended and its next turn is a job in line for a slot; done: reported
+   */
+  phase: "starting" | "running" | "waiting" | "queued" | "done"
+  /**
+   * Each turn is a worker_task job, holding its slot only while the turn runs (docs/research.md,
+   * "Worker turns"): the job of the turn running now, or of the one queued. The first is `task`.
+   */
+  turnJob?: string | null
+  /** turns started so far */
+  turns?: number
+  /** a queued turn's first message, and whether its job has reached the platform */
+  nextPrompt?: string
+  submitted?: boolean
   /** experiments it has submitted that haven't been shown to it yet */
   pending: string[]
   experiments: string[]
@@ -36,6 +52,9 @@ export interface ExperimentResult {
   outcome: string | null
   metrics: Record<string, number>
   logTail: string
+  /** a site's experiment: where its files were downloaded to, and their paths in it */
+  filesDir?: string
+  files?: string[]
   endedAt: number
 }
 
@@ -51,6 +70,8 @@ export interface RunState {
   results: Record<string, ExperimentResult>
   /** tasks that ended since the var-op last looked */
   unseen: string[]
+  /** what workers said at the end of a turn (mid-hypothesis), since the var-op last looked */
+  turnNotes?: { task: string; turn: number; text: string }[]
   /**
    * The runner's journal: every job it holds (docs/jobs.md, "The runner's protocol"). Kept here
    * so a supervisor that restarts says it still holds them, and carries them on, rather than
@@ -64,6 +85,8 @@ export interface HeldJob {
   kind: "task" | "experiment"
   /** the unit it occupies: a worker slot (worker-1 …) or an endpoint's type */
   unit: string
+  /** a task that's a worker's later turn: the worker it continues (a first turn is its own id) */
+  worker?: string
   /** an experiment's props as assigned (its commit and branch), to run it again */
   props?: Record<string, unknown>
   /** its end, reported and not yet acknowledged: sent again after a restart */

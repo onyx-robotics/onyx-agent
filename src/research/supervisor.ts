@@ -1,15 +1,23 @@
 /**
  * The supervisor (docs/research.md, "The runtime"): plain code on the user's machine. It sets a
  * run up (the base agent studies the repository), then is two runners in one (docs/jobs.md): one
- * offering worker slots, which forks a worker for each worker_task it's given, and one offering
- * the project's endpoints, which runs experiments. Between them it wakes the var-op and resumes
- * workers whose experiments have ended.
+ * offering worker slots, which runs a worker's turn for each worker_task it's given, and one
+ * offering the project's endpoints, which runs experiments. Between them it wakes the var-op, and
+ * puts a worker whose experiments have ended back in the queue for its next turn.
  */
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { hostname } from "node:os"
-import { join } from "node:path"
+import { dirname, join, normalize } from "node:path"
 
-import type { RunnerAssignment } from "../generated/contracts/contracts"
+import { JOB_PRIORITY_MAX, type RunnerAssignment } from "../generated/contracts/contracts"
 import type { OnyxClient } from "../sdk"
 
 import { runAgent } from "./agents"
@@ -38,12 +46,25 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const TURN_MS = 45 * 60_000
 /** after the deadline, what's running gets this long to finish */
 const GRACE_MS = 15 * 60_000
+/** on a stop, the turns it cuts short get this long to wind up before the last sync */
+const SETTLE_MS = 20_000
 /** the var-op is woken at least this often while the run proposes */
 const VAROP_TICK_MS = 10 * 60_000
 const LOG_TAIL = 6_000
 /** how often a site's experiments are looked up, and how many looks an end gets for its metrics */
 const SITE_POLL_MS = 3_000
 const SITE_METRIC_LOOKS = 5
+/** a site's experiment's files are downloaded for its worker up to these sizes (bytes) */
+const SITE_FILE_MAX = 20 * 1024 * 1024
+const SITE_FILES_MAX = 100 * 1024 * 1024
+/** the log a site's driver keeps beside a job's own files */
+const SITE_LOG = "_onyx/driver.log"
+/** how much of a worker's end-of-turn message the var-op is shown */
+const TURN_NOTE_MAX = 2_000
+/** how many related insights from the graph a resumed worker is shown */
+const RELATED_ON_RESUME = 6
+/** a worker's next turn goes ahead of every new hypothesis (theirs are the var-op's, far lower) */
+const TURN_PRIORITY = JOB_PRIORITY_MAX
 
 export function runDirFor(cfg: LoadedConfig) {
   return new RunDir(join(cfg.root, ".onyx-research", slug(cfg.name)))
@@ -162,8 +183,20 @@ export class Supervisor {
   private readonly journal = new Map<string, HeldJob>()
   private outbox: Record<string, unknown>[] = []
   private readonly running = new Map<string, number>()
+  /**
+   * Worker slots in use: slot -> the worker whose turn runs in it, exactly while that turn's job
+   * is held there. A turn that ends with experiments in flight ends its job, so the platform frees
+   * the slot too; the worker's next turn is a new job in the queue (queueTurn).
+   */
+  private readonly slots = new Map<string, string>()
   private varopBusy = false
   private stopping = false
+  /** aborted on a stop: cuts every agent's turn short, so a stop doesn't wait on them */
+  private readonly halt = new AbortController()
+  /** what's under way (turns, experiments, var-op wakes): a stop lets it settle before its last sync */
+  private readonly inflight = new Set<Promise<unknown>>()
+  /** the queue's new hypotheses were cancelled at the deadline: slots now only take later turns */
+  private queueClosed = false
   private readonly instance = `research-${hostname()}`
 
   constructor(
@@ -194,11 +227,14 @@ export class Supervisor {
 
   /**
    * After a restart: the jobs it held are held again (its first sync says so, so none is found
-   * lost), and each carries on. A worker that had finished reports its end; one waiting on
-   * experiments waits; one that was working resumes its session, or starts its first turn again
-   * if it never finished one. An experiment runs again from its commit.
+   * lost), and each carries on. A worker whose turn is held: one that had finished reports its
+   * end; one waiting on experiments ends the turn, freeing its slot; one that was working resumes
+   * its session in the same slot, or starts its first turn again if it never finished one. A
+   * worker whose next turn was queued has it sent again (the same id, so the same job). An
+   * experiment runs again from its commit.
    */
   private async resume() {
+    for (const w of Object.values(this.state.workers)) if (w.phase === "queued") w.submitted = false
     let held = this.state.held
     if (!held) {
       // a run from before the journal was kept: its unfinished workers are what it held
@@ -224,8 +260,8 @@ export class Supervisor {
       const carry =
         h.kind === "experiment"
           ? this.runExperiment({ id, unit: h.unit, props: h.props ?? {} })
-          : this.resumeWorker(id)
-      void carry.catch((e: Error) => {
+          : this.resumeWorker(id, h)
+      this.track(carry).catch((e: Error) => {
         this.log(`${h.kind} ${short(id)} couldn't resume: ${e.message}`)
         this.end(id, "failed", {
           failure: "infra",
@@ -235,23 +271,32 @@ export class Supervisor {
     }
   }
 
-  private async resumeWorker(task: string) {
+  /** A held turn job after a restart (job: its id; h.worker: the worker, when it's a later turn). */
+  private async resumeWorker(job: string, h: HeldJob) {
+    const task = h.worker ?? job
     const w = this.state.workers[task]
     if (!w) throw new Error("it was taken but never set up")
-    if (existsSync(join(this.run.workerDir(task), "finished.json")))
-      return this.endTask(task, "succeeded")
-    if (this.pendingOf(task).length) {
-      w.phase = "waiting"
-      this.save()
+    // a run from before turns were jobs: the worker's one job is its first
+    w.turnJob ??= task
+    w.turns ??= 1
+    if (w.turnJob !== job) {
+      // not the worker's turn now (its later turn has replaced it): nothing runs it
+      this.end(job, "cancelled", { reason: "a later turn of its worker replaced it" })
       return
     }
-    this.log(`worker ${short(task)} resumes`)
+    if (existsSync(join(this.run.workerDir(task), "finished.json")))
+      return this.endTask(task, "succeeded")
+    this.slots.set(h.unit, task)
+    if (this.pendingOf(task).length) return this.waitOnExperiments(task)
+    this.log(`worker ${short(task)} resumes in ${h.unit}`)
     if (w.session)
       return this.workerTurn(
         task,
-        "The run was interrupted and has restarted. Carry on where you left off: check your worktree's state, then continue (submit an experiment, or record your insights and finish)."
+        "The run was interrupted and has restarted. Carry on where you left off: check your worktree's state, then continue (submit an experiment, or record your insights and finish).",
+        false,
+        h.unit
       )
-    return this.workerTurn(task, w.prompt ?? (await this.firstPrompt(w)), true)
+    return this.workerTurn(task, w.prompt ?? (await this.firstPrompt(w)), true, h.unit)
   }
 
   /** A worker's first message, from its hypothesis as the graph has it. */
@@ -297,6 +342,13 @@ export class Supervisor {
     console.log(`${new Date().toISOString().slice(11, 19)} ${msg}`)
   }
 
+  /** Kept in `inflight` until it settles, so a stop can wait for it; returns it. */
+  private track<T>(p: Promise<T>): Promise<T> {
+    this.inflight.add(p)
+    void p.finally(() => this.inflight.delete(p)).catch(() => undefined)
+    return p
+  }
+
   async start() {
     if (!this.state.base.session) throw new Error("no base agent yet: run setup first")
     if (!this.state.startedAt) {
@@ -304,7 +356,11 @@ export class Supervisor {
       this.state.deadline = Date.now() + this.cfg.minutes * 60_000
       this.save()
     }
-    for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => (this.stopping = true))
+    for (const sig of ["SIGINT", "SIGTERM"] as const)
+      process.on(sig, () => {
+        this.stopping = true
+        this.halt.abort()
+      })
     writeShim(this.run)
     // a fresh run key (the same run's agent and runner as before a restart), then renewed hourly
     await renewRunKey(this.run.dir, slug(this.cfg.name))
@@ -328,16 +384,25 @@ export class Supervisor {
 
   // ------------------------------------------------------------ runner
 
-  /** Each worker slot is a unit of its own (worker-1 …), so a task's slot shows where it ran. */
+  private slotKeys() {
+    return Array.from({ length: this.cfg.workers }, (_, i) => `worker-${i + 1}`)
+  }
+
+  /**
+   * Each worker slot is a unit of its own (worker-1 …), free while no turn's job is held in it.
+   * The queue fills it: a worker's next turn first (TURN_PRIORITY), then the var-op's hypotheses.
+   * Past the deadline, once the hypotheses still queued are cancelled, slots take only later turns.
+   */
   private units(): { key: string; type: string; name: string; capacity: number; free: number }[] {
     const busy = (k: string) => this.running.get(k) ?? 0
+    const offering = !this.past() || this.queueClosed
     return [
-      ...Array.from({ length: this.cfg.workers }, (_, i) => ({
-        key: `worker-${i + 1}`,
+      ...this.slotKeys().map((key, i) => ({
+        key,
         type: "agent_worker",
         name: `${hostname()} worker ${i + 1}`,
         capacity: 1,
-        free: this.past() ? 0 : Math.max(0, 1 - busy(`worker-${i + 1}`)),
+        free: offering && !this.slots.has(key) ? 1 : 0,
       })),
       // a site's endpoints are the site's to offer
       ...this.cfg.endpoints
@@ -382,6 +447,7 @@ export class Supervisor {
       if (this.past() && !closed) {
         closed = true
         await this.closeQueue().catch((e: Error) => this.log(`closing the queue: ${e.message}`))
+        this.queueClosed = true
       }
       // what's sent leaves the outbox now: a job that ends while the sync is out reports in the
       // next one (sharing the array, its report was dropped unsent and the job counted as lost)
@@ -400,20 +466,34 @@ export class Supervisor {
         for (const r of sent) if (r.state === "ended") this.release(String(r.id))
         for (const id of [...res.stale, ...res.cancel]) {
           // a queued task the var-op withdrew, or one gone elsewhere: nothing of ours runs it yet
-          if (this.journal.get(id)?.kind === "task" && !this.state.workers[id])
+          const h = this.journal.get(id)
+          if (h?.kind === "task" && this.state.workers[h.worker ?? id]?.turnJob !== id)
             this.end(id, "cancelled")
         }
         for (const a of res.assign) {
           if (this.journal.has(a.id)) continue
           const kind = a.type === "worker_task" ? "task" : "experiment"
+          // a worker's later turn names the worker it continues; a first turn is a new worker
+          const worker =
+            kind === "task" && typeof a.props.continues === "string" ? a.props.continues : a.id
           this.hold(a.id, {
             attempt: a.attempt,
             kind,
             unit: a.unit,
             ...(kind === "experiment" ? { props: a.props } : {}),
+            ...(worker !== a.id ? { worker } : {}),
           })
-          const work = kind === "task" ? this.startWorker(a) : this.runExperiment(a)
-          void work.catch((e: Error) => {
+          // a turn has its slot from now: setting a worker up takes seconds, and a slot still
+          // offered meanwhile would be given a second task (and the platform would show both there)
+          if (kind === "task") this.slots.set(a.unit, worker)
+          const work =
+            kind === "experiment"
+              ? this.runExperiment(a)
+              : worker === a.id
+                ? this.startWorker(a)
+                : this.continueWorker(a, worker)
+          this.track(work).catch((e: Error) => {
+            if (this.slots.get(a.unit) === worker) this.slots.delete(a.unit)
             this.log(`${kind} ${short(a.id)} failed: ${e.message}`)
             this.end(a.id, "failed", { failure: "infra", reason: e.message.slice(0, 900) })
           })
@@ -425,6 +505,22 @@ export class Supervisor {
         this.log(`sync: ${(e as Error).message}`)
       }
       await sleep(wait)
+    }
+    // a stop has cut the agents' turns short: let them settle, so what they end is reported below
+    // (a site's experiment still running isn't waited for: a restart picks it back up)
+    await Promise.race([Promise.allSettled([...this.inflight]), sleep(SETTLE_MS)])
+    // over for good (not stopped to restart): later turns still in the queue won't run
+    if (!this.stopping) {
+      const queued = Object.values(this.state.workers).filter(
+        (w) => w.phase === "queued" && w.turnJob
+      )
+      if (queued.length)
+        await this.onyx
+          .cancelJobs(
+            queued.map((w) => w.turnJob!),
+            "the run is over"
+          )
+          .catch((e: Error) => this.log(`cancelling queued turns: ${e.message}`))
     }
     // anything still held: say what happened to it
     if (this.outbox.length)
@@ -502,6 +598,9 @@ export class Supervisor {
       task,
       attempt: a.attempt,
       hypothesis,
+      title: (h.name ?? a.name ?? "").slice(0, 400),
+      turnJob: task,
+      turns: 1,
       agent,
       session: null,
       worktree,
@@ -517,13 +616,37 @@ export class Supervisor {
     this.save()
     w.prompt = await this.firstPrompt(w, h.summary ?? a.summary ?? undefined)
     this.save()
-    this.log(`worker ${short(task)} starts: ${h.name ?? a.name}`)
-    await this.workerTurn(task, w.prompt, true)
+    this.log(`worker ${short(task)} starts in ${a.unit}: ${h.name ?? a.name}`)
+    await this.workerTurn(task, w.prompt, true, a.unit)
   }
 
-  private async workerTurn(task: string, prompt: string, fork = false) {
+  /** A worker's later turn, given a slot by the queue: its session resumes there. */
+  private async continueWorker(a: RunnerAssignment, task: string) {
+    const w = this.state.workers[task]
+    if (!w || w.phase !== "queued" || w.turnJob !== a.id || !w.nextPrompt) {
+      // a turn its worker no longer waits for (sent again, or the worker has ended): let it go
+      if (this.slots.get(a.unit) === task) this.slots.delete(a.unit)
+      this.end(a.id, "cancelled", { reason: "its worker isn't waiting for this turn" })
+      return
+    }
+    this.started(a.id)
+    w.turns = (w.turns ?? 1) + 1
+    const prompt = w.nextPrompt
+    w.nextPrompt = undefined
+    this.save()
+    this.log(`worker ${short(task)} resumes in ${a.unit} (turn ${w.turns})`)
+    await this.workerTurn(task, prompt, false, a.unit)
+  }
+
+  /**
+   * One turn of a worker's session, in the slot its turn's job holds (a new worker is a fork of
+   * the base agent; any other turn resumes its session). The slot stays its own until afterTurn
+   * ends the job: a nudge runs in the same job and slot.
+   */
+  private async workerTurn(task: string, prompt: string, fork: boolean, slot: string) {
     const w = this.state.workers[task]!
     w.phase = "running"
+    this.slots.set(slot, task)
     this.save()
     const r = await runAgent({
       prompt,
@@ -532,34 +655,127 @@ export class Supervisor {
       env: agentEnv(this.run, this.cfg, w.agent, task),
       resume: fork ? this.state.base.session! : w.session!,
       fork,
-      addDirs: [w.worktree],
+      addDirs: [w.worktree, this.experimentsDir(task)],
       log: join(this.run.workerDir(task), "agent.log"),
       timeoutMs: TURN_MS,
+      signal: this.halt.signal,
     })
     if (r.session) w.session = r.session
     w.costUsd += r.costUsd
+    if (r.aborted) {
+      // stopped, not ended: its job stays held, and a restart resumes the turn (resumeWorker)
+      this.save()
+      this.log(`worker ${short(task)} stopped mid-turn; a restart carries it on`)
+      return
+    }
+    // what it said at the end of the turn goes to the var-op at its next wake, so a finding
+    // mid-hypothesis reaches the run without waiting for the worker to finish (a finish is
+    // reported as one, with the worker's state)
+    if (r.text.trim() && !existsSync(join(this.run.workerDir(task), "finished.json")))
+      (this.state.turnNotes ??= []).push({
+        task,
+        turn: w.turns ?? 1,
+        text: r.text.trim().slice(0, TURN_NOTE_MAX),
+      })
     this.save()
-    await this.afterTurn(task, r.ok ? null : r.text)
+    await this.afterTurn(task, r.ok ? null : r.text, slot)
+  }
+
+  /** End the worker's turn job: the platform frees its slot, and so does this. */
+  private endTurn(task: string, outcome: string, extra: Record<string, unknown> = {}) {
+    const w = this.state.workers[task]!
+    for (const [slot, t] of this.slots) if (t === task) this.slots.delete(slot)
+    if (w.turnJob) this.end(w.turnJob, outcome, extra)
+    w.turnJob = null
+  }
+
+  /** A turn ended with experiments in flight: its job ends, and the worker waits holding no slot. */
+  private waitOnExperiments(task: string) {
+    const w = this.state.workers[task]!
+    const job = w.turnJob
+    this.endTurn(task, "succeeded", {
+      props: {
+        turn: w.turns ?? 1,
+        then: "waiting on its experiments",
+        experiments: this.pendingOf(task),
+      },
+    })
+    w.phase = "waiting"
+    this.save()
+    this.log(
+      `worker ${short(task)} waits on its experiment; its turn ${job ? short(job) : ""} ended, freeing its slot`
+    )
+  }
+
+  /**
+   * A waiting worker's experiments have all ended: its next turn, with their results, is a new
+   * worker_task in the queue, ahead of every new hypothesis. The queue gives it the next free slot.
+   * Minted and saved before it's sent, so a restart sends the same job again rather than another.
+   */
+  private async queueTurn(w: WorkerState) {
+    if (!w.turnJob) {
+      w.turnJob = this.onyx.newId()
+      w.submitted = false
+      w.phase = "queued"
+      this.save()
+    }
+    const turn = (w.turns ?? 1) + 1
+    // a worker from before titles were kept: its hypothesis's, for its turns' names
+    if (!w.title) {
+      const h = (await this.onyx.getEntity(w.hypothesis).catch(() => null)) as {
+        name?: string
+      } | null
+      if (h?.name) w.title = h.name.slice(0, 400)
+    }
+    await this.onyx.submitJobs([
+      {
+        id: w.turnJob,
+        type: "worker_task",
+        on: "agent_worker",
+        name: `${w.title || "worker"} (turn ${turn})`.slice(0, 500),
+        summary: `Worker ${short(w.task)} carries on with its hypothesis, with its experiments' results.`,
+        priority: TURN_PRIORITY,
+        props: {
+          hypothesis: w.hypothesis,
+          continues: w.task,
+          turn,
+          base_commit: w.baseCommit,
+        },
+        links: [
+          { rel: "tests", dst: w.hypothesis },
+          { rel: "performed_by", dst: w.agent },
+        ],
+        createdBy: w.agent,
+      },
+    ])
+    w.submitted = true
+    this.save()
+    this.log(`worker ${short(w.task)} is back in the queue for a slot (turn ${turn})`)
+  }
+
+  /** where a worker's site experiments' files are downloaded, one folder per experiment */
+  private experimentsDir(task: string) {
+    const dir = join(this.run.workerDir(task), "experiments")
+    mkdirSync(dir, { recursive: true })
+    return dir
   }
 
   private pendingOf(task: string): string[] {
     return this.run.read<string[]>(`workers/${task}/pending.json`) ?? []
   }
 
-  private async afterTurn(task: string, error: string | null) {
+  private async afterTurn(task: string, error: string | null, slot: string) {
     const w = this.state.workers[task]!
     if (existsSync(join(this.run.workerDir(task), "finished.json")))
       return this.endTask(task, "succeeded")
-    if (this.pendingOf(task).length) {
-      w.phase = "waiting"
-      this.save()
-      return
-    }
+    if (this.pendingOf(task).length) return this.waitOnExperiments(task)
     if (w.nudges < 2 && w.session) {
       w.nudges++
       return this.workerTurn(
         task,
-        `You ended your turn without an experiment in flight and without finishing${error ? ` (${error.slice(0, 300)})` : ""}. If you have something to test, submit it with \`onyx research experiment\`. If you're done, record your insights (\`onyx research insight\`) and \`onyx research finish --state <file>\`.`
+        `You ended your turn without an experiment in flight and without finishing${error ? ` (${error.slice(0, 300)})` : ""}. If you have something to test, submit it with \`onyx research experiment\`. If you're done, record your insights (\`onyx research insight\`) and \`onyx research finish --state <file>\`.`,
+        false,
+        slot
       )
     }
     return this.endTask(task, "failed", {
@@ -572,34 +788,58 @@ export class Supervisor {
     const w = this.state.workers[task]!
     w.phase = "done"
     this.state.unseen.push(task)
+    // the worker's end is its last turn's: the job it ends in
+    this.endTurn(task, outcome, extra)
     this.save()
-    this.end(task, outcome, extra)
     this.log(
       `worker ${short(task)} ${outcome} after ${w.experiments.length} experiments ($${w.costUsd.toFixed(2)})`
     )
   }
 
-  /** Workers waiting on experiments: resumed once all of theirs have ended. */
+  /**
+   * Workers waiting on experiments: once all of theirs have ended, the next turn (with their
+   * results) goes in the queue (queueTurn). One that couldn't be sent is sent again.
+   */
   private async waitingLoop() {
     while (!this.done()) {
       for (const w of Object.values(this.state.workers)) {
+        if (w.phase === "queued" && !w.submitted) {
+          await this.queueTurn(w).catch((e: Error) =>
+            this.log(`worker ${short(w.task)}: queueing its next turn: ${e.message}`)
+          )
+          continue
+        }
         if (w.phase !== "waiting") continue
         const pending = this.pendingOf(w.task)
         if (!pending.every((id) => this.state.results[id])) continue
         w.pending = []
         w.experiments.push(...pending)
-        this.run.write(`workers/${w.task}/pending.json`, [])
         const left = this.cfg.experimentsPerTask - w.experiments.length
         const digest = pending.map((id) => this.describe(this.state.results[id]!)).join("\n\n")
+        // the graph as it is now: what others (and earlier runs) have learned since this worker began
+        const related = await relatedText(this.onyx, {
+          q: `${w.title ?? ""}\n${digest.slice(0, 1500)}`,
+          types: ["note"],
+          limit: RELATED_ON_RESUME,
+        }).catch(() => "")
         const next = this.past()
           ? "The run's time is up: record your insights and finish now."
           : left > 0
-            ? `You have ${left} experiment${left === 1 ? "" : "s"} left for this hypothesis. Iterate, or record your insights and finish.`
-            : "You're out of experiments: record your insights and finish."
-        void this.workerTurn(
-          w.task,
-          `Your experiment${pending.length === 1 ? " has" : "s have"} ended.\n\n${digest}\n\n${next}`
-        ).catch((e: Error) => this.log(`worker ${short(w.task)}: ${e.message}`))
+            ? "Read the log and the files (open the images), record what this result teaches as insights now, then decide: iterate until the hypothesis is answered, or finish if it is."
+            : `That was the run's ceiling of ${this.cfg.experimentsPerTask} experiments for one hypothesis: record your insights, including what you'd test next and why, and finish.`
+        w.nextPrompt = `Your experiment${pending.length === 1 ? " has" : "s have"} ended.\n\n${digest}\n\n${
+          related
+            ? `Insights in the knowledge graph related to your work now, other workers' included (\`onyx research ask <id> "<question>"\` asks their author):\n${related}\n\n`
+            : ""
+        }${next}`
+        w.phase = "queued"
+        w.turnJob = null
+        w.submitted = false
+        this.save()
+        this.run.write(`workers/${w.task}/pending.json`, [])
+        await this.queueTurn(w).catch((e: Error) =>
+          this.log(`worker ${short(w.task)}: queueing its next turn: ${e.message}`)
+        )
       }
       await sleep(2000)
     }
@@ -609,7 +849,12 @@ export class Supervisor {
     const m = Object.entries(r.metrics)
       .map(([k, v]) => `${k}=${v}`)
       .join(", ")
-    return `Experiment ${r.id} at ${r.commit.slice(0, 10)} on ${r.endpoint}: ${r.outcome}${m ? `; ${m}` : ""}.\nLog (its end):\n${r.logTail}`
+    const files = r.filesDir
+      ? r.files?.length
+        ? `\nIts files (its log is ${SITE_LOG}), downloaded to ${r.filesDir}:\n${r.files.map((f) => `- ${f}`).join("\n")}`
+        : `\nIt left no files.`
+      : ""
+    return `Experiment ${r.id} at ${r.commit.slice(0, 10)} on ${r.endpoint}: ${r.outcome}${m ? `; ${m}` : ""}.${files}\nLog (its end):\n${r.logTail}`
   }
 
   // ------------------------------------------------------------ endpoints
@@ -724,7 +969,7 @@ export class Supervisor {
     const props = item.props ?? {}
     // what the site reported goes back to the worker: its metrics, and, from a driver that sends
     // them as props, numbers the registry doesn't declare (`results`) and its log's end
-    // (`log_tail`). The job's files, its full log included, stay on the site for now
+    // (`log_tail`); and its files, downloaded from the site for the worker to read, its log among them
     const metrics: Record<string, number> = {}
     const results = props.results
     if (results && typeof results === "object")
@@ -735,10 +980,24 @@ export class Supervisor {
     // the end can be visible a moment before the fold records its results: look again a few times
     const looks = (seen.get(id) ?? 0) + 1
     seen.set(id, looks)
-    if (ok && !Object.keys(metrics).length && !props.log_tail && looks < SITE_METRIC_LOOKS) return
+    const listed = await this.onyx.jobFiles(id).catch((e: Error) => {
+      this.log(`experiment ${short(id)}: its files: ${e.message}`)
+      return { files: [] }
+    })
+    if (
+      ok &&
+      !Object.keys(metrics).length &&
+      !props.log_tail &&
+      !listed.files.length &&
+      looks < SITE_METRIC_LOOKS
+    )
+      return
     seen.delete(id)
     const why = ok ? "" : `${job.failure ?? "failed"}: ${job.reason ?? "no reason given"}`
-    const tail = typeof props.log_tail === "string" ? props.log_tail : ""
+    const filesDir = join(this.experimentsDir(task), short(id))
+    const files = await this.download(id, listed.files, filesDir)
+    const log = files.includes(SITE_LOG) ? readFileSync(join(filesDir, SITE_LOG), "utf8") : ""
+    const tail = typeof props.log_tail === "string" && props.log_tail ? props.log_tail : log
     this.state.results[id] = {
       id,
       task,
@@ -748,10 +1007,49 @@ export class Supervisor {
       outcome: job.outcome,
       metrics,
       logTail: (why ? `${why}\n` : "") + tail.slice(-LOG_TAIL),
+      filesDir,
+      files,
       endedAt: Date.now(),
     }
     this.save()
-    this.log(`experiment ${short(id)} ended on a site: ${job.outcome} ${JSON.stringify(metrics)}`)
+    this.log(
+      `experiment ${short(id)} ended on a site: ${job.outcome} ${JSON.stringify(metrics)}, ${files.length} files`
+    )
+  }
+
+  /**
+   * A site's experiment's files, from the site's file server through the links the platform signs,
+   * into dir: what it downloaded, by path. A file too large, or past the total, is left on the site
+   * and listed as such.
+   */
+  private async download(
+    id: string,
+    list: { path: string; sizeBytes: number | null; url: string }[],
+    dir: string
+  ): Promise<string[]> {
+    const got: string[] = []
+    let total = 0
+    for (const f of list) {
+      const path = normalize(f.path)
+      if (path.startsWith("..") || path.startsWith("/")) continue
+      const size = f.sizeBytes ?? 0
+      if (size > SITE_FILE_MAX || total + size > SITE_FILES_MAX) {
+        got.push(`${path} (${Math.round(size / 1024)} KB: left on the site, too large)`)
+        continue
+      }
+      try {
+        const res = await fetch(f.url)
+        if (!res.ok) throw new Error(`the site answered ${res.status}`)
+        const body = Buffer.from(await res.arrayBuffer())
+        mkdirSync(dirname(join(dir, path)), { recursive: true })
+        writeFileSync(join(dir, path), body)
+        total += body.length
+        got.push(path)
+      } catch (e) {
+        this.log(`experiment ${short(id)}: couldn't download ${path}: ${(e as Error).message}`)
+      }
+    }
+    return got
   }
 
   // ------------------------------------------------------------ the var-op
@@ -765,7 +1063,22 @@ export class Supervisor {
       this.log(`board.json: ${(e as Error).message}`)
       return 0
     }
-    return b.hypotheses.filter((h) => this.state.workers[h.task]?.phase !== "done").length
+    // the ones that want a slot: queued, or a worker working. One waiting on its experiments has none
+    return b.hypotheses.filter((h) => {
+      const phase = this.state.workers[h.task]?.phase
+      return phase !== "done" && phase !== "waiting"
+    }).length
+  }
+
+  private waitingWorkers(): number {
+    return Object.values(this.state.workers).filter((w) => w.phase === "waiting").length
+  }
+
+  /** The slots as the var-op should count them: only a running turn, or one in line, fills one. */
+  private slotWords(): string {
+    const want = this.activeHypotheses()
+    const idle = Math.max(0, this.cfg.workers - want)
+    return `${this.cfg.workers} worker slots: ${this.slots.size} running a turn now; ${want} hypotheses queued, back in line or running in all; ${this.waitingWorkers()} workers waiting on experiments hold no slot.${idle ? ` ${idle} slots will sit idle unless you queue at least ${idle} more hypotheses now.` : ""}`
   }
 
   private async varopLoop() {
@@ -778,11 +1091,13 @@ export class Supervisor {
           !v.session ||
           this.state.unseen.length > 0 ||
           inbox.length > 0 ||
+          // workers' findings mid-hypothesis: soon, but not once per turn
+          ((this.state.turnNotes?.length ?? 0) > 0 && now - v.lastWake > 60_000) ||
           (this.activeHypotheses() < this.cfg.workers && now - v.lastWake > 60_000) ||
           now - v.lastWake > VAROP_TICK_MS
         if (due) {
           this.varopBusy = true
-          void this.wakeVarop(inbox)
+          void this.track(this.wakeVarop(inbox))
             .catch((e: Error) => this.log(`var-op: ${e.message}`))
             .finally(() => (this.varopBusy = false))
         }
@@ -795,15 +1110,17 @@ export class Supervisor {
     const v = this.state.varop
     const first = !v.session
     const seen = this.state.unseen.splice(0)
+    const notes = (this.state.turnNotes ?? []).splice(0)
     v.lastWake = Date.now()
     v.wakes++
     this.save()
+    const steered: [file: string, text: string][] = []
     let prompt: string
     if (first) {
       prompt = varopPrompt(this.cfg, Math.round((this.state.deadline - Date.now()) / 60_000))
     } else {
       const parts: string[] = [
-        `${Math.max(0, Math.round((this.state.deadline - Date.now()) / 60_000))} minutes of proposing left; ${this.activeHypotheses()} hypotheses queued or running for ${this.cfg.workers} slots.`,
+        `${Math.max(0, Math.round((this.state.deadline - Date.now()) / 60_000))} minutes of proposing left. ${this.slotWords()}`,
       ]
       for (const task of seen) {
         const w = this.state.workers[task]
@@ -825,8 +1142,19 @@ export class Supervisor {
           }\n${existsSync(ghost) ? `Its state:\n${readFileSync(ghost, "utf8").slice(0, 2500)}` : "It left no state."}\nIts insights: onyx research related --item ${w.hypothesis}`
         )
       }
+      // the latest from each worker still under way: what it said as its turn ended
+      const latest = new Map(notes.map((n) => [n.task, n]))
+      for (const n of latest.values()) {
+        const w = this.state.workers[n.task]
+        if (!w || w.phase === "done") continue
+        parts.push(
+          `Worker ${short(n.task)} (hypothesis ${w.hypothesis}: ${w.title ?? ""}), still under way, after its turn ${n.turn}:\n${n.text}`
+        )
+      }
       for (const f of inbox) {
-        parts.push(`The user says: ${readFileSync(this.run.path("inbox", f), "utf8")}`)
+        const text = readFileSync(this.run.path("inbox", f), "utf8")
+        parts.push(`The user says: ${text}`)
+        steered.push([f, text])
         rmSync(this.run.path("inbox", f))
       }
       const journal = this.run.path("journal.md")
@@ -838,7 +1166,7 @@ export class Supervisor {
       prompt = parts.join("\n\n")
     }
     this.log(
-      `var-op wakes${first ? " (first time)" : ""}: ${seen.length} finished, ${inbox.length} messages`
+      `var-op wakes${first ? " (first time)" : ""}: ${seen.length} finished, ${notes.length} turn notes, ${inbox.length} messages`
     )
     const r = await runAgent({
       prompt,
@@ -849,9 +1177,19 @@ export class Supervisor {
       fork: first,
       log: this.run.path("logs", "varop.log"),
       timeoutMs: TURN_MS,
+      signal: this.halt.signal,
     })
     if (r.session) v.session = r.session
     v.costUsd += r.costUsd
+    if (r.aborted) {
+      // stopped before it could act on them: what it was shown waits for its next wake, after a restart
+      this.state.unseen.unshift(...seen)
+      ;(this.state.turnNotes ??= []).unshift(...notes)
+      for (const [f, text] of steered) writeFileSync(this.run.path("inbox", f), text)
+      this.save()
+      this.log("var-op stopped mid-turn; it sees the same again after a restart")
+      return
+    }
     this.save()
     this.log(`var-op: ${r.text.replace(/\s+/g, " ").slice(0, 300)}`)
   }
