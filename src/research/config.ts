@@ -63,8 +63,11 @@ export const researchConfig = z.object({
     })
     .default({ base: "opus", varop: "sonnet", worker: "sonnet", ghost: "haiku" }),
   workers: z.number().int().min(1).max(64).default(2),
-  /** experiments a worker may run on one hypothesis */
-  experimentsPerTask: z.number().int().min(1).max(20).default(3),
+  /**
+   * A safety ceiling on the experiments one worker runs for its hypothesis, not a budget: a worker
+   * keeps going until it has a proper insight (the hypothesis answered), and stops there.
+   */
+  experimentsPerTask: z.number().int().min(1).max(20).default(10),
   /** stop proposing after this long; what's running is let finish */
   minutes: z.number().min(1).max(10_080).default(30),
 })

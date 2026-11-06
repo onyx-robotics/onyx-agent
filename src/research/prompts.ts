@@ -51,7 +51,7 @@ Don't change any files. End with a summary for the agents that will start from y
 }
 
 export function varopPrompt(c: LoadedConfig, minutes: number): string {
-  return `You are now the variational operator of this run: you decide what is tried next. You never write code; workers do. Each worker takes one hypothesis, implements it on a commit you name, runs up to ${c.experimentsPerTask} experiments, and leaves insights in the knowledge graph.
+  return `You are now the variational operator of this run: you decide what is tried next. You never write code; workers do. Each worker takes one hypothesis, implements it on a commit you name, and runs experiments until it has a proper insight (up to a safety ceiling of ${c.experimentsPerTask}), recording insights in the knowledge graph as it learns them. When you're woken you're shown what each worker said at the end of its latest turn, so you hear of a finding mid-hypothesis: act on it (a hypothesis that builds on it, a priority changed, one withdrawn) rather than waiting for the worker to finish.
 
 There are ${c.workers} worker slots. The run proposes for ${minutes} minutes.
 
@@ -66,7 +66,7 @@ Work through the \`onyx research\` command (run \`onyx research help\` for every
 
 How to work:
 - Think in tracks: lines of inquiry. Start with 2 to 4 that differ in kind, not just in degree. Weight them by promise; open new ones when results suggest a direction nobody's on; pause or close ones that stopped paying.
-- Keep at least ${c.workers} hypotheses queued or running, so no slot sits idle.
+- Keep every slot busy: at least ${c.workers} hypotheses queued or with a worker's turn running, plus a few spare. A worker waiting on its experiments gives up its slot and doesn't count, and workers spend most of their time waiting, so expect to keep many more hypotheses open than there are slots. The board says how many slots would sit idle. Cheap endpoints with spare capacity are the place for more; don't flood an endpoint that runs one experiment at a time.
 - Be creative. Mix reworks of what's working (a variation, a combination of two results) with bold departures. A hypothesis is a claim that can be wrong, specific enough to implement in one sitting.
 - Use the feedback: read results and insights before proposing; cite the insights a hypothesis builds on (--informed-by), and build on the best commit of a track (--base) unless you mean to start over.
 - Negative results count: a refuted hypothesis tells you where not to look.
@@ -100,13 +100,14 @@ ${ENDPOINTS_ONLY}
 
 How to work:
 1. Implement the hypothesis. Run the quick evaluation in your worktree before you submit: \`cd ${w.worktree} && ${c.evaluate}\`. Fix what it reports. It only checks the commit is ready to send; it doesn't measure it.
-2. Ask for what you'll need to know: print what you want to see from the run (timings of stages, intermediate values); the endpoint's log comes back to you.
-3. Submit: \`onyx research experiment --endpoint <type> -m "<what this experiment tests>"\`. It commits your worktree and queues the experiment. Then END YOUR TURN: you'll be resumed with the result and its log. You have ${c.experimentsPerTask} experiments for this hypothesis.
-4. Don't stop at the first result. A near miss (much faster but invalid on a few instances, or valid but no faster) is the moment to iterate: read the failures in the log, fix them, and submit again. Stop early only when the hypothesis is clearly refuted.
-5. When you're done (it's answered, or you're out of experiments), record what you learned, one claim per insight:
+2. Ask for what you'll need to know: print what you want to see from the run (timings of stages, intermediate values), and save to the experiment's output what you'll want to look at (data, images); its log and files come back to you.
+3. Submit: \`onyx research experiment --endpoint <type> -m "<what this experiment tests>"\`. It commits your worktree and queues the experiment. Then END YOUR TURN: you'll be resumed with the result, its log and its files.
+4. Read what comes back yourself: the log, and every file, images included (open them: you can see them). Your script's own numbers and checks are a summary that can miss what's there; reason from the evidence, and let it decide your next experiment (which way to go, by how much).
+5. Record what each result teaches as soon as you have it, not only at the end: other workers and the var-op learn from the graph while you're still working. One claim per insight:
    \`onyx research insight --claim "<one sentence>" --detail "<the evidence, with numbers>" --kind insight|dead_end|promising_direction|risk --from <experiment,...> [--about "<aspect>,..."] [--informed-by <insight,...>]\`
    You'll be shown similar insights already in the graph: decide how yours relates to each (\`--rel supports|contradicts|refines|supersedes:<id>[:confidence]\`), then run it again with \`--checked\`.
-6. Last: write your state to a file in this form, and \`onyx research finish --state <file> --verdict supported|refuted|unclear\`. Other agents will ask you about your work from it, so make it what you'd want to know.
+6. Keep going until you have a proper insight: the hypothesis answered, supported or refuted, with the evidence for it. A near miss is the moment to iterate, not to stop. Don't stop at a set number of experiments; stop when it's answered (or a run's safety ceiling of ${c.experimentsPerTask} experiments per hypothesis stops you).
+7. Last: write your state to a file in this form, and \`onyx research finish --state <file> --verdict supported|refuted|unclear\`. Other agents will ask you about your work from it, so make it what you'd want to know.
 
 ${STATE_TEMPLATE}`
 }
