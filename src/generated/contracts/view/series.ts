@@ -6,8 +6,8 @@
  * values of the dim it's split by open in place (`expanded`: their children's lanes under them).
  * Browser-safe: the page, the server and the URL compile the same list into one view of lanes.
  *
- * What's saved is the pinned series (the workspace's document); what's shown is every series, in
- * the page's URL (workspace.ts), so a link reproduces the view. A series is named by its id: its
+ * What's saved is the workspace's series as its owner last showed them (its document); what's
+ * shown differs in the page's URL (workspace.ts), so a link reproduces the view. A series is named by its id: its
  * conditions change as it's edited. Where a series was made from (the lane whose conditions are
  * its own) is found on the page, never stored.
  */
@@ -95,7 +95,7 @@ export type SeriesText = z.output<typeof seriesText>
 
 export const laneSeries = z
   .strictObject({
-    /** stable in the workspace: pins and the list beside the lanes name it */
+    /** stable in the workspace: the list beside the lanes and a sync name it */
     id: seriesKey,
     /** its name; none: its conditions and dimension in words */
     label: z.string().trim().min(1).max(80).optional(),
@@ -125,12 +125,12 @@ export const laneSeries = z
     text: seriesText.optional(),
     /**
      * a plot of its items in place of its lanes (docs/inline-plots-design.md; none: its lanes): in
-     * the URL with the series, and saved with it when it's pinned
+     * the URL with the series, and saved with it
      */
     plot: plotState.optional(),
     /**
      * a graph of its items and their relations in place of its lanes (docs/graph-design.md; none:
-     * its lanes, or its plot): in the URL with the series, saved with it when it's pinned
+     * its lanes, or its plot): in the URL with the series, saved with it
      */
     graph: graphState.optional(),
     /**
@@ -177,8 +177,7 @@ export const workspaceSeries = z
 
 /**
  * Every item, one lane (no conditions, not split): the series a new workspace starts with
- * (docs/lane-series-design.md), a series like any other: typed into, split, plotted, pinned,
- * removed. Its id is the one a workspace before version 4 showed it by, first, where it didn't
+ * (docs/lane-series-design.md), a series like any other: typed into, split, plotted, removed. Its id is the one a workspace before version 4 showed it by, first, where it didn't
  * list it (`withAllItems`).
  */
 export const allItemsSeries = (): Series => laneSeries.parse({ id: ALL_ITEMS_ID })
@@ -705,49 +704,6 @@ export function moveSeries(list: readonly Series[], id: string, by: -1 | 1): Ser
   ;[out[i], out[j]] = [out[j]!, out[i]!]
   return out
 }
-
-// ---------------------------------------------------------------- pins
-
-export const isPinned = (pinned: readonly Series[], id: string): boolean =>
-  pinned.some((s) => s.id === id)
-
-/**
- * The pinned series after a change on the page: each takes what the page shows of it, in the
- * order shown. One the page doesn't show (a link, a step Back from before it was pinned) stays
- * pinned, after the series it followed.
- */
-export function pinnedAsShown(pinned: readonly Series[], shown: readonly Series[]): Series[] {
-  const byId = new Map(shown.map((s) => [s.id, s]))
-  // series not shown, after the pinned one they followed (null: before every one)
-  const after = new Map<string | null, Series[]>()
-  let anchor: string | null = null
-  for (const p of pinned) {
-    if (byId.has(p.id)) anchor = p.id
-    else after.set(anchor, [...(after.get(anchor) ?? []), p])
-  }
-  const ids = new Set(pinned.map((p) => p.id))
-  const out: Series[] = [...(after.get(null) ?? [])]
-  for (const s of shown) {
-    if (!ids.has(s.id)) continue
-    out.push(s)
-    out.push(...(after.get(s.id) ?? []))
-  }
-  return out
-}
-
-/** Pin a series as it's shown: it's saved with the workspace, in the order shown. */
-export function pinSeries(
-  pinned: readonly Series[],
-  shown: readonly Series[],
-  id: string
-): Series[] {
-  const s = shown.find((x) => x.id === id)
-  if (!s || isPinned(pinned, id)) return [...pinned]
-  return pinnedAsShown([...pinned, s], shown)
-}
-
-export const unpinSeries = (pinned: readonly Series[], id: string): Series[] =>
-  pinned.filter((s) => s.id !== id)
 
 // ---------------------------------------------------------------- what the list beside lists
 

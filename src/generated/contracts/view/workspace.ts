@@ -3,8 +3,8 @@
  * Workspaces: a list of series, each a query of the org's items (docs/lane-series-design.md; the
  * series: series.ts). Browser-safe: the page and the server compile the same document.
  *
- * The document holds what the workspace counts from (its settings) and its pinned series, keys and
- * never labels; it compiles to one view of lanes (no columns) that runs with the viewer's context,
+ * The document holds what the workspace counts from (its settings) and its series, keys and never
+ * labels; it compiles to one view of lanes (no columns) that runs with the viewer's context,
  * so what each viewer sees follows their own spaces. Every lane counts all time: the time setting
  * is where the page's time axis opens, which it zooms and pans from. What a page shows is its view
  * (`workspaceView`): the document's fields as shown, saved or not, and the viewer's own; the page's
@@ -101,7 +101,7 @@ const DOC_VERSION = 4
 export const workspaceDoc = z.strictObject({
   version: z.literal(DOC_VERSION).default(DOC_VERSION),
   settings: workspaceSettings.default(DEFAULT_SETTINGS),
-  /** the pinned series: what everyone who opens the workspace starts from (none: every item) */
+  /** its series: what everyone who opens the workspace starts from (none: every item) */
   series: workspaceSeries.default(() => [allItemsSeries()]),
 })
 export type WorkspaceDoc = z.output<typeof workspaceDoc>
@@ -159,7 +159,7 @@ export const starterWorkspace = (): WorkspaceDoc =>
 
 /**
  * What a workspace page shows: every field of the document as shown (its settings and every
- * series, pinned or not; saved or not), and the viewer's own fields, which aren't saved. A field
+ * series, saved or not), and the viewer's own fields, which aren't saved. A field
  * added to the document is a field of the view; one the viewer keeps to themselves (and a link
  * carries) is added here, with a default.
  */

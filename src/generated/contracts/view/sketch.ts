@@ -2,7 +2,7 @@
 /**
  * A workspace's sketch: its thumbnail, drawn in someone's browser from what they saw in it (their
  * own spaces'), and kept for them alone (the table: `workspace_sketch`). A few of its cards, each
- * as little as tells them apart: a lane card's total over time, a plot's points, a graph's shape.
+ * as little as tells them apart: a lane card's total over time, a plot's points, a graph's glyph.
  * Coordinates are integers over a card's own box (0…1000), heights 0…100. Browser-safe.
  */
 import { z } from "zod"
@@ -35,7 +35,7 @@ export const sketchCard = z.discriminatedUnion("k", [
     pts: z.array(point).max(40),
     best: z.array(point).max(SKETCH_BINS).default([]),
   }),
-  /** its busiest nodes where they were drawn, the edges between them, and how many there were */
+  /** a glyph of it: nodes and the edges between them, and how many items and edges it drew */
   z.strictObject({
     k: z.literal("graph"),
     label,
