@@ -54,14 +54,16 @@ export const researchConfig = z.object({
     .array(endpoint)
     .min(1)
     .refine((eps) => eps.every((e) => e.site || e.driver), "an endpoint needs a driver, or site"),
+  // the var-op plans the whole run (which hypotheses, how experiments should look) and is a small
+  // share of its cost, so it gets the strongest model; workers, most of the cost, a cheaper one
   models: z
     .object({
       base: z.string().default("opus"),
-      varop: z.string().default("sonnet"),
+      varop: z.string().default("opus"),
       worker: z.string().default("sonnet"),
       ghost: z.string().default("haiku"),
     })
-    .default({ base: "opus", varop: "sonnet", worker: "sonnet", ghost: "haiku" }),
+    .default({ base: "opus", varop: "opus", worker: "sonnet", ghost: "haiku" }),
   workers: z.number().int().min(1).max(64).default(2),
   /**
    * A safety ceiling on the experiments one worker runs for its hypothesis, not a budget: a worker

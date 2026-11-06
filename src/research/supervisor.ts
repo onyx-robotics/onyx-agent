@@ -46,6 +46,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const TURN_MS = 45 * 60_000
 /** after the deadline, what's running gets this long to finish */
 const GRACE_MS = 15 * 60_000
+/** on a stop, the turns it cuts short get this long to wind up before the last sync */
+const SETTLE_MS = 20_000
 /** the var-op is woken at least this often while the run proposes */
 const VAROP_TICK_MS = 10 * 60_000
 const LOG_TAIL = 6_000
@@ -189,6 +191,10 @@ export class Supervisor {
   private readonly slots = new Map<string, string>()
   private varopBusy = false
   private stopping = false
+  /** aborted on a stop: cuts every agent's turn short, so a stop doesn't wait on them */
+  private readonly halt = new AbortController()
+  /** what's under way (turns, experiments, var-op wakes): a stop lets it settle before its last sync */
+  private readonly inflight = new Set<Promise<unknown>>()
   /** the queue's new hypotheses were cancelled at the deadline: slots now only take later turns */
   private queueClosed = false
   private readonly instance = `research-${hostname()}`
@@ -255,7 +261,7 @@ export class Supervisor {
         h.kind === "experiment"
           ? this.runExperiment({ id, unit: h.unit, props: h.props ?? {} })
           : this.resumeWorker(id, h)
-      void carry.catch((e: Error) => {
+      this.track(carry).catch((e: Error) => {
         this.log(`${h.kind} ${short(id)} couldn't resume: ${e.message}`)
         this.end(id, "failed", {
           failure: "infra",
@@ -336,6 +342,13 @@ export class Supervisor {
     console.log(`${new Date().toISOString().slice(11, 19)} ${msg}`)
   }
 
+  /** Kept in `inflight` until it settles, so a stop can wait for it; returns it. */
+  private track<T>(p: Promise<T>): Promise<T> {
+    this.inflight.add(p)
+    void p.finally(() => this.inflight.delete(p)).catch(() => undefined)
+    return p
+  }
+
   async start() {
     if (!this.state.base.session) throw new Error("no base agent yet: run setup first")
     if (!this.state.startedAt) {
@@ -343,7 +356,11 @@ export class Supervisor {
       this.state.deadline = Date.now() + this.cfg.minutes * 60_000
       this.save()
     }
-    for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => (this.stopping = true))
+    for (const sig of ["SIGINT", "SIGTERM"] as const)
+      process.on(sig, () => {
+        this.stopping = true
+        this.halt.abort()
+      })
     writeShim(this.run)
     // a fresh run key (the same run's agent and runner as before a restart), then renewed hourly
     await renewRunKey(this.run.dir, slug(this.cfg.name))
@@ -475,7 +492,7 @@ export class Supervisor {
               : worker === a.id
                 ? this.startWorker(a)
                 : this.continueWorker(a, worker)
-          void work.catch((e: Error) => {
+          this.track(work).catch((e: Error) => {
             if (this.slots.get(a.unit) === worker) this.slots.delete(a.unit)
             this.log(`${kind} ${short(a.id)} failed: ${e.message}`)
             this.end(a.id, "failed", { failure: "infra", reason: e.message.slice(0, 900) })
@@ -489,6 +506,9 @@ export class Supervisor {
       }
       await sleep(wait)
     }
+    // a stop has cut the agents' turns short: let them settle, so what they end is reported below
+    // (a site's experiment still running isn't waited for: a restart picks it back up)
+    await Promise.race([Promise.allSettled([...this.inflight]), sleep(SETTLE_MS)])
     // over for good (not stopped to restart): later turns still in the queue won't run
     if (!this.stopping) {
       const queued = Object.values(this.state.workers).filter(
@@ -638,9 +658,16 @@ export class Supervisor {
       addDirs: [w.worktree, this.experimentsDir(task)],
       log: join(this.run.workerDir(task), "agent.log"),
       timeoutMs: TURN_MS,
+      signal: this.halt.signal,
     })
     if (r.session) w.session = r.session
     w.costUsd += r.costUsd
+    if (r.aborted) {
+      // stopped, not ended: its job stays held, and a restart resumes the turn (resumeWorker)
+      this.save()
+      this.log(`worker ${short(task)} stopped mid-turn; a restart carries it on`)
+      return
+    }
     // what it said at the end of the turn goes to the var-op at its next wake, so a finding
     // mid-hypothesis reaches the run without waiting for the worker to finish (a finish is
     // reported as one, with the worker's state)
@@ -1070,7 +1097,7 @@ export class Supervisor {
           now - v.lastWake > VAROP_TICK_MS
         if (due) {
           this.varopBusy = true
-          void this.wakeVarop(inbox)
+          void this.track(this.wakeVarop(inbox))
             .catch((e: Error) => this.log(`var-op: ${e.message}`))
             .finally(() => (this.varopBusy = false))
         }
@@ -1087,6 +1114,7 @@ export class Supervisor {
     v.lastWake = Date.now()
     v.wakes++
     this.save()
+    const steered: [file: string, text: string][] = []
     let prompt: string
     if (first) {
       prompt = varopPrompt(this.cfg, Math.round((this.state.deadline - Date.now()) / 60_000))
@@ -1124,7 +1152,9 @@ export class Supervisor {
         )
       }
       for (const f of inbox) {
-        parts.push(`The user says: ${readFileSync(this.run.path("inbox", f), "utf8")}`)
+        const text = readFileSync(this.run.path("inbox", f), "utf8")
+        parts.push(`The user says: ${text}`)
+        steered.push([f, text])
         rmSync(this.run.path("inbox", f))
       }
       const journal = this.run.path("journal.md")
@@ -1147,9 +1177,19 @@ export class Supervisor {
       fork: first,
       log: this.run.path("logs", "varop.log"),
       timeoutMs: TURN_MS,
+      signal: this.halt.signal,
     })
     if (r.session) v.session = r.session
     v.costUsd += r.costUsd
+    if (r.aborted) {
+      // stopped before it could act on them: what it was shown waits for its next wake, after a restart
+      this.state.unseen.unshift(...seen)
+      ;(this.state.turnNotes ??= []).unshift(...notes)
+      for (const [f, text] of steered) writeFileSync(this.run.path("inbox", f), text)
+      this.save()
+      this.log("var-op stopped mid-turn; it sees the same again after a restart")
+      return
+    }
     this.save()
     this.log(`var-op: ${r.text.replace(/\s+/g, " ").slice(0, 300)}`)
   }

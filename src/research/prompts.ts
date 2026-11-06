@@ -27,9 +27,10 @@ export const STATE_TEMPLATE = `## Hypothesis and verdict
 
 /** Experiments run on the endpoints, through the queue, and nowhere else: an agent running an
  * endpoint's work itself (a simulator, a rig's server, the experiment) measures what no one else
- * sees, and takes the machine from the site. */
+ * sees, and takes the machine from the site. Long computations go the same way: a worker's turn
+ * that waits on one holds its slot all the while (a fit on saved data, in one run, for 28 min). */
 const ENDPOINTS_ONLY =
-  "Experiments run only on the endpoints, sent through the queue. Never run an endpoint's work yourself: not its simulator, its hardware's server, or the experiment itself. A run that isn't an experiment is lost to the rest of the run, and it takes the machine from the site."
+  "Experiments run only on the endpoints, sent through the queue. Never run an endpoint's work yourself: not its simulator, its hardware's server, or the experiment itself. A run that isn't an experiment is lost to the rest of the run, and it takes the machine from the site. The same goes for any computation longer than a quick check (about a minute), such as a fit or a search over saved data: commit it as a script and send it as an experiment to an endpoint that can run it, several variants at once if they're independent, then end your turn. A turn spent waiting on a computation holds a worker slot the whole time; an experiment in the queue holds none."
 
 export function basePrompt(c: LoadedConfig): string {
   return `You are the base agent of an autoresearch run on this repository.
