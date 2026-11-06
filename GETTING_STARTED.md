@@ -183,6 +183,8 @@ When experiments need hardware (a robot, a rig, a GPU box), they run on a **site
    fidelity = "sim"                                 # "hardware" for a physical rig
    ```
 
+   The site fetches each experiment's commit itself, with a read-only deploy key of its own (`ssh_key`). Make one on the site's machine, add its `.pub` to your repository as a deploy key without write access (`gh repo deploy-key add keys/solver_ro.pub -R you/project`), and have the site's user trust GitHub's host key, since the site won't fetch from a host it doesn't know (`gh api meta -q '.ssh_keys[]' | sed 's/^/github.com /' >> ~/.ssh/known_hosts`). `SETUP.md`, "Giving the site read access to a repository", has the steps and a check.
+
    A program run this way reports its metrics in `$ONYX_OUT/metrics.json` (`{"solver.speedup": 3.2}`), not in a `METRICS` line, and everything it writes to `$ONYX_OUT` is kept: the run downloads those files for the worker that sent the experiment. The worker's packet path is in `$ONYX_PARAMS` (`params.json`, the job's props). Hardware that needs a long-lived connection gets a driver of its own (`DRIVERS.md`).
 
 3. Enrol it: `onyx-site enrol`, and an admin approves the code it prints. Then `onyx-site run`, as a service (`SETUP.md`, step 7).

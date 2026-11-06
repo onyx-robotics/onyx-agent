@@ -59,7 +59,8 @@ Write `onyx/research.json` (fields: `GETTING_STARTED.md`, step 6, and the packag
 A site is a machine running `onyx-site`, which takes jobs for its units from the org's queue. An endpoint it runs has `"site": true` and no `driver` in the config. Its setup is on that machine, partly by hand (installing, approving): tell the user what to do there, and write what you can.
 
 - **Install**: `onyx-site` comes from the Onyx repository (`python/site-runner`; its `SETUP.md` is the full guide). It isn't a published package yet.
-- **The site file**: `[policy] unit_types` lists the endpoint types; `[repos.<name>] url` is the run's `remote`, character for character, with a read-only key; `[files] public_url` is reachable from the machine the run is on (it downloads experiments' files from there).
+- **The site file**: `[policy] unit_types` lists the endpoint types; `[repos.<name>] url` is the run's `remote`, character for character; `[files] public_url` is reachable from the machine the run is on (it downloads experiments' files from there).
+- **Read access, the site's own**: the site fetches each commit itself, with a read-only deploy key made on its machine (`ssh_key`), added to the repository without write access (`gh repo deploy-key add <key>.pub -R <repo>`), and GitHub's host key in the site user's `known_hosts`, taken from `gh api meta` (the site fetches with `StrictHostKeyChecking=yes`). The site-runner's `SETUP.md`, "Giving the site read access to a repository", has the steps. Never route around it: no path mappings to a local copy, no shared folders, no key that can push. A site that can't fetch the run's remote can't run its experiments, and that's what to fix.
 - **A program in the repository** (most experiments): the shipped `onyx_site.drivers.local_program:LocalProgram` driver runs a `command` in the experiment's commit. It reports metrics from `$ONYX_OUT/metrics.json`, not a `METRICS` line, and keeps everything in `$ONYX_OUT`; the job's props (the packet included) are in `$ONYX_PARAMS`. Write the endpoint's program to that contract.
 - **Hardware with a long-lived connection** (a robot's server, a serial bus): a driver of its own (`DRIVERS.md` in the site-runner). Put the hardware's limits in the goal and the guide: joint ranges, currents, what tripped it before, what a person must do to recover it.
 - **Enrol**: `onyx-site enrol` on that machine; an admin approves the code it prints. Then `onyx-site run` as a service, and `onyx-site status` shows its units.
@@ -71,8 +72,9 @@ Nothing goes to the run unchecked:
 1. `onyx registry show types <type>` for each endpoint type, and `onyx registry show props <metric>` for each metric: loaded.
 2. The quick evaluation runs from the root, in under a minute, and prints the metrics.
 3. Each driver of this machine, in a clean checkout of `HEAD` (`git worktree add /tmp/check HEAD`): runs, and its last line is `METRICS` with every metric's key.
-4. Each site endpoint: one job by hand on a pushed commit (`onyx run -f -` with `on`, and `props.git` = `{url, commit, ref}`), ended `succeeded`, with its metrics and files (`onyx jobs get <id>`).
-5. Commit and push `baseBranch` to `remote`.
+4. Each site's read access, as it will fetch: with `GIT_SSH_COMMAND="ssh -i <its key> -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes"`, `git ls-remote <remote> main` answers, and a push with that key is refused.
+5. Each site endpoint: one job by hand on a pushed commit (`onyx run -f -` with `on`, and `props.git` = `{url, commit, ref}`), ended `succeeded`, with its metrics and files (`onyx jobs get <id>`).
+6. Commit and push `baseBranch` to `remote`.
 
 ## 8. Hand over
 
