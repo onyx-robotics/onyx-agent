@@ -210,5 +210,5 @@ onyx jobs get <id>          # its outcome and metrics; GET /jobs/<id>/files list
 | An experiment ends `failed` / `refused` | The site's policy refused it: its unit type isn't in `[policy] unit_types`, or the run's remote isn't in `[repos]` |
 | An experiment's results are refused | A metric it reported isn't in the registry: add it to the pack and load it again |
 | The base agent fails at setup | `claude` isn't signed in, or the remote has no `baseBranch` |
-| Workers sit waiting while endpoints are idle | More workers, or a cheaper endpoint for the quick work: a CPU endpoint (`local_program` with a few slots) takes fits and analyses off the workers' own machine |
+| Workers sit waiting while endpoints are idle | More workers, or a CPU endpoint (`local_program` with a few slots) for processes that need no hardware, so workers send them as experiments instead of running them on their own machine |
 | A run stopped (crash, laptop asleep) | Run `onyx research run` again on the same config: it holds the same jobs and carries them on |

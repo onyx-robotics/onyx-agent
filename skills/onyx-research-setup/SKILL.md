@@ -42,7 +42,7 @@ For each, write in `onyx/endpoints/`:
 - **The driver**: run in a checkout of an experiment's commit, from the repository's root, with the worker's packet path appended if it named one. It prints its log and ends with one line `METRICS {json}`, keys from the pack; exit 0. A failure says why in its last lines. Keep it honest: measure the way the user does, time against a reference where speed matters, check validity.
 - **The guide** (`<name>.md`, about ten lines): the packet (usually the commit itself), what it measures and how, what's in the log, how long one takes, its rules. Workers read it before every experiment.
 - **The quick evaluation** (`evaluate` in the config): the driver on a few samples, or a compile and test. Under a minute: workers run it before every commit.
-- **A CPU endpoint**, when workers will fit models, search or analyse saved data: offer one. Workers send long computations as experiments, and a turn spent computing locally holds a worker slot.
+- **A CPU endpoint**: offer one for processes that need no hardware, so workers have somewhere to run any program longer than a quick check. Workers send those as experiments too, and a turn spent running a process locally holds a worker slot.
 
 ## 5. The config
 
