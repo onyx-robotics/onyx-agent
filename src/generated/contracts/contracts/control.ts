@@ -4,18 +4,16 @@
  */
 import { z } from "zod"
 
-import { workspaceSketch } from "../view/sketch"
 import { workspaceDocInput, workspaceViewInput } from "../view/workspace"
 
 const workspaceName = z.string().trim().min(1).max(200)
 const visibility = z.enum(["private", "link"])
 
-/** A new workspace: empty unless a document is given; with its maker's sketch of it, if any. */
+/** A new workspace: empty unless a document is given. */
 export const workspaceCreateInput = z.object({
   name: workspaceName,
   doc: workspaceDocInput.optional(),
   visibility: visibility.optional(),
-  sketch: workspaceSketch.optional(),
 })
 export type WorkspaceCreateInput = z.input<typeof workspaceCreateInput>
 
@@ -53,24 +51,14 @@ export type WorkspaceDuplicateInput = z.input<typeof workspaceDuplicateInput>
 
 /**
  * The viewer's copy of a workspace they can open (one per person and workspace): with what it shows
- * now, if given (the change that made it), and their sketch of it.
+ * now, if given (the change that made it).
  */
-export const workspaceForkInput = z.object({
-  doc: workspaceDocInput.optional(),
-  sketch: workspaceSketch.optional(),
-})
+export const workspaceForkInput = z.object({ doc: workspaceDocInput.optional() })
 export type WorkspaceForkInput = z.input<typeof workspaceForkInput>
 
 /** A workspace put back as it was (its revision) or as it started (its original, the template). */
 export const workspaceResetInput = z.object({ expectedVersion: z.number().int().min(1) })
 export type WorkspaceResetInput = z.input<typeof workspaceResetInput>
-
-/** Someone's sketch of a workspace, drawn over its revision `version`. */
-export const workspaceSketchInput = z.object({
-  sketch: workspaceSketch,
-  version: z.number().int().min(1),
-})
-export type WorkspaceSketchInput = z.input<typeof workspaceSketchInput>
 
 /** The org's template made what a workspace shows (admins): its document, or the one given. */
 export const workspaceTemplateInput = z.object({ doc: workspaceDocInput.optional() })
