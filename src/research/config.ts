@@ -17,9 +17,16 @@ const endpoint = z.object({
   guide: z.string().min(1),
   /**
    * the driver, run in a checkout of the experiment's commit with the packet's path appended. It
-   * prints its log; a last line `METRICS {json}` carries the metrics (property keys)
+   * prints its log; a last line `METRICS {json}` carries the metrics (property keys). Unused for a
+   * site's endpoint
    */
-  driver: z.string().min(1),
+  driver: z.string().default(""),
+  /**
+   * run by a site (docs/jobs.md, "Personal runners": a site takes anyone's jobs, a run's too), not
+   * by this run's supervisor: it doesn't offer the unit, the site fetches the experiment's commit
+   * from `remote` (its `git` prop), and the result is read from the experiment's record
+   */
+  site: z.boolean().default(false),
   /** how many experiments it runs at once */
   capacity: z.number().int().min(1).max(64).default(1),
   /** give up on an experiment after this long */
@@ -43,7 +50,10 @@ export const researchConfig = z.object({
   metrics: z
     .array(z.object({ key: z.string().min(1), better: z.enum(["higher", "lower"]) }))
     .min(1),
-  endpoints: z.array(endpoint).min(1),
+  endpoints: z
+    .array(endpoint)
+    .min(1)
+    .refine((eps) => eps.every((e) => e.site || e.driver), "an endpoint needs a driver, or site"),
   models: z
     .object({
       base: z.string().default("opus"),

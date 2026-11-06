@@ -41,6 +41,9 @@ const GRACE_MS = 15 * 60_000
 /** the var-op is woken at least this often while the run proposes */
 const VAROP_TICK_MS = 10 * 60_000
 const LOG_TAIL = 6_000
+/** how often a site's experiments are looked up, and how many looks an end gets for its metrics */
+const SITE_POLL_MS = 3_000
+const SITE_METRIC_LOOKS = 5
 
 export function runDirFor(cfg: LoadedConfig) {
   return new RunDir(join(cfg.root, ".onyx-research", slug(cfg.name)))
@@ -309,7 +312,13 @@ export class Supervisor {
     this.log(
       `run "${this.cfg.name}": ${this.cfg.workers} workers, proposing until ${new Date(this.state.deadline).toISOString().slice(11, 19)}`
     )
-    await Promise.all([this.runnerLoop(), this.varopLoop(), this.waitingLoop(), this.keyLoop()])
+    await Promise.all([
+      this.runnerLoop(),
+      this.varopLoop(),
+      this.waitingLoop(),
+      this.siteLoop(),
+      this.keyLoop(),
+    ])
     const cost =
       this.state.base.costUsd +
       this.state.varop.costUsd +
@@ -330,13 +339,16 @@ export class Supervisor {
         capacity: 1,
         free: this.past() ? 0 : Math.max(0, 1 - busy(`worker-${i + 1}`)),
       })),
-      ...this.cfg.endpoints.map((e) => ({
-        key: e.type,
-        type: e.type,
-        name: `${hostname()} ${e.label}`,
-        capacity: e.capacity,
-        free: Math.max(0, e.capacity - busy(e.type)),
-      })),
+      // a site's endpoints are the site's to offer
+      ...this.cfg.endpoints
+        .filter((e) => !e.site)
+        .map((e) => ({
+          key: e.type,
+          type: e.type,
+          name: `${hostname()} ${e.label}`,
+          capacity: e.capacity,
+          free: Math.max(0, e.capacity - busy(e.type)),
+        })),
     ]
   }
 
@@ -673,6 +685,73 @@ export class Supervisor {
       ],
     })
     this.log(`experiment ${short(a.id)} ${ok ? "succeeded" : "failed"} ${JSON.stringify(metrics)}`)
+  }
+
+  /**
+   * Experiments a site runs (an endpoint with `site`) end on the site, so their results come from
+   * the platform: each pending one is looked up until it has ended and its record has its metrics.
+   * Experiments this supervisor runs itself are in its journal, and record their own results.
+   */
+  private async siteLoop() {
+    if (!this.cfg.endpoints.some((e) => e.site)) return
+    const seen = new Map<string, number>() // ended, but its record not yet complete: looks so far
+    while (!this.done()) {
+      for (const w of Object.values(this.state.workers)) {
+        if (w.phase === "done") continue
+        for (const id of this.pendingOf(w.task)) {
+          if (this.state.results[id] || this.journal.has(id)) continue
+          await this.siteResult(id, w.task, seen).catch((e: Error) =>
+            this.log(`experiment ${short(id)}: ${e.message}`)
+          )
+        }
+      }
+      await sleep(SITE_POLL_MS)
+    }
+  }
+
+  private async siteResult(id: string, task: string, seen: Map<string, number>) {
+    const job = (await this.onyx.getJob(id)) as {
+      state: string
+      outcome: string | null
+      failure: string | null
+      reason: string | null
+    }
+    if (job.state !== "ended") return
+    const item = (await this.onyx.getEntity(id)) as {
+      props: Record<string, unknown>
+      metrics: { property: string; value: number }[]
+    }
+    const props = item.props ?? {}
+    // what the site reported goes back to the worker: its metrics, and, from a driver that sends
+    // them as props, numbers the registry doesn't declare (`results`) and its log's end
+    // (`log_tail`). The job's files, its full log included, stay on the site for now
+    const metrics: Record<string, number> = {}
+    const results = props.results
+    if (results && typeof results === "object")
+      for (const [k, v] of Object.entries(results))
+        if (typeof v === "number" && Number.isFinite(v)) metrics[k] = v
+    for (const m of item.metrics ?? []) metrics[m.property] = m.value
+    const ok = job.outcome === "succeeded"
+    // the end can be visible a moment before the fold records its results: look again a few times
+    const looks = (seen.get(id) ?? 0) + 1
+    seen.set(id, looks)
+    if (ok && !Object.keys(metrics).length && !props.log_tail && looks < SITE_METRIC_LOOKS) return
+    seen.delete(id)
+    const why = ok ? "" : `${job.failure ?? "failed"}: ${job.reason ?? "no reason given"}`
+    const tail = typeof props.log_tail === "string" ? props.log_tail : ""
+    this.state.results[id] = {
+      id,
+      task,
+      endpoint: String(props.endpoint ?? "a site's endpoint"),
+      commit: String(props.git_sha ?? ""),
+      status: job.outcome,
+      outcome: job.outcome,
+      metrics,
+      logTail: (why ? `${why}\n` : "") + tail.slice(-LOG_TAIL),
+      endedAt: Date.now(),
+    }
+    this.save()
+    this.log(`experiment ${short(id)} ended on a site: ${job.outcome} ${JSON.stringify(metrics)}`)
   }
 
   // ------------------------------------------------------------ the var-op
