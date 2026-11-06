@@ -5,7 +5,9 @@
 - **`onyx`**, the command line: sign in, read the graph, log work, ingest files, queue jobs, keep your org's vocabulary as code.
 - **`onyx research`**: autoresearch on your machine. Agents run experiments on your codebase in parallel, and what they learn goes into your org's knowledge graph.
 - **The SDK** (`@onyx-robotics/agent/sdk`): `OnyxClient`, for agents, scripts and integrations.
-- **A skill for coding agents** (`skills/onyx`): how Claude Code and similar agents use `onyx`.
+- **Skills for coding agents** (`skills/`): how Claude Code and similar agents use `onyx`, and set a repository up for a research run.
+
+**New to Onyx?** [GETTING_STARTED.md](GETTING_STARTED.md) takes you from installing to your first research run, endpoints on other machines included.
 
 ## Install
 
@@ -96,10 +98,10 @@ You need: `onyx login`, a logged-in [Claude Code](https://claude.com/claude-code
   "remote": "git@github.com:you/project.git",
   "editable": ["solver.py"],
   "evaluate": "python onyx/endpoints/bench.py --samples 8",
-  "metrics": [{ "key": "speedup", "better": "higher" }],
+  "metrics": [{ "key": "solver.speedup", "better": "higher" }],
   "endpoints": [
     {
-      "type": "bench",
+      "type": "solver.bench",
       "label": "the benchmark, 100 instances",
       "guide": "onyx/endpoints/bench.md",
       "driver": "python onyx/endpoints/bench.py"
@@ -110,7 +112,7 @@ You need: `onyx login`, a logged-in [Claude Code](https://claude.com/claude-code
 }
 ```
 
-An endpoint's `type` is a unit type from your org's pack (a subtype of `research_endpoint`); its driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults.
+An endpoint's `type` and the metrics are from your org's pack (the type a subtype of `research_endpoint`), which an admin loads first; its driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
 
 ```bash
 onyx research setup onyx/research.json          # the base agent studies the repository
@@ -137,12 +139,15 @@ await onyx.ingest({
 
 Every write carries an Idempotency-Key its retries reuse (network errors, 429 and 5xx, retryable conflicts), so the server applies it once. `stream()` sends records in order, in chunks, as `onyx ingest` does. The SDK runs in Bun and in Node 22 or later.
 
-## The skill
+## The skills
 
-`skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`. For Claude Code, copy it into your skills:
+- `skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`.
+- `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, the org pack, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
+
+For Claude Code, copy them into your skills:
 
 ```bash
-mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/onyx" ~/.claude/skills/
+mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
 ```
 
 (or into a project's `.claude/skills/`).

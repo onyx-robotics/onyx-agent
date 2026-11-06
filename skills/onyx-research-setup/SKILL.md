@@ -1,0 +1,87 @@
+---
+name: onyx-research-setup
+description: Set a repository up for an Onyx research run (onyx research), with the user - the goal and metrics, the org pack, endpoint drivers and guides, onyx/research.json, and sites for hardware or other machines - then check every piece before the run. Use when the user asks to set up, prepare or configure an Onyx research or autoresearch run, add an endpoint or a site to one, or asks how to start with onyx research.
+---
+
+# Setting a repository up for an Onyx research run
+
+A run needs, in the repository: `onyx/research.json`, a driver and a guide for each endpoint, and a pack that puts the endpoints' types and the metrics in the org's registry. You write them with the user, check each one works, and hand over `onyx research setup` and `run`. The package's `GETTING_STARTED.md` is the same path for a person; use the `onyx` skill for the CLI itself.
+
+Work in this order. Don't write files before step 2's answers, and don't start a run: that's the user's call (step 8).
+
+## 1. Check what's there
+
+- `onyx whoami`: signed in, and to the right org. Exit 4: the user runs `onyx login` themselves (in Claude Code, `! onyx login`). Never handle a token.
+- `claude --version`, `git remote -v`: the run's agents are Claude Code sessions, and workers push branches to a remote, which must exist and be pushable. A bare repository (`git init --bare`) is fine for a first try on one machine.
+- Linux or macOS (WSL on Windows).
+- `onyx/research.json` already there: read it and its endpoints' guides, and change only what the user asks.
+- `onyx registry show types` (the ones whose `parent` is `research_endpoint`, or a subtype of it) and `onyx registry show props` (those with `metric: true`): endpoint types and metrics the org already has. Reuse them when they fit rather than inventing near-duplicates.
+
+## 2. Ask the user
+
+Ask what you can't read from the code, in one go:
+
+- **The goal**: what to improve, what must stay true (validity, limits, safety), and what an agent wouldn't know (what's been tried, where hardware is, what breaks it).
+- **The metrics**, each with its direction, and which matters most.
+- **What agents may edit**: the method's files only. Measurement code is never editable.
+- **Where experiments run**: this machine (a benchmark, a simulator), or hardware or another machine (a site, step 6). How long one takes, and how many can run at once.
+- **The budget**: workers and minutes. A run spends the user's Claude usage, mostly in workers' turns; say so.
+
+## 3. The pack (the org's vocabulary)
+
+Write `onyx/pack.yaml`: one asset type per endpoint (`parent: research_endpoint`) and one property per metric (`metric: true`, `better`), all named `<pack key>.<name>`, with `requires: [research]`. Each needs a `label`; a type's `description` says what it runs. See `GETTING_STARTED.md`, step 4.
+
+- `onyx registry check onyx/pack.yaml` must pass, then `onyx registry plan research onyx/pack.yaml` shows what it adds.
+- **Loading it is an admin's change to the whole org.** Show the plan, and ask the user to run `onyx registry apply research onyx/pack.yaml` (after `onyx login --admin`), or to have an admin do it. Don't apply it yourself unless they tell you to.
+- Every metric the drivers report must be in it, or a result is refused. Every endpoint type must be, or its experiments never start.
+
+## 4. Endpoints this machine runs
+
+For each, write in `onyx/endpoints/`:
+
+- **The driver**: run in a checkout of an experiment's commit, from the repository's root, with the worker's packet path appended if it named one. It prints its log and ends with one line `METRICS {json}`, keys from the pack; exit 0. A failure says why in its last lines. Keep it honest: measure the way the user does, time against a reference where speed matters, check validity.
+- **The guide** (`<name>.md`, about ten lines): the packet (usually the commit itself), what it measures and how, what's in the log, how long one takes, its rules. Workers read it before every experiment.
+- **The quick evaluation** (`evaluate` in the config): the driver on a few samples, or a compile and test. Under a minute: workers run it before every commit.
+- **A CPU endpoint**, when workers will fit models, search or analyse saved data: offer one. Workers send long computations as experiments, and a turn spent computing locally holds a worker slot.
+
+## 5. The config
+
+Write `onyx/research.json` (fields: `GETTING_STARTED.md`, step 6, and the package README). Then:
+
+- `remote`: the URL every endpoint fetches from, exactly; workers push there.
+- `capacity`: what the endpoint really runs at once (1 for a single rig). `timeoutS` above the longest honest experiment.
+- `workers`: about the endpoints' total capacity, since a waiting worker frees its slot; fewer if experiments are slow.
+- Leave `models` to their defaults unless the user asks.
+- Add `.onyx-research/` to `.gitignore`.
+
+## 6. Sites: hardware and other machines
+
+A site is a machine running `onyx-site`, which takes jobs for its units from the org's queue. An endpoint it runs has `"site": true` and no `driver` in the config. Its setup is on that machine, partly by hand (installing, approving): tell the user what to do there, and write what you can.
+
+- **Install**: `onyx-site` comes from the Onyx repository (`python/site-runner`; its `SETUP.md` is the full guide). It isn't a published package yet.
+- **The site file**: `[policy] unit_types` lists the endpoint types; `[repos.<name>] url` is the run's `remote`, character for character, with a read-only key; `[files] public_url` is reachable from the machine the run is on (it downloads experiments' files from there).
+- **A program in the repository** (most experiments): the shipped `onyx_site.drivers.local_program:LocalProgram` driver runs a `command` in the experiment's commit. It reports metrics from `$ONYX_OUT/metrics.json`, not a `METRICS` line, and keeps everything in `$ONYX_OUT`; the job's props (the packet included) are in `$ONYX_PARAMS`. Write the endpoint's program to that contract.
+- **Hardware with a long-lived connection** (a robot's server, a serial bus): a driver of its own (`DRIVERS.md` in the site-runner). Put the hardware's limits in the goal and the guide: joint ranges, currents, what tripped it before, what a person must do to recover it.
+- **Enrol**: `onyx-site enrol` on that machine; an admin approves the code it prints. Then `onyx-site run` as a service, and `onyx-site status` shows its units.
+
+## 7. Check every piece
+
+Nothing goes to the run unchecked:
+
+1. `onyx registry show types <type>` for each endpoint type, and `onyx registry show props <metric>` for each metric: loaded.
+2. The quick evaluation runs from the root, in under a minute, and prints the metrics.
+3. Each driver of this machine, in a clean checkout of `HEAD` (`git worktree add /tmp/check HEAD`): runs, and its last line is `METRICS` with every metric's key.
+4. Each site endpoint: one job by hand on a pushed commit (`onyx run -f -` with `on`, and `props.git` = `{url, commit, ref}`), ended `succeeded`, with its metrics and files (`onyx jobs get <id>`).
+5. Commit and push `baseBranch` to `remote`.
+
+## 8. Hand over
+
+Tell the user what you set up and what you checked, then the commands:
+
+```bash
+onyx research setup onyx/research.json   # the base agent studies the repository (minutes, a few dollars)
+onyx research run onyx/research.json     # until minutes are up; keep the terminal and machine on
+onyx research steer onyx/research.json "<a note for the var-op>"
+```
+
+Starting a run is theirs to decide: say how long it lasts and that it spends their Claude usage, and start it only if they ask, in the background or in their terminal. After setup, read its summary (`.onyx-research/<run>/base-summary.md`) with them: if the base agent misunderstood the problem, fix the goal or a guide and run setup again.
