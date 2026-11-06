@@ -30,7 +30,10 @@ export const TREE_SPLITS_MAX = 4
  * could never have earned a branch, so leaving it out never changes what's drawn.
  */
 export const TREE_MIN_RUNS = 5
-/** The buckets a tree may be counted in, finest first: the finest that fits `TREE_CELLS`. */
+/**
+ * The buckets a tree may be counted in, finest first: each level's the finest that fits
+ * `TREE_CELLS` with the levels above it as fine or finer.
+ */
 export const TREE_STEPS = ["1h", "1d", "7d", "28d"] as const satisfies readonly BucketKey[]
 export type TreeStep = (typeof TREE_STEPS)[number]
 /** The most path × bucket cells a tree's counts return. */
@@ -136,6 +139,11 @@ export interface TreeGraphNode {
   /** its buckets with runs, in order: each one's index from the read's `t0`, and its runs */
   b: number[]
   c: number[]
+  /**
+   * how many of the read's buckets each of its buckets spans (its level counted coarser: each count
+   * is of the `w` buckets from its index); none, 1
+   */
+  w?: number
 }
 
 /** A split of a tree: its dim, and its name. */
@@ -155,8 +163,13 @@ export interface TreeGraphRead {
   /** the match plan its total lane was placed by: what a delta changes */
   match: MatchPlan
   splits: TreeGraphSplit[]
-  /** the bucket its counts came in (the finest that fit) */
+  /** the bucket its counts came in: the origin's, the finest (a node's `b` count in it) */
   step: TreeStep
+  /**
+   * each level's bucket (the origin's, then each split's): the finest the budget allows at the top,
+   * coarser deeper (a deep split's paths are many)
+   */
+  steps: TreeStep[]
   /** its first bucket's start (epoch ms): a node's `b` count from it */
   t0: number
   /** every path with at least `min` runs (the origin first), and each kept parent's other */
