@@ -178,6 +178,17 @@ export interface TreeGraphRead {
   folded: { parent: string[]; values: number; n: number }[]
   /** value key -> its name, for the values its paths name */
   labels: Record<string, string>
+  /**
+   * each split's dim, and its values as the counts placed them ([facet value id, value key]): what
+   * places a published row's values on paths, so the counts follow each run as it ends
+   */
+  levels: { dim: number; ids: [number, string][] }[]
+  /** each path folded into its parent's other, and its runs (one reaching `min` is a branch) */
+  small: { path: string[]; n: number }[]
+  /** the fewest runs a path is counted apart with */
+  min: number
+  /** the messages applied to it since it was read (docs/SEMANTICS.md, "Resync") */
+  applied?: string[]
 }
 
 /** What's in flight at a node of a tree (`path`: its values; the origin, none). */
