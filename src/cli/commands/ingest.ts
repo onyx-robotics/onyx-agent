@@ -157,7 +157,7 @@ a file that stops partway can be sent again whole, and what was sent comes back 
         )
       return
     }
-    // what a person just made, the app's "Your work" button shows (an API key's agent's it doesn't:
+    // what a person just made, they're pointed at in the app (an API key's agent's they aren't:
     // it's not theirs)
     const app = c.app()
     const yours = app.person && totals.items.created > 0 ? app.url : null
@@ -165,7 +165,7 @@ a file that stops partway can be sent again whole, and what was sent comes back 
       c.out.line(
         `sent ${totals.records} records from ${label} in ${totals.chunks} chunk${totals.chunks === 1 ? "" : "s"}: ${sum(totals)}`
       )
-      if (yours) c.out.line(`see it with Your work: ${yours}`)
+      if (yours) c.out.line(`see it in the app: ${yours}`)
     } else c.out.ndjson({ done: true, ...totals, ...(yours ? { url: yours } : {}) })
   },
 }
