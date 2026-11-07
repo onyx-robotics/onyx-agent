@@ -35,7 +35,6 @@ import {
   type ViewWhere,
   type ViewWhereInput,
 } from "./spec"
-import { seriesId as treeSeriesPathId, type TreeChild, type WorkspaceTree } from "./tree"
 
 /** A series' busiest values shown, unless it says otherwise. */
 export const SERIES_LIMIT = 50
@@ -732,87 +731,3 @@ export const seriesFocus = z.union([
   z.strictObject({ where: viewWhere }),
 ])
 export type SeriesFocus = z.output<typeof seriesFocus>
-
-// ---------------------------------------------------------------- trees (document version 2)
-
-/** A series converted from a tree: its id, from where the tree had it. */
-export const treeSeriesKey = (path: readonly NodeRef[], dimKey: string): string =>
-  `t${fnv64(treeSeriesPathId([...path], dimKey))}`
-
-/** A tree's path as conditions: a value with a later value of its dim on the path is under it. */
-function pathWhere(path: readonly NodeRef[]): ViewWhere {
-  const kept = path.filter(
-    (r, i) =>
-      "none" in r || r.mode !== "rollup" || !path.slice(i + 1).some((later) => later.dim === r.dim)
-  )
-  return canonicalWhere({ all: kept })
-}
-
-const childRef = (dimKey: string, c: Pick<TreeChild, "value" | "direct">): NodeRef => ({
-  dim: dimKey,
-  key: c.value,
-  mode: c.direct ? "direct" : "rollup",
-})
-
-/**
- * A tree (a workspace document of version 2, or a view's address of version 1) as series: depth
- * first in the tree's order, so a series follows the series it was split from. Each series of the
- * tree at a path is a series of that path's conditions; a value's chevron (a series of its own
- * dim under it) is an expanded value of its series; a series under a closed one is closed.
- */
-export function seriesFromTree(tree: WorkspaceTree): Series[] {
-  const out: Series[] = []
-  type TreeSeries = WorkspaceTree["series"][number]
-
-  const walk = (list: TreeSeries[], path: NodeRef[], open: boolean) => {
-    for (const s of list) {
-      const made: Series = laneSeries.parse({
-        id: treeSeriesKey(path, s.dim),
-        where: pathWhere(path),
-        by: s.dim,
-        ...(s.siblings ? { then: { dim: s.siblings.dim, closed: s.siblings.closed } } : {}),
-        limit: s.limit,
-        ...(s.mode ? { mode: s.mode } : {}),
-        open: open && s.open,
-      })
-      out.push(made)
-      under(s, made, path, open && s.open)
-    }
-  }
-
-  /** What's under a series' values: chevrons (expanded values), and series of other dims. */
-  const under = (s: TreeSeries, made: Series, path: NodeRef[], open: boolean) => {
-    for (const c of s.children) {
-      const childPath = [
-        ...path,
-        childRef(s.dim, c),
-        ...(c.pair && s.siblings
-          ? [{ dim: s.siblings.dim, key: c.pair, mode: "rollup" as const }]
-          : []),
-      ]
-      const others: TreeSeries[] = []
-      for (const n of c.series) {
-        if (n.dim === s.dim && !c.pair && !c.direct) {
-          // a chevron: the value's children, in its series
-          if (n.open && open && made.expanded.length < EXPANDED_MAX) made.expanded.push(c.value)
-          under(n, made, childPath, open && n.open)
-        } else others.push(n)
-      }
-      walk(others, childPath, open)
-    }
-  }
-
-  walk(tree.series, [], true)
-  return out
-}
-
-/**
- * What an older link listed beside the lanes, as this version names it: a series' heading by the
- * series converted from it; a lane by its conditions.
- */
-export function focusFromTree(focus: { path: NodeRef[]; dim?: string } | null): SeriesFocus | null {
-  if (!focus) return null
-  if (focus.dim) return { series: treeSeriesKey(focus.path, focus.dim) }
-  if (!focus.path.length) return null
-  return { where: pathWhere(focus.path) }
-}
