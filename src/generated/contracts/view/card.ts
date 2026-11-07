@@ -84,12 +84,10 @@ export const card = z
     if (c.then && c.then.dim === c.by) issue(`split ${c.by}'s values by another dim`)
     if (c.expanded.length && !c.by) issue("a card opens values only of what it splits by")
   })
-  .transform(
-    ({ panels, ...c }): typeof c & { panels: SplitNode<Panel> } => ({
-      ...c,
-      panels: panels ?? newPanel(DEFAULT_PANEL, defaultPanelId(c.id)),
-    })
-  )
+  .transform(({ panels, ...c }): typeof c & { panels: SplitNode<Panel> } => ({
+    ...c,
+    panels: panels ?? newPanel(DEFAULT_PANEL, defaultPanelId(c.id)),
+  }))
 export type Card = z.output<typeof card>
 export type CardInput = z.input<typeof card>
 /** What a card counts: its query, apart from how it's shown. */
@@ -281,8 +279,6 @@ export function withThen(c: Card, then: string | null): Card {
   if (!then || !c.by || then === c.by) return rest
   return { ...rest, then: { dim: then, closed: was?.dim === then ? was.closed : [] } }
 }
-
-export const withLimit = (c: Card, limit: number): Card => ({ ...c, limit })
 
 /**
  * Named: its title is the name, and what was typed in its text bar goes (title.ts). None: neither,

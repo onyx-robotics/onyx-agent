@@ -11,14 +11,11 @@ import {
   axisRange as range,
   axisScales as scales,
   field,
-  onlyFromSolo,
-  onlyLanes,
   timeOf,
   type Field,
   type FieldInput,
   type ScaleKind,
 } from "./plot-state"
-import { seriesFocus } from "./series"
 import type { MatchPlan, ViewResult } from "./types"
 
 export * from "./plot-state"
@@ -50,23 +47,6 @@ export const pickWhat = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("ids"), ids: z.array(z.guid()).min(1).max(PICK_IDS_MAX) }),
 ])
 export type PickWhat = z.output<typeof pickWhat>
-
-/**
- * What's picked in a plot (the view's `pick` field): a brush, a lasso (in the axes' transformed
- * units: log₁₀ on a log scale) or ids, of the items of the series it was made in (its scope: the
- * focus it was made in, a series, one of its lanes, or an older link's lane by its conditions; and
- * the lanes drawn alone, an older link's one lane alone as those), wherever they're drawn.
- */
-export const pickState = z.preprocess(
-  (raw) =>
-    typeof raw === "object" && raw !== null ? onlyFromSolo(raw as Record<string, unknown>) : raw,
-  z.strictObject({
-    scope: seriesFocus.nullable(),
-    only: onlyLanes,
-    what: pickWhat,
-  })
-)
-export type PickState = z.output<typeof pickState>
 
 /** A field as a key (maps, columns, query keys, the API). */
 export function fieldKey(f: FieldInput): string {

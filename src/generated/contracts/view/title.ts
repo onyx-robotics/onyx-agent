@@ -12,12 +12,9 @@ import { QUERY_TEXT_MAX, type TextSpan } from "../contracts/query"
 import {
   conditionRefs,
   conditionsOf,
-  editSeries,
-  queryOf,
   SERIES_LIMIT,
   TEXT_MARKS_MAX,
   type Condition,
-  type Series,
   type SeriesQueryOf,
   type SeriesText,
   type TextMark,
@@ -259,26 +256,6 @@ export function seriesTitle(q: SeriesQueryOf, words: TitleWords): SeriesText {
   }
   return textOf(out)
 }
-
-/**
- * A series' name, its title: the name it was given, else what's typed in its text bar, else its
- * query in words.
- */
-export const seriesName = (s: Series, words: TitleWords): string =>
-  s.label ?? s.text?.value ?? seriesTitle(queryOf(s), words).value
-
-/**
- * How a series is shown in its card, said beside its title, so two cards of the same query shown
- * different ways read apart ("All items · Tree graph", "All items · Force graph"): a graph by its
- * layout, a plot. Null: its lanes (the title says it all).
- */
-export function representationTitle(s: Pick<Series, "plot" | "graph">): string | null {
-  if (s.graph) return s.graph.layout === "force" ? "Force graph" : "Tree graph"
-  if (s.plot) return "Plot"
-  return null
-}
-
-// ---------------------------------------------------------------- a typed title kept
 
 interface Canonical {
   refs: Map<string, NodeRef>
@@ -560,25 +537,4 @@ function say(t: Draft, at: number, lead: string, pieces: Piece[]): Draft {
     pos += words.length
   }
   return next
-}
-
-/**
- * A list after a change to one series' query by its chips (`edit`), its typed title kept saying
- * what it is (`retitle`): one edit, a step Back undoes. A title the change set itself is its own.
- */
-export function keepTitle(
-  before: readonly Series[],
-  after: Series[],
-  id: string,
-  words: TitleWords
-): Series[] {
-  const was = before.find((s) => s.id === id)
-  const now = after.find((s) => s.id === id)
-  if (!was?.text || !now?.text || now.text !== was.text) return after
-  const text = retitle(now.text, queryOf(was), queryOf(now), words)
-  if (text === now.text) return after
-  return editSeries(after, id, (s) => {
-    const { text: _t, ...rest } = s
-    return text ? { ...rest, text } : rest
-  })
 }

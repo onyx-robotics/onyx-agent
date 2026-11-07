@@ -127,16 +127,6 @@ export function resizeSplit<L extends Leaf>(
   return { root: tree.root, sizes: { ...tree.sizes, [splitId]: normalShares(shares) } }
 }
 
-/** Shares no split of these ids has (a card removed, a split gone): dropped. */
-export function pruneSizes(sizes: Sizes, live: Iterable<string>): Sizes {
-  const keep = new Set(live)
-  const out: Sizes = {}
-  for (const [k, v] of Object.entries(sizes)) if (keep.has(k)) out[k] = v
-  return out
-}
-
-// ---------------------------------------------------------------- normalizing
-
 /**
  * A tree normalized: a split of one child is that child, a split's child split of its own direction
  * is part of it (its children taking their shares of its share), and shares of splits that went

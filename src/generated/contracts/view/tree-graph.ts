@@ -5,16 +5,15 @@
  * on its own over all of time. What a tree counts is a read of its own (`tree_counts`), never the
  * page's view: drawing a graph changes nothing the page counts. Browser-safe.
  */
-import { countedTime, parentOf, withValue, type Series, type SeriesSettings } from "./series"
+import { countedTime, parentOf, type SeriesSettings } from "./series"
 import {
   canonicalWhere,
   groupKey,
   pinnedKey,
-  refCount,
   type BucketKey,
   type LaneGroupInput,
   type ViewSpecInput,
-  type ViewWhere,
+  type ViewWhereInput,
 } from "./spec"
 import type { MatchPlan, ViewResult } from "./types"
 
@@ -47,10 +46,14 @@ export const TREE_OTHER = "other"
 export const TREE_RESTRICTED = "restricted"
 
 /**
- * A series' splits as a tree, in order: its graph's own chain, else what its lanes are split by
- * (its `by`, then its `then` or its ideas), else its ideas.
+ * A card's splits as a tree, in order: its Node panel's own chain, else what its lanes are split
+ * by (its `by`, then its `then` or its ideas), else its ideas.
  */
-export function treeSplits(s: Pick<Series, "by" | "then" | "graph">): string[] {
+export function treeSplits(s: {
+  by?: string
+  then?: { dim: string }
+  graph?: { splits?: readonly string[] }
+}): string[] {
   const own = s.graph?.splits
   if (own?.length) return [...new Set(own)].slice(0, TREE_SPLITS_MAX)
   const chain = s.by && s.by !== TRACK_DIM ? [s.by, s.then?.dim ?? TRACK_DIM] : [TRACK_DIM]
@@ -75,7 +78,7 @@ export interface CompiledTreeGraph {
  * values are its candidates (the roots of its dim, or the children of its value the series names).
  */
 export function compileTreeGraph(
-  s: Pick<Series, "where">,
+  s: { where: ViewWhereInput },
   splits: readonly string[],
   settings: SeriesSettings
 ): CompiledTreeGraph | null {
@@ -104,27 +107,6 @@ export function compileTreeGraph(
     total: pinnedKey(where),
     levels: groups.map(groupKey),
   }
-}
-
-/**
- * The conditions of a node of a tree (its path from the origin, a value per split): the series'
- * and each value's, in place of its parent the series names. None for a place that isn't a value
- * (other, restricted): what's there can't be named as a condition.
- */
-export function treeNodeWhere(
-  s: Pick<Series, "where">,
-  splits: readonly string[],
-  path: readonly string[]
-): ViewWhere | null {
-  const base = canonicalWhere(s.where)
-  let w = base
-  for (let i = 0; i < path.length; i++) {
-    const key = path[i]!
-    const dim = splits[i]
-    if (!dim || key === TREE_OTHER || key === TREE_RESTRICTED) return null
-    w = withValue(w, { dim, key, mode: "rollup" }, parentOf(base, dim))
-  }
-  return refCount(w) || path.length === 0 ? w : null
 }
 
 /** A path's key (its values joined): the origin is "". */

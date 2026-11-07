@@ -89,6 +89,3 @@ export interface GraphResult extends PlotMeta {
   /** the realtime messages applied to it (a signal read: none, it's refetched) */
   applied?: string[]
 }
-
-/** An empty graph state: every relation drawn, a row of its card. */
-export const defaultGraph = (): GraphState => graphState.parse({})
