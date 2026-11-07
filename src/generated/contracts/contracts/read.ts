@@ -67,6 +67,17 @@ export const flowQuery = z.strictObject({
 export type FlowQueryInput = z.input<typeof flowQuery>
 
 /**
+ * A card's queue (docs/jobs.md, "The queue"; @onyx/core/view queue.ts): its flow, and what a flow
+ * doesn't say (places in line, what finished in the last hour, the units serving it, estimates).
+ */
+export const queueQuery = z.strictObject({
+  ...flowQuery.shape,
+  /** how many of what finished in the last hour to send in full, newest first */
+  finished: z.number().int().min(1).max(500).default(200),
+})
+export type QueueQueryInput = z.input<typeof queueQuery>
+
+/**
  * A series' graph as a tree (docs/tree-design.md): its runs counted at every path of its splits
  * (`compileTreeGraph`: its counts' spec, its total lane and a group per split, in order).
  */
