@@ -18,14 +18,14 @@ import {
   EXPANDED_MAX,
   groupLaneKey,
   parentOf,
-  seriesGroup,
-  seriesText,
-  SERIES_LIMIT,
-  type SeriesGroup,
-  type SeriesQueryOf,
-  type SeriesSettings,
-  type SeriesText,
-} from "./series"
+  cardGroup,
+  cardText,
+  CARD_LIMIT,
+  type CardGroup,
+  type TextQueryOf,
+  type CountSettings,
+  type CardText,
+} from "./card-query"
 import {
   canonicalWhere,
   groupKey,
@@ -39,7 +39,7 @@ import {
   type ViewSpecInput,
   type ViewWhereInput,
 } from "./spec"
-import { retitle, seriesTitle, type TitleWords } from "./title"
+import { retitle, queryTitle, type TitleWords } from "./title"
 import { isSplit, mapLeaves, newNodeId, nodeId, splitNode, splits, type SplitNode } from "./split"
 
 /** Panels a card holds at most, and how deeply it splits them. */
@@ -70,9 +70,9 @@ export const card = z
     /** hierarchy values of `by` opened in place: their children's lanes under them */
     expanded: z.array(uuid).max(EXPANDED_MAX).default([]),
     /** its busiest values shown */
-    limit: z.number().int().min(1).max(500).default(SERIES_LIMIT),
+    limit: z.number().int().min(1).max(500).default(CARD_LIMIT),
     /** what its text bar says (none: it's empty) */
-    text: seriesText.optional(),
+    text: cardText.optional(),
     /** its time window is shared with every card of the same key (none: its own) */
     synced: nodeId.optional(),
     /** its panels: views of its query (none written: a queue, named after the card) */
@@ -98,7 +98,7 @@ export type CardQuery = Pick<Card, "where" | "by" | "then" | "expanded" | "limit
  * query in words.
  */
 export const cardName = (c: Card, words: TitleWords): string =>
-  c.label ?? c.text?.value ?? seriesTitle(queryOfCard(c), words).value
+  c.label ?? c.text?.value ?? queryTitle(queryOfCard(c), words).value
 
 /** A card's time window's key: its sync's, or its own id. */
 export const windowKey = (c: Pick<Card, "id" | "synced">): string => c.synced ?? c.id
@@ -185,12 +185,12 @@ export interface CompiledCard {
  * (its own, each opened value's). Groups are sorted by key, so renaming a card or changing how it's
  * shown changes nothing counted.
  */
-export function compileCard(c: CardQuery, settings: SeriesSettings): CompiledCard {
+export function compileCard(c: CardQuery, settings: CountSettings): CompiledCard {
   const where = canonicalWhere(c.where)
   const total = pinnedKey(where)
   const groups = new Map<string, LaneGroupInput>()
 
-  const addGroup = (g: SeriesGroup): string => {
+  const addGroup = (g: CardGroup): string => {
     const subParent = c.then ? parentOf(g.where, c.then.dim) : undefined
     const base: LaneGroupInput = {
       where: g.where,
@@ -212,8 +212,8 @@ export function compileCard(c: CardQuery, settings: SeriesSettings): CompiledCar
   let group: string | null = null
   const expansions = new Map<string, string>()
   if (c.by) {
-    group = addGroup(seriesGroup(c))
-    for (const v of c.expanded) expansions.set(v, addGroup(seriesGroup(c, v)))
+    group = addGroup(cardGroup(c))
+    for (const v of c.expanded) expansions.set(v, addGroup(cardGroup(c, v)))
   }
 
   const grouped = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, g]) => g)
@@ -291,11 +291,11 @@ export function withLabel(c: Card, label: string | null): Card {
 }
 
 /** Its query, as its text bar sends it to be refined. */
-export const queryOfCard = (c: Card): SeriesQueryOf => ({
+export const queryOfCard = (c: Card): TextQueryOf => ({
   where: c.where,
   ...(c.by ? { by: c.by } : {}),
   ...(c.then ? { then: c.then.dim } : {}),
-  ...(c.limit !== SERIES_LIMIT ? { limit: c.limit } : {}),
+  ...(c.limit !== CARD_LIMIT ? { limit: c.limit } : {}),
 })
 
 /**
@@ -304,7 +304,7 @@ export const queryOfCard = (c: Card): SeriesQueryOf => ({
  * The values it opened stay while it's split by the same dim, and its folded pairs while each
  * value is split again by the same.
  */
-export function withQuery(c: Card, q: SeriesQueryOf, text?: SeriesText | null): Card {
+export function withQuery(c: Card, q: TextQueryOf, text?: CardText | null): Card {
   const { by: _by, then: was, expanded, text: had, label, ...rest } = c
   const by = q.by || undefined
   const then = by && q.then && q.then !== by ? q.then : undefined
@@ -316,7 +316,7 @@ export function withQuery(c: Card, q: SeriesQueryOf, text?: SeriesText | null): 
     ...(by ? { by } : {}),
     ...(then ? { then: { dim: then, closed: same && was?.dim === then ? was.closed : [] } } : {}),
     expanded: same ? expanded : [],
-    limit: q.limit ?? SERIES_LIMIT,
+    limit: q.limit ?? CARD_LIMIT,
     ...(says ? { text: says } : {}),
     ...(label && text === undefined ? { label } : {}),
   }

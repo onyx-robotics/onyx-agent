@@ -12,13 +12,13 @@ import { QUERY_TEXT_MAX, type TextSpan } from "../contracts/query"
 import {
   conditionRefs,
   conditionsOf,
-  SERIES_LIMIT,
+  CARD_LIMIT,
   TEXT_MARKS_MAX,
   type Condition,
-  type SeriesQueryOf,
-  type SeriesText,
+  type TextQueryOf,
+  type CardText,
   type TextMark,
-} from "./series"
+} from "./card-query"
 import { canonicalWhere, type NodeRef } from "./spec"
 
 /** What a title says things with. */
@@ -173,7 +173,7 @@ const joined = (groups: Piece[][], sep: string): Piece[] =>
   groups.flatMap((g, i) => (i ? [sep, ...g] : g))
 
 /** Pieces as a text: their words, and the places of the phrases that say parts. */
-function textOf(pieces: Piece[]): SeriesText {
+function textOf(pieces: Piece[]): CardText {
   let value = ""
   const marks: TextMark[] = []
   for (const p of pieces) {
@@ -198,7 +198,7 @@ function textOf(pieces: Piece[]): SeriesText {
  * Atlas · Friction modeling"). Every part is said by its dim's role, so two queries never read
  * alike. How many values it shows isn't said: it's how much of it is shown, said beside it.
  */
-export function seriesTitle(q: SeriesQueryOf, words: TitleWords): SeriesText {
+export function queryTitle(q: TextQueryOf, words: TitleWords): CardText {
   const by: Record<Role, Condition[]> = {
     type: [],
     creator: [],
@@ -264,15 +264,15 @@ interface Canonical {
   limit: number
 }
 
-function canonical(q: SeriesQueryOf): Canonical {
+function canonical(q: TextQueryOf): Canonical {
   const w = canonicalWhere(q.where)
   const refs = new Map([...w.all, ...w.any.flat()].map((r) => [idOf(r), r] as const))
   const by = q.by ?? null
-  return { refs, by, then: (by && q.then !== by && q.then) || null, limit: q.limit ?? SERIES_LIMIT }
+  return { refs, by, then: (by && q.then !== by && q.then) || null, limit: q.limit ?? CARD_LIMIT }
 }
 
 /** Whether a query still has a phrase's part (changed another way since, it's only words). */
-export function markHolds(m: TextMark, q: SeriesQueryOf): boolean {
+export function markHolds(m: TextMark, q: TextQueryOf): boolean {
   return holds(m, canonical(q))
 }
 
@@ -410,11 +410,11 @@ function tailAt(t: Draft, kinds: readonly TextMark["kind"][]): number {
  * How many values it shows is said anew only where the title says it. Null: nothing's left of it.
  */
 export function retitle(
-  text: SeriesText,
-  before: SeriesQueryOf,
-  after: SeriesQueryOf,
+  text: CardText,
+  before: TextQueryOf,
+  after: TextQueryOf,
   words: TitleWords
-): SeriesText | null {
+): CardText | null {
   const b = canonical(before)
   const a = canonical(after)
   // (a value it can't name yet isn't said: a title never says "…")
@@ -461,7 +461,7 @@ export function retitle(
             ? old.slice(0, at) + dimWords(dim, words) + old.slice(at + label.length)
             : splitWords(m.kind, dim, words)
       }
-    } else if (m.kind === "limit" && a.limit !== SERIES_LIMIT) {
+    } else if (m.kind === "limit" && a.limit !== CARD_LIMIT) {
       part = { kind: "limit", limit: a.limit }
       said = t.value.slice(m.span[0], m.span[1]).replace(/\d+/u, String(a.limit))
     }

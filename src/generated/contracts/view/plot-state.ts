@@ -1,8 +1,8 @@
 // Generated from packages/core/src/view/plot-state.ts in Onyx's monorepo (bun run agent:contracts): don't edit.
 /**
  * What a plot shows (docs/plots-design.md §4, §5; docs/inline-plots-design.md): the fields an
- * axis can show, what it draws of them, and a plot's state. Apart from plot.ts so a series
- * (series.ts) can hold its plot: plot.ts names series in its picks. Browser-safe.
+ * axis can show, what it draws of them, and a plot's state. Apart from plot.ts so a Plot panel
+ * (panel.ts) can hold its plot: plot.ts names cards' lanes in its picks. Browser-safe.
  */
 import { z } from "zod"
 

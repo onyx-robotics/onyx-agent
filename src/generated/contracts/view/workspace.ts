@@ -19,7 +19,7 @@ import { card, cardFocus, copyCard, windowKey, type Card } from "./card"
 import { type Panel, type PanelKind, type PanelOf } from "./panel"
 import { pickWhat } from "./plot"
 import { onlyLanes } from "./plot-state"
-import type { SeriesSettings } from "./series"
+import type { CountSettings } from "./card-query"
 import { viewSpec, type BucketKey } from "./spec"
 import {
   findLeaf,
@@ -133,7 +133,7 @@ export function readStoredDoc(raw: unknown): { doc: WorkspaceDoc; read: StoredDo
 }
 
 /** What a workspace's cards count with: its item set over all time, in `base` buckets. */
-export const countSettings = (s: WorkspaceSettings, base: BucketKey = "1d"): SeriesSettings => ({
+export const countSettings = (s: WorkspaceSettings, base: BucketKey = "1d"): CountSettings => ({
   itemTypes: s.itemTypes,
   itemKinds: s.itemKinds,
   spaces: s.spaces,

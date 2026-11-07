@@ -5,7 +5,7 @@
  * on its own over all of time. What a tree counts is a read of its own (`tree_counts`), never the
  * page's view: drawing a graph changes nothing the page counts. Browser-safe.
  */
-import { countedTime, parentOf, type SeriesSettings } from "./series"
+import { countedTime, parentOf, type CountSettings } from "./card-query"
 import {
   canonicalWhere,
   groupKey,
@@ -80,7 +80,7 @@ export interface CompiledTreeGraph {
 export function compileTreeGraph(
   s: { where: ViewWhereInput },
   splits: readonly string[],
-  settings: SeriesSettings
+  settings: CountSettings
 ): CompiledTreeGraph | null {
   const asked = settings.statusClasses ?? []
   const statusClasses = ENDED_CLASSES.filter((c) => !asked.length || asked.includes(c))

@@ -1,8 +1,8 @@
 // Generated from packages/core/src/contracts/query.ts in Onyx's monorepo (bun run agent:contracts): don't edit.
 /**
- * Series query resolution (docs/query-builder.md): what a series header's text means as the
- * series' query (its conditions, what it's split by), shown as chips the person checks and
- * changes. Shared by the route, the page and the evaluation harness. Browser-safe.
+ * Query resolution (docs/query-builder.md): what a series card's text means as its query (its
+ * conditions, what it's split by), shown as chips the person checks and changes. Shared by the
+ * route, the page and the evaluation harness. Browser-safe.
  */
 import { z } from "zod"
 
@@ -12,20 +12,20 @@ export const QUERY_TEXT_MAX = 500
 
 const dim = z.string().min(1).max(100)
 
-/** The part of a series the text says: its conditions, its splits and how many values it shows. */
-export const seriesQuery = z.strictObject({
+/** The part of a card the text says: its conditions, its splits and how many values it shows. */
+export const textQuery = z.strictObject({
   where: viewWhere.default({ all: [], any: [] }),
   by: dim.optional(),
   then: dim.optional(),
   limit: z.number().int().min(1).max(500).optional(),
 })
-export type SeriesQuery = z.output<typeof seriesQuery>
-export type SeriesQueryInput = z.input<typeof seriesQuery>
+export type TextQuery = z.output<typeof textQuery>
+export type TextQueryInput = z.input<typeof textQuery>
 
 export const resolveQueryInput = z.object({
   text: z.string().max(QUERY_TEXT_MAX),
-  /** the series' query now: the text changes it; omitted, the text says the whole query */
-  current: seriesQuery.optional(),
+  /** the card's query now: the text changes it; omitted, the text says the whole query */
+  current: textQuery.optional(),
   /** the resolver to use (a development menu compares them); omitted, the server's default */
   strategy: z
     .string()
@@ -81,7 +81,7 @@ export const queryChip = z.object({
 export type QueryChip = z.output<typeof queryChip>
 export type QueryChipInput = z.input<typeof queryChip>
 
-/** What the text asks for that a series can't say yet: shown, never silently dropped. */
+/** What the text asks for that a card can't say yet: shown, never silently dropped. */
 export const UNSUPPORTED_KINDS = [
   "negation",
   "range",
@@ -101,7 +101,7 @@ export type QueryUnsupported = z.output<typeof queryUnsupported>
 
 export const queryResolution = z.object({
   /** the series' query after the text */
-  query: seriesQuery,
+  query: textQuery,
   chips: z.array(queryChip),
   unsupported: z.array(queryUnsupported),
   /** words that became nothing (beyond the small ones: "the", "of") */
