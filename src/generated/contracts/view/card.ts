@@ -39,7 +39,7 @@ import {
   type ViewSpecInput,
   type ViewWhereInput,
 } from "./spec"
-import { seriesTitle, type TitleWords } from "./title"
+import { retitle, seriesTitle, type TitleWords } from "./title"
 import { isSplit, mapLeaves, newNodeId, nodeId, splitNode, splits, type SplitNode } from "./split"
 
 /** Panels a card holds at most, and how deeply it splits them. */
@@ -244,6 +244,18 @@ export function compileCard(c: CardQuery, settings: SeriesSettings): CompiledCar
 }
 
 // ---------------------------------------------------------------- editing its query
+
+/**
+ * A card after a change to its query by its chips (`after`), its typed title kept saying what it
+ * is (`retitle`). A title the change set itself is its own.
+ */
+export function keepCardTitle(before: Card, after: Card, words: TitleWords): Card {
+  if (!before.text || !after.text || after.text !== before.text) return after
+  const text = retitle(after.text, queryOfCard(before), queryOfCard(after), words)
+  if (text === after.text) return after
+  const { text: _t, ...rest } = after
+  return text ? { ...rest, text } : rest
+}
 
 /** Its conditions changed. */
 export const withWhere = (c: Card, where: ViewWhereInput): Card => ({
