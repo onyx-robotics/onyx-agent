@@ -333,6 +333,27 @@ export function minSize<L extends Leaf>(
 }
 
 /**
+ * Its leaves in the order they're read on screen, by where each starts at its shares: top to
+ * bottom, and left to right at one height (side by side in a row, all start at its top).
+ */
+export function readingOrder<L extends Leaf>(tree: Tree<L>): L[] {
+  const placed: { leaf: L; x: number; y: number }[] = []
+  const place = (n: SplitNode<L>, x: number, y: number, w: number, h: number) => {
+    if (!isSplit(n)) return void placed.push({ leaf: n, x: round(x), y: round(y) })
+    const shares = sharesOf(tree.sizes, n)
+    let at = 0
+    n.children.forEach((c, i) => {
+      const s = shares[i]!
+      if (n.dir === "row") place(c, x + at * w, y, s * w, h)
+      else place(c, x, y + at * h, w, s * h)
+      at += s
+    })
+  }
+  if (tree.root) place(tree.root, 0, 0, 1, 1)
+  return placed.sort((a, b) => a.y - b.y || a.x - b.x).map((p) => p.leaf)
+}
+
+/**
  * A tree as it's shown `width` wide: a row whose children's least widths don't fit is stacked
  * instead, its children evenly (`reflowed` names those, for the page not to resize or save them).
  * For display only: what's saved stays as it was.
