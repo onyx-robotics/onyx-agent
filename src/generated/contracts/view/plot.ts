@@ -28,7 +28,7 @@ export const LASSO_MAX = 64
 /** The most points picked one by one. */
 export const PICK_IDS_MAX = 200
 
-const pickWhat = z.discriminatedUnion("kind", [
+export const pickWhat = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("brush"),
     x: field,
