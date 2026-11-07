@@ -622,7 +622,7 @@ export interface SeriesQueryOf {
 }
 
 /** A series' query, as its header's text bar sends it to be refined. */
-export const queryOf = (s: Series): SeriesQueryOf => ({
+export const queryOf = (s: Pick<Series, "where" | "by" | "then" | "limit">): SeriesQueryOf => ({
   where: s.where,
   ...(s.by ? { by: s.by } : {}),
   ...(s.then ? { then: s.then.dim } : {}),
