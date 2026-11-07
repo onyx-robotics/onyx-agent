@@ -91,25 +91,6 @@ export const listJobsQuery = z.object({
   after: uuid.optional(),
 })
 
-/**
- * What ended on the units lately (the queue page): its numbers over the last `minutes`, and the
- * runs of the last `line` minutes for a timeline.
- */
-export const recentRunsQuery = z.object({
-  minutes: z.coerce
-    .number()
-    .int()
-    .min(5)
-    .max(24 * 60)
-    .default(60),
-  line: z.coerce
-    .number()
-    .int()
-    .min(5)
-    .max(24 * 60)
-    .default(30),
-})
-
 export const setUnitsInput = z.object({
   ids: z.array(uuid).min(1).max(1000),
   reason: z.string().max(500).optional(),
