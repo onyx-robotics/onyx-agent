@@ -302,7 +302,14 @@ const NODE = {
 
 const PANELS = {
   lanes: { id: "layout", kind: "layout" },
-  queue: { id: "layout", kind: "layout", color: "viewer", folded: "viewer", opened: "viewer" },
+  queue: {
+    id: "layout",
+    kind: "layout",
+    color: "viewer",
+    folded: "viewer",
+    opened: "viewer",
+    window: "viewer",
+  },
   inspector: { id: "layout", kind: "layout" },
   plot: { id: "layout", kind: "layout", plot: "layout", legend: "viewer" },
   node: { id: "layout", kind: "layout", graph: "layout" },

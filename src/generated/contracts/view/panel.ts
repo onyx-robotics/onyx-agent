@@ -58,6 +58,18 @@ export const queueColor = z.enum(["type", "status"])
 const queueFolded = z.array(z.number().int()).max(64).default([])
 const queueOpened = z.array(z.string().min(1).max(64)).max(64).default([])
 
+/**
+ * Where a queue's timeline looks: `span` (ms) up to now, which it follows; or a stretch of the past,
+ * its ends (epoch ms). None: the last hour, up to now.
+ */
+export const queueWindow = z.union([
+  z.strictObject({ span: z.number().int().positive() }),
+  z
+    .strictObject({ t0: z.number().int().min(0), t1: z.number().int() })
+    .refine((w) => w.t1 > w.t0, "a window ends after it starts"),
+])
+export type QueueWindow = z.output<typeof queueWindow>
+
 export const panel = z.discriminatedUnion("kind", [
   z.strictObject({ id: nodeId, kind: z.literal("lanes") }),
   z.strictObject({
@@ -66,6 +78,7 @@ export const panel = z.discriminatedUnion("kind", [
     color: queueColor.default("type"),
     folded: queueFolded,
     opened: queueOpened,
+    window: queueWindow.nullable().default(null),
   }),
   z.strictObject({ id: nodeId, kind: z.literal("inspector") }),
   z.strictObject({
