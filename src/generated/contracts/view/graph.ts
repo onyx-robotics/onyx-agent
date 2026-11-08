@@ -7,6 +7,7 @@
 import { z } from "zod"
 
 import type { PlotMeta } from "./plot"
+import type { MatchPlan } from "./types"
 
 /** The most items a graph reads (its scope's newest); past it, `truncated`. */
 export const GRAPH_ITEMS_MAX = 5000
@@ -86,6 +87,25 @@ export interface GraphResult extends PlotMeta {
   truncated: boolean
   /** nodes with more edges in a direction than were read */
   capped: number[]
-  /** the realtime messages applied to it (a signal read: none, it's refetched) */
+  /** the realtime messages applied to it (graph-live.ts) */
   applied?: string[]
+  /**
+   * what decides it, for keeping it live (graph-live.ts): the request's lanes (what `lanes`
+   * index), its window (from ≤ t < to), how many items it reads at most, and its match plan
+   */
+  scope: { lanes: string[]; window: { from: number; to: number }; limit: number; match: MatchPlan }
+}
+
+/**
+ * Some of a graph's nodes read again (graph-live.ts): `members`' summaries and their edges both
+ * ways (as the graph reads them: current, both ends visible, the first `GRAPH_EDGES_PER_ITEM` per
+ * direction), `others`' summaries, and the nodes at their edges' other ends. Edges by id.
+ */
+export interface GraphPatch {
+  nodes: GraphNode[]
+  /** per member asked, its edges as [source, target, relation key] */
+  edges: Record<string, [string, string, string][]>
+  relations: GraphRelation[]
+  /** members with more edges in a direction than were read */
+  capped: string[]
 }
