@@ -314,6 +314,9 @@ export interface FacetDeltaMessage {
    */
   touch?: string[]
   cur?: FacetTouchRow[]
-  /** `job`: from the job fold, ids only: any of the others, and an order or a unit's availability */
-  what?: "item" | "metrics" | "refs" | "job"
+  /**
+   * `job`: from the job fold, ids only: any of the others, and an order or a unit's availability;
+   * `edges`: an edge from or to each was added, closed or removed (a graph reads their edges again)
+   */
+  what?: "item" | "metrics" | "refs" | "job" | "edges"
 }

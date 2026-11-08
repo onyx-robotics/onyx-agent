@@ -116,6 +116,17 @@ export const graphQuery = z.strictObject({
 })
 export type GraphQueryInput = z.input<typeof graphQuery>
 
+/**
+ * Some of a series' graph's nodes read again (a patch, graph-live.ts): `members`' summaries and
+ * edges both ways, `others`' summaries (neighbours, or nodes a message named).
+ */
+export const graphPatchQuery = z.strictObject({
+  scope: plotScope,
+  members: z.array(z.guid()).max(1000),
+  others: z.array(z.guid()).max(1000),
+})
+export type GraphPatchQueryInput = z.input<typeof graphPatchQuery>
+
 export const lineageQuery = z.object({
   direction: z.enum(["up", "down", "both"]).default("both"),
   depth: z.number().int().min(1).max(6).default(3),
