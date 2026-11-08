@@ -9,7 +9,7 @@
 import { z } from "zod"
 
 import { graphState } from "./graph"
-import { axisRange, axisScales, field, onlyLanes, plotShow } from "./plot-state"
+import { axisRange, axisScales, field, moreY, onlyLanes, plotShow } from "./plot-state"
 import { nodeId } from "./split"
 
 export const PANEL_KINDS = ["lanes", "queue", "inspector", "plot", "node"] as const
@@ -25,6 +25,7 @@ export const plotPanelState = z.strictObject({
   show: plotShow.default("both"),
   x: field.nullable().default(null),
   y: field.nullable().default(null),
+  more: moreY,
   scale: axisScales.default({ x: "linear", y: "linear" }),
   /** lanes of the card drawn alone (their value keys); none: every lane */
   only: onlyLanes,

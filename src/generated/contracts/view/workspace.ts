@@ -285,6 +285,7 @@ const PLOT = {
   show: "layout",
   x: "layout",
   y: "layout",
+  more: "layout",
   scale: "layout",
   only: "viewer",
   zoom: "viewer",

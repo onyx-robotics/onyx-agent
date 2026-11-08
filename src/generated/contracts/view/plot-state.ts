@@ -58,11 +58,20 @@ export const ONLY_MAX = 64
 /** Lanes of a series alone (their value keys); the others aren't drawn. None: every lane. */
 export const onlyLanes = z.array(z.guid()).max(ONLY_MAX).default([])
 
+/** The most other y fields a plot draws beside its `y` (each a series of its own). */
+export const MORE_Y_MAX = 5
+/**
+ * Other fields up, beside `y`: each a series of its own (its own range, its own color: no y ticks
+ * while there are any). An item with several is in each.
+ */
+export const moreY = z.array(field).max(MORE_Y_MAX).default([])
+
 const plotFields = z.strictObject({
   /** what it draws, where its axes can show it (only points, where they can't a best so far) */
   show: plotShow.default("both"),
   x: field,
   y: field,
+  more: moreY,
   scale: axisScales.default({ x: "linear", y: "linear" }),
   only: onlyLanes,
   /** zoomed in, in each axis's own units (times and order: epoch ms and rank) */
