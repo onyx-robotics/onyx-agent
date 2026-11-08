@@ -50,9 +50,23 @@ export type NodePanelState = z.output<typeof nodePanelState>
 /** What colors the queue's boxes: the item's type, or its status. */
 export const queueColor = z.enum(["type", "status"])
 
+/**
+ * How a queue's timeline is opened: the kinds of unit folded to one row (their type ids; each
+ * opens unfolded), and the units that run several jobs at once opened to a row for each run at a
+ * time (their ids; each opens folded, its runs nested in its row).
+ */
+const queueFolded = z.array(z.number().int()).max(64).default([])
+const queueOpened = z.array(z.string().min(1).max(64)).max(64).default([])
+
 export const panel = z.discriminatedUnion("kind", [
   z.strictObject({ id: nodeId, kind: z.literal("lanes") }),
-  z.strictObject({ id: nodeId, kind: z.literal("queue"), color: queueColor.default("type") }),
+  z.strictObject({
+    id: nodeId,
+    kind: z.literal("queue"),
+    color: queueColor.default("type"),
+    folded: queueFolded,
+    opened: queueOpened,
+  }),
   z.strictObject({ id: nodeId, kind: z.literal("inspector") }),
   z.strictObject({
     id: nodeId,

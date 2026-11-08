@@ -258,8 +258,8 @@ export function tidyView(view: WorkspaceView): WorkspaceView {
  * Layout: what a card counts (its conditions, splits, text, name), its panels (their kinds, how
  * they're split, a plot's axes, a graph's look), how cards are split, and what the workspace counts
  * from. Viewer: the shares of every split, how many values are listed, values opened and pairs
- * folded, a time sync, a plot's lanes alone, zoom and legend, a graph's solo, a queue's colors,
- * where the time axis opens.
+ * folded, a time sync, a plot's lanes alone, zoom and legend, a graph's solo, a queue's colors and
+ * what's folded in its timeline, where the time axis opens.
  */
 type Role = "layout" | "viewer"
 
@@ -302,7 +302,7 @@ const NODE = {
 
 const PANELS = {
   lanes: { id: "layout", kind: "layout" },
-  queue: { id: "layout", kind: "layout", color: "viewer" },
+  queue: { id: "layout", kind: "layout", color: "viewer", folded: "viewer", opened: "viewer" },
   inspector: { id: "layout", kind: "layout" },
   plot: { id: "layout", kind: "layout", plot: "layout", legend: "viewer" },
   node: { id: "layout", kind: "layout", graph: "layout" },
