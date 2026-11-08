@@ -78,6 +78,27 @@ export const queueQuery = z.strictObject({
 export type QueueQueryInput = z.input<typeof queueQuery>
 
 /**
+ * A card's queue over a window of the past (docs/jobs.md, "Runs and busy time"): its units' busy
+ * time in bins, their state over it, and with `runs`, the runs on them (the card's marked).
+ * `from` and `to` are ms, on `bin`'s boundaries.
+ */
+export const queueHistoryQuery = z
+  .strictObject({
+    spec: viewSpec,
+    lanes: z.array(z.string().min(1)).max(500),
+    shown: z.array(z.string().min(1)).max(5000),
+    /** the units to read (the card's: those serving it) */
+    units: z.array(uuid).max(200),
+    from: z.number().int(),
+    to: z.number().int(),
+    bin: z.enum(["5m", "1h", "6h", "1d", "7d", "28d"]),
+    runs: z.boolean().default(false),
+  })
+  .refine((q) => q.to > q.from, { message: "to is after from" })
+  .refine((q) => q.to - q.from <= 3 * 366 * 86_400_000, { message: "at most three years at once" })
+export type QueueHistoryQueryInput = z.input<typeof queueHistoryQuery>
+
+/**
  * A series' graph as a tree (docs/tree-design.md): its runs counted at every path of its splits
  * (`compileTreeGraph`: its counts' spec, its total lane and a group per split, in order).
  */
