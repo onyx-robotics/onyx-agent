@@ -12,17 +12,29 @@
 ## Install
 
 ```bash
+curl -fsSL https://onyxresearch.ai/install.sh | bash
+```
+
+It installs the latest release: `onyx` as a binary for your machine (Linux or macOS, x64 or arm64; on Windows, in WSL) that needs neither Bun nor Node, in `~/.local/bin`, and the skills for Claude Code in `~/.claude/skills` (below), each checked against the release's `SHA256SUMS`. It says so if `~/.local/bin` isn't on your `PATH`. Run it again to update. Settings go to `bash`, after the pipe:
+
+- `ONYX_VERSION=0.2.1` installs that release rather than the latest: `curl -fsSL https://onyxresearch.ai/install.sh | ONYX_VERSION=0.2.1 bash`
+- `ONYX_INSTALL_DIR=<dir>` puts `onyx` elsewhere, `ONYX_SKILLS_DIR=<dir>` the skills
+- `ONYX_NO_SKILLS=1` leaves the skills out
+
+Or install the package with npm or Bun. Its `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`:
+
+```bash
 npm install -g @onyx-robotics/agent   # or: bun add -g @onyx-robotics/agent
 ```
 
-The `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`. Or take a binary that needs neither Bun nor Node, for Linux or macOS, x64 or arm64, from the [releases](https://github.com/onyx-robotics/onyx-agent/releases):
+Or take a binary yourself from the [releases](https://github.com/onyx-robotics/onyx-agent/releases):
 
 ```bash
 curl -fsSL -o onyx https://github.com/onyx-robotics/onyx-agent/releases/latest/download/onyx-darwin-arm64
 chmod +x onyx && sudo mv onyx /usr/local/bin/
 ```
 
-(`onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64`, `onyx-darwin-arm64`.)
+(`onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64`, `onyx-darwin-arm64`; their checksums are in the release's `SHA256SUMS`.)
 
 ## Sign in
 
@@ -144,7 +156,7 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 - `skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`.
 - `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, the org pack, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
 
-For Claude Code, copy them into your skills:
+The installer has already put them in `~/.claude/skills`, for Claude Code, and running it again updates them. If you installed with npm, copy them there yourself:
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
@@ -159,6 +171,7 @@ bun install
 bun run lint && bun run typecheck && bun run test
 bun run build        # dist/: the JavaScript for Node
 bun run compile      # dist/onyx-<platform>-<arch>: a binary for this machine (-- --all for every one)
+bun scripts/release-assets.ts   # then the rest of a release beside it: skills.tar.gz, install.sh, SHA256SUMS
 bun run onyx -- help # the CLI from source
 ```
 

@@ -7,7 +7,7 @@ You can let Claude Code do most of it. Steps 1 and 2 are yours; after that, ask 
 ## What you need
 
 - **Linux or macOS.** On Windows, use WSL: the agents run as Unix processes.
-- **[Bun](https://bun.sh)** 1.3.14 or later, and **git**.
+- **git**, and **[Bun](https://bun.sh)** 1.3.14 or later if you install with npm (the installer's binary needs neither Bun nor Node).
 - **[Claude Code](https://claude.com/claude-code)**, signed in (`claude` works in your terminal). A run's agents are Claude Code sessions on your account, so a run spends your Claude usage.
 - **An account in an Onyx org**, and someone with the org's **admin** role for two things: loading your project's vocabulary (step 4) and approving a site (step 9). That may be you.
 - **A git repository** with the code to improve, and a remote you can push to. Workers push their branches there.
@@ -15,21 +15,27 @@ You can let Claude Code do most of it. Steps 1 and 2 are yours; after that, ask 
 ## 1. Install and sign in
 
 ```bash
-npm install -g @onyx-robotics/agent    # or: bun add -g @onyx-robotics/agent
+curl -fsSL https://onyxresearch.ai/install.sh | bash
 onyx login                             # approve this machine in your browser, pick the org
 onyx whoami                            # who you act as, in which org
 ```
 
+The installer puts `onyx` in `~/.local/bin` (it prints the line to add if that isn't on your `PATH`) and the skills for Claude Code in `~/.claude/skills` (step 2). Or install the package with npm, which needs Bun, and copy the skills yourself in step 2:
+
+```bash
+npm install -g @onyx-robotics/agent    # or: bun add -g @onyx-robotics/agent
+```
+
 ## 2. Give Claude the skills
 
-The package has two skills for Claude Code: `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you).
+The package has two skills for Claude Code: `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you). The installer has already put them in `~/.claude/skills`. If you installed with npm, copy them there:
 
 ```bash
 mkdir -p ~/.claude/skills
 cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
 ```
 
-From here, in your repository: ask Claude to set up an Onyx research run. The rest of this guide is the same steps by hand.
+From here, in your repository: run `/onyx` in Claude Code, or ask Claude to set up an Onyx research run. The rest of this guide is the same steps by hand.
 
 ## 3. Decide what to improve, and how it's measured
 
