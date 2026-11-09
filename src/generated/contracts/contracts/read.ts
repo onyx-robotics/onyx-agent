@@ -161,6 +161,11 @@ export const searchQuery = z.object({
   q: z.string().min(1).max(200),
   types: z.array(z.string()).default([]),
   limit: z.number().int().min(1).max(100).default(20),
+  /**
+   * each item's serving row as the viewer's views count it, so a client keeps only what's in a
+   * view's lanes (`contrib`): an Inspector searching its series
+   */
+  rows: z.boolean().default(false),
 })
 export type SearchQueryInput = z.input<typeof searchQuery>
 
