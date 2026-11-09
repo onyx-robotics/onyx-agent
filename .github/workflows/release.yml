@@ -2,8 +2,11 @@ name: Release
 
 # On a push to main: when package.json's version isn't on npm yet, it's published there, and when
 # it has no GitHub release yet, the onyx binaries (linux and macOS, x64 and arm64) are built and
-# attached to one, tagged v<version>. Each half checks for itself, so a run that failed partway
-# is finished by running it again. Versions come from Changesets (.changeset/README.md).
+# attached to one, tagged v<version>, with the skills, the one-line installer and their checksums
+# (scripts/release-assets.ts). https://onyxresearch.ai/install.sh redirects to the latest
+# release's install.sh, so every release needs one. Each half checks for itself, so a run that
+# failed partway is finished by running it again. Versions come from Changesets
+# (.changeset/README.md).
 #
 # npm publishing is trusted publishing (OpenID Connect: no token is kept here), with provenance.
 # On npmjs.com, the package's Settings -> Trusted publishing names this repository and this
@@ -109,9 +112,8 @@ jobs:
       - name: The linux binary runs
         run: ./dist/onyx-linux-x64 help
 
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum onyx-* > SHA256SUMS
+      - name: The skills, the installer, and checksums of them all
+        run: bun scripts/release-assets.ts
 
       - name: Attach them to a release
         env:
@@ -120,5 +122,6 @@ jobs:
           # this version's section of the changelog
           awk -v v="## $VERSION" '$0 == v { on = 1; next } /^## / && on { exit } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           if [ -s "$RUNNER_TEMP/notes.md" ]; then notes=(--notes-file "$RUNNER_TEMP/notes.md"); else notes=(--generate-notes); fi
-          gh release create "v$VERSION" dist/onyx-* dist/SHA256SUMS \
+          gh release create "v$VERSION" \
+            dist/onyx-* dist/skills.tar.gz dist/install.sh dist/SHA256SUMS \
             --title "v$VERSION" --target "$GITHUB_SHA" "${notes[@]}"
