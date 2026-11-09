@@ -91,7 +91,7 @@ export const queueHistoryQuery = z
     units: z.array(uuid).max(200),
     from: z.number().int(),
     to: z.number().int(),
-    bin: z.enum(["5m", "1h", "6h", "1d", "7d", "28d"]),
+    bin: z.enum(["5m", "15m", "1h", "6h", "1d", "7d", "28d"]),
     runs: z.boolean().default(false),
   })
   .refine((q) => q.to > q.from, { message: "to is after from" })
