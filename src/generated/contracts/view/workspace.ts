@@ -301,7 +301,6 @@ const NODE = {
 } as const satisfies Record<keyof PanelOf<"node">["graph"], Role>
 
 const PANELS = {
-  lanes: { id: "layout", kind: "layout" },
   queue: {
     id: "layout",
     kind: "layout",

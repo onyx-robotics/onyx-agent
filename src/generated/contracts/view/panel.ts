@@ -1,9 +1,9 @@
 // Generated from packages/core/src/view/panel.ts in Onyx's monorepo (bun run agent:contracts): don't edit.
 /**
  * Panels (docs/panels-design.md): the views a series card holds of its query. Each kind draws the
- * card's items its own way, from the card's scope, window and selection: its lanes over time, its
- * work as it queues and runs, the item chosen in it, a plot of its items by other axes, or its items
- * as a graph of their relations. A panel keeps only how it draws (its axes, its look); what it
+ * card's items its own way, from the card's scope, window and selection: its work as it queues and
+ * runs, the item chosen in it, a plot of its items by other axes, or its items as a graph of their
+ * relations. A panel keeps only how it draws (its axes, its look); what it
  * draws is the card's. Browser-safe.
  */
 import { z } from "zod"
@@ -12,7 +12,7 @@ import { graphState } from "./graph"
 import { axisRange, axisScales, field, moreY, onlyLanes, plotShow } from "./plot-state"
 import { nodeId } from "./split"
 
-export const PANEL_KINDS = ["lanes", "queue", "inspector", "plot", "node"] as const
+export const PANEL_KINDS = ["queue", "inspector", "plot", "node"] as const
 export const panelKind = z.enum(PANEL_KINDS)
 export type PanelKind = z.output<typeof panelKind>
 
@@ -71,7 +71,6 @@ export const queueWindow = z.union([
 export type QueueWindow = z.output<typeof queueWindow>
 
 export const panel = z.discriminatedUnion("kind", [
-  z.strictObject({ id: nodeId, kind: z.literal("lanes") }),
   z.strictObject({
     id: nodeId,
     kind: z.literal("queue"),
@@ -105,5 +104,4 @@ export const newPanel = <K extends PanelKind>(kind: K, id: string): PanelOf<K> =
 export const DEFAULT_PANEL: PanelKind = "queue"
 
 /** Whether a panel draws over the card's time window (its card then shows the time control). */
-export const usesWindow = (p: Panel): boolean =>
-  p.kind === "lanes" || p.kind === "plot" || p.kind === "node"
+export const usesWindow = (p: Panel): boolean => p.kind === "plot" || p.kind === "node"
