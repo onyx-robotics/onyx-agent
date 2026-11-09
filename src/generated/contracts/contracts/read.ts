@@ -33,11 +33,6 @@ export const itemsQuery = z.object({
   pick: plotPick.optional(),
   /** with `pick`: only the picked items */
   picked: z.boolean().default(false),
-  /**
-   * each item's serving row as the viewer's views count it, so a client places it on the view's
-   * lanes (`contrib`): a tree drawing the items of the window it shows
-   */
-  rows: z.boolean().default(false),
   cursor: z.string().optional(),
   limit: z.number().int().min(1).max(500).default(50),
 })

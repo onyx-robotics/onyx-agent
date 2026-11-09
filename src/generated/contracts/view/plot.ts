@@ -470,9 +470,3 @@ export interface BestResult extends PlotMeta {
   records: OutlierRows
   ends: { key: string; end: number }[]
 }
-
-/** Picked items per lane and bucket. */
-export interface PickCountsResult extends PlotMeta {
-  lanes: { key: string; buckets: [number, number][] }[]
-  total: number
-}

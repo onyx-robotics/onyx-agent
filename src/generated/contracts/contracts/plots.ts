@@ -8,7 +8,7 @@
 import { z } from "zod"
 
 import { isPow2, LASSO_MAX, PICK_IDS_MAX, scaleKind, timeOf } from "../view/plot"
-import { BUCKETS, viewSpec, type BucketKey } from "../view/spec"
+import { viewSpec } from "../view/spec"
 
 const window = z
   .strictObject({ from: z.number().int(), to: z.number().int() })
@@ -127,14 +127,3 @@ export const plotBestQuery = z.strictObject({
   max: z.number().int().min(2).max(10_000).default(2_000),
 })
 export type PlotBestQueryInput = z.input<typeof plotBestQuery>
-
-export const plotPickQuery = z.strictObject({
-  spec: viewSpec,
-  shown: z.array(z.string().min(1)).max(5000),
-  /** the tree's lanes to count the picked items of */
-  lanes: laneKeys,
-  window,
-  bucket: z.enum(Object.keys(BUCKETS) as [BucketKey]),
-  pick: plotPick,
-})
-export type PlotPickQueryInput = z.input<typeof plotPickQuery>
