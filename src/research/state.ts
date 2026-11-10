@@ -62,7 +62,16 @@ export interface RunState {
   /** the supervisor's own agent (its API key's) */
   supervisor: string
   base: { agent: string; session: string | null }
-  varop: { agent: string; session: string | null; lastWake: number; wakes: number }
+  varop: {
+    agent: string
+    session: string | null
+    lastWake: number
+    wakes: number
+    /** wakes of its current session: past VAROP_SESSION_WAKES it starts afresh from the board */
+    sessionWakes?: number
+    /** its last wake queued no new hypothesis: a short queue alone doesn't wake it again */
+    idle?: boolean
+  }
   startedAt: number
   deadline: number
   workers: Record<string, WorkerState>

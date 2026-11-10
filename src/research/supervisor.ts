@@ -20,7 +20,7 @@ import { dirname, join, normalize } from "node:path"
 import { JOB_PRIORITY_MAX, type RunnerAssignment } from "../generated/contracts/contracts"
 import type { OnyxClient } from "../sdk"
 
-import { runAgent } from "./agents"
+import { readOnlyTools, runAgent, workerTools } from "./agents"
 import { loadConfig, vocabularyOf, type LoadedConfig, type ResearchConfig } from "./config"
 import { addWorktree, checkout, ensureClone, resolveCommit } from "./git"
 import { agentItem, client, RENEW_EVERY_MS, renewRunKey, upsert } from "./platform"
@@ -51,6 +51,15 @@ const GRACE_MS = 15 * 60_000
 const SETTLE_MS = 20_000
 /** the var-op is woken at least this often while the run proposes */
 const VAROP_TICK_MS = 10 * 60_000
+/** workers' mid-turn notes wake the var-op at most this often: they're batched */
+const VAROP_NOTES_MS = 3 * 60_000
+/**
+ * The var-op's session is resumed at each wake, so each costs more than the last (in one run, $7 a
+ * wake after 74): past this many it starts afresh from the base agent and takes over the board
+ */
+const VAROP_SESSION_WAKES = 20
+/** experiments in flight, in multiples of the endpoints' capacity, past which slots take no turn */
+const EXPERIMENT_BACKLOG = 2
 const LOG_TAIL = 6_000
 /** how often a site's experiments are looked up, and how many looks an end gets for its metrics */
 const SITE_POLL_MS = 3_000
@@ -181,6 +190,8 @@ export async function setup(cfgPath: string) {
     env: agentEnv(run, cfg, base),
     log: run.path("logs", "base.log"),
     timeoutMs: TURN_MS,
+    // it reads: the quick evaluation (once) and recording aspects are all it can run
+    tools: readOnlyTools([cfg.evaluate, "onyx research aspect *"]),
   })
   if (!r.ok || !r.session) throw new Error(`the base agent failed: ${r.text.slice(0, 1000)}`)
   state.base.session = r.session
@@ -411,7 +422,13 @@ export class Supervisor {
    */
   private units(): { key: string; type: string; name: string; capacity: number; free: number }[] {
     const busy = (k: string) => this.running.get(k) ?? 0
-    const offering = !this.past() || this.queueClosed
+    // Backpressure: past EXPERIMENT_BACKLOG times the endpoints' capacity in experiments queued and
+    // not ended, slots take no turn until some end. A worker waiting on its experiments holds no
+    // slot, so without it each free slot starts another hypothesis whose experiments join the line:
+    // in one run 182 waited on 8 bench slots, most never to run before the run's end.
+    const capacity = this.cfg.endpoints.reduce((n, e) => n + e.capacity, 0)
+    const backlogged = this.inFlightExperiments() >= EXPERIMENT_BACKLOG * capacity
+    const offering = (!this.past() || this.queueClosed) && !backlogged
     return [
       ...this.slotKeys().map((key, i) => ({
         key,
@@ -435,6 +452,14 @@ export class Supervisor {
 
   private past() {
     return Date.now() > this.state.deadline
+  }
+
+  /** Experiments this run has submitted that haven't ended: queued or running, anywhere. */
+  private inFlightExperiments(): number {
+    let n = 0
+    for (const w of Object.values(this.state.workers))
+      if (w.phase !== "done") for (const id of this.pendingOf(w.task)) if (!this.state.results[id]) n++
+    return n
   }
 
   private done() {
@@ -674,6 +699,8 @@ export class Supervisor {
       log: join(this.run.workerDir(task), "agent.log"),
       timeoutMs: TURN_MS,
       signal: this.halt.signal,
+      // it edits and checks its code; every computation is an experiment
+      tools: workerTools(this.cfg.evaluate),
     })
     if (r.session) w.session = r.session
     if (r.aborted) {
@@ -996,14 +1023,9 @@ export class Supervisor {
       this.log(`experiment ${short(id)}: its files: ${e.message}`)
       return { files: [] }
     })
-    if (
-      ok &&
-      !Object.keys(metrics).length &&
-      !props.log_tail &&
-      !listed.files.length &&
-      looks < SITE_METRIC_LOOKS
-    )
-      return
+    // a site's files are listed as soon as it ends, but its metrics only once the fold records
+    // them: a success without metrics waits for them (a driver that sends none waits it out)
+    if (ok && !Object.keys(metrics).length && looks < SITE_METRIC_LOOKS) return
     seen.delete(id)
     const why = ok ? "" : `${job.failure ?? "failed"}: ${job.reason ?? "no reason given"}`
     const filesDir = join(this.experimentsDir(task), short(id))
@@ -1100,12 +1122,15 @@ export class Supervisor {
         const inbox = readdirSync(this.run.path("inbox"))
         const now = Date.now()
         const due =
-          !v.session ||
+          // its first wake plans the run (a session started afresh waits for a reason to wake)
+          v.wakes === 0 ||
           this.state.unseen.length > 0 ||
           inbox.length > 0 ||
-          // workers' findings mid-hypothesis: soon, but not once per turn
-          ((this.state.turnNotes?.length ?? 0) > 0 && now - v.lastWake > 60_000) ||
-          (this.activeHypotheses() < this.cfg.workers && now - v.lastWake > 60_000) ||
+          // workers' findings mid-hypothesis: batched, not once per turn
+          ((this.state.turnNotes?.length ?? 0) > 0 && now - v.lastWake > VAROP_NOTES_MS) ||
+          // a short queue, unless its last wake chose to queue nothing: then only an event or
+          // the tick wakes it (each wake of a long session costs dollars, to say nothing changed)
+          (!v.idle && this.activeHypotheses() < this.cfg.workers && now - v.lastWake > 60_000) ||
           now - v.lastWake > VAROP_TICK_MS
         if (due) {
           this.varopBusy = true
@@ -1125,11 +1150,40 @@ export class Supervisor {
     const notes = (this.state.turnNotes ?? []).splice(0)
     v.lastWake = Date.now()
     v.wakes++
+    v.sessionWakes = first ? 1 : (v.sessionWakes ?? 0) + 1
     this.save()
+    const proposedBefore = this.run.read<Board>("board.json")?.hypotheses.length ?? 0
     const steered: [file: string, text: string][] = []
+    // the user's messages and the var-op's journal: shown at every wake, a first one's included
+    const said = () => {
+      const out: string[] = []
+      for (const f of inbox) {
+        const text = readFileSync(this.run.path("inbox", f), "utf8")
+        out.push(`The user says: ${text}`)
+        steered.push([f, text])
+        rmSync(this.run.path("inbox", f))
+      }
+      const journal = this.run.path("journal.md")
+      if (existsSync(journal))
+        out.push(
+          `Your journal (latest):${readFileSync(journal, "utf8").split("\n").slice(-15).join("\n")}`
+        )
+      return out
+    }
     let prompt: string
     if (first) {
-      prompt = varopPrompt(this.cfg, Math.round((this.state.deadline - Date.now()) / 60_000))
+      const parts = [
+        varopPrompt(this.cfg, Math.round((this.state.deadline - Date.now()) / 60_000)),
+      ]
+      // a new var-op on a run already under way (its session was started afresh, say to keep its
+      // turns short): it takes over the board rather than opening tracks from nothing
+      const b = this.run.read<Board>("board.json")
+      if (b?.hypotheses.length)
+        parts.push(
+          `This run is already under way: you take over from an earlier variational operator, with its board of ${b.tracks.length} tracks and ${b.hypotheses.length} hypotheses and their results. Before you propose anything, read the board (onyx research board), the journal below and the insights on the best results (onyx research related), then build on what's there: rework the best commits and follow the open leads rather than starting over.`
+        )
+      parts.push(...said())
+      prompt = parts.join("\n\n")
     } else {
       const parts: string[] = [
         `${Math.max(0, Math.round((this.state.deadline - Date.now()) / 60_000))} minutes of proposing left. ${this.slotWords()}`,
@@ -1163,17 +1217,7 @@ export class Supervisor {
           `Worker ${short(n.task)} (hypothesis ${w.hypothesis}: ${w.title ?? ""}), still under way, after its turn ${n.turn}:\n${n.text}`
         )
       }
-      for (const f of inbox) {
-        const text = readFileSync(this.run.path("inbox", f), "utf8")
-        parts.push(`The user says: ${text}`)
-        steered.push([f, text])
-        rmSync(this.run.path("inbox", f))
-      }
-      const journal = this.run.path("journal.md")
-      if (existsSync(journal))
-        parts.push(
-          `Your journal (latest):${readFileSync(journal, "utf8").split("\n").slice(-15).join("\n")}`
-        )
+      parts.push(...said())
       parts.push("Look at the board (onyx research board), update it, and end your turn.")
       prompt = parts.join("\n\n")
     }
@@ -1190,6 +1234,8 @@ export class Supervisor {
       log: this.run.path("logs", "varop.log"),
       timeoutMs: TURN_MS,
       signal: this.halt.signal,
+      // it plans: it reads the code and works the board, and workers do the rest
+      tools: readOnlyTools(["onyx research *"]),
     })
     if (r.session) v.session = r.session
     if (r.aborted) {
@@ -1200,6 +1246,13 @@ export class Supervisor {
       this.save()
       this.log("var-op stopped mid-turn; it sees the same again after a restart")
       return
+    }
+    // it chose to queue nothing: a short queue alone won't wake it again, an event will
+    v.idle = (this.run.read<Board>("board.json")?.hypotheses.length ?? 0) === proposedBefore
+    if (v.sessionWakes >= VAROP_SESSION_WAKES) {
+      // its next wake is a fresh session, which takes over the board (its first-wake note)
+      v.session = null
+      this.log(`var-op: ${v.sessionWakes} wakes in this session; the next starts afresh`)
     }
     this.save()
     this.log(`var-op: ${r.text.replace(/\s+/g, " ").slice(0, 300)}`)

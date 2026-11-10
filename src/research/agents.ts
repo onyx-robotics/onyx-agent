@@ -19,8 +19,23 @@ export interface AgentRun {
   timeoutMs?: number
   /** cuts the turn short, as the timeout would (a supervisor stopping) */
   signal?: AbortSignal
+  /** what it may use: always stated (workerTools, readOnlyTools, NO_TOOLS) */
+  tools: AgentTools
   /** where its output goes, appended */
   log: string
+}
+
+/**
+ * What an agent may use: the tools it has at all (`--tools`), the rules that let them run
+ * (`--allowedTools`), and what happens to anything else (`--permission-mode`). `dontAsk` refuses
+ * whatever no rule allows, so a Bash rule like `onyx research *` is the only shell command such an
+ * agent can run. (`acceptEdits` would let any shell command that only writes files run too, a
+ * redirect included.)
+ */
+export interface AgentTools {
+  tools: string[]
+  allow: string[]
+  mode: "dontAsk"
 }
 
 export interface AgentResult {
@@ -34,12 +49,57 @@ export interface AgentResult {
 /** the coding agent a run's agents are sessions of (preflight.ts knows how to check each one) */
 export const AGENT_CLI = "claude"
 
-/** the tools an agent has: the codebase, a shell (its own commands and onyx research), nothing else */
-const TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
+/** read-only git: what a worker may look at in its worktree's history */
+const GIT_READ = ["git status*", "git diff*", "git log*", "git show*"]
+/**
+ * Shell helpers that read or print and run no program. Agents wrap their commands in them (`cd x
+ * && …`, `… | tail -30`, `…; echo $?`): every part of a compound command needs a rule, so without
+ * them the quick evaluation itself would be refused. A part that runs a program is still refused.
+ */
+const SHELL_READ = ["cd *", "ls*", "cat *", "head*", "tail*", "wc *", "grep *", "echo*", "pwd"]
+
+/**
+ * A worker: it reads and edits the code, and its shell runs only the project's quick evaluation
+ * (exactly as configured), `onyx research` and read-only git. Anything else is refused: it can't run
+ * a program, a script or a search itself, so every computation is an experiment on an endpoint,
+ * where the whole run sees it and it holds no worker slot (in one run, workers ran their searches
+ * in their own turns for minutes, and none of it reached the run).
+ */
+export function workerTools(evaluate: string): AgentTools {
+  const files = ["Read", "Edit", "Write", "Glob", "Grep"]
+  return {
+    tools: ["Bash", ...files],
+    allow: [
+      ...files,
+      ...[evaluate, `${evaluate} 2>&1`, "onyx research *", ...GIT_READ, ...SHELL_READ].map(
+        (c) => `Bash(${c})`
+      ),
+    ],
+    mode: "dontAsk",
+  }
+}
+
+/**
+ * An agent that reads and doesn't write: the codebase to read, and a shell for only these commands
+ * (each a Bash rule, `onyx research *` say). The base agent and the var-op are these: they study
+ * and plan, and workers do the work, so they can't write files or run anything else.
+ */
+export function readOnlyTools(commands: string[]): AgentTools {
+  const read = ["Read", "Glob", "Grep"]
+  return {
+    tools: [...read, ...(commands.length ? ["Bash"] : [])],
+    allow: [...read, ...commands.map((c) => `Bash(${c})`)],
+    mode: "dontAsk",
+  }
+}
+
+/** No tools: an agent that answers from what it's told (a ghost) */
+export const NO_TOOLS: AgentTools = { tools: [], allow: [], mode: "dontAsk" }
 /** after an agent exits, how long its output is read for (a command it started may hold it open) */
 const OUTPUT_GRACE_MS = 3_000
 
 export async function runAgent(a: AgentRun): Promise<AgentResult> {
+  const t = a.tools
   const args = [
     "-p",
     a.prompt,
@@ -47,10 +107,12 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
     "json",
     "--model",
     a.model,
-    "--allowedTools",
-    TOOLS.join(" "),
+    // each rule its own argument: a rule may have spaces in it (`Bash(onyx research *)`)
+    "--tools",
+    ...(t.tools.length ? t.tools : [""]),
+    ...(t.allow.length ? ["--allowedTools", ...t.allow] : []),
     "--permission-mode",
-    "acceptEdits",
+    t.mode,
   ]
   if (a.resume) args.push("--resume", a.resume)
   if (a.resume && a.fork) args.push("--fork-session")

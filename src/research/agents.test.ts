@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { runAgent } from "./agents"
+import { NO_TOOLS, readOnlyTools, runAgent, workerTools } from "./agents"
 
 /** A `claude` first on PATH that runs `body` (sh), and the run options to use it. */
 function fakeClaude(body: string) {
@@ -12,7 +12,14 @@ function fakeClaude(body: string) {
   writeFileSync(bin, `#!/bin/sh\n${body}\n`)
   chmodSync(bin, 0o755)
   process.env.PATH = `${dir}:${process.env.PATH}`
-  return { prompt: "hi", model: "sonnet", cwd: dir, env: {}, log: join(dir, "agent.log") }
+  return {
+    prompt: "hi",
+    model: "sonnet",
+    cwd: dir,
+    env: {},
+    log: join(dir, "agent.log"),
+    tools: NO_TOOLS,
+  }
 }
 
 test("an agent's turn reports its session, and what it said", async () => {
@@ -21,6 +28,79 @@ test("an agent's turn reports its session, and what it said", async () => {
   )
   const r = await runAgent(run)
   expect(r).toEqual({ session: "s1", text: "done", ok: true, aborted: false })
+})
+
+/** The arguments `claude` was called with, one per line. */
+async function argsFor(tools: Parameters<typeof runAgent>[0]["tools"]) {
+  const run = fakeClaude(
+    `printf '%s\\n' "$@" > "$(dirname "$0")/args"; echo '{"session_id":"s","result":"","is_error":false}'`
+  )
+  await runAgent({ ...run, tools })
+  return readFileSync(join(run.cwd, "args"), "utf8").trimEnd().split("\n")
+}
+
+const after = (args: string[], flag: string) => {
+  const i = args.indexOf(flag)
+  const next = args.findIndex((a, j) => j > i && a.startsWith("--"))
+  return args.slice(i + 1, next === -1 ? args.length : next)
+}
+
+// a worker edits the code, but its shell runs only the quick evaluation, onyx research and
+// read-only git: a program, a script or a search of its own is refused, so it's an experiment
+test("a worker edits code, and runs only the quick evaluation and onyx research", async () => {
+  const args = await argsFor(workerTools("timeout 60 python run.py"))
+  expect(after(args, "--tools")).toEqual(["Bash", "Read", "Edit", "Write", "Glob", "Grep"])
+  expect(after(args, "--allowedTools")).toEqual([
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Bash(timeout 60 python run.py)",
+    "Bash(timeout 60 python run.py 2>&1)",
+    "Bash(onyx research *)",
+    "Bash(git status*)",
+    "Bash(git diff*)",
+    "Bash(git log*)",
+    "Bash(git show*)",
+    // helpers that read or print, so `cd x && …`, `… | tail` and `…; echo $?` still pass
+    "Bash(cd *)",
+    "Bash(ls*)",
+    "Bash(cat *)",
+    "Bash(head*)",
+    "Bash(tail*)",
+    "Bash(wc *)",
+    "Bash(grep *)",
+    "Bash(echo*)",
+    "Bash(pwd)",
+  ])
+  // nothing that runs a program: no python, no interpreter, no wildcard Bash
+  expect(after(args, "--allowedTools").some((r) => /python(?! run\.py)|Bash\(\*\)/.test(r))).toBe(
+    false
+  )
+  expect(after(args, "--permission-mode")).toEqual(["dontAsk"])
+})
+
+// the base agent and the var-op: no Edit or Write at all, and a shell for only their commands, each
+// rule one argument though it has spaces in it
+test("a read-only agent can't write, and runs only its own commands", async () => {
+  const args = await argsFor(readOnlyTools(["python bench.py --samples 8", "onyx research *"]))
+  expect(after(args, "--tools")).toEqual(["Read", "Glob", "Grep", "Bash"])
+  expect(after(args, "--allowedTools")).toEqual([
+    "Read",
+    "Glob",
+    "Grep",
+    "Bash(python bench.py --samples 8)",
+    "Bash(onyx research *)",
+  ])
+  // acceptEdits would let a shell command that writes a file (a redirect) run unasked
+  expect(after(args, "--permission-mode")).toEqual(["dontAsk"])
+})
+
+test("a ghost has no tools", async () => {
+  const args = await argsFor(NO_TOOLS)
+  expect(after(args, "--tools")).toEqual([""])
+  expect(args).not.toContain("--allowedTools")
 })
 
 // the agent's own command (here sleep) outlives it and holds its output open, as a worker's long

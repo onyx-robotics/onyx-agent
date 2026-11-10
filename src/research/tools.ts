@@ -11,7 +11,7 @@ import { FILE_MAX_BYTES } from "../generated/contracts/contracts"
 import type { KgResult } from "../generated/contracts/contracts"
 import type { OnyxClient } from "../sdk"
 
-import { runAgent } from "./agents"
+import { NO_TOOLS, runAgent } from "./agents"
 import { loadConfig, type LoadedConfig } from "./config"
 import { commitAndPush } from "./git"
 import { client, SOURCE, upsert } from "./platform"
@@ -385,6 +385,8 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
         fork: true,
         log: e.run.path("logs", "ghosts.log"),
         timeoutMs: 300_000,
+        // it answers from its state, which is in the prompt
+        tools: NO_TOOLS,
       })
       return r.ok ? r.text : `the ghost couldn't answer: ${r.text.slice(0, 500)}`
     },
@@ -430,11 +432,22 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
         return `You've reached the run's ceiling of ${e.cfg.experimentsPerTask} experiments for one hypothesis. Record your insights, including what you'd test next and why, and finish: the var-op can give a follow-up its own hypothesis.`
       const commit = commitAndPush(w.worktree, w.branch, o.m)
       const id = e.onyx.newId()
+      // Fair share of a shared endpoint: the more experiments this run has in flight, the lower the
+      // priority of its next one, so a run using little of the endpoint goes ahead of one using a
+      // lot. (Two runs on one site's bench, at equal priority, were served first come: one run's
+      // slow experiments held 7 of 8 slots and the other's waited behind them.)
+      const s = e.run.state()
+      let inFlight = 0
+      for (const x of Object.values(s.workers))
+        if (x.phase !== "done")
+          for (const p of e.run.read<string[]>(`workers/${x.task}/pending.json`) ?? [])
+            if (!s.results[p]) inFlight++
       await e.onyx.submitJobs([
         {
           id,
           type: "experiment",
           on: ep.type,
+          priority: -inFlight,
           name: o.m.slice(0, 500),
           summary: o.m.slice(0, 4000),
           props: {

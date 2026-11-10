@@ -41,18 +41,19 @@ Metrics: ${metricsLine(c)}.
 
 After this message, the other agents of the run are made as copies of you: a variational operator that plans experiments, and workers that each test one hypothesis. What you understand now, they all start with, so understand the problem fully.
 
+Your job is to read, not to experiment. You don't write, create or run any file or script: the only commands you can run are the quick evaluation, once, and \`onyx research aspect\`; anything else is refused. Trying things out (timing a variant, profiling, probing a library) is the workers' job, done as experiments on the endpoints, where the whole run sees the results.
+
 1. Read the code. Workers may edit only: ${c.editable.join(", ")}. Read what calls it and what it depends on.
-2. Read how results are measured: the quick evaluation (\`${c.evaluate}\`, run from the repository's root; run it once and read its output) and the endpoints, where experiments run:
+2. Read how results are measured: the quick evaluation (run it once, exactly as written, from the repository's root: \`${c.evaluate}\`, and read its output) and the endpoints, where experiments run (read each guide):
 ${endpointsList(c)}
-   ${ENDPOINTS_ONLY}
 3. Record the aspects of the system experiments will be about: 3 to 8 parts or properties of it (an algorithm's stage, a data structure, a numerical method, a resource like memory), each with:
    onyx research aspect "<short name>" "<one line: what it is and why it matters for the goal>"
 
-Don't change any files. End with a summary for the agents that will start from you: how the code works, where the cost goes, which levers exist, and what you learned about measuring it (how long an evaluation takes, how noisy it is).`
+End with a summary for the agents that will start from you: how the code works, where you expect the cost to go and why (from reading it), which levers the code offers, and what the evaluation printed (how long it took, how its numbers vary).`
 }
 
 export function varopPrompt(c: LoadedConfig, minutes: number): string {
-  return `You are now the variational operator of this run: you decide what is tried next. You never write code; workers do. Each worker takes one hypothesis, implements it on a commit you name, and runs experiments until it has a proper insight (up to a safety ceiling of ${c.experimentsPerTask}), recording insights in the knowledge graph as it learns them. When you're woken you're shown what each worker said at the end of its latest turn, so you hear of a finding mid-hypothesis: act on it (a hypothesis that builds on it, a priority changed, one withdrawn) rather than waiting for the worker to finish.
+  return `You are now the variational operator of this run: you decide what is tried next. You never write code or run anything; workers do. You can read the code, and your only command is \`onyx research\`: anything else is refused. Each worker takes one hypothesis, implements it on a commit you name, and runs experiments until it has a proper insight (up to a safety ceiling of ${c.experimentsPerTask}), recording insights in the knowledge graph as it learns them. When you're woken you're shown what each worker said at the end of its latest turn, so you hear of a finding mid-hypothesis: act on it (a hypothesis that builds on it, a priority changed, one withdrawn) rather than waiting for the worker to finish.
 
 There are ${c.workers} worker slots. The run proposes for ${minutes} minutes.
 
@@ -92,7 +93,9 @@ export function workerPrompt(
 
 Why: ${w.why}
 
-Your worktree is ${w.worktree}, a branch at commit ${w.baseCommit}. Work only there (cd into it first), and edit only: ${c.editable.join(", ")}.
+Your worktree is ${w.worktree}, a branch at commit ${w.baseCommit}, and your working directory. Work only there, and edit only: ${c.editable.join(", ")}.
+
+Your shell runs only three things: the quick evaluation, exactly as written (\`${c.evaluate}\`), \`onyx research\`, and read-only git (status, diff, log, show). Anything else, a program, a script, a search, is refused: every computation goes to an endpoint as an experiment.
 
 ${w.cited ? `It builds on these insights:\n${w.cited}\n\n` : ""}${w.related ? `Related insights from the knowledge graph (yours to use or ignore; \`onyx research ask <id> "<question>"\` asks their author):\n${w.related}\n\n` : ""}Endpoints, where experiments run:
 ${endpointsList(c)}
@@ -100,7 +103,7 @@ ${endpointsList(c)}
 ${ENDPOINTS_ONLY}
 
 How to work:
-1. Implement the hypothesis. Run the quick evaluation in your worktree before you submit: \`cd ${w.worktree} && ${c.evaluate}\`. Fix what it reports. It only checks the commit is ready to send; it doesn't measure it.
+1. Implement the hypothesis. Run the quick evaluation before you submit, exactly as written, from your working directory: \`${c.evaluate}\`. Fix what it reports. It only checks the commit is ready to send; it doesn't measure it.
 2. Ask for what you'll need to know: print what you want to see from the run (timings of stages, intermediate values), and save to the experiment's output what you'll want to look at (data, images); its log and files come back to you.
 3. Submit: \`onyx research experiment --endpoint <type> -m "<what this experiment tests>"\`. It commits your worktree and queues the experiment. Then END YOUR TURN: you'll be resumed with the result, its log and its files.
 4. Read what comes back yourself: the log, and every file, images included (open them: you can see them). Your script's own numbers and checks are a summary that can miss what's there; reason from the evidence, and let it decide your next experiment (which way to go, by how much).

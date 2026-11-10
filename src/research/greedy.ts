@@ -13,7 +13,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { parseArgs } from "node:util"
 
-import { runAgent } from "./agents"
+import { runAgent, workerTools } from "./agents"
 import { loadConfig } from "./config"
 import { addWorktree, commitAndPush, ensureClone, git, resolveCommit } from "./git"
 import { preflight } from "./preflight"
@@ -73,9 +73,9 @@ export async function runGreedy(cfgPath: string, argv: string[]) {
   const deadline = Date.now() + minutes * 60_000
   const history: Record<string, unknown>[] = []
   let session: string | null = null
-  let prompt = `You are now running a greedy search on this repository, on your own. Your worktree is ${worktree}: work only there (cd into it first), and edit only: ${cfg.editable.join(", ")}.
+  let prompt = `You are now running a greedy search on this repository, on your own. Your worktree is ${worktree}, your working directory: work only there, and edit only: ${cfg.editable.join(", ")}.
 
-Each turn, make ONE change you expect to improve ${metric.key} (${metric.better} is better). Run the quick evaluation (\`cd ${worktree} && ${cfg.evaluate}\`) and fix what it reports, then end your turn. Your change is then measured on the endpoint (${ep.label}): it's kept if it beats the best so far by ${margin * 100}%, otherwise the code goes back to the best version. You'll be told which, and asked for the next change.
+Each turn, make ONE change you expect to improve ${metric.key} (${metric.better} is better). Run the quick evaluation, exactly as written, from your working directory (\`${cfg.evaluate}\`), and fix what it reports, then end your turn. Your change is then measured on the endpoint (${ep.label}): it's kept if it beats the best so far by ${margin * 100}%, otherwise the code goes back to the best version. You'll be told which, and asked for the next change.
 
 The best so far: ${metric.key}=${best.value}.`
   let n = 0
@@ -89,6 +89,8 @@ The best so far: ${metric.key}=${best.value}.`
       fork: !session,
       addDirs: [worktree],
       log: join(dir, "agent.log"),
+      // a run's worker's tools: its change is measured by the endpoint, not by itself
+      tools: workerTools(cfg.evaluate),
       // a change in progress at the deadline is still measured, as a run lets its workers finish
       timeoutMs: Math.max(60_000, deadline - Date.now()) + 15 * 60_000,
     })
