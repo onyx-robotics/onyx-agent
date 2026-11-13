@@ -193,6 +193,24 @@ export const pauseQueueInput = z.object({
     .optional()
     .transform((r) => r || undefined),
 })
+/**
+ * POST /jobs/queue/clear: cancel every waiting job the caller may cancel (anyone's for an admin,
+ * their own otherwise), or only those waiting for one kind of unit (`on`). What's running is left
+ * alone: stopping it is a cancel of that job.
+ */
+export const clearQueueInput = z.object({
+  on: z.string().min(1).optional(),
+  reason: z
+    .string()
+    .trim()
+    .max(500)
+    .optional()
+    .transform((r) => r || undefined),
+})
+export interface ClearQueueResult {
+  /** how many waiting jobs it cancelled */
+  cancelled: number
+}
 /** POST /jobs/queue/resume */
 export const resumeQueueInput = z.object({ reason: z.string().trim().max(500).optional() })
 
