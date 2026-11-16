@@ -4,8 +4,10 @@
  * (`ONYX_AGENT`), and to the run's directory what the supervisor needs to see.
  */
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
+import { basename } from "node:path"
 import { parseArgs } from "node:util"
 
+import { FILE_MAX_BYTES } from "../generated/contracts/contracts"
 import type { KgResult } from "../generated/contracts/contracts"
 import type { OnyxClient } from "../sdk"
 
@@ -520,6 +522,45 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
         edges,
       })
       return `insight ${id} recorded`
+    },
+  },
+
+  image: {
+    help: 'image <file> [<file> ...] [--on <item>] [--caption "<what it shows>"] [--step <n>]: put screenshots or GIFs (PNG, JPEG, GIF, WebP; at most 4 MB each) on an item\'s page for people to see: your hypothesis by default, or an experiment or insight',
+    async run(args) {
+      const { values: o, positionals: files } = parseArgs({
+        args,
+        allowPositionals: true,
+        options: {
+          on: { type: "string" },
+          caption: { type: "string" },
+          step: { type: "string" },
+        },
+      })
+      if (!files.length) throw new Usage("image <file> [<file> ...] [--on <item>]")
+      const step = o.step === undefined ? undefined : Number(o.step)
+      if (step !== undefined && !(Number.isInteger(step) && step >= 0))
+        throw new Usage("--step: a whole number, 0 or more")
+      const e = env()
+      const task = process.env.ONYX_TASK
+      const on = o.on ?? (task ? e.run.state().workers[task]?.hypothesis : undefined)
+      if (!on) throw new Usage("--on <item>: the hypothesis, experiment or insight it belongs to")
+      const lines: string[] = []
+      for (const file of files) {
+        if (!existsSync(file)) throw new Usage(`${file}: no such file`)
+        const bytes = new Uint8Array(readFileSync(file))
+        if (bytes.byteLength > FILE_MAX_BYTES)
+          throw new Usage(
+            `${file} is ${(bytes.byteLength / 1e6).toFixed(1)} MB; at most ${FILE_MAX_BYTES / 2 ** 20} MB. Make it smaller: fewer frames or a lower resolution for a GIF (ffmpeg -i in.gif -vf "fps=8,scale=480:-1" out.gif), a JPEG or WebP for a screenshot`
+          )
+        const f = await e.onyx.uploadFile(on, bytes, {
+          name: basename(file).slice(0, 200),
+          ...(o.caption !== undefined && { caption: o.caption.slice(0, 2000) }),
+          ...(step !== undefined && { step }),
+        })
+        lines.push(`image ${f.id} (${f.mediaType}) on ${on}`)
+      }
+      return lines.join("\n")
     },
   },
 
