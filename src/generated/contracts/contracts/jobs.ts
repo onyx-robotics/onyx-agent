@@ -153,6 +153,9 @@ export const runnerSyncInput = z.object({
   reports: z.array(z.unknown()).max(1000).default([]),
   /** take at most this many new jobs */
   maxAssign: z.number().int().min(0).max(500).default(100),
+  /** a clean stop: this sync's reports go in, nothing is assigned, and the lease is given up so
+   *  the next process needn't wait it out. Not sent on a crash: the lease protects that */
+  leaving: z.boolean().optional(),
 })
 export type RunnerSyncInput = z.input<typeof runnerSyncInput>
 
