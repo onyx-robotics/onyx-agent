@@ -184,7 +184,7 @@ export async function setup(cfgPath: string) {
   run.write("state.json", state)
   writeFileSync(run.path("base-summary.md"), r.text)
   console.log(
-    `${r.text}\n\nbase session ${r.session} ($${r.costUsd.toFixed(2)}). Start the run: onyx research run ${cfgPath}`
+    `${r.text}\n\nbase session ${r.session}. Start the run: onyx research run ${cfgPath}`
   )
 }
 
@@ -807,7 +807,7 @@ export class Supervisor {
     this.endTurn(task, outcome, extra)
     this.save()
     this.log(
-      `worker ${short(task)} ${outcome} after ${w.experiments.length} experiments ($${w.costUsd.toFixed(2)})`
+      `worker ${short(task)} ${outcome} after ${w.experiments.length} experiments`
     )
   }
 
