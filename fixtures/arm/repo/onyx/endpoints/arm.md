@@ -3,7 +3,7 @@
 The Onyx arm behind its joint server, run by a site. Two endpoints reach it the same way:
 
 - **`arm.sim`**: the arm in MuJoCo behind the real joint server (`joint_server.py --sim`), a fresh one at home for each experiment.
-- **`arm.real`**: the real arm, on its Orin, through its sandbox: your experiment runs in a fresh container whose only way to the arm is the joint server, so only within its limits. The arm is sent home before and after each experiment. One experiment at a time; others queue.
+- **`arm.real`**: the real arm, on its Orin, through its agent runner: your experiment runs in a fresh working folder and must reach the arm only through the joint server (`arm.py`), so within its limits. The arm is sent home before and after each experiment. One experiment at a time; others queue.
 
 Experiments run only on these endpoints, sent through the queue: don't run the sim, a joint server or `experiment.py` yourself. The quick evaluation only checks that `controller.py` compiles. The sim isn't the real arm either (its gravity, friction and timing differ): compare the two endpoints' numbers, not one with the other's.
 

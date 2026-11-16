@@ -29,7 +29,7 @@ case "$which" in
   sim) real=0 ;;
   both)
     real=1
-    : "${ARM_SSH:?set ARM_SSH to the command that reaches the sandbox on the Orin, as a JSON list}" ;;
+    : "${ARM_SSH:?set ARM_SSH to the command that reaches the agent runner on the Orin, as a JSON list}" ;;
   *) echo "the endpoints are sim or both, not $which" >&2; exit 2 ;;
 esac
 
@@ -51,14 +51,14 @@ rm -rf "$dir/remote.git" "$dir/calib"
 git init --quiet --bare --initial-branch=main "$dir/remote.git"
 git init --quiet --initial-branch=main "$dir/calib"
 cp -r "$here/repo/." "$dir/calib/"
-cp "$arm/sandbox/arm.py" "$dir/calib/arm.py"
+cp "$arm/remote/arm.py" "$dir/calib/arm.py"
 mkdir -p "$dir/calib/onyx"
 
 real_endpoint=""
 if [ "$real" = 1 ]; then
   real_endpoint=',
     { "type": "arm.real", "site": true, "capacity": 1, "timeoutS": 900, "guide": "README.md",
-      "label": "the real arm, through the sandbox on its Orin, run by a site: runs experiment.py, sent home before and after; one at a time; the only way to find where the tags really are" }'
+      "label": "the real arm, through the agent runner on its Orin, run by a site: runs experiment.py, sent home before and after; one at a time; the only way to find where the tags really are" }'
 fi
 cat > "$dir/calib/onyx/research.json" <<JSON
 {
