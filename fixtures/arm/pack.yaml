@@ -1,5 +1,5 @@
 # The Onyx arm as research endpoints, each run by a site (docs/research.md, "Setup"): the arm in
-# MuJoCo, and the real one through its Orin's sandbox. A project runs the same experiment on either.
+# MuJoCo, and the real one through its Orin's agent runner. A project runs the same experiment on either.
 key: arm
 version: 1
 label: Onyx arm
@@ -16,7 +16,7 @@ types:
     kind: asset
     parent: research_endpoint
     label: Real arm
-    description: The Onyx arm, through its Orin's sandbox (python/onyx_arm, "Agent sandbox"); sent home before and after each experiment.
+    description: The Onyx arm, through its Orin's agent runner (python/onyx_arm, "Agent runner"); sent home before and after each experiment.
 
 # What the example project's experiment.py measures (fixtures/arm/repo).
 properties:
