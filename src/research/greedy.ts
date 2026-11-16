@@ -71,7 +71,6 @@ export async function runGreedy(cfgPath: string, argv: string[]) {
   const deadline = Date.now() + minutes * 60_000
   const history: Record<string, unknown>[] = []
   let session: string | null = null
-  let cost = 0
   let prompt = `You are now running a greedy search on this repository, on your own. Your worktree is ${worktree}: work only there (cd into it first), and edit only: ${cfg.editable.join(", ")}.
 
 Each turn, make ONE change you expect to improve ${metric.key} (${metric.better} is better). Run the quick evaluation (\`cd ${worktree} && ${cfg.evaluate}\`) and fix what it reports, then end your turn. Your change is then measured on the endpoint (${ep.label}): it's kept if it beats the best so far by ${margin * 100}%, otherwise the code goes back to the best version. You'll be told which, and asked for the next change.
@@ -92,7 +91,6 @@ The best so far: ${metric.key}=${best.value}.`
       timeoutMs: Math.max(60_000, deadline - Date.now()) + 15 * 60_000,
     })
     session = r.session ?? session
-    cost += r.costUsd
     n++
     const commit = commitAndPush(worktree, branch, `greedy change ${n}`)
     const m = await measure()
@@ -107,17 +105,11 @@ The best so far: ${metric.key}=${best.value}.`
     )
     writeFileSync(
       join(dir, "summary.json"),
-      JSON.stringify(
-        { minutes, margin, metric: metric.key, best, changes: n, costUsd: cost, history },
-        null,
-        2
-      )
+      JSON.stringify({ minutes, margin, metric: metric.key, best, changes: n, history }, null, 2)
     )
     prompt = `${m.ok ? `Measured: ${JSON.stringify(m.metrics)}.` : "Your change was invalid on the endpoint."} ${keep ? "Kept" : "Reverted: the code is back to the best version"}. Best so far: ${metric.key}=${best.value}.\nThe end of its log:\n${m.tail}\n\nMake your next change.`
   }
-  log(
-    `done: ${n} changes, best ${metric.key}=${best.value} at ${best.commit} ($${cost.toFixed(2)})`
-  )
+  log(`done: ${n} changes, best ${metric.key}=${best.value} at ${best.commit}`)
   // the best commit stays reachable on the remote for scoring
   git(worktree, "push", "--quiet", "--force", "origin", `${best.commit}:refs/heads/${branch}-best`)
 }

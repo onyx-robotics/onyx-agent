@@ -26,7 +26,6 @@ export interface AgentRun {
 export interface AgentResult {
   session: string | null
   text: string
-  costUsd: number
   ok: boolean
   /** cut short by `signal`: the turn didn't end, it was stopped */
   aborted: boolean
@@ -83,17 +82,15 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
     const r = JSON.parse(out) as {
       session_id?: string
       result?: string
-      total_cost_usd?: number
       is_error?: boolean
     }
     return {
       session: r.session_id ?? null,
       text: r.result ?? "",
-      costUsd: r.total_cost_usd ?? 0,
       ok: !r.is_error && proc.exitCode === 0,
       aborted,
     }
   } catch {
-    return { session: null, text: err || out, costUsd: 0, ok: false, aborted }
+    return { session: null, text: err || out, ok: false, aborted }
   }
 }

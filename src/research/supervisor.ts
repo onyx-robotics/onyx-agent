@@ -159,8 +159,8 @@ export async function setup(cfgPath: string) {
   const state: RunState = prior ?? {
     campaign,
     supervisor: me.actor?.id ?? "",
-    base: { agent: base, session: null, costUsd: 0 },
-    varop: { agent: varop, session: null, lastWake: 0, costUsd: 0, wakes: 0 },
+    base: { agent: base, session: null },
+    varop: { agent: varop, session: null, lastWake: 0, wakes: 0 },
     startedAt: 0,
     deadline: 0,
     workers: {},
@@ -180,7 +180,6 @@ export async function setup(cfgPath: string) {
   })
   if (!r.ok || !r.session) throw new Error(`the base agent failed: ${r.text.slice(0, 1000)}`)
   state.base.session = r.session
-  state.base.costUsd += r.costUsd
   run.write("state.json", state)
   writeFileSync(run.path("base-summary.md"), r.text)
   console.log(`${r.text}\n\nbase session ${r.session}. Start the run: onyx research run ${cfgPath}`)
@@ -623,7 +622,6 @@ export class Supervisor {
       pending: [],
       experiments: [],
       nudges: 0,
-      costUsd: 0,
     }
     this.state.workers[task] = w
     this.save()
@@ -674,7 +672,6 @@ export class Supervisor {
       signal: this.halt.signal,
     })
     if (r.session) w.session = r.session
-    w.costUsd += r.costUsd
     if (r.aborted) {
       // stopped, not ended: its job stays held, and a restart resumes the turn (resumeWorker)
       this.save()
@@ -1191,7 +1188,6 @@ export class Supervisor {
       signal: this.halt.signal,
     })
     if (r.session) v.session = r.session
-    v.costUsd += r.costUsd
     if (r.aborted) {
       // stopped before it could act on them: what it was shown waits for its next wake, after a restart
       this.state.unseen.unshift(...seen)

@@ -15,12 +15,12 @@ function fakeClaude(body: string) {
   return { prompt: "hi", model: "sonnet", cwd: dir, env: {}, log: join(dir, "agent.log") }
 }
 
-test("an agent's turn reports its session, what it said and its cost", async () => {
+test("an agent's turn reports its session, and what it said", async () => {
   const run = fakeClaude(
     `echo '{"session_id":"s1","result":"done","total_cost_usd":0.5,"is_error":false}'`
   )
   const r = await runAgent(run)
-  expect(r).toEqual({ session: "s1", text: "done", costUsd: 0.5, ok: true, aborted: false })
+  expect(r).toEqual({ session: "s1", text: "done", ok: true, aborted: false })
 })
 
 // the agent's own command (here sleep) outlives it and holds its output open, as a worker's long
