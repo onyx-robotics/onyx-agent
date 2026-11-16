@@ -276,6 +276,8 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
       const base = o.base ?? null
       const edges = [
         { rel: "in_track", src: id, dst: track.id },
+        // and its run, so the campaign's plot (onyx research plot) finds its experiments
+        { rel: "in_campaign", src: id, dst: e.run.state().campaign },
         ...list(o["informed-by"]).map((x) => ({ rel: "informed_by", src: id, dst: x })),
         ...(o.reworks ? [{ rel: "reworks", src: id, dst: o.reworks }] : []),
       ]

@@ -168,6 +168,8 @@ export async function setup(cfgPath: string) {
     unseen: [],
   }
   run.write("state.json", state)
+  const link = plotLink(run)
+  if (link) console.log(`its plot: ${link}`)
 
   console.log(`base agent (${cfg.models.base}) is studying ${cfg.root} ...`)
   const r = await runAgent({
@@ -1204,7 +1206,39 @@ export class Supervisor {
 
 export async function runResearch(cfgPath: string) {
   const cfg = loadConfig(cfgPath)
-  await new Supervisor(cfg, runDirFor(cfg)).start()
+  const run = runDirFor(cfg)
+  const link = plotLink(run)
+  if (link) console.log(`its plot: ${link}`)
+  await new Supervisor(cfg, run).start()
+}
+
+/** A run's plot in the app (`/items/<campaign>/plot`), once it's set up: null before. */
+export function plotLink(run: RunDir): string | null {
+  const state = run.read<RunState>("state.json")
+  const key = run.read<{ url: string }>("run-key.json")
+  return state?.campaign && key?.url
+    ? `${key.url.replace(/\/+$/, "")}/items/${state.campaign}/plot`
+    : null
+}
+
+/**
+ * `onyx research plot <config>`: the run's plot in the app, and its hypotheses linked to its
+ * campaign (as runs since link them when they're proposed), so an older run's plot has them too.
+ */
+export async function plot(cfgPath: string): Promise<string> {
+  const run = runDirFor(loadConfig(cfgPath))
+  const state = run.read<RunState>("state.json")
+  const link = plotLink(run)
+  if (!state || !link) throw new Error("no run here yet: run `onyx research setup` first")
+  const board = run.read<Board>("board.json")
+  const edges = (board?.hypotheses ?? []).map((h) => ({
+    rel: "in_campaign",
+    src: h.id,
+    dst: state.campaign,
+  }))
+  for (let i = 0; i < edges.length; i += 500)
+    await client(run.dir).ingest({ items: [], edges: edges.slice(i, i + 500) })
+  return link
 }
 
 /** A message to the var-op from the user or the orchestrator, read when it's next woken. */
