@@ -394,11 +394,7 @@ export class Supervisor {
       this.siteLoop(),
       this.keyLoop(),
     ])
-    const cost =
-      this.state.base.costUsd +
-      this.state.varop.costUsd +
-      Object.values(this.state.workers).reduce((s, w) => s + w.costUsd, 0)
-    this.log(`stopped. Agents cost $${cost.toFixed(2)}.`)
+    this.log("stopped.")
   }
 
   // ------------------------------------------------------------ runner
