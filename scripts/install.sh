@@ -59,4 +59,4 @@ case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "$dir isn't on your PATH: add it (export PATH=\"$dir:\$PATH\" in your shell's profile)" ;;
 esac
-echo "Next: onyx login"
+echo "Next: onyx setup"

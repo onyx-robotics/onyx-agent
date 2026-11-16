@@ -16,6 +16,7 @@ import { ingestCommand } from "./commands/ingest"
 import { reads } from "./commands/read"
 import { registry } from "./commands/registry"
 import { research } from "./commands/research"
+import { setup } from "./commands/setup"
 import { writes } from "./commands/write"
 import { jobs } from "./commands/jobs"
 import type { Command, Context } from "./command"
@@ -27,6 +28,7 @@ export type { Io } from "./io"
 export { EXIT } from "./output"
 
 const COMMANDS: Record<string, Command> = {
+  setup,
   ...auth,
   ...reads,
   registry,

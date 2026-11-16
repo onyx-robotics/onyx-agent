@@ -31,6 +31,9 @@ export interface AgentResult {
   aborted: boolean
 }
 
+/** the coding agent a run's agents are sessions of (preflight.ts knows how to check each one) */
+export const AGENT_CLI = "claude"
+
 /** the tools an agent has: the codebase, a shell (its own commands and onyx research), nothing else */
 const TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
 /** after an agent exits, how long its output is read for (a command it started may hold it open) */
@@ -56,7 +59,7 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
     a.log,
     `\n==== ${new Date().toISOString()} ${a.resume ? (a.fork ? `fork of ${a.resume}` : `resume ${a.resume}`) : "new"}\n${a.prompt}\n----\n`
   )
-  const proc = Bun.spawn(["claude", ...args], {
+  const proc = Bun.spawn([AGENT_CLI, ...args], {
     cwd: a.cwd,
     env: { ...process.env, ...a.env },
     stdout: "pipe",

@@ -2,7 +2,7 @@
 
 This guide takes you from installing `onyx` to a research run: agents that improve your code against your metrics, test their ideas as experiments on your endpoints, and record what they learn in your org's knowledge graph.
 
-You can let Claude Code do most of it. Steps 1 and 2 are yours; after that, ask Claude "set up an Onyx research run for this repository" and it follows the same steps with you, using the skill from step 2. This guide is what it does, so you can check its work or do it by hand.
+You can let Claude Code do most of it. Step 1 is yours (`onyx setup` also does step 2); after that, ask Claude "set up an Onyx research run for this repository" and it follows the same steps with you, using the skill from step 2. This guide is what it does, so you can check its work or do it by hand.
 
 ## What you need
 
@@ -17,18 +17,14 @@ You can let Claude Code do most of it. Steps 1 and 2 are yours; after that, ask 
 ```bash
 npm install -g @onyx-robotics/agent    # or: bun add -g @onyx-robotics/agent
 # or, with no Bun or Node: curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh
-onyx login                             # approve this machine in your browser, pick the org
-onyx whoami                            # who you act as, in which org
+onyx setup                             # checks git and your coding agent, signs you in, installs the skills
 ```
+
+`onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
 
 ## 2. Give Claude the skills
 
-The package has two skills for Claude Code: `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you).
-
-```bash
-mkdir -p ~/.claude/skills
-cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
-```
+`onyx setup` did this: it installed the package's two skills for Claude Code in `~/.claude/skills`, `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you). `onyx setup --project` puts them in the repository's `.claude/skills` instead.
 
 From here, in your repository: ask Claude to set up an Onyx research run. The rest of this guide is the same steps by hand.
 

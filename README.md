@@ -23,7 +23,13 @@ curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scrip
 
 It picks this machine's binary from the [releases](https://github.com/onyx-robotics/onyx-agent/releases), checks it against the release's `SHA256SUMS`, and puts it in `~/.local/bin` (`ONYX_INSTALL_DIR` for another folder, `ONYX_VERSION=v0.2.0` for another release). Or download one yourself: `onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64` or `onyx-darwin-arm64`.
 
-## Sign in
+## Set up
+
+```bash
+onyx setup                # checks git and your coding agent, signs you in, installs the skills for Claude Code
+```
+
+Safe to run again (after an upgrade, it refreshes the skills). Or do its steps one at a time:
 
 ```bash
 onyx login                # shows a code and opens a page: check the code, pick an org, approve
@@ -143,13 +149,11 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 - `skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`.
 - `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
 
-For Claude Code, copy them into your skills:
+`onyx setup` installs them for Claude Code in `~/.claude/skills` (`--project`: in this folder's `.claude/skills`). They're part of the program, so a standalone binary installs them too. Or copy them yourself from an npm install:
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
 ```
-
-(or into a project's `.claude/skills/`).
 
 ## Develop
 
