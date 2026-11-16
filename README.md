@@ -15,14 +15,13 @@
 npm install -g @onyx-robotics/agent   # or: bun add -g @onyx-robotics/agent
 ```
 
-The `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`. Or take a binary that needs neither Bun nor Node, for Linux or macOS, x64 or arm64, from the [releases](https://github.com/onyx-robotics/onyx-agent/releases):
+The `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`. Or install a binary that needs neither Bun nor Node, for Linux or macOS, x64 or arm64:
 
 ```bash
-curl -fsSL -o onyx https://github.com/onyx-robotics/onyx-agent/releases/latest/download/onyx-darwin-arm64
-chmod +x onyx && sudo mv onyx /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh
 ```
 
-(`onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64`, `onyx-darwin-arm64`.)
+It picks this machine's binary from the [releases](https://github.com/onyx-robotics/onyx-agent/releases), checks it against the release's `SHA256SUMS`, and puts it in `~/.local/bin` (`ONYX_INSTALL_DIR` for another folder, `ONYX_VERSION=v0.2.0` for another release). Or download one yourself: `onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64` or `onyx-darwin-arm64`.
 
 ## Sign in
 
