@@ -7,18 +7,18 @@
 #
 # - sim (the default): SIM_UNITS sim arms (2), the MuJoCo arm behind its joint server
 #   (python/onyx_arm/endpoint/sim_arm.py);
-# - real: the real arm, through its Orin's sandbox (endpoint/real_arm.py). ARM_SSH is the command
-#   that reaches the sandbox with the agent key, as a JSON list, e.g.
+# - real: the real arm, through its Orin's agent runner (endpoint/real_arm.py). ARM_SSH is the command
+#   that reaches the agent runner with the agent key, as a JSON list, e.g.
 #   '["ssh", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
 #     "-i", "/home/me/.ssh/onyx_agent", "onyx@onyx-2.local"]' (a Windows ssh.exe's key path
 #   with forward slashes: a backslash is an escape in TOML).
-#   joint_server.py must be serving on the Orin's sandbox socket (python/onyx_arm/README.md).
+#   joint_server.py must be serving on the agent runner's socket on the Orin (python/onyx_arm/README.md).
 # - both: the two endpoints in one run; workers choose one for each experiment.
 # Whichever, a worker's quick evaluation only compiles controller.py: experiments run on the endpoints.
 #
 # Needs ONYX_ROOT (the onyx checkout, with python/onyx_arm synced: uv sync --extra sim). Then:
-#   bun run research:dev -- --org <org> --pack onyx-agent/fixtures/arm/pack.yaml \
-#     --site <name> --site-state <dir>/site-state
+#   bun run research:dev -- --org <org> --site <name> --site-state <dir>/site-state
+#   onyx research vocabulary <dir>/arm/onyx/research.json   # arm.sim and its metrics, for the site
 #   onyx-site --site <dir>/site.toml run      # in python/site-runner
 #   onyx research setup <dir>/arm/onyx/research.json && onyx research run <dir>/arm/onyx/research.json
 set -euo pipefail
@@ -74,7 +74,7 @@ JSON
 endpoint_real() {
   cat <<JSON
     { "type": "arm.real", "site": true, "capacity": 1, "timeoutS": 600, "guide": "onyx/endpoints/arm.md",
-      "label": "the real Onyx arm, through the sandbox on its Orin, run by a site: runs experiment.py, sent home before and after; one at a time" }
+      "label": "the real Onyx arm, through the agent runner on its Orin, run by a site: runs experiment.py, sent home before and after; one at a time" }
 JSON
 }
 case "$which" in
@@ -84,7 +84,7 @@ case "$which" in
   *) echo "the endpoint is sim, real or both, not $which" >&2; exit 2 ;;
 esac
 if [[ " ${kinds[*]} " == *" real "* ]]; then
-  : "${ARM_SSH:?set ARM_SSH to the command that reaches the sandbox on the Orin, as a JSON list}"
+  : "${ARM_SSH:?set ARM_SSH to the command that reaches the agent runner on the Orin, as a JSON list}"
 fi
 endpoints=$(for k in "${kinds[@]}"; do "endpoint_$k"; done | sed '$!s/}$/},/')
 types=$(for k in "${kinds[@]}"; do printf '"arm.%s", ' "$k"; done | sed 's/, $//')
@@ -94,7 +94,7 @@ rm -rf "$dir/remote.git" "$dir/arm"
 git init --quiet --bare --initial-branch=main "$dir/remote.git"
 git init --quiet --initial-branch=main "$dir/arm"
 cp -r "$here/repo/." "$dir/arm/"
-cp "$arm/sandbox/arm.py" "$dir/arm/arm.py"
+cp "$arm/remote/arm.py" "$dir/arm/arm.py"
 cp "$here/task.json" "$dir/arm/onyx/endpoints/task.json"
 cat > "$dir/arm/onyx/research.json" <<JSON
 {
@@ -105,8 +105,8 @@ cat > "$dir/arm/onyx/research.json" <<JSON
   "editable": ["controller.py"],
   "evaluate": "python3 -m py_compile controller.py && echo ok",
   "metrics": [
-    { "key": "arm.total_time_s", "better": "lower" },
-    { "key": "arm.poses_done", "better": "higher" }
+    { "key": "arm.total_time_s", "better": "lower", "label": "Total time", "unit": "s" },
+    { "key": "arm.poses_done", "better": "higher", "label": "Poses reached" }
   ],
   "endpoints": [
 $endpoints

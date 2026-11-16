@@ -32,10 +32,10 @@ cat > "$dir/$task/onyx/research.json" <<JSON
   "editable": ["solver.py"],
   "evaluate": "python onyx/endpoints/bench.py --task $task --samples 8 --runs 1",
   "metrics": [
-    { "key": "algotune.speedup", "better": "higher" },
-    { "key": "algotune.peak_mem_mb", "better": "lower" },
-    { "key": "algotune.code_lines", "better": "lower" },
-    { "key": "algotune.valid_fraction", "better": "higher" }
+    { "key": "algotune.speedup", "better": "higher", "label": "Speedup" },
+    { "key": "algotune.peak_mem_mb", "better": "lower", "label": "Peak memory", "unit": "MB" },
+    { "key": "algotune.code_lines", "better": "lower", "label": "Code lines" },
+    { "key": "algotune.valid_fraction", "better": "higher", "label": "Valid fraction" }
   ],
   "endpoints": [
     {

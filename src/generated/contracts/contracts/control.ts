@@ -4,6 +4,7 @@
  */
 import { z } from "zod"
 
+import { packPropertySchema, packTypeSchema } from "../registry/pack-format"
 import { workspaceDocInput, workspaceViewInput } from "../view/workspace"
 
 const workspaceName = z.string().trim().min(1).max(200)
@@ -79,6 +80,16 @@ export const loadPackInput = planPackInput.extend({
   expectedRegistryVersion: z.number().int().min(0).optional(),
 })
 export type LoadPackInput = z.input<typeof loadPackInput>
+
+/**
+ * Definitions to add to the org's own packs, each `<pack>.<key>`: any that exists already is left
+ * as it is (a research run's types and metrics, from its config).
+ */
+export const extendRegistryInput = z.object({
+  types: z.array(packTypeSchema).max(50).default([]),
+  properties: z.array(packPropertySchema).max(200).default([]),
+})
+export type ExtendRegistryInput = z.input<typeof extendRegistryInput>
 
 export const createOrgInput = z.object({
   name: z.string().min(1).max(200),

@@ -9,7 +9,7 @@ You can let Claude Code do most of it. Steps 1 and 2 are yours; after that, ask 
 - **Linux or macOS.** On Windows, use WSL: the agents run as Unix processes.
 - **[Bun](https://bun.sh)** 1.3.14 or later, and **git**.
 - **[Claude Code](https://claude.com/claude-code)**, signed in (`claude` works in your terminal). A run's agents are Claude Code sessions on your account, so a run spends your Claude usage.
-- **An account in an Onyx org**, and someone with the org's **admin** role for two things: loading your project's vocabulary (step 4) and approving a site (step 9). That may be you.
+- **An account in an Onyx org**, and, for a site (step 9), someone with the org's **admin** role to approve it. That may be you.
 - **A git repository** with the code to improve, and a remote you can push to. Workers push their branches there.
 
 ## 1. Install and sign in
@@ -36,43 +36,18 @@ From here, in your repository: ask Claude to set up an Onyx research run. The re
 Write these down before anything else; every later file comes from them.
 
 - **The goal**, in a few sentences an agent can act on: what to make better, what must stay true (correctness, safety limits), and anything an agent wouldn't know (where the hardware is, what's been tried).
-- **The metrics**, each with a direction: `speedup` higher, `error_mm` lower. Name them `<pack>.<name>` (step 4), for example `solver.speedup`.
+- **The metrics**, each with a direction: `speedup` higher, `error_mm` lower. Name them `<namespace>.<name>` (step 4), for example `solver.speedup`.
 - **What agents may edit**: the files that hold the method (`solver.py`, `calibrate.py`). Everything else is read only to them, the measurement included.
 - **The quick evaluation**: a command that checks a change is ready to send, in well under a minute (a few samples, a compile, a unit test). It isn't the experiment.
 - **Where experiments run**: an **endpoint**, a kind of machine that runs one experiment and reports its metrics. A benchmark on your own machine is the simplest (steps 5 to 8). A robot, a GPU box or a lab bench is a **site** (step 9).
 
-## 4. Add your project's vocabulary to the org
+## 4. Name your project's vocabulary
 
-Every endpoint type and every metric must exist in the org's registry before a run can use it: a job for an unknown type never starts, and a result with an unknown metric is refused. You declare them in a small **pack**, `onyx/pack.yaml`:
+Every endpoint type and every metric is a key in the org's registry: a job for an unknown type never starts, and a result with an unknown metric is refused. You don't load them yourself: `onyx research setup` and `onyx research run` add the ones in your `research.json` (step 6) that the org doesn't have yet, each endpoint's type as a kind of `research_endpoint` and each metric with its direction.
 
-```yaml
-key: solver # your pack's namespace: everything in it is solver.<name>
-version: 1
-label: Solver
-description: How fast the solver is, and the bench that times it.
-requires: [research]
-
-types:
-  - key: solver.bench
-    kind: asset
-    parent: research_endpoint
-    label: Solver bench
-    description: Times solver.py on 100 instances against the reference.
-
-properties:
-  - { key: solver.speedup, label: Speedup, type: number, metric: true, better: higher }
-  - { key: solver.valid_fraction, label: Valid fraction, type: number, metric: true, better: higher }
-```
-
-An admin loads it (with the built-in `research` pack, if the org doesn't have it yet):
-
-```bash
-onyx registry check onyx/pack.yaml               # offline: its format and namespace
-onyx registry plan research onyx/pack.yaml       # what loading it would change
-onyx login --admin && onyx registry apply research onyx/pack.yaml
-```
-
-Loading a pack again with more in it adds what's new; nothing is deleted.
+- **Name them `<namespace>.<name>`**, one namespace for the project: `solver.bench`, `solver.speedup`. A built-in metric (`score`, `loss`, `duration_s`) is used as it is.
+- **List every metric your endpoints report** in `metrics`, not only the one that matters most, or a result with the others is refused. A metric can have a `label` and a `unit` (`{ "key": "solver.peak_mem_mb", "better": "lower", "label": "Peak memory", "unit": "MB" }`); without one, its label comes from its key.
+- **Once added, a definition is the org's**: a run never changes one, so a later config that says another direction for the same key doesn't change it. To change one that no data uses yet, or to give it a description, an admin edits its pack (`onyx registry pull solver`, then `onyx registry apply`).
 
 ## 5. Write the endpoint's driver and guide
 
@@ -208,9 +183,9 @@ onyx jobs get <id>          # its outcome and metrics; GET /jobs/<id>/files list
 | What you see | Why, and what to do |
 | --- | --- |
 | `onyx` exits 4 | Not signed in, or not allowed: `onyx login` (admin commands need `onyx login --admin`) |
-| An experiment never starts | No unit of its type is free: a site that's down, a unit held or quarantined (`onyx-site status`), or a type not in the registry (step 4) |
+| An experiment never starts | No unit of its type is free: a site that's down, a unit held or quarantined (`onyx-site status`), or a site that offers a type the run hasn't added yet (it tries again until the run's setup has) |
 | An experiment ends `failed` / `refused` | The site's policy refused it: its unit type isn't in `[policy] unit_types`, or the run's remote isn't in `[repos]` |
-| An experiment's results are refused | A metric it reported isn't in the registry: add it to the pack and load it again |
+| An experiment's results are refused | A metric it reported isn't in the registry: add it to `metrics` in `research.json` (step 4), and start the run again |
 | The base agent fails at setup | `claude` isn't signed in, or the remote has no `baseBranch` |
 | Workers sit waiting while endpoints are idle | More workers, or a CPU endpoint (`local_program` with a few slots) for processes that need no hardware, so workers send them as experiments instead of running them on their own machine |
 | A run stopped (crash, laptop asleep) | Run `onyx research run` again on the same config: it holds the same jobs and carries them on |
