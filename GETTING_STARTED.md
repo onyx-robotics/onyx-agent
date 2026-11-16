@@ -183,6 +183,7 @@ onyx jobs get <id>          # its outcome and metrics; GET /jobs/<id>/files list
 | An experiment never starts | No unit of its type is free: a site that's down, a unit held or quarantined (`onyx-site status`), or a site that offers a type the run hasn't added yet (it tries again until the run's setup has) |
 | An experiment ends `failed` / `refused` | The site's policy refused it: its unit type isn't in `[policy] unit_types`, or the run's remote isn't in `[repos]` |
 | An experiment's results are refused | A metric it reported isn't in the registry: add it to `metrics` in `research.json` (step 4), and start the run again |
-| The base agent fails at setup | `claude` isn't signed in, or the remote has no `baseBranch` |
+| `not ready to run` | `setup`, `run` and `greedy` check git, the coding agent (installed and signed in) and `baseBranch` on the remote before they start: fix each line it lists |
+| The base agent fails at setup | Read its log, `.onyx-research/<run name>/logs/base.log` |
 | Workers sit waiting while endpoints are idle | More workers, or a CPU endpoint (`local_program` with a few slots) for processes that need no hardware, so workers send them as experiments instead of running them on their own machine |
 | A run stopped (crash, laptop asleep) | Run `onyx research run` again on the same config: it holds the same jobs and carries them on |
