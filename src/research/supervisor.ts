@@ -21,7 +21,7 @@ import { JOB_PRIORITY_MAX, type RunnerAssignment } from "../generated/contracts/
 import type { OnyxClient } from "../sdk"
 
 import { runAgent } from "./agents"
-import { loadConfig, type LoadedConfig } from "./config"
+import { loadConfig, vocabularyOf, type LoadedConfig, type ResearchConfig } from "./config"
 import { addWorktree, checkout, ensureClone, resolveCommit } from "./git"
 import { agentItem, client, RENEW_EVERY_MS, renewRunKey, upsert } from "./platform"
 import { basePrompt, varopPrompt, workerPrompt } from "./prompts"
@@ -111,12 +111,29 @@ export function writeShim(run: RunDir, self = selfCommand()) {
 
 // ---------------------------------------------------------------- setup
 
+/** The config's endpoint types and metrics, in the org's registry (what's there stays as it is). */
+async function declareVocabulary(onyx: OnyxClient, cfg: ResearchConfig, log: (m: string) => void) {
+  const { added } = await onyx.extendRegistry(vocabularyOf(cfg))
+  if (added.length) log(`added to the org's registry: ${added.join(", ")}`)
+  return added
+}
+
+/** Only the config's types and metrics, in the org: what a site's check needs before setup. */
+export async function declare(cfgPath: string) {
+  const cfg = loadConfig(cfgPath)
+  const run = runDirFor(cfg)
+  await renewRunKey(run.dir, slug(cfg.name))
+  if (!(await declareVocabulary(client(run.dir), cfg, console.log)).length)
+    console.log("the org has them all")
+}
+
 export async function setup(cfgPath: string) {
   const cfg = loadConfig(cfgPath)
   const run = runDirFor(cfg)
   // the run's key, for everything it does (docs/auth.md, "Run keys"): its jobs are its own
   await renewRunKey(run.dir, slug(cfg.name))
   const onyx = client(run.dir)
+  await declareVocabulary(onyx, cfg, console.log)
   const repo = run.path("repo")
   ensureClone(cfg.remote, repo)
   writeShim(run)
@@ -364,6 +381,8 @@ export class Supervisor {
     writeShim(this.run)
     // a fresh run key (the same run's agent and runner as before a restart), then renewed hourly
     await renewRunKey(this.run.dir, slug(this.cfg.name))
+    // the config may have changed since setup: a new metric, another endpoint
+    await declareVocabulary(this.onyx, this.cfg, (m) => this.log(m))
     await this.resume()
     this.log(
       `run "${this.cfg.name}": ${this.cfg.workers} workers, proposing until ${new Date(this.state.deadline).toISOString().slice(11, 19)}`

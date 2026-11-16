@@ -1,6 +1,7 @@
 /**
  * onyx research: autoresearch on the user's machine.
  *
+ *   onyx research vocabulary <config>               # its endpoint types and metrics, in the org
  *   onyx research setup <repo>/onyx/research.json   # the base agent studies the repository
  *   onyx research run <repo>/onyx/research.json     # the var-op, workers and endpoints, until done
  *   onyx research steer <config> "<message>"        # tell the var-op something
@@ -11,10 +12,11 @@
  * only its own runner takes. And a logged-in `claude`.
  */
 import { runGreedy } from "./greedy"
-import { runResearch, setup, steer } from "./supervisor"
+import { declare, runResearch, setup, steer } from "./supervisor"
 import { runTool } from "./tools"
 
-export const RESEARCH_USAGE = `onyx research setup <repo>/onyx/research.json
+export const RESEARCH_USAGE = `onyx research vocabulary <repo>/onyx/research.json
+onyx research setup <repo>/onyx/research.json
 onyx research run <repo>/onyx/research.json
 onyx research steer <config> "<message>"
 onyx research greedy <config> [--minutes <n>] [--margin <fraction>]
@@ -22,7 +24,8 @@ onyx research help
 
 Autoresearch on this machine: a base agent studies the repository (setup), then a var-op proposes
 hypotheses and workers test them on the project's endpoints (run) until the config's minutes are
-up. steer tells the var-op something; greedy runs the one-agent baseline to compare a run with.
+up. Both add the config's endpoint types and metrics the org doesn't have; vocabulary does only
+that. steer tells the var-op something; greedy runs the one-agent baseline to compare a run with.
 Agents call the rest from their shells: onyx research help lists them. Needs a sign-in (onyx
 login) and a logged-in claude.`
 
@@ -30,6 +33,10 @@ login) and a logged-in claude.`
 export async function research(args: string[]): Promise<number> {
   const [cmd, ...rest] = args
   switch (cmd) {
+    case "vocabulary":
+      if (!rest[0]) break
+      await declare(rest[0])
+      return 0
     case "setup":
       if (!rest[0]) break
       await setup(rest[0])

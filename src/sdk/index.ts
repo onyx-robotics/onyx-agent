@@ -20,6 +20,7 @@
  * that member). Records in order, from a file say, go through `stream()` (stream.ts).
  */
 import type {
+  ExtendRegistryInput,
   JobSubmit,
   KgRelated,
   KgRelatedInput,
@@ -420,6 +421,18 @@ export class OnyxClient {
       rebuildPending: boolean
       plan: PackPlan
     }>("POST", "/registry/packs", { packs, ...opts })
+  }
+
+  /**
+   * Add types and properties to the org's own packs, each `<pack>.<key>`: what's new is added,
+   * what exists is left as it is (`added` names what was new).
+   */
+  extendRegistry(input: ExtendRegistryInput) {
+    return this.request<{ added: string[]; registryVersion: number }>(
+      "POST",
+      "/registry/extend",
+      input
+    )
   }
 
   /** A loaded pack: its text as loaded (when it came as text) and its body. */

@@ -26,7 +26,7 @@ onyx get <item>                            # props, metrics, sources, edges (--h
 onyx lineage <item> --up                   # what it came from (--down: what came from it)
 ```
 
-Use only the types, relations and props the registry has; if what you need isn't there, tell the user rather than inventing keys (an admin adds them to the org's pack).
+Use only the types, relations and props the registry has; if what you need isn't there, tell the user rather than inventing keys (an admin adds them to the org's pack; a research run adds its config's endpoint types and metrics itself).
 
 ## Log work
 

@@ -11,8 +11,8 @@
 # against. `both` needs ARM_SSH, as fixtures/arm/setup.sh says.
 #
 # Needs ONYX_ROOT (the onyx checkout, python/onyx_arm synced: uv sync --extra sim). Then:
-#   bun run research:dev -- --org <org> --pack onyx-agent/fixtures/arm/pack.yaml \
-#     --pack onyx-agent/fixtures/arm_calib/pack.yaml --site <name> --site-state <dir>/site-state
+#   bun run research:dev -- --org <org> --site <name> --site-state <dir>/site-state
+#   onyx research vocabulary <dir>/calib/onyx/research.json   # arm.sim and its metrics, for the site
 #   onyx-site --site <dir>/site.toml run      # in python/site-runner
 #   onyx research setup <dir>/calib/onyx/research.json && onyx research run <dir>/calib/onyx/research.json
 set -euo pipefail
@@ -69,10 +69,14 @@ cat > "$dir/calib/onyx/research.json" <<JSON
   "editable": ["calibrate.py", "scene.json"],
   "evaluate": "python3 -m py_compile calibrate.py && python3 -m json.tool scene.json > /dev/null && echo ok",
   "metrics": [
-    { "key": "calib.joint_err_deg", "better": "lower" },
-    { "key": "calib.camera_err_mm", "better": "lower" },
-    { "key": "calib.reprojection_px", "better": "lower" },
-    { "key": "calib.tags_seen", "better": "higher" }
+    { "key": "calib.joint_err_deg", "better": "lower", "label": "Joint error", "unit": "deg" },
+    { "key": "calib.camera_err_mm", "better": "lower", "label": "Camera mount error", "unit": "mm" },
+    { "key": "calib.camera_rot_err_deg", "better": "lower", "label": "Camera rotation error", "unit": "deg" },
+    { "key": "calib.reprojection_px", "better": "lower", "label": "Reprojection error", "unit": "px" },
+    { "key": "calib.joint_sigma_deg", "better": "lower", "label": "Joint uncertainty", "unit": "deg" },
+    { "key": "calib.camera_sigma_mm", "better": "lower", "label": "Camera uncertainty", "unit": "mm" },
+    { "key": "calib.views", "better": "higher", "label": "Views" },
+    { "key": "calib.tags_seen", "better": "higher", "label": "Tags seen" }
   ],
   "endpoints": [
     { "type": "arm.sim", "site": true, "capacity": $sim_units, "timeoutS": 900, "guide": "README.md",

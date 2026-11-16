@@ -1,11 +1,11 @@
 ---
 name: onyx-research-setup
-description: Set a repository up for an Onyx research run (onyx research), with the user - the goal and metrics, the org pack, endpoint drivers and guides, onyx/research.json, and sites for hardware or other machines - then check every piece before the run. Use when the user asks to set up, prepare or configure an Onyx research or autoresearch run, add an endpoint or a site to one, or asks how to start with onyx research.
+description: Set a repository up for an Onyx research run (onyx research), with the user - the goal and metrics, endpoint drivers and guides, onyx/research.json, and sites for hardware or other machines - then check every piece before the run. Use when the user asks to set up, prepare or configure an Onyx research or autoresearch run, add an endpoint or a site to one, or asks how to start with onyx research.
 ---
 
 # Setting a repository up for an Onyx research run
 
-A run needs, in the repository: `onyx/research.json`, a driver and a guide for each endpoint, and a pack that puts the endpoints' types and the metrics in the org's registry. You write them with the user, check each one works, and hand over `onyx research setup` and `run`. The package's `GETTING_STARTED.md` is the same path for a person; use the `onyx` skill for the CLI itself.
+A run needs, in the repository: `onyx/research.json`, a driver and a guide for each endpoint, and names for the endpoints' types and the metrics, which the run adds to the org's registry. You write them with the user, check each one works, and hand over `onyx research setup` and `run`. The package's `GETTING_STARTED.md` is the same path for a person; use the `onyx` skill for the CLI itself.
 
 Work in this order. Don't write files before step 2's answers, and don't start a run: that's the user's call (step 8).
 
@@ -27,19 +27,18 @@ Ask what you can't read from the code, in one go:
 - **Where experiments run**: this machine (a benchmark, a simulator), or hardware or another machine (a site, step 6). How long one takes, and how many can run at once.
 - **The budget**: workers and minutes. A run spends the user's Claude usage, mostly in workers' turns; say so.
 
-## 3. The pack (the org's vocabulary)
+## 3. The vocabulary (names)
 
-Write `onyx/pack.yaml`: one asset type per endpoint (`parent: research_endpoint`) and one property per metric (`metric: true`, `better`), all named `<pack key>.<name>`, with `requires: [research]`. Each needs a `label`; a type's `description` says what it runs. See `GETTING_STARTED.md`, step 4.
+Name each endpoint type and each metric `<namespace>.<name>`, one namespace for the project (a built-in metric like `score` as it is). There's no pack to write or load: the run adds the config's types and metrics to the org's registry when it starts, only those the org doesn't have, and never changes one that's there. See `GETTING_STARTED.md`, step 4.
 
-- `onyx registry check onyx/pack.yaml` must pass, then `onyx registry plan research onyx/pack.yaml` shows what it adds.
-- **Loading it is an admin's change to the whole org.** Show the plan, and ask the user to run `onyx registry apply research onyx/pack.yaml` (after `onyx login --admin`), or to have an admin do it. Don't apply it yourself unless they tell you to.
-- Every metric the drivers report must be in it, or a result is refused. Every endpoint type must be, or its experiments never start.
+- Every metric the drivers report goes in the config's `metrics`, with its direction, or a result is refused. Give it a `label` and a `unit` where the key doesn't say them.
+- A key the org already has keeps its meaning: check `onyx registry` for one the project means to reuse, and pick a new name if it means something else.
 
 ## 4. Endpoints this machine runs
 
 For each, write in `onyx/endpoints/`:
 
-- **The driver**: run in a checkout of an experiment's commit, from the repository's root, with the worker's packet path appended if it named one. It prints its log and ends with one line `METRICS {json}`, keys from the pack; exit 0. A failure says why in its last lines. Keep it honest: measure the way the user does, time against a reference where speed matters, check validity.
+- **The driver**: run in a checkout of an experiment's commit, from the repository's root, with the worker's packet path appended if it named one. It prints its log and ends with one line `METRICS {json}`, keys from the config's `metrics`; exit 0. A failure says why in its last lines. Keep it honest: measure the way the user does, time against a reference where speed matters, check validity.
 - **The guide** (`<name>.md`, about ten lines): the packet (usually the commit itself), what it measures and how, what's in the log, how long one takes, its rules. Workers read it before every experiment.
 - **The quick evaluation** (`evaluate` in the config): the driver on a few samples, or a compile and test. Under a minute: workers run it before every commit.
 - **A CPU endpoint**: offer one for processes that need no hardware, so workers have somewhere to run any program longer than a quick check. Workers send those as experiments too, and a turn spent running a process locally holds a worker slot.
@@ -69,7 +68,7 @@ A site is a machine running `onyx-site`, which takes jobs for its units from the
 
 Nothing goes to the run unchecked:
 
-1. `onyx registry show types <type>` for each endpoint type, and `onyx registry show props <metric>` for each metric: loaded.
+1. `onyx research vocabulary onyx/research.json` adds the config's endpoint types and metrics the org doesn't have (setup and run do it too; a site's check below needs them first). For each key it didn't add, `onyx registry show props <metric>` has the direction the config says.
 2. The quick evaluation runs from the root, in under a minute, and prints the metrics.
 3. Each driver of this machine, in a clean checkout of `HEAD` (`git worktree add /tmp/check HEAD`): runs, and its last line is `METRICS` with every metric's key.
 4. Each site's read access, as it will fetch: with `GIT_SSH_COMMAND="ssh -i <its key> -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes"`, `git ls-remote <remote> main` answers, and a push with that key is refused.

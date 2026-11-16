@@ -112,7 +112,7 @@ You need: `onyx login`, a logged-in [Claude Code](https://claude.com/claude-code
 }
 ```
 
-An endpoint's `type` and the metrics are from your org's pack (the type a subtype of `research_endpoint`), which an admin loads first; its driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
+Endpoint types and metrics are named `<namespace>.<name>`, and the run adds the ones your org doesn't have to its registry (every metric the endpoints report goes in `metrics`, with an optional `label` and `unit`); an endpoint's driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
 
 ```bash
 onyx research setup onyx/research.json          # the base agent studies the repository
@@ -142,7 +142,7 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 ## The skills
 
 - `skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`.
-- `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, the org pack, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
+- `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
 
 For Claude Code, copy them into your skills:
 

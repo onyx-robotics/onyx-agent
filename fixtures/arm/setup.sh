@@ -17,8 +17,8 @@
 # Whichever, a worker's quick evaluation only compiles controller.py: experiments run on the endpoints.
 #
 # Needs ONYX_ROOT (the onyx checkout, with python/onyx_arm synced: uv sync --extra sim). Then:
-#   bun run research:dev -- --org <org> --pack onyx-agent/fixtures/arm/pack.yaml \
-#     --site <name> --site-state <dir>/site-state
+#   bun run research:dev -- --org <org> --site <name> --site-state <dir>/site-state
+#   onyx research vocabulary <dir>/arm/onyx/research.json   # arm.sim and its metrics, for the site
 #   onyx-site --site <dir>/site.toml run      # in python/site-runner
 #   onyx research setup <dir>/arm/onyx/research.json && onyx research run <dir>/arm/onyx/research.json
 set -euo pipefail
@@ -105,8 +105,8 @@ cat > "$dir/arm/onyx/research.json" <<JSON
   "editable": ["controller.py"],
   "evaluate": "python3 -m py_compile controller.py && echo ok",
   "metrics": [
-    { "key": "arm.total_time_s", "better": "lower" },
-    { "key": "arm.poses_done", "better": "higher" }
+    { "key": "arm.total_time_s", "better": "lower", "label": "Total time", "unit": "s" },
+    { "key": "arm.poses_done", "better": "higher", "label": "Poses reached" }
   ],
   "endpoints": [
 $endpoints
