@@ -1,6 +1,6 @@
 /**
  * `onyx setup`: a machine ready for Onyx in one command. It checks what a research run needs,
- * signs in if nobody is, and gives Claude Code the package's skills. Safe to run again.
+ * signs in if nobody is, and gives the coding agent the package's skills. Safe to run again.
  */
 import { spawnSync } from "node:child_process"
 import { mkdirSync, writeFileSync } from "node:fs"
@@ -47,17 +47,18 @@ async function signedIn(c: Context): Promise<string | null> {
 }
 
 export const setup: Command = {
-  summary: "get this machine ready: check it, sign in, install the skills for Claude Code",
+  summary: "get this machine ready: check it, sign in, install the skills for your coding agent",
   usage: `onyx setup [--project] [--url <url>]
 
 One command for a new machine, safe to run again:
   1. checks git, and the coding agent a research run's agents are sessions of (Claude Code):
      installed, and signed in where its CLI can say;
   2. signs you in, as onyx login does, if you aren't;
-  3. installs the package's skills for Claude Code in ~/.claude/skills (--project: in this
-     folder's .claude/skills instead): onyx and onyx-research-setup.
+  3. installs the package's skills, onyx and onyx-research-setup, in ~/.claude/skills (--project:
+     in this folder's .claude/skills instead), where Claude Code reads them; another coding agent
+     takes the same files.
 
-Then, in Claude Code, in your project: "set up an Onyx research run for this repository".
+Then ask your coding agent, in your project: "set up an Onyx research run for this repository".
 --url is the server to sign in to, as for onyx login.`,
   async run(c) {
     const { values } = flags(c.argv, { project: { type: "boolean" }, url: { type: "string" } })
@@ -91,7 +92,7 @@ Then, in Claude Code, in your project: "set up an Onyx research run for this rep
       c.out.line("")
       c.out.line(
         ready
-          ? 'Ready. In Claude Code, in your project: "set up an Onyx research run for this repository".'
+          ? 'Ready. Ask your coding agent, in your project: "set up an Onyx research run for this repository".'
           : "Fix what's marked todo, then run onyx setup again."
       )
     } else c.out.json({ ready, steps, skills: { dir, names } })

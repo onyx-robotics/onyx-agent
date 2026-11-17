@@ -61,7 +61,7 @@ onyx research run onyx/research.json      # until the config's minutes are up
 onyx research steer onyx/research.json "<a note for the var-op>"
 ```
 
-A run lasts as long as its config says and spends the user's Claude usage: confirm with the user before you start one, and start `run` in the background or in their terminal. Its state is in `.onyx-research/` in the repository. If you are one of a run's agents, your prompt names the `onyx research` commands you use.
+A run lasts as long as its config says and spends the user's coding-agent usage: confirm with the user before you start one, and start `run` in the background or in their terminal. Its state is in `.onyx-research/` in the repository. If you are one of a run's agents, your prompt names the `onyx research` commands you use.
 
 ## Ask first
 
