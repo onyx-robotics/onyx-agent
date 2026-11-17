@@ -2,13 +2,13 @@
 
 This guide takes you from installing `onyx` to a research run: agents that improve your code against your metrics, test their ideas as experiments on your endpoints, and record what they learn in your org's knowledge graph.
 
-You can let Claude Code do most of it. Steps 1 and 2 are yours; after that, ask Claude "set up an Onyx research run for this repository" and it follows the same steps with you, using the skill from step 2. This guide is what it does, so you can check its work or do it by hand.
+You can let your coding agent do most of it. Step 1 is yours (`onyx setup` also does step 2); after that, ask it to "set up an Onyx research run for this repository" and it follows the same steps with you, using the skill from step 2. This guide is what it does, so you can check its work or do it by hand.
 
 ## What you need
 
 - **Linux or macOS.** On Windows, use WSL: the agents run as Unix processes.
-- **[Bun](https://bun.sh)** 1.3.14 or later, and **git**.
-- **[Claude Code](https://claude.com/claude-code)**, signed in (`claude` works in your terminal). A run's agents are Claude Code sessions on your account, so a run spends your Claude usage.
+- **git**, and **[Bun](https://bun.sh)** 1.3.14 or later (not needed for the binary from `install.sh`).
+- **A coding agent**, signed in (Claude Code, Codex CLI, Gemini CLI or opencode), to set the run up with you. A run's own agents are [Claude Code](https://claude.com/claude-code) sessions today, so a run needs Claude Code signed in (`claude` works in your terminal), and spends its usage.
 - **An account in an Onyx org**, and, for a site (step 9), someone with the org's **admin** role to approve it. That may be you.
 - **A git repository** with the code to improve, and a remote you can push to. Workers push their branches there.
 
@@ -16,20 +16,17 @@ You can let Claude Code do most of it. Steps 1 and 2 are yours; after that, ask 
 
 ```bash
 npm install -g @onyx-robotics/agent    # or: bun add -g @onyx-robotics/agent
-onyx login                             # approve this machine in your browser, pick the org
-onyx whoami                            # who you act as, in which org
+# or, with no Bun or Node: curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh
+onyx setup                             # checks git and your coding agent, signs you in, installs the skills
 ```
 
-## 2. Give Claude the skills
+`onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
 
-The package has two skills for Claude Code: `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you).
+## 2. Give your coding agent the skills
 
-```bash
-mkdir -p ~/.claude/skills
-cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
-```
+`onyx setup` did this: it installed the package's two skills in `~/.claude/skills` (where Claude Code reads them; another coding agent gets the same files from the package's `skills/`), `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you). `onyx setup --project` puts them in the repository's `.claude/skills` instead.
 
-From here, in your repository: ask Claude to set up an Onyx research run. The rest of this guide is the same steps by hand.
+From here, in your repository: ask your coding agent to set up an Onyx research run. The rest of this guide is the same steps by hand.
 
 ## 3. Decide what to improve, and how it's measured
 
@@ -119,7 +116,7 @@ onyx research steer onyx/research.json "try caching the factorisation"
 - Watch it in Onyx: its hypotheses, experiments and insights are graph items and jobs like the rest of the org's work, under a campaign named after the run.
 - `steer` leaves a note for the var-op, the agent that decides what's tried next; it reads it the next time it's woken.
 - Ctrl+C stops the run. `onyx research run` on the same config carries it on, with the same deadline.
-- Before a long run, work out the cost: each worker's turn is a Claude Code session, and a run's total is printed when it stops.
+- Before a long run, work out the cost: each worker's turn is a coding-agent session, and a run's total is printed when it stops.
 
 ## 9. Endpoints on other machines: sites
 
@@ -186,6 +183,7 @@ onyx jobs get <id>          # its outcome and metrics; GET /jobs/<id>/files list
 | An experiment never starts | No unit of its type is free: a site that's down, a unit held or quarantined (`onyx-site status`), or a site that offers a type the run hasn't added yet (it tries again until the run's setup has) |
 | An experiment ends `failed` / `refused` | The site's policy refused it: its unit type isn't in `[policy] unit_types`, or the run's remote isn't in `[repos]` |
 | An experiment's results are refused | A metric it reported isn't in the registry: add it to `metrics` in `research.json` (step 4), and start the run again |
-| The base agent fails at setup | `claude` isn't signed in, or the remote has no `baseBranch` |
+| `not ready to run` | `setup`, `run` and `greedy` check git, the coding agent (installed and signed in) and `baseBranch` on the remote before they start: fix each line it lists |
+| The base agent fails at setup | Read its log, `.onyx-research/<run name>/logs/base.log` |
 | Workers sit waiting while endpoints are idle | More workers, or a CPU endpoint (`local_program` with a few slots) for processes that need no hardware, so workers send them as experiments instead of running them on their own machine |
 | A run stopped (crash, laptop asleep) | Run `onyx research run` again on the same config: it holds the same jobs and carries them on |

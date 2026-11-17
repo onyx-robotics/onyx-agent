@@ -16,6 +16,7 @@ import { parseArgs } from "node:util"
 import { runAgent } from "./agents"
 import { loadConfig } from "./config"
 import { addWorktree, commitAndPush, ensureClone, git, resolveCommit } from "./git"
+import { preflight } from "./preflight"
 import { runDirFor } from "./supervisor"
 
 export async function runGreedy(cfgPath: string, argv: string[]) {
@@ -24,6 +25,7 @@ export async function runGreedy(cfgPath: string, argv: string[]) {
     options: { minutes: { type: "string" }, margin: { type: "string" } },
   })
   const cfg = loadConfig(cfgPath)
+  preflight(cfg)
   const run = runDirFor(cfg)
   const state = run.state()
   if (!state.base.session) throw new Error("no base agent yet: run setup first")

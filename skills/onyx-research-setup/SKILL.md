@@ -12,7 +12,7 @@ Work in this order. Don't write files before step 2's answers, and don't start a
 ## 1. Check what's there
 
 - `onyx whoami`: signed in, and to the right org. Exit 4: the user runs `onyx login` themselves (in Claude Code, `! onyx login`). Never handle a token.
-- `claude --version`, `git remote -v`: the run's agents are Claude Code sessions, and workers push branches to a remote, which must exist and be pushable. A bare repository (`git init --bare`) is fine for a first try on one machine.
+- `claude --version`, `git remote -v`: the run's agents are Claude Code sessions today, even when you, setting it up, are another coding agent, and workers push branches to a remote, which must exist and be pushable. A bare repository (`git init --bare`) is fine for a first try on one machine.
 - Linux or macOS (WSL on Windows).
 - `onyx/research.json` already there: read it and its endpoints' guides, and change only what the user asks.
 - `onyx registry show types` (the ones whose `parent` is `research_endpoint`, or a subtype of it) and `onyx registry show props` (those with `metric: true`): endpoint types and metrics the org already has. Reuse them when they fit rather than inventing near-duplicates.
@@ -25,7 +25,7 @@ Ask what you can't read from the code, in one go:
 - **The metrics**, each with its direction, and which matters most.
 - **What agents may edit**: the method's files only. Measurement code is never editable.
 - **Where experiments run**: this machine (a benchmark, a simulator), or hardware or another machine (a site, step 6). How long one takes, and how many can run at once.
-- **The budget**: workers and minutes. A run spends the user's Claude usage, mostly in workers' turns; say so.
+- **The budget**: workers and minutes. A run spends the user's coding-agent usage, mostly in workers' turns; say so.
 
 ## 3. The vocabulary (names)
 
@@ -85,4 +85,4 @@ onyx research run onyx/research.json     # until minutes are up; keep the termin
 onyx research steer onyx/research.json "<a note for the var-op>"
 ```
 
-Starting a run is theirs to decide: say how long it lasts and that it spends their Claude usage, and start it only if they ask, in the background or in their terminal. After setup, read its summary (`.onyx-research/<run>/base-summary.md`) with them: if the base agent misunderstood the problem, fix the goal or a guide and run setup again.
+Starting a run is theirs to decide: say how long it lasts and that it spends their coding-agent usage, and start it only if they ask, in the background or in their terminal. After setup, read its summary (`.onyx-research/<run>/base-summary.md`) with them: if the base agent misunderstood the problem, fix the goal or a guide and run setup again.

@@ -24,6 +24,7 @@ import { runAgent } from "./agents"
 import { loadConfig, vocabularyOf, type LoadedConfig, type ResearchConfig } from "./config"
 import { addWorktree, checkout, ensureClone, resolveCommit } from "./git"
 import { agentItem, client, RENEW_EVERY_MS, renewRunKey, upsert } from "./platform"
+import { preflight } from "./preflight"
 import { basePrompt, varopPrompt, workerPrompt } from "./prompts"
 import {
   RunDir,
@@ -129,6 +130,7 @@ export async function declare(cfgPath: string) {
 
 export async function setup(cfgPath: string) {
   const cfg = loadConfig(cfgPath)
+  preflight(cfg)
   const run = runDirFor(cfg)
   // the run's key, for everything it does (docs/auth.md, "Run keys"): its jobs are its own
   await renewRunKey(run.dir, slug(cfg.name))
@@ -1206,6 +1208,7 @@ export class Supervisor {
 
 export async function runResearch(cfgPath: string) {
   const cfg = loadConfig(cfgPath)
+  preflight(cfg)
   const run = runDirFor(cfg)
   const link = plotLink(run)
   if (link) console.log(`its plot: ${link}`)

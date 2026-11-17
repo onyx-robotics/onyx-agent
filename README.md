@@ -5,7 +5,7 @@
 - **`onyx`**, the command line: sign in, read the graph, log work, ingest files, queue jobs, keep your org's vocabulary as code.
 - **`onyx research`**: autoresearch on your machine. Agents run experiments on your codebase in parallel, and what they learn goes into your org's knowledge graph.
 - **The SDK** (`@onyx-robotics/agent/sdk`): `OnyxClient`, for agents, scripts and integrations.
-- **Skills for coding agents** (`skills/`): how Claude Code and similar agents use `onyx`, and set a repository up for a research run.
+- **Skills for coding agents** (`skills/`): how a coding agent (Claude Code, Codex CLI, Gemini CLI or opencode) uses `onyx`, and set a repository up for a research run.
 
 **New to Onyx?** [GETTING_STARTED.md](GETTING_STARTED.md) takes you from installing to your first research run, endpoints on other machines included.
 
@@ -15,16 +15,21 @@
 npm install -g @onyx-robotics/agent   # or: bun add -g @onyx-robotics/agent
 ```
 
-The `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`. Or take a binary that needs neither Bun nor Node, for Linux or macOS, x64 or arm64, from the [releases](https://github.com/onyx-robotics/onyx-agent/releases):
+The `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`. Or install a binary that needs neither Bun nor Node, for Linux or macOS, x64 or arm64:
 
 ```bash
-curl -fsSL -o onyx https://github.com/onyx-robotics/onyx-agent/releases/latest/download/onyx-darwin-arm64
-chmod +x onyx && sudo mv onyx /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh
 ```
 
-(`onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64`, `onyx-darwin-arm64`.)
+It picks this machine's binary from the [releases](https://github.com/onyx-robotics/onyx-agent/releases), checks it against the release's `SHA256SUMS`, and puts it in `~/.local/bin` (`ONYX_INSTALL_DIR` for another folder, `ONYX_VERSION=v0.2.0` for another release). Or download one yourself: `onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64` or `onyx-darwin-arm64`.
 
-## Sign in
+## Set up
+
+```bash
+onyx setup                # checks git and your coding agent, signs you in, installs the skills for your coding agent
+```
+
+Safe to run again (after an upgrade, it refreshes the skills). Or do its steps one at a time:
 
 ```bash
 onyx login                # shows a code and opens a page: check the code, pick an org, approve
@@ -89,7 +94,7 @@ onyx registry apply packs/acme.yaml --yes --wait
 
 Agents improve your code against your metrics: a base agent studies the repository, then a variational operator proposes hypotheses and workers test them, each in its own worktree, by running experiments on your project's endpoints (a benchmark, a simulator, a robot). Every hypothesis and experiment is a job in your org's queue, and every result and insight is in the knowledge graph, for anyone in the org to read and question.
 
-You need: `onyx login`, a logged-in [Claude Code](https://claude.com/claude-code) (`claude`), git, and an `onyx/research.json` in the repository:
+You need: `onyx login`, git, a logged-in [Claude Code](https://claude.com/claude-code) (`claude`: a run's agents are Claude Code sessions today), and an `onyx/research.json` in the repository:
 
 ```json
 {
@@ -144,13 +149,11 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 - `skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`.
 - `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
 
-For Claude Code, copy them into your skills:
+`onyx setup` installs them in `~/.claude/skills` (`--project`: in this folder's `.claude/skills`), where Claude Code reads them. They're part of the program, so a standalone binary installs them too. For another coding agent, give it the same files in its own skills or instructions folder. Or copy them yourself from an npm install:
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
 ```
-
-(or into a project's `.claude/skills/`).
 
 ## Develop
 
