@@ -7,7 +7,7 @@ You can let your coding agent do most of it. Step 1 is yours (`onyx setup` also 
 ## What you need
 
 - **Linux or macOS.** On Windows, use WSL: the agents run as Unix processes.
-- **git**, and **[Bun](https://bun.sh)** 1.3.14 or later (not needed for the binary from `install.sh`).
+- **git**, and **[Bun](https://bun.sh)** 1.3.14 or later.
 - **A coding agent**, signed in (Claude Code, Codex CLI, Gemini CLI or opencode), to set the run up with you. A run's own agents are [Claude Code](https://claude.com/claude-code) sessions today, so a run needs Claude Code signed in (`claude` works in your terminal), and spends its usage.
 - **An account in an Onyx org**, and, for a site (step 9), someone with the org's **admin** role to approve it. That may be you.
 - **A git repository** with the code to improve, and a remote you can push to. Workers push their branches there.
@@ -15,12 +15,11 @@ You can let your coding agent do most of it. Step 1 is yours (`onyx setup` also 
 ## 1. Install and sign in
 
 ```bash
-npm install -g @onyx-robotics/agent    # or: bun add -g @onyx-robotics/agent
-# or, with no Bun or Node: curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh
-onyx setup                             # checks git and your coding agent, signs you in, installs the skills
+git clone git@github.com:onyx-robotics/onyx.git && onyx/install.sh   # builds onyx from main into ~/.local/bin
+onyx setup        # checks git and your coding agent, signs you in, installs the skills
 ```
 
-`onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
+To update onyx later: `git -C onyx pull && onyx/install.sh`. `onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
 
 ## 2. Give your coding agent the skills
 

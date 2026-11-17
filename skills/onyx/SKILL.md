@@ -9,7 +9,7 @@ Onyx is a graph of an org's research: items (experiments, runs, commits, dataset
 
 ## Before anything
 
-- `onyx whoami` says who you act as, in which org. Exit code 4 means not signed in: ask the user to run `onyx login` in their own terminal (it opens a browser page to approve; in Claude Code they can type `! onyx login`). Don't try to approve it yourself, and never put a token in a command line or a file. `command not found` means it isn't installed: the user installs it (`npm install -g @onyx-robotics/agent`, which needs Bun) and runs `onyx setup`.
+- `onyx whoami` says who you act as, in which org. Exit code 4 means not signed in: ask the user to run `onyx login` in their own terminal (it opens a browser page to approve; in Claude Code they can type `! onyx login`). Don't try to approve it yourself, and never put a token in a command line or a file. `command not found` means it isn't installed: the user installs it from a clone of the monorepo (`git clone git@github.com:onyx-robotics/onyx.git && onyx/install.sh`, which needs Bun) and runs `onyx setup`.
 - Several orgs: `onyx org` lists the profiles, `--profile <slug>` picks one for a command. Ask which org if it isn't clear.
 - Off a terminal `onyx` prints JSON (errors on stderr as `{"error": {...}}`), so parse it. Exit codes: 0 ok, 2 bad usage, 3 invalid input, 4 not signed in or not allowed, 5 not found, 6 conflict, 7 unavailable, 9 a job didn't succeed. `onyx help <command>` gives a command's flags.
 
