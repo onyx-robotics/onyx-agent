@@ -40,7 +40,6 @@ export interface WorkerState {
   nudges: number
   /** what it was first told: a worker interrupted before its first turn ended starts from it again */
   prompt?: string
-  costUsd: number
 }
 
 export interface ExperimentResult {
@@ -62,8 +61,8 @@ export interface RunState {
   campaign: string
   /** the supervisor's own agent (its API key's) */
   supervisor: string
-  base: { agent: string; session: string | null; costUsd: number }
-  varop: { agent: string; session: string | null; lastWake: number; costUsd: number; wakes: number }
+  base: { agent: string; session: string | null }
+  varop: { agent: string; session: string | null; lastWake: number; wakes: number }
   startedAt: number
   deadline: number
   workers: Record<string, WorkerState>

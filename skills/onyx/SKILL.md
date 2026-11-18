@@ -9,7 +9,7 @@ Onyx is a graph of an org's research: items (experiments, runs, commits, dataset
 
 ## Before anything
 
-- `onyx whoami` says who you act as, in which org. Exit code 4 means not signed in: ask the user to run `onyx login` in their own terminal (it opens a browser page to approve; in Claude Code they can type `! onyx login`). Don't try to approve it yourself, and never put a token in a command line or a file. `command not found` means it isn't installed: the user installs it with `curl -fsSL https://onyxresearch.ai/install.sh | bash` (or `npm install -g @onyx-robotics/agent`, which needs Bun). Just installed but still not found: `~/.local/bin` isn't on the PATH yet, and `~/.local/bin/onyx` runs it.
+- `onyx whoami` says who you act as, in which org. Exit code 4 means not signed in: ask the user to run `onyx login` in their own terminal (it opens a browser page to approve; in Claude Code they can type `! onyx login`). Don't try to approve it yourself, and never put a token in a command line or a file. `command not found` means it isn't installed: the user installs it from a clone of the monorepo (`git clone git@github.com:onyx-robotics/onyx.git && onyx/install.sh`, which needs Bun) and runs `onyx setup`.
 - Several orgs: `onyx org` lists the profiles, `--profile <slug>` picks one for a command. Ask which org if it isn't clear.
 - Off a terminal `onyx` prints JSON (errors on stderr as `{"error": {...}}`), so parse it. Exit codes: 0 ok, 2 bad usage, 3 invalid input, 4 not signed in or not allowed, 5 not found, 6 conflict, 7 unavailable, 9 a job didn't succeed. `onyx help <command>` gives a command's flags.
 
@@ -26,7 +26,7 @@ onyx get <item>                            # props, metrics, sources, edges (--h
 onyx lineage <item> --up                   # what it came from (--down: what came from it)
 ```
 
-Use only the types, relations and props the registry has; if what you need isn't there, tell the user rather than inventing keys (an admin adds them to the org's pack).
+Use only the types, relations and props the registry has; if what you need isn't there, tell the user rather than inventing keys (an admin adds them to the org's pack; a research run adds its config's endpoint types and metrics itself).
 
 ## Log work
 
@@ -61,7 +61,7 @@ onyx research run onyx/research.json      # until the config's minutes are up
 onyx research steer onyx/research.json "<a note for the var-op>"
 ```
 
-A run lasts as long as its config says and spends the user's Claude usage: confirm with the user before you start one, and start `run` in the background or in their terminal. Its state is in `.onyx-research/` in the repository. If you are one of a run's agents, your prompt names the `onyx research` commands you use.
+A run lasts as long as its config says and spends the user's coding-agent usage: confirm with the user before you start one, and start `run` in the background or in their terminal. Its state is in `.onyx-research/` in the repository. If you are one of a run's agents, your prompt names the `onyx research` commands you use.
 
 ## Ask first
 

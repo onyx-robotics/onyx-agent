@@ -20,6 +20,8 @@
  * that member). Records in order, from a file say, go through `stream()` (stream.ts).
  */
 import type {
+  ExtendRegistryInput,
+  FileUploadQuery,
   JobSubmit,
   KgRelated,
   KgRelatedInput,
@@ -27,6 +29,7 @@ import type {
   RunnerSyncInput,
   RunnerSyncResult,
   SubmitJobsResult,
+  UploadedFile,
 } from "../generated/contracts/contracts"
 import type {
   IngestBatch,
@@ -144,7 +147,9 @@ export class OnyxClient {
     return uuidv7()
   }
 
+  /** A JSON body, or a file's bytes (sent as they are: `uploadFile`). */
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const raw = body instanceof Uint8Array
     let attempt = 0
     // one key per write, reused by every retry: the server runs it once and replays the answer
     const idempotencyKey = method === "GET" ? undefined : uuidv7()
@@ -156,10 +161,16 @@ export class OnyxClient {
           method,
           headers: {
             authorization: `Bearer ${this.token}`,
-            ...(body !== undefined ? { "content-type": "application/json" } : {}),
+            ...(body !== undefined
+              ? { "content-type": raw ? "application/octet-stream" : "application/json" }
+              : {}),
             ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
           },
-          body: body !== undefined ? JSON.stringify(body) : undefined,
+          body: raw
+            ? (body as Uint8Array<ArrayBuffer>)
+            : body !== undefined
+              ? JSON.stringify(body)
+              : undefined,
           signal: AbortSignal.timeout(this.timeoutMs),
         })
       } catch (e) {
@@ -229,6 +240,22 @@ export class OnyxClient {
   /** Attach a ref: `content` (pinned by version or hash), `mirror` (a copy) or `annotation`. */
   attachRef(entity: ItemRefInput, ref: Omit<IngestRef, "entity">): Promise<IngestResult> {
     return this.ingest({ refs: [{ entity, ...ref }] })
+  }
+
+  /**
+   * Upload an image to an item (PNG, JPEG, GIF or WebP, at most 4 MB): a checkpoint's screenshot,
+   * a GIF of a rollout. Anyone who can see the item sees it on its page, at `GET /files/:id`.
+   */
+  uploadFile(
+    entity: string,
+    bytes: Uint8Array,
+    opts: Omit<FileUploadQuery, "entity"> = {}
+  ): Promise<UploadedFile> {
+    const q = new URLSearchParams({ entity })
+    if (opts.name !== undefined) q.set("name", opts.name)
+    if (opts.caption !== undefined) q.set("caption", opts.caption)
+    if (opts.step !== undefined) q.set("step", String(opts.step))
+    return this.request("POST", `/files?${q}`, bytes)
   }
 
   /** Seal an artifact: its props and content refs are frozen (it's used as evidence). */
@@ -420,6 +447,18 @@ export class OnyxClient {
       rebuildPending: boolean
       plan: PackPlan
     }>("POST", "/registry/packs", { packs, ...opts })
+  }
+
+  /**
+   * Add types and properties to the org's own packs, each `<pack>.<key>`: what's new is added,
+   * what exists is left as it is (`added` names what was new).
+   */
+  extendRegistry(input: ExtendRegistryInput) {
+    return this.request<{ added: string[]; registryVersion: number }>(
+      "POST",
+      "/registry/extend",
+      input
+    )
   }
 
   /** A loaded pack: its text as loaded (when it came as text) and its body. */

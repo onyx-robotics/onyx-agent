@@ -5,38 +5,31 @@
 - **`onyx`**, the command line: sign in, read the graph, log work, ingest files, queue jobs, keep your org's vocabulary as code.
 - **`onyx research`**: autoresearch on your machine. Agents run experiments on your codebase in parallel, and what they learn goes into your org's knowledge graph.
 - **The SDK** (`@onyx-robotics/agent/sdk`): `OnyxClient`, for agents, scripts and integrations.
-- **Skills for coding agents** (`skills/`): how Claude Code and similar agents use `onyx`, and set a repository up for a research run.
+- **Skills for coding agents** (`skills/`): how a coding agent (Claude Code, Codex CLI, Gemini CLI or opencode) uses `onyx`, and set a repository up for a research run.
 
 **New to Onyx?** [GETTING_STARTED.md](GETTING_STARTED.md) takes you from installing to your first research run, endpoints on other machines included.
 
 ## Install
 
 ```bash
-curl -fsSL https://onyxresearch.ai/install.sh | bash
-```
-
-It installs the latest release: `onyx` as a binary for your machine (Linux or macOS, x64 or arm64; on Windows, in WSL) that needs neither Bun nor Node, in `~/.local/bin`, and the skills for Claude Code in `~/.claude/skills` (below), each checked against the release's `SHA256SUMS`. It says so if `~/.local/bin` isn't on your `PATH`. Run it again to update. Settings go to `bash`, after the pipe:
-
-- `ONYX_VERSION=0.2.1` installs that release rather than the latest: `curl -fsSL https://onyxresearch.ai/install.sh | ONYX_VERSION=0.2.1 bash`
-- `ONYX_INSTALL_DIR=<dir>` puts `onyx` elsewhere, `ONYX_SKILLS_DIR=<dir>` the skills
-- `ONYX_NO_SKILLS=1` leaves the skills out
-
-Or install the package with npm or Bun. Its `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`:
-
-```bash
 npm install -g @onyx-robotics/agent   # or: bun add -g @onyx-robotics/agent
 ```
 
-Or take a binary yourself from the [releases](https://github.com/onyx-robotics/onyx-agent/releases):
+The `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`. Or install a binary that needs neither Bun nor Node, for Linux or macOS, x64 or arm64:
 
 ```bash
-curl -fsSL -o onyx https://github.com/onyx-robotics/onyx-agent/releases/latest/download/onyx-darwin-arm64
-chmod +x onyx && sudo mv onyx /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh
 ```
 
-(`onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64`, `onyx-darwin-arm64`; their checksums are in the release's `SHA256SUMS`.)
+It picks this machine's binary from the [releases](https://github.com/onyx-robotics/onyx-agent/releases), checks it against the release's `SHA256SUMS`, and puts it in `~/.local/bin` (`ONYX_INSTALL_DIR` for another folder, `ONYX_VERSION=v0.2.0` for another release). Or download one yourself: `onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64` or `onyx-darwin-arm64`.
 
-## Sign in
+## Set up
+
+```bash
+onyx setup                # checks git and your coding agent, signs you in, installs the skills for your coding agent
+```
+
+Safe to run again (after an upgrade, it refreshes the skills). Or do its steps one at a time:
 
 ```bash
 onyx login                # shows a code and opens a page: check the code, pick an org, approve
@@ -101,7 +94,7 @@ onyx registry apply packs/acme.yaml --yes --wait
 
 Agents improve your code against your metrics: a base agent studies the repository, then a variational operator proposes hypotheses and workers test them, each in its own worktree, by running experiments on your project's endpoints (a benchmark, a simulator, a robot). Every hypothesis and experiment is a job in your org's queue, and every result and insight is in the knowledge graph, for anyone in the org to read and question.
 
-You need: `onyx login`, a logged-in [Claude Code](https://claude.com/claude-code) (`claude`), git, and an `onyx/research.json` in the repository:
+You need: `onyx login`, git, a logged-in [Claude Code](https://claude.com/claude-code) (`claude`: a run's agents are Claude Code sessions today), and an `onyx/research.json` in the repository:
 
 ```json
 {
@@ -124,7 +117,7 @@ You need: `onyx login`, a logged-in [Claude Code](https://claude.com/claude-code
 }
 ```
 
-An endpoint's `type` and the metrics are from your org's pack (the type a subtype of `research_endpoint`), which an admin loads first; its driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
+Endpoint types and metrics are named `<namespace>.<name>`, and the run adds the ones your org doesn't have to its registry (every metric the endpoints report goes in `metrics`, with an optional `label` and `unit`); an endpoint's driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
 
 ```bash
 onyx research setup onyx/research.json          # the base agent studies the repository
@@ -154,15 +147,13 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 ## The skills
 
 - `skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`.
-- `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, the org pack, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
+- `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
 
-The installer has already put them in `~/.claude/skills`, for Claude Code, and running it again updates them. If you installed with npm, copy them there yourself:
+`onyx setup` installs them in `~/.claude/skills` (`--project`: in this folder's `.claude/skills`), where Claude Code reads them. They're part of the program, so a standalone binary installs them too. For another coding agent, give it the same files in its own skills or instructions folder. Or copy them yourself from an npm install:
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
 ```
-
-(or into a project's `.claude/skills/`).
 
 ## Develop
 
@@ -171,7 +162,6 @@ bun install
 bun run lint && bun run typecheck && bun run test
 bun run build        # dist/: the JavaScript for Node
 bun run compile      # dist/onyx-<platform>-<arch>: a binary for this machine (-- --all for every one)
-bun scripts/release-assets.ts   # then the rest of a release beside it: skills.tar.gz, install.sh, SHA256SUMS
 bun run onyx -- help # the CLI from source
 ```
 

@@ -146,3 +146,15 @@ test("a split batch names source-keyed items by their key, which the server reso
   })
   expect(bodies[3].metrics[0].entity).toEqual({ source: { system: "mlflow", key: "d-1" } })
 })
+
+test("uploadFile sends the file's bytes as they are, and what it is in the query", async () => {
+  const f = fakeFetch([ok({ id: "r" })])
+  const c = new OnyxClient({ baseUrl: "http://x", apiKey: "onyx_sk_k", fetch: f.impl })
+  const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+  await c.uploadFile("e1", bytes, { caption: "step 3", step: 3 })
+  expect(f.calls[0]!.url).toBe("http://x/api/v1/files?entity=e1&caption=step+3&step=3")
+  expect(f.calls[0]!.init.body).toBe(bytes)
+  expect((f.calls[0]!.init.headers as Record<string, string>)["content-type"]).toBe(
+    "application/octet-stream"
+  )
+})

@@ -9,9 +9,12 @@ import { dirname, isAbsolute, resolve } from "node:path"
 import { z } from "zod"
 
 const endpoint = z.object({
-  /** the unit type its runner offers (a subtype of research_endpoint, from the project's pack) */
+  /**
+   * the unit type its runner offers, `<pack>.<name>`: declared in the org as a research_endpoint
+   * when the run starts, if it isn't there
+   */
   type: z.string().min(1),
-  /** what it's for, in a line */
+  /** what it's for, in a line (the type's description, when the run declares it) */
   label: z.string().min(1),
   /** a short guide for workers: what a packet is, what it measures, how long it takes (repo path) */
   guide: z.string().min(1),
@@ -46,9 +49,19 @@ export const researchConfig = z.object({
   editable: z.array(z.string().min(1)).min(1),
   /** a quick metric evaluation workers run on their code before they commit it */
   evaluate: z.string().min(1),
-  /** the metrics that matter, as property keys, each with its direction */
+  /**
+   * every metric its endpoints report, as property keys (`<pack>.<name>`, or a built-in one), each
+   * with its direction; declared in the org when the run starts, if it isn't there
+   */
   metrics: z
-    .array(z.object({ key: z.string().min(1), better: z.enum(["higher", "lower"]) }))
+    .array(
+      z.object({
+        key: z.string().min(1),
+        better: z.enum(["higher", "lower"]),
+        label: z.string().min(1).optional(),
+        unit: z.string().min(1).optional(),
+      })
+    )
     .min(1),
   endpoints: z
     .array(endpoint)
@@ -79,6 +92,37 @@ export interface LoadedConfig extends ResearchConfig {
   /** the repository's root (the config is at <root>/onyx/research.json) */
   root: string
   path: string
+}
+
+const humanize = (key: string) => {
+  const s = key.replace(/[._]/g, " ")
+  return s[0]!.toUpperCase() + s.slice(1)
+}
+
+/**
+ * What the config's endpoints and metrics need in the org's registry (each declared only if it
+ * isn't there: `extendRegistry` leaves what exists as it is).
+ */
+export function vocabularyOf(cfg: ResearchConfig) {
+  return {
+    types: cfg.endpoints
+      .filter((e, i, all) => all.findIndex((x) => x.type === e.type) === i)
+      .map((e) => ({
+        key: e.type,
+        kind: "asset" as const,
+        parent: "research_endpoint",
+        label: humanize(e.type),
+        description: e.label,
+      })),
+    properties: cfg.metrics.map((m) => ({
+      key: m.key,
+      label: m.label ?? humanize(m.key.split(".").pop()!),
+      type: "number" as const,
+      unit: m.unit,
+      metric: true,
+      better: m.better,
+    })),
+  }
 }
 
 export function loadConfig(path: string): LoadedConfig {

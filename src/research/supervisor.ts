@@ -21,9 +21,10 @@ import { JOB_PRIORITY_MAX, type RunnerAssignment } from "../generated/contracts/
 import type { OnyxClient } from "../sdk"
 
 import { runAgent } from "./agents"
-import { loadConfig, type LoadedConfig } from "./config"
+import { loadConfig, vocabularyOf, type LoadedConfig, type ResearchConfig } from "./config"
 import { addWorktree, checkout, ensureClone, resolveCommit } from "./git"
 import { agentItem, client, RENEW_EVERY_MS, renewRunKey, upsert } from "./platform"
+import { preflight } from "./preflight"
 import { basePrompt, varopPrompt, workerPrompt } from "./prompts"
 import {
   RunDir,
@@ -111,12 +112,30 @@ export function writeShim(run: RunDir, self = selfCommand()) {
 
 // ---------------------------------------------------------------- setup
 
+/** The config's endpoint types and metrics, in the org's registry (what's there stays as it is). */
+async function declareVocabulary(onyx: OnyxClient, cfg: ResearchConfig, log: (m: string) => void) {
+  const { added } = await onyx.extendRegistry(vocabularyOf(cfg))
+  if (added.length) log(`added to the org's registry: ${added.join(", ")}`)
+  return added
+}
+
+/** Only the config's types and metrics, in the org: what a site's check needs before setup. */
+export async function declare(cfgPath: string) {
+  const cfg = loadConfig(cfgPath)
+  const run = runDirFor(cfg)
+  await renewRunKey(run.dir, slug(cfg.name))
+  if (!(await declareVocabulary(client(run.dir), cfg, console.log)).length)
+    console.log("the org has them all")
+}
+
 export async function setup(cfgPath: string) {
   const cfg = loadConfig(cfgPath)
+  preflight(cfg)
   const run = runDirFor(cfg)
   // the run's key, for everything it does (docs/auth.md, "Run keys"): its jobs are its own
   await renewRunKey(run.dir, slug(cfg.name))
   const onyx = client(run.dir)
+  await declareVocabulary(onyx, cfg, console.log)
   const repo = run.path("repo")
   ensureClone(cfg.remote, repo)
   writeShim(run)
@@ -142,8 +161,8 @@ export async function setup(cfgPath: string) {
   const state: RunState = prior ?? {
     campaign,
     supervisor: me.actor?.id ?? "",
-    base: { agent: base, session: null, costUsd: 0 },
-    varop: { agent: varop, session: null, lastWake: 0, costUsd: 0, wakes: 0 },
+    base: { agent: base, session: null },
+    varop: { agent: varop, session: null, lastWake: 0, wakes: 0 },
     startedAt: 0,
     deadline: 0,
     workers: {},
@@ -151,6 +170,8 @@ export async function setup(cfgPath: string) {
     unseen: [],
   }
   run.write("state.json", state)
+  const link = plotLink(run)
+  if (link) console.log(`its plot: ${link}`)
 
   console.log(`base agent (${cfg.models.base}) is studying ${cfg.root} ...`)
   const r = await runAgent({
@@ -163,12 +184,9 @@ export async function setup(cfgPath: string) {
   })
   if (!r.ok || !r.session) throw new Error(`the base agent failed: ${r.text.slice(0, 1000)}`)
   state.base.session = r.session
-  state.base.costUsd += r.costUsd
   run.write("state.json", state)
   writeFileSync(run.path("base-summary.md"), r.text)
-  console.log(
-    `${r.text}\n\nbase session ${r.session} ($${r.costUsd.toFixed(2)}). Start the run: onyx research run ${cfgPath}`
-  )
+  console.log(`${r.text}\n\nbase session ${r.session}. Start the run: onyx research run ${cfgPath}`)
 }
 
 // ---------------------------------------------------------------- the run
@@ -364,6 +382,8 @@ export class Supervisor {
     writeShim(this.run)
     // a fresh run key (the same run's agent and runner as before a restart), then renewed hourly
     await renewRunKey(this.run.dir, slug(this.cfg.name))
+    // the config may have changed since setup: a new metric, another endpoint
+    await declareVocabulary(this.onyx, this.cfg, (m) => this.log(m))
     await this.resume()
     this.log(
       `run "${this.cfg.name}": ${this.cfg.workers} workers, proposing until ${new Date(this.state.deadline).toISOString().slice(11, 19)}`
@@ -375,11 +395,7 @@ export class Supervisor {
       this.siteLoop(),
       this.keyLoop(),
     ])
-    const cost =
-      this.state.base.costUsd +
-      this.state.varop.costUsd +
-      Object.values(this.state.workers).reduce((s, w) => s + w.costUsd, 0)
-    this.log(`stopped. Agents cost $${cost.toFixed(2)}.`)
+    this.log("stopped.")
   }
 
   // ------------------------------------------------------------ runner
@@ -610,7 +626,6 @@ export class Supervisor {
       pending: [],
       experiments: [],
       nudges: 0,
-      costUsd: 0,
     }
     this.state.workers[task] = w
     this.save()
@@ -661,7 +676,6 @@ export class Supervisor {
       signal: this.halt.signal,
     })
     if (r.session) w.session = r.session
-    w.costUsd += r.costUsd
     if (r.aborted) {
       // stopped, not ended: its job stays held, and a restart resumes the turn (resumeWorker)
       this.save()
@@ -791,9 +805,7 @@ export class Supervisor {
     // the worker's end is its last turn's: the job it ends in
     this.endTurn(task, outcome, extra)
     this.save()
-    this.log(
-      `worker ${short(task)} ${outcome} after ${w.experiments.length} experiments ($${w.costUsd.toFixed(2)})`
-    )
+    this.log(`worker ${short(task)} ${outcome} after ${w.experiments.length} experiments`)
   }
 
   /**
@@ -1180,7 +1192,6 @@ export class Supervisor {
       signal: this.halt.signal,
     })
     if (r.session) v.session = r.session
-    v.costUsd += r.costUsd
     if (r.aborted) {
       // stopped before it could act on them: what it was shown waits for its next wake, after a restart
       this.state.unseen.unshift(...seen)
@@ -1197,7 +1208,40 @@ export class Supervisor {
 
 export async function runResearch(cfgPath: string) {
   const cfg = loadConfig(cfgPath)
-  await new Supervisor(cfg, runDirFor(cfg)).start()
+  preflight(cfg)
+  const run = runDirFor(cfg)
+  const link = plotLink(run)
+  if (link) console.log(`its plot: ${link}`)
+  await new Supervisor(cfg, run).start()
+}
+
+/** A run's plot in the app (`/items/<campaign>/plot`), once it's set up: null before. */
+export function plotLink(run: RunDir): string | null {
+  const state = run.read<RunState>("state.json")
+  const key = run.read<{ url: string }>("run-key.json")
+  return state?.campaign && key?.url
+    ? `${key.url.replace(/\/+$/, "")}/items/${state.campaign}/plot`
+    : null
+}
+
+/**
+ * `onyx research plot <config>`: the run's plot in the app, and its hypotheses linked to its
+ * campaign (as runs since link them when they're proposed), so an older run's plot has them too.
+ */
+export async function plot(cfgPath: string): Promise<string> {
+  const run = runDirFor(loadConfig(cfgPath))
+  const state = run.read<RunState>("state.json")
+  const link = plotLink(run)
+  if (!state || !link) throw new Error("no run here yet: run `onyx research setup` first")
+  const board = run.read<Board>("board.json")
+  const edges = (board?.hypotheses ?? []).map((h) => ({
+    rel: "in_campaign",
+    src: h.id,
+    dst: state.campaign,
+  }))
+  for (let i = 0; i < edges.length; i += 500)
+    await client(run.dir).ingest({ items: [], edges: edges.slice(i, i + 500) })
+  return link
 }
 
 /** A message to the var-op from the user or the orchestrator, read when it's next woken. */

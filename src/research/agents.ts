@@ -26,11 +26,13 @@ export interface AgentRun {
 export interface AgentResult {
   session: string | null
   text: string
-  costUsd: number
   ok: boolean
   /** cut short by `signal`: the turn didn't end, it was stopped */
   aborted: boolean
 }
+
+/** the coding agent a run's agents are sessions of (preflight.ts knows how to check each one) */
+export const AGENT_CLI = "claude"
 
 /** the tools an agent has: the codebase, a shell (its own commands and onyx research), nothing else */
 const TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
@@ -57,7 +59,7 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
     a.log,
     `\n==== ${new Date().toISOString()} ${a.resume ? (a.fork ? `fork of ${a.resume}` : `resume ${a.resume}`) : "new"}\n${a.prompt}\n----\n`
   )
-  const proc = Bun.spawn(["claude", ...args], {
+  const proc = Bun.spawn([AGENT_CLI, ...args], {
     cwd: a.cwd,
     env: { ...process.env, ...a.env },
     stdout: "pipe",
@@ -83,17 +85,15 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
     const r = JSON.parse(out) as {
       session_id?: string
       result?: string
-      total_cost_usd?: number
       is_error?: boolean
     }
     return {
       session: r.session_id ?? null,
       text: r.result ?? "",
-      costUsd: r.total_cost_usd ?? 0,
       ok: !r.is_error && proc.exitCode === 0,
       aborted,
     }
   } catch {
-    return { session: null, text: err || out, costUsd: 0, ok: false, aborted }
+    return { session: null, text: err || out, ok: false, aborted }
   }
 }
