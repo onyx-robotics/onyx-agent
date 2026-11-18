@@ -1,5 +1,5 @@
 /**
- * The supervisor (docs/research.md, "The runtime"): plain code on the user's machine. It sets a
+ * The supervisor (docs/research.md, "The queue"): plain code on the user's machine. It sets a
  * run up (the base agent studies the repository), then is two runners in one (docs/jobs.md): one
  * offering worker slots, which runs a worker's turn for each worker_task it's given, and one
  * offering the project's endpoints, which runs experiments. Between them it wakes the var-op, and
@@ -23,6 +23,7 @@ import type { OnyxClient } from "../sdk"
 import { readOnlyTools, runAgent, workerTools } from "./agents"
 import { loadConfig, vocabularyOf, type LoadedConfig, type ResearchConfig } from "./config"
 import { addWorktree, checkout, ensureClone, resolveCommit } from "./git"
+import { limitsText, setTimeLimit, timeLimits } from "./limits"
 import { agentItem, client, RENEW_EVERY_MS, renewRunKey, upsert } from "./platform"
 import { preflight } from "./preflight"
 import { basePrompt, varopPrompt, workerPrompt } from "./prompts"
@@ -33,7 +34,7 @@ import {
   type RunState,
   type WorkerState,
 } from "./state"
-import { relatedText, type Board } from "./tools"
+import { boardText, relatedText, type Board } from "./tools"
 
 const slug = (s: string) =>
   s
@@ -43,9 +44,10 @@ const slug = (s: string) =>
 const short = (id: string) => id.slice(-8)
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** a worker's turn, and the var-op's, end after this long whatever they're doing */
-const TURN_MS = 45 * 60_000
-/** after the deadline, what's running gets this long to finish */
+/**
+ * After the deadline, what's running gets this long to finish. Turns have no time limit of their
+ * own: a turn still running when this is up is cut short, as a stop cuts it.
+ */
 const GRACE_MS = 15 * 60_000
 /** on a stop, the turns it cuts short get this long to wind up before the last sync */
 const SETTLE_MS = 20_000
@@ -54,10 +56,11 @@ const VAROP_TICK_MS = 10 * 60_000
 /** workers' mid-turn notes wake the var-op at most this often: they're batched */
 const VAROP_NOTES_MS = 3 * 60_000
 /**
- * The var-op's session is resumed at each wake, so each costs more than the last (in one run, $7 a
- * wake after 74): past this many it starts afresh from the base agent and takes over the board
+ * How much of the var-op's journal each wake shows it. Each wake is a fresh fork of the base agent
+ * (a resumed session cost more each wake: $7 a wake after 74, in one run), so the journal and the
+ * board are its memory from one wake to the next.
  */
-const VAROP_SESSION_WAKES = 20
+const JOURNAL_LINES = 40
 /** experiments in flight, in multiples of the endpoints' capacity, past which slots take no turn */
 const EXPERIMENT_BACKLOG = 2
 const LOG_TAIL = 6_000
@@ -189,9 +192,8 @@ export async function setup(cfgPath: string) {
     cwd: repo,
     env: agentEnv(run, cfg, base),
     log: run.path("logs", "base.log"),
-    timeoutMs: TURN_MS,
     // it reads: the quick evaluation (once) and recording aspects are all it can run
-    tools: readOnlyTools([cfg.evaluate, "onyx research aspect *"]),
+    tools: readOnlyTools(["onyx research aspect *"]),
   })
   if (!r.ok || !r.session) throw new Error(`the base agent failed: ${r.text.slice(0, 1000)}`)
   state.base.session = r.session
@@ -343,13 +345,15 @@ export class Supervisor {
       }).catch(() => ""),
       relatedText(this.onyx, { item: w.hypothesis, types: ["note"], limit: 6 }).catch(() => ""),
     ])
-    return workerPrompt(this.cfg, {
+    return workerPrompt({
       hypothesis: title,
       why: why ?? h.summary ?? "",
       baseCommit: w.baseCommit,
       worktree: w.worktree,
       cited,
       related,
+      ...(w.measurement ? { measurement: this.cfg.measurement } : {}),
+      limits: timeLimits(this.run, this.cfg),
     })
   }
 
@@ -458,7 +462,8 @@ export class Supervisor {
   private inFlightExperiments(): number {
     let n = 0
     for (const w of Object.values(this.state.workers))
-      if (w.phase !== "done") for (const id of this.pendingOf(w.task)) if (!this.state.results[id]) n++
+      if (w.phase !== "done")
+        for (const id of this.pendingOf(w.task)) if (!this.state.results[id]) n++
     return n
   }
 
@@ -547,6 +552,8 @@ export class Supervisor {
       }
       await sleep(wait)
     }
+    // the run is over (a stop, or the grace period gone): what's still running is cut short now
+    this.halt.abort()
     // a stop has cut the agents' turns short: let them settle, so what they end is reported below
     // (a site's experiment still running isn't waited for: a restart picks it back up)
     await Promise.race([Promise.allSettled([...this.inflight]), sleep(SETTLE_MS)])
@@ -640,6 +647,7 @@ export class Supervisor {
       attempt: a.attempt,
       hypothesis,
       title: (h.name ?? a.name ?? "").slice(0, 400),
+      ...(a.props.measurement === true ? { measurement: true } : {}),
       turnJob: task,
       turns: 1,
       agent,
@@ -697,12 +705,13 @@ export class Supervisor {
       fork,
       addDirs: [w.worktree, this.experimentsDir(task)],
       log: join(this.run.workerDir(task), "agent.log"),
-      timeoutMs: TURN_MS,
       signal: this.halt.signal,
       // it edits and checks its code; every computation is an experiment
-      tools: workerTools(this.cfg.evaluate),
+      tools: workerTools(),
     })
     if (r.session) w.session = r.session
+    w.lastText = r.text.trim().slice(0, TURN_NOTE_MAX)
+    w.denied = r.denied
     if (r.aborted) {
       // stopped, not ended: its job stays held, and a restart resumes the turn (resumeWorker)
       this.save()
@@ -810,24 +819,38 @@ export class Supervisor {
     if (existsSync(join(this.run.workerDir(task), "finished.json")))
       return this.endTask(task, "succeeded")
     if (this.pendingOf(task).length) return this.waitOnExperiments(task)
+    // a worker whose command was refused can take it for its whole shell refused, and stop: say
+    // which was refused, and that the rest works (in one run, 3 of 25 hypotheses ended so)
+    const refused = (w.denied ?? []).map((c) => `\`${c.replace(/\s+/g, " ").slice(0, 200)}\``)
+    const refusedWords = refused.length
+      ? ` These commands were refused: ${refused.join("; ")}. A refused command is refused on its own: the rest of your shell still works, \`onyx research\` included, and \`onyx research experiment\` commits and pushes your worktree for you.`
+      : ""
     if (w.nudges < 2 && w.session) {
       w.nudges++
       return this.workerTurn(
         task,
-        `You ended your turn without an experiment in flight and without finishing${error ? ` (${error.slice(0, 300)})` : ""}. If you have something to test, submit it with \`onyx research experiment\`. If you're done, record your insights (\`onyx research insight\`) and \`onyx research finish --state <file>\`.`,
+        `You ended your turn without an experiment in flight and without finishing${error ? ` (${error.slice(0, 300)})` : ""}.${refusedWords} If you have something to test, submit it with \`onyx research experiment\`. If you're done, record your insights (\`onyx research insight\`) and \`onyx research finish --state <file>\`.`,
         false,
         slot
       )
     }
     return this.endTask(task, "failed", {
       failure: "job",
-      reason: "the worker stopped without finishing",
+      reason:
+        `the worker stopped without finishing${refused.length ? `; its last turn had these commands refused: ${refused.join("; ")}` : ""}`.slice(
+          0,
+          900
+        ),
     })
   }
 
   private endTask(task: string, outcome: string, extra: Record<string, unknown> = {}) {
     const w = this.state.workers[task]!
     w.phase = "done"
+    w.ended = {
+      outcome,
+      ...(typeof extra.reason === "string" ? { reason: extra.reason } : {}),
+    }
     this.state.unseen.push(task)
     // the worker's end is its last turn's: the job it ends in
     this.endTurn(task, outcome, extra)
@@ -866,7 +889,7 @@ export class Supervisor {
           : left > 0
             ? "Read the log and the files (open the images), record what this result teaches as insights now, then decide: iterate until the hypothesis is answered, or finish if it is."
             : `That was the run's ceiling of ${this.cfg.experimentsPerTask} experiments for one hypothesis: record your insights, including what you'd test next and why, and finish.`
-        w.nextPrompt = `Your experiment${pending.length === 1 ? " has" : "s have"} ended.\n\n${digest}\n\n${
+        w.nextPrompt = `Your experiment${pending.length === 1 ? " has" : "s have"} ended.\n\n${digest}\n\nTime limit per experiment now: ${limitsText(timeLimits(this.run, this.cfg))}.\n\n${
           related
             ? `Insights in the knowledge graph related to your work now, other workers' included (\`onyx research ask <id> "<question>"\` asks their author):\n${related}\n\n`
             : ""
@@ -893,7 +916,7 @@ export class Supervisor {
         ? `\nIts files (its log is ${SITE_LOG}), downloaded to ${r.filesDir}:\n${r.files.map((f) => `- ${f}`).join("\n")}`
         : `\nIt left no files.`
       : ""
-    return `Experiment ${r.id} at ${r.commit.slice(0, 10)} on ${r.endpoint}: ${r.outcome}${m ? `; ${m}` : ""}.${files}\nLog (its end):\n${r.logTail}`
+    return `Experiment ${r.id} (${r.kind ?? "measure"}) at ${r.commit.slice(0, 10)} on ${r.endpoint}: ${r.outcome}${m ? `; ${m}` : ""}.${files}\nLog (its end):\n${r.logTail}`
   }
 
   // ------------------------------------------------------------ endpoints
@@ -910,7 +933,13 @@ export class Supervisor {
     const cmd = `${ep.driver}${a.props.packet ? ` ${JSON.stringify(String(a.props.packet))}` : ""}`
     this.log(`experiment ${short(a.id)} on ${ep.type} at ${commit.slice(0, 10)}`)
     const proc = Bun.spawn(["sh", "-c", `${cmd} 2>&1`], { cwd: dir, stdout: "pipe" })
-    const timer = setTimeout(() => proc.kill(), ep.timeoutS * 1000)
+    // the campaign's time limit, sent with the experiment: a hard cutoff
+    const limitS = typeof a.props.time_limit_s === "number" ? a.props.time_limit_s : ep.timeoutS
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      proc.kill()
+    }, limitS * 1000)
     const out = await new Response(proc.stdout).text()
     await proc.exited
     clearTimeout(timer)
@@ -945,6 +974,8 @@ export class Supervisor {
       status: ok ? "succeeded" : "failed",
       outcome: ok ? "succeeded" : "failed",
       metrics,
+      kind: String(a.props.kind ?? "measure"),
+      ...(typeof a.props.measurement === "string" ? { measurement: a.props.measurement } : {}),
       logTail: tail,
       endedAt: Date.now(),
     }
@@ -954,8 +985,9 @@ export class Supervisor {
         ? {}
         : {
             failure: "job",
-            reason:
-              proc.exitCode === 0
+            reason: timedOut
+              ? `stopped at its time limit (${limitS} s)`
+              : proc.exitCode === 0
                 ? "the driver reported no metrics"
                 : `the driver exited ${proc.exitCode}`,
           }),
@@ -1040,6 +1072,8 @@ export class Supervisor {
       status: job.outcome,
       outcome: job.outcome,
       metrics,
+      kind: String(props.kind ?? "measure"),
+      ...(typeof props.measurement === "string" ? { measurement: props.measurement } : {}),
       logTail: (why ? `${why}\n` : "") + tail.slice(-LOG_TAIL),
       filesDir,
       files,
@@ -1104,17 +1138,6 @@ export class Supervisor {
     }).length
   }
 
-  private waitingWorkers(): number {
-    return Object.values(this.state.workers).filter((w) => w.phase === "waiting").length
-  }
-
-  /** The slots as the var-op should count them: only a running turn, or one in line, fills one. */
-  private slotWords(): string {
-    const want = this.activeHypotheses()
-    const idle = Math.max(0, this.cfg.workers - want)
-    return `${this.cfg.workers} worker slots: ${this.slots.size} running a turn now; ${want} hypotheses queued, back in line or running in all; ${this.waitingWorkers()} workers waiting on experiments hold no slot.${idle ? ` ${idle} slots will sit idle unless you queue at least ${idle} more hypotheses now.` : ""}`
-  }
-
   private async varopLoop() {
     while (!this.done()) {
       if (!this.varopBusy && !this.past()) {
@@ -1122,14 +1145,14 @@ export class Supervisor {
         const inbox = readdirSync(this.run.path("inbox"))
         const now = Date.now()
         const due =
-          // its first wake plans the run (a session started afresh waits for a reason to wake)
+          // its first wake plans the run
           v.wakes === 0 ||
           this.state.unseen.length > 0 ||
           inbox.length > 0 ||
           // workers' findings mid-hypothesis: batched, not once per turn
           ((this.state.turnNotes?.length ?? 0) > 0 && now - v.lastWake > VAROP_NOTES_MS) ||
           // a short queue, unless its last wake chose to queue nothing: then only an event or
-          // the tick wakes it (each wake of a long session costs dollars, to say nothing changed)
+          // the tick wakes it (a wake costs dollars, to say nothing changed)
           (!v.idle && this.activeHypotheses() < this.cfg.workers && now - v.lastWake > 60_000) ||
           now - v.lastWake > VAROP_TICK_MS
         if (due) {
@@ -1145,94 +1168,88 @@ export class Supervisor {
 
   private async wakeVarop(inbox: string[]) {
     const v = this.state.varop
-    const first = !v.session
     const seen = this.state.unseen.splice(0)
     const notes = (this.state.turnNotes ?? []).splice(0)
     v.lastWake = Date.now()
     v.wakes++
-    v.sessionWakes = first ? 1 : (v.sessionWakes ?? 0) + 1
     this.save()
     const proposedBefore = this.run.read<Board>("board.json")?.hypotheses.length ?? 0
     const steered: [file: string, text: string][] = []
-    // the user's messages and the var-op's journal: shown at every wake, a first one's included
-    const said = () => {
-      const out: string[] = []
-      for (const f of inbox) {
-        const text = readFileSync(this.run.path("inbox", f), "utf8")
-        out.push(`The user says: ${text}`)
-        steered.push([f, text])
-        rmSync(this.run.path("inbox", f))
-      }
-      const journal = this.run.path("journal.md")
-      if (existsSync(journal))
-        out.push(
-          `Your journal (latest):${readFileSync(journal, "utf8").split("\n").slice(-15).join("\n")}`
-        )
-      return out
+    const parts: string[] = []
+    if (v.wakes === 1) parts.push("Your first wake: plan the run.")
+    // a refused command can read as the whole shell refused, and a wake that took it so queued
+    // nothing (in one run, the first wake's proposals went out as one command with variables in it)
+    if (v.refused?.length)
+      parts.push(
+        `## Refused at your last wake\n\n${v.refused.map((c) => `- \`${c.replace(/\s+/g, " ").slice(0, 300)}\``).join("\n")}\n\nA command with anything but \`onyx research\` in it (a variable assignment, another program) is refused whole. A refused command is refused on its own: \`onyx research\` commands still work.`
+      )
+    for (const task of seen) {
+      const w = this.state.workers[task]
+      if (!w) continue
+      const exps = w.experiments
+        .map((id) => this.state.results[id])
+        .filter((r): r is ExperimentResult => !!r)
+      const ghost = this.run.path("ghosts", `${w.agent}.md`)
+      const stopped = w.ended?.outcome !== "succeeded"
+      parts.push(
+        `## Worker ${short(task)} ${stopped ? "stopped without finishing" : "finished"} hypothesis ${w.hypothesis}: ${w.title ?? ""}\n\n${
+          stopped
+            ? `Why: ${w.ended?.reason ?? "it didn't say"}.\nIts last message:\n${w.lastText || "(none)"}\n\n`
+            : ""
+        }${
+          exps
+            .map(
+              (r) =>
+                `- experiment ${r.id} (${r.kind ?? "measure"}) ${r.outcome} ${Object.entries(
+                  r.metrics
+                )
+                  .map(([k, x]) => `${k}=${x}`)
+                  .join(" ")} @${r.commit}`
+            )
+            .join("\n") || "- no experiments"
+        }\n\n${existsSync(ghost) ? `Its state:\n${readFileSync(ghost, "utf8").slice(0, 2500)}` : "It left no state."}\n\nIts insights: onyx research related --item ${w.hypothesis}`
+      )
     }
-    let prompt: string
-    if (first) {
-      const parts = [
-        varopPrompt(this.cfg, Math.round((this.state.deadline - Date.now()) / 60_000)),
-      ]
-      // a new var-op on a run already under way (its session was started afresh, say to keep its
-      // turns short): it takes over the board rather than opening tracks from nothing
-      const b = this.run.read<Board>("board.json")
-      if (b?.hypotheses.length)
-        parts.push(
-          `This run is already under way: you take over from an earlier variational operator, with its board of ${b.tracks.length} tracks and ${b.hypotheses.length} hypotheses and their results. Before you propose anything, read the board (onyx research board), the journal below and the insights on the best results (onyx research related), then build on what's there: rework the best commits and follow the open leads rather than starting over.`
-        )
-      parts.push(...said())
-      prompt = parts.join("\n\n")
-    } else {
-      const parts: string[] = [
-        `${Math.max(0, Math.round((this.state.deadline - Date.now()) / 60_000))} minutes of proposing left. ${this.slotWords()}`,
-      ]
-      for (const task of seen) {
-        const w = this.state.workers[task]
-        if (!w) continue
-        const exps = w.experiments
-          .map((id) => this.state.results[id])
-          .filter((r): r is ExperimentResult => !!r)
-        const ghost = this.run.path("ghosts", `${w.agent}.md`)
-        parts.push(
-          `Worker ${short(task)} finished hypothesis ${w.hypothesis}.\n${
-            exps
-              .map(
-                (r) =>
-                  `- experiment ${r.id} ${r.outcome} ${Object.entries(r.metrics)
-                    .map(([k, x]) => `${k}=${x}`)
-                    .join(" ")} @${r.commit}`
-              )
-              .join("\n") || "- no experiments"
-          }\n${existsSync(ghost) ? `Its state:\n${readFileSync(ghost, "utf8").slice(0, 2500)}` : "It left no state."}\nIts insights: onyx research related --item ${w.hypothesis}`
-        )
-      }
-      // the latest from each worker still under way: what it said as its turn ended
-      const latest = new Map(notes.map((n) => [n.task, n]))
-      for (const n of latest.values()) {
-        const w = this.state.workers[n.task]
-        if (!w || w.phase === "done") continue
-        parts.push(
-          `Worker ${short(n.task)} (hypothesis ${w.hypothesis}: ${w.title ?? ""}), still under way, after its turn ${n.turn}:\n${n.text}`
-        )
-      }
-      parts.push(...said())
-      parts.push("Look at the board (onyx research board), update it, and end your turn.")
-      prompt = parts.join("\n\n")
+    // the latest from each worker still under way: what it said as its turn ended
+    const latest = new Map(notes.map((n) => [n.task, n]))
+    for (const n of latest.values()) {
+      const w = this.state.workers[n.task]
+      if (!w || w.phase === "done") continue
+      parts.push(
+        `## Worker ${short(n.task)} (hypothesis ${w.hypothesis}: ${w.title ?? ""}), still under way, after its turn ${n.turn}\n\n${n.text}`
+      )
     }
+    for (const f of inbox) {
+      const text = readFileSync(this.run.path("inbox", f), "utf8")
+      parts.push(`## The user says\n\n${text}`)
+      steered.push([f, text])
+      rmSync(this.run.path("inbox", f))
+    }
+    const journal = this.run.path("journal.md")
+    parts.push(
+      `## Your journal${
+        existsSync(journal)
+          ? ` (its latest ${JOURNAL_LINES} lines)\n${readFileSync(journal, "utf8").trim().split("\n").slice(-JOURNAL_LINES).join("\n")}`
+          : "\n\n(empty)"
+      }`
+    )
+    parts.push(`## The board\n\n${boardText(this.run, this.cfg)}`)
+    parts.push(
+      "Update the board, write in your journal what your next wake needs, and end your turn."
+    )
     this.log(
-      `var-op wakes${first ? " (first time)" : ""}: ${seen.length} finished, ${notes.length} turn notes, ${inbox.length} messages`
+      `var-op wakes (${v.wakes}): ${seen.length} finished, ${notes.length} turn notes, ${inbox.length} messages`
     )
     const r = await runAgent({
-      prompt,
+      prompt: varopPrompt(parts.join("\n\n")),
       model: this.cfg.models.varop,
       cwd: this.repo,
       env: agentEnv(this.run, this.cfg, v.agent),
-      resume: first ? this.state.base.session! : v.session!,
-      fork: first,
+      // a fresh fork of the base agent at every wake: what it knows is the codebase, the brief and
+      // what this wake shows it, so each wake costs about the same
+      resume: this.state.base.session!,
+      fork: true,
       log: this.run.path("logs", "varop.log"),
-      timeoutMs: TURN_MS,
       signal: this.halt.signal,
       // it plans: it reads the code and works the board, and workers do the rest
       tools: readOnlyTools(["onyx research *"]),
@@ -1247,13 +1264,12 @@ export class Supervisor {
       this.log("var-op stopped mid-turn; it sees the same again after a restart")
       return
     }
-    // it chose to queue nothing: a short queue alone won't wake it again, an event will
-    v.idle = (this.run.read<Board>("board.json")?.hypotheses.length ?? 0) === proposedBefore
-    if (v.sessionWakes >= VAROP_SESSION_WAKES) {
-      // its next wake is a fresh session, which takes over the board (its first-wake note)
-      v.session = null
-      this.log(`var-op: ${v.sessionWakes} wakes in this session; the next starts afresh`)
-    }
+    v.refused = r.denied
+    // it chose to queue nothing: a short queue alone won't wake it again, an event will. Not when a
+    // command was refused: it may not have chosen to, and its next wake is told what was refused
+    v.idle =
+      !r.denied.length &&
+      (this.run.read<Board>("board.json")?.hypotheses.length ?? 0) === proposedBefore
     this.save()
     this.log(`var-op: ${r.text.replace(/\s+/g, " ").slice(0, 300)}`)
   }
@@ -1295,6 +1311,31 @@ export async function plot(cfgPath: string): Promise<string> {
   for (let i = 0; i < edges.length; i += 500)
     await client(run.dir).ingest({ items: [], edges: edges.slice(i, i + 500) })
   return link
+}
+
+/**
+ * The campaign's time limits: printed, or one endpoint's changed for the experiments sent from now
+ * on. The var-op is told at its next wake, and each worker when it's next resumed.
+ */
+export function limit(cfgPath: string, endpoint?: string, seconds?: string): number {
+  const cfg = loadConfig(cfgPath)
+  const run = runDirFor(cfg)
+  if (!endpoint) {
+    for (const [type, s] of Object.entries(timeLimits(run, cfg))) console.log(`${type}\t${s} s`)
+    return 0
+  }
+  const s = Number(seconds)
+  if (!Number.isInteger(s) || s < 1 || s > 86_400) {
+    console.error("usage: onyx research limit <config> <endpoint> <seconds, 1 to 86400>")
+    return 2
+  }
+  const { was, now } = setTimeLimit(run, cfg, endpoint, s)
+  writeFileSync(
+    run.path("inbox", `${Date.now()}-limit.md`),
+    `The time limit for each experiment on \`${endpoint}\` is now ${now} s (it was ${was} s): an experiment still running at it is stopped, and fails. It applies to experiments sent from now on.`
+  )
+  console.log(`${endpoint}: ${was} s -> ${now} s, for experiments sent from now on`)
+  return 0
 }
 
 /** A message to the var-op from the user or the orchestrator, read when it's next woken. */

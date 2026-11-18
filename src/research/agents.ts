@@ -44,6 +44,8 @@ export interface AgentResult {
   ok: boolean
   /** cut short by `signal`: the turn didn't end, it was stopped */
   aborted: boolean
+  /** the shell commands its tool rules refused in this turn */
+  denied: string[]
 }
 
 /** the coding agent a run's agents are sessions of (preflight.ts knows how to check each one) */
@@ -59,22 +61,16 @@ const GIT_READ = ["git status*", "git diff*", "git log*", "git show*"]
 const SHELL_READ = ["cd *", "ls*", "cat *", "head*", "tail*", "wc *", "grep *", "echo*", "pwd"]
 
 /**
- * A worker: it reads and edits the code, and its shell runs only the project's quick evaluation
- * (exactly as configured), `onyx research` and read-only git. Anything else is refused: it can't run
+ * A worker: it reads and edits the code, and its shell runs only `onyx research` and read-only git. Anything else is refused: it can't run
  * a program, a script or a search itself, so every computation is an experiment on an endpoint,
  * where the whole run sees it and it holds no worker slot (in one run, workers ran their searches
  * in their own turns for minutes, and none of it reached the run).
  */
-export function workerTools(evaluate: string): AgentTools {
+export function workerTools(): AgentTools {
   const files = ["Read", "Edit", "Write", "Glob", "Grep"]
   return {
     tools: ["Bash", ...files],
-    allow: [
-      ...files,
-      ...[evaluate, `${evaluate} 2>&1`, "onyx research *", ...GIT_READ, ...SHELL_READ].map(
-        (c) => `Bash(${c})`
-      ),
-    ],
+    allow: [...files, ...["onyx research *", ...GIT_READ, ...SHELL_READ].map((c) => `Bash(${c})`)],
     mode: "dontAsk",
   }
 }
@@ -148,14 +144,18 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
       session_id?: string
       result?: string
       is_error?: boolean
+      permission_denials?: { tool_input?: { command?: unknown } }[]
     }
     return {
       session: r.session_id ?? null,
       text: r.result ?? "",
       ok: !r.is_error && proc.exitCode === 0,
       aborted,
+      denied: (r.permission_denials ?? [])
+        .map((d) => d.tool_input?.command)
+        .filter((c): c is string => typeof c === "string"),
     }
   } catch {
-    return { session: null, text: err || out, ok: false, aborted }
+    return { session: null, text: err || out, ok: false, aborted, denied: [] }
   }
 }

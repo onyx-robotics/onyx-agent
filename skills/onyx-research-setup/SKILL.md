@@ -23,7 +23,7 @@ Ask what you can't read from the code, in one go:
 
 - **The goal**: what to improve, what must stay true (validity, limits, safety), and what an agent wouldn't know (what's been tried, where hardware is, what breaks it).
 - **The metrics**, each with its direction, and which matters most.
-- **What agents may edit**: the method's files only. Measurement code is never editable.
+- **What agents may edit**: the method's files. The measurement (the config's `measurement` paths, `onyx/endpoints` by default) changes only in a measurement hypothesis, which the var-op proposes.
 - **Where experiments run**: this machine (a benchmark, a simulator), or hardware or another machine (a site, step 6). How long one takes, and how many can run at once.
 - **The budget**: workers and minutes. A run spends the user's coding-agent usage, mostly in workers' turns; say so.
 
@@ -40,15 +40,14 @@ For each, write in `onyx/endpoints/`:
 
 - **The driver**: run in a checkout of an experiment's commit, from the repository's root, with the worker's packet path appended if it named one. It prints its log and ends with one line `METRICS {json}`, keys from the config's `metrics`; exit 0. A failure says why in its last lines. Keep it honest: measure the way the user does, time against a reference where speed matters, check validity.
 - **The guide** (`<name>.md`, about ten lines): the packet (usually the commit itself), what it measures and how, what's in the log, how long one takes, its rules. Workers read it before every experiment.
-- **The quick evaluation** (`evaluate` in the config): the driver on a few samples, or a compile and test. Under a minute: workers run it before every commit.
-- **A CPU endpoint**: offer one for processes that need no hardware, so workers have somewhere to run any program longer than a quick check. Workers send those as experiments too, and a turn spent running a process locally holds a worker slot.
+- **A CPU endpoint**: offer one for processes that need no hardware, so workers have somewhere to run any program longer than about a minute. Workers send those as experiments too, and a turn spent running a process locally holds a worker slot.
 
 ## 5. The config
 
 Write `onyx/research.json` (fields: `GETTING_STARTED.md`, step 6, and the package README). Then:
 
 - `remote`: the URL every endpoint fetches from, exactly; workers push there.
-- `capacity`: what the endpoint really runs at once (1 for a single rig). `timeoutS` above the longest honest experiment.
+- `capacity`: what the endpoint really runs at once (1 for a single rig). `timeoutS`: the time limit per experiment the run starts with, a hard cutoff sent with each experiment to the driver (`time_limit_s` in its params); the user can change it during a run (`onyx research limit`).
 - `workers`: about the endpoints' total capacity, since a waiting worker frees its slot; fewer if experiments are slow.
 - Leave `models` to their defaults unless the user asks.
 - Add `.onyx-research/` to `.gitignore`.
@@ -69,7 +68,7 @@ A site is a machine running `onyx-site`, which takes jobs for its units from the
 Nothing goes to the run unchecked:
 
 1. `onyx research vocabulary onyx/research.json` adds the config's endpoint types and metrics the org doesn't have (setup and run do it too; a site's check below needs them first). For each key it didn't add, `onyx registry show props <metric>` has the direction the config says.
-2. The quick evaluation runs from the root, in under a minute, and prints the metrics.
+2. Each driver stops an experiment at its `time_limit_s` (in the job's params, `$ONYX_PARAMS` for `local_program`): the site-runner only passes it on.
 3. Each driver of this machine, in a clean checkout of `HEAD` (`git worktree add /tmp/check HEAD`): runs, and its last line is `METRICS` with every metric's key.
 4. Each site's read access, as it will fetch: with `GIT_SSH_COMMAND="ssh -i <its key> -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes"`, `git ls-remote <remote> main` answers, and a push with that key is refused.
 5. Each site endpoint: one job by hand on a pushed commit (`onyx run -f -` with `on`, and `props.git` = `{url, commit, ref}`), ended `succeeded`, with its metrics and files (`onyx jobs get <id>`).

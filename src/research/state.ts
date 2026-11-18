@@ -13,6 +13,14 @@ export interface WorkerState {
   hypothesis: string
   /** the hypothesis's title, for its later turns' jobs */
   title?: string
+  /** a measurement hypothesis: its worker may change the measurement paths */
+  measurement?: boolean
+  /** what it said at the end of its latest turn */
+  lastText?: string
+  /** the commands its latest turn had refused */
+  denied?: string[]
+  /** how it ended: the var-op is told, a failure with its reason */
+  ended?: { outcome: string; reason?: string }
   /** the worker's ai_agent entity */
   agent: string
   session: string | null
@@ -26,7 +34,7 @@ export interface WorkerState {
   phase: "starting" | "running" | "waiting" | "queued" | "done"
   /**
    * Each turn is a worker_task job, holding its slot only while the turn runs (docs/research.md,
-   * "Worker turns"): the job of the turn running now, or of the one queued. The first is `task`.
+   * "The queue"): the job of the turn running now, or of the one queued. The first is `task`.
    */
   turnJob?: string | null
   /** turns started so far */
@@ -50,6 +58,10 @@ export interface ExperimentResult {
   status: string | null
   outcome: string | null
   metrics: Record<string, number>
+  /** what it was for (tools.ts EXPERIMENT_KINDS): measure, diagnose, repeat, ablate, variant */
+  kind?: string
+  /** which measurement it ran with (git.ts measurementOf): only results with the same compare */
+  measurement?: string
   logTail: string
   /** a site's experiment: where its files were downloaded to, and their paths in it */
   filesDir?: string
@@ -64,13 +76,14 @@ export interface RunState {
   base: { agent: string; session: string | null }
   varop: {
     agent: string
+    /** its last wake's session (each wake is a fresh fork of the base agent's) */
     session: string | null
     lastWake: number
     wakes: number
-    /** wakes of its current session: past VAROP_SESSION_WAKES it starts afresh from the board */
-    sessionWakes?: number
     /** its last wake queued no new hypothesis: a short queue alone doesn't wake it again */
     idle?: boolean
+    /** the commands its last wake had refused: its next wake is told */
+    refused?: string[]
   }
   startedAt: number
   deadline: number

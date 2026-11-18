@@ -22,12 +22,18 @@ function fakeClaude(body: string) {
   }
 }
 
-test("an agent's turn reports its session, and what it said", async () => {
+test("an agent's turn reports its session, what it said, and the commands it had refused", async () => {
   const run = fakeClaude(
-    `echo '{"session_id":"s1","result":"done","total_cost_usd":0.5,"is_error":false}'`
+    `echo '{"session_id":"s1","result":"done","total_cost_usd":0.5,"is_error":false,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}]}'`
   )
   const r = await runAgent(run)
-  expect(r).toEqual({ session: "s1", text: "done", ok: true, aborted: false })
+  expect(r).toEqual({
+    session: "s1",
+    text: "done",
+    ok: true,
+    aborted: false,
+    denied: ["git commit -m x"],
+  })
 })
 
 /** The arguments `claude` was called with, one per line. */
@@ -45,10 +51,10 @@ const after = (args: string[], flag: string) => {
   return args.slice(i + 1, next === -1 ? args.length : next)
 }
 
-// a worker edits the code, but its shell runs only the quick evaluation, onyx research and
-// read-only git: a program, a script or a search of its own is refused, so it's an experiment
-test("a worker edits code, and runs only the quick evaluation and onyx research", async () => {
-  const args = await argsFor(workerTools("timeout 60 python run.py"))
+// a worker edits the code, but its shell runs only onyx research and read-only git: a program, a
+// script or a search of its own is refused, so it's an experiment
+test("a worker edits code, and runs only onyx research and read-only git", async () => {
+  const args = await argsFor(workerTools())
   expect(after(args, "--tools")).toEqual(["Bash", "Read", "Edit", "Write", "Glob", "Grep"])
   expect(after(args, "--allowedTools")).toEqual([
     "Read",
@@ -56,8 +62,6 @@ test("a worker edits code, and runs only the quick evaluation and onyx research"
     "Write",
     "Glob",
     "Grep",
-    "Bash(timeout 60 python run.py)",
-    "Bash(timeout 60 python run.py 2>&1)",
     "Bash(onyx research *)",
     "Bash(git status*)",
     "Bash(git diff*)",

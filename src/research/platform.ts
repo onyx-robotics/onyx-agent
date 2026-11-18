@@ -117,6 +117,10 @@ export async function upsert(
   }
 ): Promise<string> {
   const source = { system: SOURCE, key }
+  // one that's there is left as it is: writing it again would change it, and an agent's item can
+  // only be changed by an admin or that agent, never the run's key (a setup run again was refused)
+  const there = await onyx.resolve(source).catch(() => null)
+  if (there) return there.id
   await onyx.ingest({ items: [{ source, ...item }] })
   const found = await onyx.resolve(source)
   return found.id

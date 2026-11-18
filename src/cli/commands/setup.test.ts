@@ -24,9 +24,16 @@ describe("onyx setup", () => {
   })
 
   test("installSkills writes them under a folder, and again over an earlier copy", () => {
+    const ALL = [
+      "onyx",
+      "onyx-research-setup",
+      "onyx-research-base",
+      "onyx-research-varop",
+      "onyx-research-worker",
+    ]
     const dir = mkdtempSync(join(tmpdir(), "onyx-skills-"))
-    expect(installSkills(dir)).toEqual(["onyx", "onyx-research-setup"])
-    expect(installSkills(dir)).toEqual(["onyx", "onyx-research-setup"])
+    expect(installSkills(dir)).toEqual(ALL)
+    expect(installSkills(dir)).toEqual(ALL)
     for (const p of Object.keys(SKILLS)) expect(readFileSync(join(dir, p), "utf8")).toBe(SKILLS[p]!)
   })
 })

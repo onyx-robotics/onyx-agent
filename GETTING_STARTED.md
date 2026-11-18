@@ -33,8 +33,7 @@ Write these down before anything else; every later file comes from them.
 
 - **The goal**, in a few sentences an agent can act on: what to make better, what must stay true (correctness, safety limits), and anything an agent wouldn't know (where the hardware is, what's been tried).
 - **The metrics**, each with a direction: `speedup` higher, `error_mm` lower. Name them `<namespace>.<name>` (step 4), for example `solver.speedup`.
-- **What agents may edit**: the files that hold the method (`solver.py`, `calibrate.py`). Everything else is read only to them, the measurement included.
-- **The quick evaluation**: a command that checks a change is ready to send, in well under a minute (a few samples, a compile, a unit test). It isn't the experiment.
+- **What agents may edit**: the files that hold the method (`solver.py`, `calibrate.py`). Everything else is read only to them. The measurement (`onyx/endpoints` by default) changes only when the var-op proposes it as a hypothesis of its own.
 - **Where experiments run**: an **endpoint**, a kind of machine that runs one experiment and reports its metrics. A benchmark on your own machine is the simplest (steps 5 to 8). A robot, a GPU box or a lab bench is a **site** (step 9).
 
 ## 4. Name your project's vocabulary
@@ -70,7 +69,6 @@ Run the driver once yourself from the repository's root, and check its last line
   "remote": "git@github.com:you/project.git",
   "baseBranch": "main",
   "editable": ["solver.py"],
-  "evaluate": "python onyx/endpoints/bench.py --samples 8",
   "metrics": [
     { "key": "solver.speedup", "better": "higher" },
     { "key": "solver.valid_fraction", "better": "higher" }
@@ -90,7 +88,7 @@ Run the driver once yourself from the repository's root, and check its last line
 }
 ```
 
-- `capacity` is how many experiments an endpoint runs at once; `timeoutS`, when one is given up on.
+- `capacity` is how many experiments an endpoint runs at once; `timeoutS`, the time limit per experiment the run starts with: a hard cutoff sent with each experiment to its driver, which you can change during a run (`onyx research limit onyx/research.json <endpoint> <seconds>`).
 - `workers` is how many agents work at once, and `minutes` how long the run proposes new hypotheses. Each worker holds a slot only while it's thinking: one waiting on its experiment frees its slot for another.
 - `models` (base, var-op, worker) and `experimentsPerTask` (a safety ceiling per hypothesis) have defaults.
 
@@ -102,7 +100,7 @@ Add `.onyx-research/` to `.gitignore` (the run's state lives there), then commit
 onyx research setup onyx/research.json
 ```
 
-A base agent reads the code, runs the quick evaluation, reads the endpoint guides, and records the aspects of the system experiments will be about. Every other agent of the run starts from it, so read its summary: if it misunderstood the problem, fix the goal or the guide and set up again.
+A base agent reads the code and the endpoint guides, and records the aspects of the system experiments will be about. Every other agent of the run starts from it, so read its summary: if it misunderstood the problem, fix the goal or the guide and set up again.
 
 ## 8. Run, watch and steer
 

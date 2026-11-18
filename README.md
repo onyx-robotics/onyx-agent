@@ -102,7 +102,6 @@ You need: `onyx login`, git, a logged-in [Claude Code](https://claude.com/claude
   "goal": "Make solver.py as fast as possible while staying valid on every instance.",
   "remote": "git@github.com:you/project.git",
   "editable": ["solver.py"],
-  "evaluate": "python onyx/endpoints/bench.py --samples 8",
   "metrics": [{ "key": "solver.speedup", "better": "higher" }],
   "endpoints": [
     {
@@ -154,6 +153,12 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 ```bash
 mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
 ```
+
+The research run's own agents work from three more, which `onyx research` builds into each agent's first message, so they're where a role is changed. `onyx setup` doesn't install them: they're for a run's agents, not your coding agent.
+
+- `skills/onyx-research-base/SKILL.md`: the base agent reads the codebase and how it's measured, and writes the summary every other agent starts from.
+- `skills/onyx-research-varop/SKILL.md`: the variational operator plans the run: tracks and hypotheses, keeping the slots busy, learning from results, and its journal.
+- `skills/onyx-research-worker/SKILL.md`: a worker tests one hypothesis: experiments only through the queue, what an experiment sends and gets back, diagnosing when unsure, the knowledge graph, insights and finishing.
 
 ## Develop
 

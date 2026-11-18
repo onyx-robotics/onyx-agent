@@ -32,7 +32,11 @@ const endpoint = z.object({
   site: z.boolean().default(false),
   /** how many experiments it runs at once */
   capacity: z.number().int().min(1).max(64).default(1),
-  /** give up on an experiment after this long */
+  /**
+   * the time limit for each experiment on it, in seconds, as the run starts: a hard cutoff sent with
+   * every experiment to the driver (`time_limit_s`). The user or the orchestrator can change it
+   * during the run (`onyx research limit`), for that run only
+   */
   timeoutS: z.number().int().min(10).max(86_400).default(1800),
 })
 
@@ -47,8 +51,12 @@ export const researchConfig = z.object({
   baseBranch: z.string().min(1).default("main"),
   /** what workers may edit (repo paths); the rest is read only to them */
   editable: z.array(z.string().min(1)).min(1),
-  /** a quick metric evaluation workers run on their code before they commit it */
-  evaluate: z.string().min(1),
+  /**
+   * what defines how results are measured (repo paths: drivers, evaluators, their data). It
+   * changes only in a measurement hypothesis (`propose --measurement`), and each experiment records
+   * which measurement it ran with, so results measured differently are never compared
+   */
+  measurement: z.array(z.string().min(1)).default(["onyx/endpoints"]),
   /**
    * every metric its endpoints report, as property keys (`<pack>.<name>`, or a built-in one), each
    * with its direction; declared in the org when the run starts, if it isn't there
