@@ -47,6 +47,7 @@
     "dist/**/*.js.map",
     "skills",
     "GETTING_STARTED.md",
+    "docs",
     "CHANGELOG.md"
   ],
   "publishConfig": {
