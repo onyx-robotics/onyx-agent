@@ -121,7 +121,7 @@ When experiments need hardware (a robot, a rig, a GPU box), they run on a **site
 
 **On the site's machine:**
 
-1. Install `onyx-site` from PyPI, as the user that will run it: `uv tool install 'onyx-site[keyring]'` (or `pip install --user 'onyx-site[keyring]'`). Its README on PyPI covers enrolling it, running it and writing a driver.
+1. Install `onyx-site` from PyPI, as the user that will run it: `uv tool install onyx-site` (or `pip install --user onyx-site`). Its README on PyPI covers enrolling it, running it and writing a driver.
 2. Write its site file. For an experiment that's a program in your repository, the shipped `local_program` driver runs it from the experiment's commit:
 
    ```toml
