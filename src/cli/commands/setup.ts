@@ -8,10 +8,11 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
 import { OnyxApiError } from "../../sdk"
-import { checkAgent } from "../../research/agent-check"
+import { AGENTS, checkAgent } from "../../research/agent-check"
+import { AGENT_CLIS } from "../../research/agents"
 import { SKILLS } from "../../skills"
 import { flags, type Command, type Context } from "../command"
-import { envVar } from "../io"
+import { envVar, type Io } from "../io"
 import { CliError, EXIT } from "../output"
 
 import { auth } from "./auth"
@@ -23,6 +24,21 @@ export function installSkills(dir: string): string[] {
     writeFileSync(join(dir, path), text)
   }
   return [...new Set(Object.keys(SKILLS).map((p) => p.split("/")[0]!))]
+}
+
+/**
+ * Where each coding agent a run's agents can be reads skills: the user's own folder, or (project)
+ * this repository's.
+ */
+export function skillDirs(io: Io, project: boolean): Record<string, string> {
+  const home = envVar(io, "HOME") ?? homedir()
+  const root = process.cwd()
+  return project
+    ? { claude: join(root, ".claude", "skills"), codex: join(root, ".agents", "skills") }
+    : {
+        claude: join(home, ".claude", "skills"),
+        codex: join(envVar(io, "CODEX_HOME") ?? join(home, ".codex"), "skills"),
+      }
 }
 
 /** A tool's version line, or null when it isn't on the PATH. */
@@ -47,16 +63,18 @@ async function signedIn(c: Context): Promise<string | null> {
 }
 
 export const setup: Command = {
-  summary: "get this machine ready: check it, sign in, install the skills for your coding agent",
+  summary: "get this machine ready: check it, sign in, install the skills for your coding agents",
   usage: `onyx setup [--project] [--url <url>]
 
 One command for a new machine, safe to run again:
-  1. checks git, and the coding agent a research run's agents are sessions of (Claude Code):
-     installed, and signed in where its CLI can say;
+  1. checks git, and the coding agents a research run's agents can be sessions of (Claude Code,
+     Codex CLI): installed, and signed in where its CLI can say. One ready is enough: a run uses
+     the one its config names (agent);
   2. signs you in, as onyx login does, if you aren't;
-  3. installs the package's skills, onyx and onyx-research-setup, in ~/.claude/skills (--project:
-     in this folder's .claude/skills instead), where Claude Code reads them; another coding agent
-     takes the same files.
+  3. installs the package's skills, onyx and onyx-research-setup, where each agent that's
+     installed reads them: ~/.claude/skills, ~/.codex/skills (or $CODEX_HOME/skills); --project:
+     this folder's .claude/skills and .agents/skills instead. Another coding agent takes the same
+     files.
 
 Then ask your coding agent, in your project: "set up an Onyx research run for this repository".
 --url is the server to sign in to, as for onyx login.`,
@@ -70,9 +88,16 @@ Then ask your coding agent, in your project: "set up an Onyx research run for th
 
     const git = tool("git")
     say("git", git !== null, git ?? "not found: install git")
-    // the coding agent research runs' agents are sessions of, checked as onyx research does
-    const agent = checkAgent()
-    say("coding agent", agent.problem === null, agent.problem ?? agent.version ?? "")
+    // the coding agents a run's agents can be sessions of, each checked as onyx research does
+    const agents = Object.keys(AGENT_CLIS).map((a) => ({ a, ...checkAgent(a) }))
+    const installed = agents.filter((x) => x.version !== null)
+    say(
+      "coding agent",
+      agents.some((x) => x.problem === null),
+      installed.length
+        ? installed.map((x) => x.problem ?? `${x.name} ${x.version}`).join("; ")
+        : `none installed: install ${agents.map((x) => `${x.name} (${AGENTS[x.a]?.install})`).join(" or ")}, and sign in`
+    )
 
     let who = await signedIn(c)
     if (!who && c.io.isTTY) {
@@ -81,11 +106,12 @@ Then ask your coding agent, in your project: "set up an Onyx research run for th
     }
     say("signed in", who !== null, who ?? "not signed in: run onyx login")
 
-    const dir = values.project
-      ? join(process.cwd(), ".claude", "skills")
-      : join(envVar(c.io, "HOME") ?? homedir(), ".claude", "skills")
-    const names = installSkills(dir)
-    say("skills", true, `${names.join(", ")} in ${dir}`)
+    // for each agent that's here, Claude Code's folder when none is
+    const where = skillDirs(c.io, values.project ?? false)
+    const dirs = (installed.length ? installed.map((x) => x.a) : ["claude"]).map((a) => where[a]!)
+    let names: string[] = []
+    for (const d of dirs) names = installSkills(d)
+    say("skills", true, `${names.join(", ")} in ${dirs.join(", ")}`)
 
     const ready = steps.every((s) => s.ok)
     if (c.out.human) {
@@ -95,7 +121,7 @@ Then ask your coding agent, in your project: "set up an Onyx research run for th
           ? 'Ready. Ask your coding agent, in your project: "set up an Onyx research run for this repository".'
           : "Fix what's marked todo, then run onyx setup again."
       )
-    } else c.out.json({ ready, steps, skills: { dir, names } })
+    } else c.out.json({ ready, steps, skills: { dir: dirs[0], dirs, names } })
     return who ? EXIT.ok : EXIT.auth
   },
 }

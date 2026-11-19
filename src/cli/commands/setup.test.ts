@@ -5,7 +5,7 @@ import { join, relative } from "node:path"
 
 import { SKILLS } from "../../skills"
 
-import { installSkills } from "./setup"
+import { installSkills, skillDirs } from "./setup"
 
 const SKILLS_DIR = join(import.meta.dir, "../../../skills")
 
@@ -35,5 +35,18 @@ describe("onyx setup", () => {
     expect(installSkills(dir)).toEqual(ALL)
     expect(installSkills(dir)).toEqual(ALL)
     for (const p of Object.keys(SKILLS)) expect(readFileSync(join(dir, p), "utf8")).toBe(SKILLS[p]!)
+  })
+
+  test("each agent's skills go where it reads them", () => {
+    const io = (env: Record<string, string>) => ({ env }) as never
+    expect(skillDirs(io({ HOME: "/h" }), false)).toEqual({
+      claude: "/h/.claude/skills",
+      codex: "/h/.codex/skills",
+    })
+    expect(skillDirs(io({ HOME: "/h", CODEX_HOME: "/c" }), false).codex).toBe("/c/skills")
+    expect(skillDirs(io({ HOME: "/h" }), true)).toEqual({
+      claude: join(process.cwd(), ".claude", "skills"),
+      codex: join(process.cwd(), ".agents", "skills"),
+    })
   })
 })

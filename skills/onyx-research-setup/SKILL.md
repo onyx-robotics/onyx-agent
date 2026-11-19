@@ -12,7 +12,7 @@ Work in this order. Don't write files before step 2's answers, and don't start a
 ## 1. Check what's there
 
 - `onyx whoami`: signed in, and to the right org. Exit 4: the user runs `onyx login` themselves (in Claude Code, `! onyx login`). Never handle a token.
-- `claude --version`, `git remote -v`: the run's agents are Claude Code sessions today, even when you, setting it up, are another coding agent, and workers push branches to a remote, which must exist and be pushable. A bare repository (`git init --bare`) is fine for a first try on one machine.
+- `claude --version` or `codex --version`, and `git remote -v`: the run's agents are sessions of Claude Code or Codex CLI, whichever the config's `agent` names (`claude`, the default, or `codex`), even when you, setting it up, are another coding agent. Ask the user which, when both are signed in. Workers push branches to a remote, which must exist and be pushable. A bare repository (`git init --bare`) is fine for a first try on one machine.
 - Linux or macOS (WSL on Windows).
 - `onyx/research.json` already there: read it and its endpoints' guides, and change only what the user asks.
 - `onyx registry show types` (the ones whose `parent` is `research_endpoint`, or a subtype of it) and `onyx registry show props` (those with `metric: true`): endpoint types and metrics the org already has. Reuse them when they fit rather than inventing near-duplicates.
@@ -49,7 +49,7 @@ Write `onyx/research.json` (fields: `GETTING_STARTED.md`, step 6, and the packag
 - `remote`: the URL every endpoint fetches from, exactly; workers push there.
 - `capacity`: what the endpoint really runs at once (1 for a single rig). `timeoutS`: the time limit per experiment the run starts with, a hard cutoff sent with each experiment to the driver (`time_limit_s` in its params); the user can change it during a run (`onyx research limit`).
 - `workers`: about the endpoints' total capacity, since a waiting worker frees its slot; fewer if experiments are slow.
-- Leave `models` to their defaults unless the user asks.
+- Set `agent` to `codex` if the run's agents are to be Codex CLI sessions (leave it out for Claude Code). Leave `models` to their defaults unless the user asks.
 - Add `.onyx-research/` to `.gitignore`.
 
 ## 6. Sites: hardware and other machines

@@ -8,7 +8,7 @@ You can let your coding agent do most of it. Step 1 is yours (`onyx setup` also 
 
 - **Linux or macOS.** On Windows, use WSL: the agents run as Unix processes.
 - **git**, and **[Bun](https://bun.sh)** 1.3.14 or later.
-- **A coding agent**, signed in (Claude Code, Codex CLI, Gemini CLI or opencode), to set the run up with you. A run's own agents are [Claude Code](https://claude.com/claude-code) sessions today, so a run needs Claude Code signed in (`claude` works in your terminal), and spends its usage.
+- **A coding agent**, signed in (Claude Code, Codex CLI, Gemini CLI or opencode), to set the run up with you. A run's own agents are [Claude Code](https://claude.com/claude-code) or [Codex CLI](https://github.com/openai/codex) sessions, whichever the config's `agent` names (Claude Code by default), so a run needs that one signed in (`claude` or `codex` works in your terminal), and spends its usage.
 - **An account in an Onyx org**, and, for a site (step 9), someone with the org's **admin** role to approve it. That may be you.
 - **A git repository** with the code to improve, and a remote you can push to. Workers push their branches there.
 
@@ -23,7 +23,7 @@ To update onyx later: `git -C onyx pull && onyx/install.sh`. `onyx setup` marks 
 
 ## 2. Give your coding agent the skills
 
-`onyx setup` did this: it installed the package's two skills in `~/.claude/skills` (where Claude Code reads them; another coding agent gets the same files from the package's `skills/`), `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you). `onyx setup --project` puts them in the repository's `.claude/skills` instead.
+`onyx setup` did this: it installed the package's two skills where each coding agent it found reads them, `~/.claude/skills` for Claude Code and `~/.codex/skills` for Codex CLI (another coding agent gets the same files from the package's `skills/`): `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you). `onyx setup --project` puts them in the repository's `.claude/skills` and `.agents/skills` instead.
 
 From here, in your repository: ask your coding agent to set up an Onyx research run. The rest of this guide is the same steps by hand.
 
@@ -90,7 +90,7 @@ Run the driver once yourself from the repository's root, and check its last line
 
 - `capacity` is how many experiments an endpoint runs at once; `timeoutS`, the time limit per experiment the run starts with: a hard cutoff sent with each experiment to its driver, which you can change during a run (`onyx research limit onyx/research.json <endpoint> <seconds>`).
 - `workers` is how many agents work at once, and `minutes` how long the run proposes new hypotheses. Each worker holds a slot only while it's thinking: one waiting on its experiment frees its slot for another.
-- `models` (base, var-op, worker) and `experimentsPerTask` (a safety ceiling per hypothesis) have defaults.
+- `agent` (`claude`, the default, or `codex`: the coding agent the run's agents are sessions of), `models` (base, var-op, worker, ghost: by default the agent's own choice for each) and `experimentsPerTask` (a safety ceiling per hypothesis) have defaults.
 
 Add `.onyx-research/` to `.gitignore` (the run's state lives there), then commit and push `baseBranch` to `remote`.
 

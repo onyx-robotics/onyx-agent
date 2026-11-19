@@ -94,7 +94,7 @@ onyx registry apply packs/acme.yaml --yes --wait
 
 Agents improve your code against your metrics: a base agent studies the repository, then a variational operator proposes hypotheses and workers test them, each in its own worktree, by running experiments on your project's endpoints (a benchmark, a simulator, a robot). Every hypothesis and experiment is a job in your org's queue, and every result and insight is in the knowledge graph, for anyone in the org to read and question.
 
-You need: `onyx login`, git, a logged-in [Claude Code](https://claude.com/claude-code) (`claude`: a run's agents are Claude Code sessions today), and an `onyx/research.json` in the repository:
+You need: `onyx login`, git, a signed-in [Claude Code](https://claude.com/claude-code) or [Codex CLI](https://github.com/openai/codex) (a run's agents are sessions of the one its config's `agent` names), and an `onyx/research.json` in the repository:
 
 ```json
 {
@@ -116,7 +116,7 @@ You need: `onyx login`, git, a logged-in [Claude Code](https://claude.com/claude
 }
 ```
 
-Endpoint types and metrics are named `<namespace>.<name>`, and the run adds the ones your org doesn't have to its registry (every metric the endpoints report goes in `metrics`, with an optional `label` and `unit`); an endpoint's driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `agent` is the coding agent the run's agents are sessions of (`claude`, the default), and `models` each agent's model (by default its CLI's choice for that role: Claude Code's base agent and var-op on `opus`, workers on `sonnet`, ghosts on `haiku`); a run set up with one agent carries on only with it, so changing `agent` means running `onyx research setup` again. `agent`, `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
+Endpoint types and metrics are named `<namespace>.<name>`, and the run adds the ones your org doesn't have to its registry (every metric the endpoints report goes in `metrics`, with an optional `label` and `unit`); an endpoint's driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `agent` is the coding agent the run's agents are sessions of (`claude`, the default, or `codex`), and `models` each agent's model (by default its CLI's choice for that role: Claude Code's base agent and var-op on `opus`, workers on `sonnet`, ghosts on `haiku`; Codex's all on the model your Codex is set to); a run set up with one agent carries on only with it, so changing `agent` means running `onyx research setup` again. `agent`, `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
 
 ```bash
 onyx research setup onyx/research.json          # the base agent studies the repository
@@ -148,7 +148,7 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 - `skills/onyx/SKILL.md` teaches a coding agent to sign in, read the graph before it writes, log its work and start `onyx research`.
 - `skills/onyx-research-setup/SKILL.md` teaches it to set a repository up for a run with you: the goal and metrics, endpoint drivers and guides, `onyx/research.json` and sites, each checked before the run.
 
-`onyx setup` installs them in `~/.claude/skills` (`--project`: in this folder's `.claude/skills`), where Claude Code reads them. They're part of the program, so a standalone binary installs them too. For another coding agent, give it the same files in its own skills or instructions folder. Or copy them yourself from an npm install:
+`onyx setup` installs them where each coding agent it finds reads them: `~/.claude/skills` for Claude Code, `~/.codex/skills` (or `$CODEX_HOME/skills`) for Codex CLI (`--project`: this folder's `.claude/skills` and `.agents/skills`). They're part of the program, so a standalone binary installs them too. For another coding agent, give it the same files in its own skills or instructions folder. Or copy them yourself from an npm install:
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/

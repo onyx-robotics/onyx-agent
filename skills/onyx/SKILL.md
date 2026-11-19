@@ -53,7 +53,7 @@ onyx archive <item>                        # nothing is deleted; it stays in his
 
 ## Research runs
 
-`onyx research` runs agents on the user's machine that improve a repository against its metrics: a base agent studies the code, a variational operator proposes hypotheses, workers test them on the project's endpoints, and what they learn goes into the graph. It needs `onyx login`, a logged-in `claude`, and `onyx/research.json` in the repository (`onyx research help`, and the package's README for its fields).
+`onyx research` runs agents on the user's machine that improve a repository against its metrics: a base agent studies the code, a variational operator proposes hypotheses, workers test them on the project's endpoints, and what they learn goes into the graph. It needs `onyx login`, a signed-in `claude` or `codex` (the config's `agent`), and `onyx/research.json` in the repository (`onyx research help`, and the package's README for its fields).
 
 ```bash
 onyx research setup onyx/research.json    # once: the base agent studies the repository
