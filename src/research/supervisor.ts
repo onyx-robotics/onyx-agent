@@ -232,10 +232,14 @@ export class Supervisor {
   /** the queue's new hypotheses were cancelled at the deadline: slots now only take later turns */
   private queueClosed = false
   private readonly instance = `research-${hostname()}`
+  /** the experiments it's running itself: their process groups */
+  private readonly procs = new Set<number>()
 
   constructor(
     private readonly cfg: LoadedConfig,
-    private readonly run: RunDir
+    private readonly run: RunDir,
+    /** resumed with this many minutes more to propose (`onyx research run --minutes`) */
+    private readonly opts: { minutes?: number } = {}
   ) {
     this.state = run.state()
     this.repo = run.path("repo")
@@ -391,7 +395,13 @@ export class Supervisor {
       this.state.startedAt = Date.now()
       this.state.deadline = Date.now() + this.cfg.minutes * 60_000
       this.save()
-    }
+    } else if (this.opts.minutes) {
+      // resumed with more time: it proposes again from now
+      this.state.deadline = Date.now() + this.opts.minutes * 60_000
+      this.state.varop.idle = false
+      this.save()
+    } else if (this.past())
+      this.log("its time is up: onyx research run <config> --minutes <n> gives it more")
     for (const sig of ["SIGINT", "SIGTERM"] as const)
       process.on(sig, () => {
         this.stopping = true
@@ -483,7 +493,15 @@ export class Supervisor {
   private async closeQueue() {
     const b = this.run.read<Board>("board.json") ?? { tracks: [], hypotheses: [] }
     const queued = b.hypotheses.filter((h) => !this.state.workers[h.task]).map((h) => h.task)
-    if (queued.length) await this.onyx.cancelJobs(queued, "the run's time was up")
+    if (queued.length) {
+      await this.onyx.cancelJobs(queued, "the run's time was up")
+      // off the board, so a resumed run proposes again rather than wait on them
+      const now = this.run.read<Board>("board.json") ?? b
+      this.run.write("board.json", {
+        ...now,
+        hypotheses: now.hypotheses.filter((h) => !queued.includes(h.task)),
+      })
+    }
     this.log(
       `proposing is over: ${queued.length} queued hypotheses cancelled; letting what's running finish`
     )
@@ -555,8 +573,10 @@ export class Supervisor {
       }
       await sleep(wait)
     }
-    // the run is over (a stop, or the grace period gone): what's still running is cut short now
+    // the run is over (a stop, or the grace period gone): what's still running is cut short now,
+    // the experiments this runs itself too (each in its own process group: see runExperiment)
     this.halt.abort()
+    for (const pid of this.procs) killGroup(pid)
     // a stop has cut the agents' turns short: let them settle, so what they end is reported below
     // (a site's experiment still running isn't waited for: a restart picks it back up)
     await Promise.race([Promise.allSettled([...this.inflight]), sleep(SETTLE_MS)])
@@ -571,18 +591,33 @@ export class Supervisor {
             queued.map((w) => w.turnJob!),
             "the run is over"
           )
+          .then(() => {
+            // a resume (onyx research run --minutes) sends each again, as a new job
+            for (const w of queued) {
+              w.turnJob = null
+              w.submitted = false
+            }
+            this.save()
+          })
           .catch((e: Error) => this.log(`cancelling queued turns: ${e.message}`))
     }
-    // anything still held: say what happened to it
-    if (this.outbox.length)
-      await this.onyx
-        .runnerSync({
-          instance: this.instance,
-          units: this.units(),
-          held: this.heldList(),
-          reports: this.outbox,
-        })
-        .catch(() => undefined)
+    // the last sync: what ended goes in, and it leaves, so its slots are archived (but one still
+    // holding a turn cut short, which the restart takes back up). What it acknowledges leaves the
+    // journal, as in any sync
+    const sent = this.outbox
+    this.outbox = []
+    await this.onyx
+      .runnerSync({
+        instance: this.instance,
+        units: this.units(),
+        held: this.heldList(),
+        reports: sent,
+        leaving: true,
+      })
+      .then(() => {
+        for (const r of sent) if (r.state === "ended") this.release(String(r.id))
+      })
+      .catch((e: Error) => this.log(`the last sync: ${e.message}`))
   }
 
   /**
@@ -936,17 +971,24 @@ export class Supervisor {
     const logPath = this.run.path("logs", `${a.id}.log`)
     const cmd = `${ep.driver}${a.props.packet ? ` ${JSON.stringify(String(a.props.packet))}` : ""}`
     this.log(`experiment ${short(a.id)} on ${ep.type} at ${commit.slice(0, 10)}`)
-    const proc = Bun.spawn(["sh", "-c", `${cmd} 2>&1`], { cwd: dir, stdout: "pipe" })
+    // its own process group, so the time limit (or the run's end) ends what the driver started too
+    const proc = Bun.spawn(["sh", "-c", `${cmd} 2>&1`], {
+      cwd: dir,
+      stdout: "pipe",
+      detached: true,
+    })
+    this.procs.add(proc.pid)
     // the campaign's time limit, sent with the experiment: a hard cutoff
     const limitS = typeof a.props.time_limit_s === "number" ? a.props.time_limit_s : ep.timeoutS
     let timedOut = false
     const timer = setTimeout(() => {
       timedOut = true
-      proc.kill()
+      killGroup(proc.pid)
     }, limitS * 1000)
     const out = await new Response(proc.stdout).text()
     await proc.exited
     clearTimeout(timer)
+    this.procs.delete(proc.pid)
     writeFileSync(logPath, out)
     rmSync(dir, { recursive: true, force: true })
     const line = out
@@ -1280,13 +1322,22 @@ export class Supervisor {
   }
 }
 
-export async function runResearch(cfgPath: string) {
+export async function runResearch(cfgPath: string, opts: { minutes?: number } = {}) {
   const cfg = loadConfig(cfgPath)
   preflight(cfg)
   const run = runDirFor(cfg)
   const link = plotLink(run)
   if (link) console.log(`its plot: ${link}`)
-  await new Supervisor(cfg, run).start()
+  await new Supervisor(cfg, run, opts).start()
+}
+
+/** End a process group: a driver and whatever it started. */
+function killGroup(pid: number) {
+  try {
+    process.kill(-pid, "SIGKILL")
+  } catch {
+    // already gone
+  }
 }
 
 /** A run's plot in the app (`/items/<campaign>/plot`), once it's set up: null before. */
