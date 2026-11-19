@@ -14,9 +14,10 @@ import { join } from "node:path"
 import { parseArgs } from "node:util"
 
 import { runAgent, workerTools } from "./agents"
-import { loadConfig } from "./config"
+import { loadConfig, modelFor } from "./config"
 import { addWorktree, commitAndPush, ensureClone, git, resolveCommit } from "./git"
 import { preflight } from "./preflight"
+import { baseSession } from "./state"
 import { runDirFor } from "./supervisor"
 
 export async function runGreedy(cfgPath: string, argv: string[]) {
@@ -28,7 +29,7 @@ export async function runGreedy(cfgPath: string, argv: string[]) {
   preflight(cfg)
   const run = runDirFor(cfg)
   const state = run.state()
-  if (!state.base.session) throw new Error("no base agent yet: run setup first")
+  const baseAgent = baseSession(state, cfg)
   const minutes = Number(o.minutes ?? cfg.minutes)
   const margin = Number(o.margin ?? 0.03)
   const metric = cfg.metrics[0]!
@@ -81,11 +82,12 @@ The best so far: ${metric.key}=${best.value}.`
   let n = 0
   while (Date.now() < deadline) {
     const r = await runAgent({
+      agent: cfg.agent,
       prompt,
-      model: cfg.models.worker,
+      model: modelFor(cfg, "worker"),
       cwd: worktree,
       env: {},
-      resume: session ?? state.base.session,
+      resume: session ?? baseAgent,
       fork: !session,
       addDirs: [worktree],
       log: join(dir, "agent.log"),

@@ -4,11 +4,11 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { AGENT_CLI } from "./agents"
+import { DEFAULT_AGENT } from "./agents"
 import { AGENTS } from "./agent-check"
 import { problems, type Exec } from "./preflight"
 
-const cfg = { remote: "git@example.com:you/project.git", baseBranch: "main" }
+const cfg = { remote: "git@example.com:you/project.git", baseBranch: "main", agent: "claude" }
 const SIGNED_IN = { "claude auth": { status: 0, stdout: '{"loggedIn": true}' } }
 
 /** A machine whose commands answer from this table (by "cmd arg"), anything else exit 0. */
@@ -22,7 +22,7 @@ function machine(answers: Record<string, { status: number | null; stdout?: strin
 
 describe("research preflight", () => {
   test("it checks the agent the run starts, which it knows how to check", () => {
-    expect(AGENTS[AGENT_CLI]).toBeDefined()
+    expect(AGENTS[DEFAULT_AGENT]).toBeDefined()
   })
 
   test("a ready machine has no problems", () => {
@@ -38,10 +38,10 @@ describe("research preflight", () => {
 
   for (const [agent, a] of Object.entries(AGENTS))
     test(`${agent}: missing, then installed`, () => {
-      const missing = problems(cfg, machine({ [agent]: { status: null } }), {}, agent)
+      const missing = problems({ ...cfg, agent }, machine({ [agent]: { status: null } }), {})
       expect(missing).toEqual([expect.stringContaining(`${a.name} isn't installed`)])
       expect(missing[0]).toContain(a.install)
-      expect(problems(cfg, machine(SIGNED_IN), {}, agent)).toEqual([])
+      expect(problems({ ...cfg, agent }, machine(SIGNED_IN), {})).toEqual([])
     })
 
   test("a signed-out agent stops it; an API key, or no clear answer, doesn't", () => {
@@ -54,16 +54,16 @@ describe("research preflight", () => {
     expect(problems(cfg, old, {})).toEqual([])
 
     const codexOut = machine({ "codex login": { status: 1, stdout: "Not logged in" } })
-    expect(problems(cfg, codexOut, {}, "codex")).toEqual([
+    expect(problems({ ...cfg, agent: "codex" }, codexOut, {})).toEqual([
       "Codex CLI isn't signed in: run codex login",
     ])
-    expect(problems(cfg, codexOut, { OPENAI_API_KEY: "k" }, "codex")).toEqual([])
+    expect(problems({ ...cfg, agent: "codex" }, codexOut, { OPENAI_API_KEY: "k" })).toEqual([])
     const odd = machine({ "codex login": { status: 2, stdout: "unrecognized subcommand" } })
-    expect(problems(cfg, odd, {}, "codex")).toEqual([])
+    expect(problems({ ...cfg, agent: "codex" }, odd, {})).toEqual([])
   })
 
   test("an agent it has no entry for is still checked for", () => {
-    expect(problems(cfg, machine({ amp: { status: null } }), {}, "amp")[0]).toContain(
+    expect(problems({ ...cfg, agent: "amp" }, machine({ amp: { status: null } }), {})[0]).toContain(
       "amp isn't installed"
     )
   })
@@ -88,7 +88,9 @@ describe("research preflight", () => {
       cmd === "git"
         ? (({ status, stdout }) => ({ status, stdout }))(spawnSync(cmd, args, { encoding: "utf8" }))
         : { status: 0, stdout: '{"loggedIn": true}' }
-    expect(problems({ remote: dir, baseBranch: "main" }, real, {})).toEqual([])
-    expect(problems({ remote: dir, baseBranch: "dev" }, real, {})[0]).toContain("has no branch dev")
+    expect(problems({ ...cfg, remote: dir }, real, {})).toEqual([])
+    expect(problems({ ...cfg, remote: dir, baseBranch: "dev" }, real, {})[0]).toContain(
+      "has no branch dev"
+    )
   })
 })

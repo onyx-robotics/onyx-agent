@@ -13,6 +13,7 @@ function fakeClaude(body: string) {
   chmodSync(bin, 0o755)
   process.env.PATH = `${dir}:${process.env.PATH}`
   return {
+    agent: "claude",
     prompt: "hi",
     model: "sonnet",
     cwd: dir,

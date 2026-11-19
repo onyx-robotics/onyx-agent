@@ -5,6 +5,10 @@
 import type { AgentCli } from "./agents"
 
 export const claude: AgentCli = {
+  provider: "anthropic",
+  // the var-op plans the whole run (which hypotheses, how experiments should look) and is a small
+  // share of its cost, so it gets the strongest model; workers, most of the cost, a cheaper one
+  models: { base: "opus", varop: "opus", worker: "sonnet", ghost: "haiku" },
   turn(a) {
     const t = a.tools
     const argv = [
@@ -13,8 +17,7 @@ export const claude: AgentCli = {
       a.prompt,
       "--output-format",
       "json",
-      "--model",
-      a.model,
+      ...(a.model ? ["--model", a.model] : []),
       // each rule its own argument: a rule may have spaces in it (`Bash(onyx research *)`)
       "--tools",
       ...(t.tools.length ? t.tools : [""]),

@@ -12,7 +12,7 @@ import type { KgResult } from "../generated/contracts/contracts"
 import type { OnyxClient } from "../sdk"
 
 import { NO_TOOLS, runAgent } from "./agents"
-import { loadConfig, type LoadedConfig } from "./config"
+import { loadConfig, type LoadedConfig, modelFor } from "./config"
 import { changedPaths, commitAndPush, measurementOf } from "./git"
 import { client, SOURCE, upsert } from "./platform"
 import { limitsText, timeLimits } from "./limits"
@@ -418,8 +418,9 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
       const state = readFileSync(statePath, "utf8")
       const agentItem = (await e.onyx.getEntity(author)) as { name?: string }
       const r = await runAgent({
+        agent: e.cfg.agent,
         prompt: ghostPrompt(agentItem.name ?? author, state, question),
-        model: e.cfg.models.ghost,
+        model: modelFor(e.cfg, "ghost"),
         cwd: e.run.path("repo"),
         env: {},
         resume: s.base.session ?? undefined,
@@ -668,7 +669,10 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
             type: "agent_state",
             name: `state of ${short(e.agent)}`,
             summary: text.slice(0, 4000),
-            props: { state_text: text.slice(0, 60_000), model: e.cfg.models.worker },
+            props: {
+              state_text: text.slice(0, 60_000),
+              model: modelFor(e.cfg, "worker") ?? `${e.cfg.agent} default`,
+            },
             createdBy: e.agent,
           },
         ],

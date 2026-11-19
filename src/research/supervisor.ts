@@ -21,16 +21,23 @@ import { JOB_PRIORITY_MAX, type RunnerAssignment } from "../generated/contracts/
 import type { OnyxClient } from "../sdk"
 
 import { readOnlyTools, runAgent, workerTools } from "./agents"
-import { loadConfig, vocabularyOf, type LoadedConfig, type ResearchConfig } from "./config"
+import {
+  loadConfig,
+  type LoadedConfig,
+  modelFor,
+  type ResearchConfig,
+  vocabularyOf,
+} from "./config"
 import { addWorktree, checkout, ensureClone, resolveCommit } from "./git"
 import { limitsText, setTimeLimit, timeLimits } from "./limits"
 import { agentItem, client, RENEW_EVERY_MS, renewRunKey, upsert } from "./platform"
 import { preflight } from "./preflight"
 import { basePrompt, varopPrompt, workerPrompt } from "./prompts"
 import {
-  RunDir,
+  baseSession,
   type ExperimentResult,
   type HeldJob,
+  RunDir,
   type RunState,
   type WorkerState,
 } from "./state"
@@ -162,12 +169,12 @@ export async function setup(cfgPath: string) {
   const base = await upsert(
     onyx,
     `agent:${slug(cfg.name)}:base`,
-    agentItem(cfg.name, "base agent", "base", cfg.models.base)
+    agentItem(cfg.name, "base agent", "base", cfg, "base")
   )
   const varop = await upsert(
     onyx,
     `agent:${slug(cfg.name)}:varop`,
-    agentItem(cfg.name, "variational operator", "var_op", cfg.models.varop)
+    agentItem(cfg.name, "variational operator", "var_op", cfg, "varop")
   )
   const prior = run.read<RunState>("state.json")
   const state: RunState = prior ?? {
@@ -185,10 +192,13 @@ export async function setup(cfgPath: string) {
   const link = plotLink(run)
   if (link) console.log(`its plot: ${link}`)
 
-  console.log(`base agent (${cfg.models.base}) is studying ${cfg.root} ...`)
+  console.log(
+    `base agent (${cfg.agent}, ${modelFor(cfg, "base") ?? "its default model"}) is studying ${cfg.root} ...`
+  )
   const r = await runAgent({
+    agent: cfg.agent,
     prompt: basePrompt(cfg),
-    model: cfg.models.base,
+    model: modelFor(cfg, "base"),
     cwd: repo,
     env: agentEnv(run, cfg, base),
     log: run.path("logs", "base.log"),
@@ -197,6 +207,7 @@ export async function setup(cfgPath: string) {
   })
   if (!r.ok || !r.session) throw new Error(`the base agent failed: ${r.text.slice(0, 1000)}`)
   state.base.session = r.session
+  state.base.cli = cfg.agent
   run.write("state.json", state)
   writeFileSync(run.path("base-summary.md"), r.text)
   console.log(`${r.text}\n\nbase session ${r.session}. Start the run: onyx research run ${cfgPath}`)
@@ -383,7 +394,7 @@ export class Supervisor {
   }
 
   async start() {
-    if (!this.state.base.session) throw new Error("no base agent yet: run setup first")
+    baseSession(this.state, this.cfg)
     if (!this.state.startedAt) {
       this.state.startedAt = Date.now()
       this.state.deadline = Date.now() + this.cfg.minutes * 60_000
@@ -632,7 +643,7 @@ export class Supervisor {
     const agent = await upsert(
       this.onyx,
       `agent:${slug(this.cfg.name)}:worker:${task}`,
-      agentItem(this.cfg.name, `worker ${short(task)}`, "worker", this.cfg.models.worker)
+      agentItem(this.cfg.name, `worker ${short(task)}`, "worker", this.cfg, "worker")
     )
     await this.onyx
       .ingest({ edges: [{ rel: "performed_by", src: task, dst: agent }] })
@@ -697,8 +708,9 @@ export class Supervisor {
     this.slots.set(slot, task)
     this.save()
     const r = await runAgent({
+      agent: this.cfg.agent,
       prompt,
-      model: this.cfg.models.worker,
+      model: modelFor(this.cfg, "worker"),
       cwd: w.worktree,
       env: agentEnv(this.run, this.cfg, w.agent, task),
       resume: fork ? this.state.base.session! : w.session!,
@@ -1241,8 +1253,9 @@ export class Supervisor {
       `var-op wakes (${v.wakes}): ${seen.length} finished, ${notes.length} turn notes, ${inbox.length} messages`
     )
     const r = await runAgent({
+      agent: this.cfg.agent,
       prompt: varopPrompt(parts.join("\n\n")),
-      model: this.cfg.models.varop,
+      model: modelFor(this.cfg, "varop"),
       cwd: this.repo,
       env: agentEnv(this.run, this.cfg, v.agent),
       // a fresh fork of the base agent at every wake: what it knows is the codebase, the brief and

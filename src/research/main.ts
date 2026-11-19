@@ -11,7 +11,7 @@
  *
  * Agents call the rest from their shells (`onyx research help`). Needs the user signed in (`onyx
  * login`, or ONYX_API_URL and ONYX_TOKEN): the run trades that for its own run key, whose jobs
- * only its own runner takes. And a logged-in `claude`.
+ * only its own runner takes. And the coding agent in its config (`agent`), signed in.
  */
 import { runGreedy } from "./greedy"
 import { declare, limit, plot, runResearch, setup, steer } from "./supervisor"
@@ -33,7 +33,7 @@ that. steer tells the var-op something; plot prints the run's plot in the app (a
 its score over time); limit shows or changes the run's time limit per experiment on an endpoint
 (a hard cutoff, sent with each experiment); greedy runs the one-agent baseline to compare a run with.
 Agents call the rest from their shells: onyx research help lists them. Needs a sign-in (onyx
-login) and a logged-in claude.`
+login) and the config's coding agent (agent, claude by default), signed in.`
 
 /** The research commands, over these arguments (after `research`): the exit code. */
 export async function research(args: string[]): Promise<number> {

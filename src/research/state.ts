@@ -73,7 +73,8 @@ export interface RunState {
   campaign: string
   /** the supervisor's own agent (its API key's) */
   supervisor: string
-  base: { agent: string; session: string | null }
+  /** cli: the coding agent its session is of (unset: claude, from before a run could choose) */
+  base: { agent: string; session: string | null; cli?: string }
   varop: {
     agent: string
     /** its last wake's session (each wake is a fresh fork of the base agent's) */
@@ -154,4 +155,18 @@ export function runFromEnv(): RunDir {
   const dir = process.env.ONYX_RESEARCH_RUN
   if (!dir) throw new Error("ONYX_RESEARCH_RUN isn't set: this command runs inside a research run")
   return new RunDir(dir)
+}
+
+/**
+ * The base agent's session, to fork the run's agents from: there once setup has run, and of the
+ * config's agent (a session of one CLI can't carry on in another).
+ */
+export function baseSession(state: RunState, cfg: { agent: string }): string {
+  if (!state.base.session) throw new Error("no base agent yet: run setup first")
+  const cli = state.base.cli ?? "claude"
+  if (cli !== cfg.agent)
+    throw new Error(
+      `the base agent is a ${cli} session and the config's agent is ${cfg.agent}: run onyx research setup again`
+    )
+  return state.base.session
 }

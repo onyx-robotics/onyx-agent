@@ -8,6 +8,8 @@ import { dirname, isAbsolute, resolve } from "node:path"
 
 import { z } from "zod"
 
+import { AGENT_CLIS, DEFAULT_AGENT, type AgentModelRole } from "./agents"
+
 const endpoint = z.object({
   /**
    * the unit type its runner offers, `<pack>.<name>`: declared in the org as a research_endpoint
@@ -75,16 +77,25 @@ export const researchConfig = z.object({
     .array(endpoint)
     .min(1)
     .refine((eps) => eps.every((e) => e.site || e.driver), "an endpoint needs a driver, or site"),
-  // the var-op plans the whole run (which hypotheses, how experiments should look) and is a small
-  // share of its cost, so it gets the strongest model; workers, most of the cost, a cheaper one
+  /**
+   * the coding agent the run's agents are sessions of, signed in on this machine: one of
+   * AGENT_CLIS (claude: Claude Code)
+   */
+  agent: z
+    .string()
+    .default(DEFAULT_AGENT)
+    .refine((a) => a in AGENT_CLIS, {
+      message: `agent: one of ${Object.keys(AGENT_CLIS).join(", ")}`,
+    }),
+  /** each agent's model; one left out is its CLI's choice for it (modelFor) */
   models: z
     .object({
-      base: z.string().default("opus"),
-      varop: z.string().default("opus"),
-      worker: z.string().default("sonnet"),
-      ghost: z.string().default("haiku"),
+      base: z.string().min(1).optional(),
+      varop: z.string().min(1).optional(),
+      worker: z.string().min(1).optional(),
+      ghost: z.string().min(1).optional(),
     })
-    .default({ base: "opus", varop: "opus", worker: "sonnet", ghost: "haiku" }),
+    .default({}),
   workers: z.number().int().min(1).max(64).default(2),
   /**
    * A safety ceiling on the experiments one worker runs for its hypothesis, not a budget: a worker
@@ -95,6 +106,14 @@ export const researchConfig = z.object({
   minutes: z.number().min(1).max(10_080).default(30),
 })
 export type ResearchConfig = z.infer<typeof researchConfig>
+
+/** A role's model: the config's, else its CLI's for that role; unset is the CLI's own default. */
+export function modelFor(
+  cfg: Pick<ResearchConfig, "agent" | "models">,
+  role: AgentModelRole
+): string | undefined {
+  return cfg.models[role] ?? AGENT_CLIS[cfg.agent]?.models[role]
+}
 
 export interface LoadedConfig extends ResearchConfig {
   /** the repository's root (the config is at <root>/onyx/research.json) */

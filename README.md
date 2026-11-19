@@ -116,7 +116,7 @@ You need: `onyx login`, git, a logged-in [Claude Code](https://claude.com/claude
 }
 ```
 
-Endpoint types and metrics are named `<namespace>.<name>`, and the run adds the ones your org doesn't have to its registry (every metric the endpoints report goes in `metrics`, with an optional `label` and `unit`); an endpoint's driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
+Endpoint types and metrics are named `<namespace>.<name>`, and the run adds the ones your org doesn't have to its registry (every metric the endpoints report goes in `metrics`, with an optional `label` and `unit`); an endpoint's driver runs in a checkout of the experiment's commit and prints a last line `METRICS {json}`. An endpoint with `"site": true` and no driver runs on a site instead: a machine with hardware, or another computer, running `onyx-site`. `agent` is the coding agent the run's agents are sessions of (`claude`, the default), and `models` each agent's model (by default its CLI's choice for that role: Claude Code's base agent and var-op on `opus`, workers on `sonnet`, ghosts on `haiku`); a run set up with one agent carries on only with it, so changing `agent` means running `onyx research setup` again. `agent`, `models`, `experimentsPerTask`, `baseBranch`, `capacity` and `timeoutS` have defaults. [GETTING_STARTED.md](GETTING_STARTED.md) has every step.
 
 ```bash
 onyx research setup onyx/research.json          # the base agent studies the repository

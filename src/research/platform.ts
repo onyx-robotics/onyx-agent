@@ -14,6 +14,9 @@ import { join } from "node:path"
 
 import { OnyxClient } from "../sdk"
 
+import { AGENT_CLIS, type AgentModelRole } from "./agents"
+import { modelFor, type ResearchConfig } from "./config"
+
 export const SOURCE = "research"
 const KEY_FILE = "run-key.json"
 /** a run key works 4 hours: renewed once an hour, so a missed renewal or two costs nothing */
@@ -129,10 +132,21 @@ export async function upsert(
 export type AgentRole = "orchestrator" | "base" | "var_op" | "worker"
 
 /** An agent of the run, as an ai_agent the graph can name as an author. */
-export function agentItem(run: string, name: string, role: AgentRole, model: string) {
+export function agentItem(
+  run: string,
+  name: string,
+  role: AgentRole,
+  cfg: Pick<ResearchConfig, "agent" | "models">,
+  modelRole: AgentModelRole
+) {
   return {
     type: "ai_agent",
     name: `${run} · ${name}`,
-    props: { agent_role: role, model, provider: "anthropic" },
+    props: {
+      agent_role: role,
+      // unset: the CLI's own default, which it doesn't say up front
+      model: modelFor(cfg, modelRole) ?? `${cfg.agent} default`,
+      provider: AGENT_CLIS[cfg.agent]?.provider ?? cfg.agent,
+    },
   }
 }

@@ -1,11 +1,11 @@
 /**
  * The coding agents Onyx's docs and tools name, and how to check one's CLI on this machine:
- * installed, and signed in where its CLI can say. `onyx research` checks AGENT_CLI, the agent its
- * runs' sessions are of, before it starts.
+ * installed, and signed in where its CLI can say. `onyx research` checks its config's `agent`, the
+ * agent its runs' sessions are of, before it starts.
  */
 import { spawnSync } from "node:child_process"
 
-import { AGENT_CLI } from "./agents"
+import { DEFAULT_AGENT } from "./agents"
 
 /** A command's exit status and output (stdout and stderr); status null when it couldn't run. */
 export type Exec = (cmd: string, args: string[]) => { status: number | null; stdout: string }
@@ -80,7 +80,7 @@ export const exec: Exec = (cmd, args) => {
 
 /** A coding agent's CLI on this machine: its version line, and what's wrong (null: nothing). */
 export function checkAgent(
-  agent: string = AGENT_CLI,
+  agent: string = DEFAULT_AGENT,
   run: Exec = exec,
   env: Record<string, string | undefined> = process.env
 ): { name: string; version: string | null; problem: string | null } {

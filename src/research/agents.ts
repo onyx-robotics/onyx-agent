@@ -9,8 +9,11 @@ import { appendFileSync } from "node:fs"
 import { claude } from "./agent-claude"
 
 export interface AgentRun {
+  /** the CLI it's a session of (AGENT_CLIS: a config's `agent`) */
+  agent: string
   prompt: string
-  model: string
+  /** unset: the CLI's own default */
+  model?: string
   cwd: string
   env: Record<string, string>
   /** carry on this session */
@@ -50,8 +53,8 @@ export interface AgentResult {
   denied: string[]
 }
 
-/** the coding agent a run's agents are sessions of (preflight.ts knows how to check each one) */
-export const AGENT_CLI = "claude"
+/** the coding agent a run's agents are sessions of when its config doesn't say (agent-check.ts knows how to check each one) */
+export const DEFAULT_AGENT = "claude"
 
 /** read-only git: what a worker may look at in its worktree's history */
 const GIT_READ = ["git status*", "git diff*", "git log*", "git show*"]
@@ -101,8 +104,15 @@ const OUTPUT_GRACE_MS = 3_000
  * it, and stops, times out and logs it the same for every CLI.
  */
 export interface AgentCli {
+  /** whose models it runs, for the agents' items in the graph */
+  provider: string
+  /** each role's model when the config doesn't say; a role it leaves out gets the CLI's default */
+  models: Partial<Record<AgentModelRole, string>>
   turn(a: AgentRun): AgentTurn
 }
+
+/** the agents whose models a config can set (`models`) */
+export type AgentModelRole = "base" | "varop" | "worker" | "ghost"
 
 export interface AgentTurn {
   argv: string[]
@@ -114,7 +124,10 @@ export interface AgentTurn {
 export const AGENT_CLIS: Record<string, AgentCli> = { claude }
 
 export async function runAgent(a: AgentRun): Promise<AgentResult> {
-  const turn = AGENT_CLIS[AGENT_CLI]!.turn(a)
+  const cli = AGENT_CLIS[a.agent]
+  if (!cli)
+    throw new Error(`no coding agent ${a.agent}: one of ${Object.keys(AGENT_CLIS).join(", ")}`)
+  const turn = cli.turn(a)
   appendFileSync(
     a.log,
     `\n==== ${new Date().toISOString()} ${a.resume ? (a.fork ? `fork of ${a.resume}` : `resume ${a.resume}`) : "new"}\n${a.prompt}\n----\n`
