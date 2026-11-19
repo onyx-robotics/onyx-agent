@@ -41,6 +41,7 @@ import {
   type RunState,
   type WorkerState,
 } from "./state"
+import { selfCommand, shellQuote } from "./self"
 import { boardText, relatedText, type Board } from "./tools"
 
 const slug = (s: string) =>
@@ -104,15 +105,6 @@ function agentEnv(
     PATH: `${run.path("bin")}:${process.env.PATH}`,
   }
 }
-
-/** This same onyx, to run again: the binary itself, or bun with its entry point (and no .env). */
-function selfCommand(): string[] {
-  return Bun.main.startsWith("/$bunfs/")
-    ? [process.execPath]
-    : [process.execPath, "--no-env-file", Bun.main]
-}
-
-const shellQuote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
 
 /**
  * Agents call `onyx research …` from their shells: the `onyx` first on their PATH runs this same

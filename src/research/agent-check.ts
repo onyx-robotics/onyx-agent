@@ -42,7 +42,8 @@ export const AGENTS: Record<string, AgentCheck> = {
   codex: {
     name: "Codex CLI",
     install: "https://github.com/openai/codex",
-    keyVars: ["OPENAI_API_KEY", "CODEX_API_KEY"],
+    // codex exec reads CODEX_API_KEY; an OPENAI_API_KEY in the environment alone doesn't sign it in
+    keyVars: ["CODEX_API_KEY"],
     login: "codex login",
     signedIn(run) {
       const r = run("codex", ["login", "status"])

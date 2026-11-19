@@ -13,6 +13,7 @@
  * login`, or ONYX_API_URL and ONYX_TOKEN): the run trades that for its own run key, whose jobs
  * only its own runner takes. And the coding agent in its config (`agent`), signed in.
  */
+import { runGate } from "./gate"
 import { runGreedy } from "./greedy"
 import { declare, limit, plot, runResearch, setup, steer } from "./supervisor"
 import { runTool } from "./tools"
@@ -59,6 +60,13 @@ export async function research(args: string[]): Promise<number> {
       if (!rest[0]) break
       await runGreedy(rest[0], rest.slice(1))
       return 0
+    case "gate": {
+      // a CLI's hook before an agent's tool call (agent-codex.ts): not for people or agents
+      if (!rest[0]) break
+      const v = runGate(rest[0], await Bun.stdin.text())
+      if (v.stderr) console.error(v.stderr)
+      return v.exit
+    }
     case "limit":
       if (!rest[0]) break
       // the user's or the orchestrator's: a run's own agents don't change their limits

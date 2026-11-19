@@ -1,12 +1,13 @@
 /**
  * Agents are sessions of a coding agent's CLI run headless, with the user's own login to it
- * (agent-claude.ts says how for Claude Code). Every agent but the base is a fork of the base
+ * (agent-claude.ts and agent-codex.ts say how for Claude Code and Codex CLI). Every agent but the base is a fork of the base
  * agent's session, so it starts knowing the codebase; a session is resumed by id to carry on (a
  * worker after its experiments end, the var-op when it's woken). Linux and macOS.
  */
 import { appendFileSync } from "node:fs"
 
 import { claude } from "./agent-claude"
+import { codex } from "./agent-codex"
 
 export interface AgentRun {
   /** the CLI it's a session of (AGENT_CLIS: a config's `agent`) */
@@ -121,7 +122,7 @@ export interface AgentTurn {
 }
 
 /** the CLIs a run's agents can be sessions of, by command */
-export const AGENT_CLIS: Record<string, AgentCli> = { claude }
+export const AGENT_CLIS: Record<string, AgentCli> = { claude, codex }
 
 export async function runAgent(a: AgentRun): Promise<AgentResult> {
   const cli = AGENT_CLIS[a.agent]
@@ -134,6 +135,8 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
   )
   const proc = Bun.spawn(turn.argv, {
     cwd: a.cwd,
+    // nothing to read: a CLI that reads a piped stdin into its prompt (codex) gets none
+    stdin: "ignore",
     env: { ...process.env, ...a.env },
     stdout: "pipe",
     stderr: "pipe",

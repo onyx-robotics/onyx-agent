@@ -57,7 +57,7 @@ describe("research preflight", () => {
     expect(problems({ ...cfg, agent: "codex" }, codexOut, {})).toEqual([
       "Codex CLI isn't signed in: run codex login",
     ])
-    expect(problems({ ...cfg, agent: "codex" }, codexOut, { OPENAI_API_KEY: "k" })).toEqual([])
+    expect(problems({ ...cfg, agent: "codex" }, codexOut, { CODEX_API_KEY: "k" })).toEqual([])
     const odd = machine({ "codex login": { status: 2, stdout: "unrecognized subcommand" } })
     expect(problems({ ...cfg, agent: "codex" }, odd, {})).toEqual([])
   })
