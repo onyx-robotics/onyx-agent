@@ -15,11 +15,11 @@ You can let your coding agent do most of it. Step 1 is yours (`onyx setup` also 
 ## 1. Install and sign in
 
 ```bash
-git clone git@github.com:onyx-robotics/onyx.git && onyx/install.sh   # builds onyx from main into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh   # the onyx binary for this machine, into ~/.local/bin
 onyx setup        # checks git and your coding agent, signs you in, installs the skills
 ```
 
-To update onyx later: `git -C onyx pull && onyx/install.sh`. `onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
+To update onyx later, run the same line again: it installs the latest release. It needs neither Bun nor Node. `onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
 
 ## 2. Give your coding agent the skills
 
@@ -121,7 +121,7 @@ When experiments need hardware (a robot, a rig, a GPU box), they run on a **site
 
 **On the site's machine:**
 
-1. Install `onyx-site`. It isn't published as a package yet: it's installed from the Onyx repository (`python/site-runner`, whose `SETUP.md` is the full guide). Ask your Onyx contact for access.
+1. Install `onyx-site` from PyPI, as the user that will run it: `uv tool install 'onyx-site[keyring]'` (or `pip install --user 'onyx-site[keyring]'`). Its README on PyPI covers enrolling it, running it and writing a driver.
 2. Write its site file. For an experiment that's a program in your repository, the shipped `local_program` driver runs it from the experiment's commit:
 
    ```toml

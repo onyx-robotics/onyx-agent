@@ -12,16 +12,16 @@
 ## Install
 
 ```bash
-npm install -g @onyx-robotics/agent   # or: bun add -g @onyx-robotics/agent
-```
-
-The `onyx` command runs on [Bun](https://bun.sh) (1.3.14 or later), so Bun has to be on your `PATH`. Or install a binary that needs neither Bun nor Node, for Linux or macOS, x64 or arm64:
-
-```bash
 curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh
 ```
 
-It picks this machine's binary from the [releases](https://github.com/onyx-robotics/onyx-agent/releases), checks it against the release's `SHA256SUMS`, and puts it in `~/.local/bin` (`ONYX_INSTALL_DIR` for another folder, `ONYX_VERSION=v0.2.0` for another release). Or download one yourself: `onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64` or `onyx-darwin-arm64`.
+A binary that needs neither Bun nor Node, for Linux or macOS (on Windows, WSL), x64 or arm64. It picks this machine's from the [releases](https://github.com/onyx-robotics/onyx-agent/releases), checks it against the release's `SHA256SUMS`, and puts it in `~/.local/bin` (`ONYX_INSTALL_DIR` for another folder, `ONYX_VERSION=v<version>` for another release). Run it again to update. Or download one yourself: `onyx-linux-x64`, `onyx-linux-arm64`, `onyx-darwin-x64` or `onyx-darwin-arm64`.
+
+From npm, for the SDK or if you use [Bun](https://bun.sh) (1.3.14 or later, on your `PATH`: the `onyx` command runs on it):
+
+```bash
+npm install -g @onyx-robotics/agent   # or: bun add -g @onyx-robotics/agent
+```
 
 ## Set up
 
@@ -154,7 +154,7 @@ Every write carries an Idempotency-Key its retries reuse (network errors, 429 an
 mkdir -p ~/.claude/skills && cp -r "$(npm root -g)/@onyx-robotics/agent/skills/"* ~/.claude/skills/
 ```
 
-The research run's own agents work from three more, which `onyx research` builds into each agent's first message, so they're where a role is changed. `onyx setup` doesn't install them: they're for a run's agents, not your coding agent.
+The research run's own agents work from three more, which `onyx research` builds into each agent's first message, so they're where a role is changed. `onyx setup` installs them with the other two, but they're for a run's agents, not your coding agent.
 
 - `skills/onyx-research-base/SKILL.md`: the base agent reads the codebase and how it's measured, and writes the summary every other agent starts from.
 - `skills/onyx-research-varop/SKILL.md`: the variational operator plans the run: tracks and hypotheses, keeping the slots busy, learning from results, and its journal.

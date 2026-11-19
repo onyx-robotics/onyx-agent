@@ -19,7 +19,7 @@
 # Needs ONYX_ROOT (the onyx checkout, with python/onyx_arm synced: uv sync --extra sim). Then:
 #   bun run research:dev -- --org <org> --site <name> --site-state <dir>/site-state
 #   onyx research vocabulary <dir>/arm/onyx/research.json   # arm.sim and its metrics, for the site
-#   onyx-site --site <dir>/site.toml run      # in python/site-runner
+#   onyx-site --site <dir>/site.toml run      # onyx-site from PyPI (uv tool install onyx-site)
 #   onyx research setup <dir>/arm/onyx/research.json && onyx research run <dir>/arm/onyx/research.json
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
