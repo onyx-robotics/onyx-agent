@@ -11,35 +11,59 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 
 import type { AgentCli, AgentRun } from "./agents"
-import { gateFiles } from "./gate"
+import { gateFiles, type GateRules } from "./gate"
 import { selfCommand, shellQuote } from "./self"
 
 /** a TOML string, for a `-c key=value` override */
 const toml = (s: string) => JSON.stringify(s)
 
-/** the `-c` overrides for a turn: no approvals asked, its sandbox, its gate, no web search */
+/** an agent that edits files: a worker, which commits its edits too */
+const edits = (a: AgentRun) => a.tools.allow.includes("Edit")
+
+/** where an agent edits files, as Claude Code's are let: where it works, and the directories it's given */
+const editDirs = (a: AgentRun) => [a.cwd, ...(a.addDirs ?? [])]
+
+/**
+ * The `-c` overrides for a turn: no approvals asked, its sandbox, its gate, no web search.
+ *
+ * A worker has no sandbox: Codex's keeps the git metadata of the repository it works in read
+ * only, whatever is writable, so a worker couldn't commit the experiments it sends. Its gate holds
+ * it to the same rules regardless (only its commands run, edits only where it works and in the directories it's given), as a
+ * Claude Code worker's rules do.
+ */
 function overrides(a: AgentRun, rulesPath: string): string[] {
   const noTools = !a.tools.tools.length
+  const gate = [...selfCommand(), "research", "gate", rulesPath].map(shellQuote).join(" ")
+  // its shell's onyx research writes the run's state
   const writable = [
     ...(a.addDirs ?? []),
     ...(a.env.ONYX_RESEARCH_RUN ? [a.env.ONYX_RESEARCH_RUN] : []),
   ]
-  const gate = [...selfCommand(), "research", "gate", rulesPath].map(shellQuote).join(" ")
+  const sandbox = noTools ? "read-only" : edits(a) ? "danger-full-access" : "workspace-write"
   const c = [
     `approval_policy="never"`,
-    `sandbox_mode="${noTools ? "read-only" : "workspace-write"}"`,
-    // onyx research, in its shell, reaches the platform and pushes the experiment's commit
-    ...(noTools
-      ? []
-      : [
+    `sandbox_mode="${sandbox}"`,
+    // onyx research, in its shell, reaches the platform
+    ...(sandbox === "workspace-write"
+      ? [
           "sandbox_workspace_write.network_access=true",
           `sandbox_workspace_write.writable_roots=[${writable.map(toml).join(",")}]`,
-        ]),
+        ]
+      : []),
     `hooks.PreToolUse=[{hooks=[{type="command",command=${toml(gate)}}]}]`,
     `web_search="disabled"`,
   ]
   return c.flatMap((o) => ["-c", o])
 }
+
+/**
+ * Codex reads files with its shell, and the run's instructions speak of file tools and name the
+ * only commands an agent may run: an agent that may read is told its reads are allowed too.
+ */
+export const READ_NOTE =
+  "You read files with your shell: commands that only read (`cat`, `head`, `tail`, `nl`, " +
+  "`sed -n '<from>,<to>p' <file>`, `rg`, `grep`, `find` without `-exec` or `-delete`, `ls`, `wc`) " +
+  "are allowed besides the commands named below. Anything that writes or runs a program is refused."
 
 export const codex: AgentCli = {
   provider: "openai",
@@ -49,7 +73,8 @@ export const codex: AgentCli = {
     // the turn's rules, beside its log, and what its gate saw: from this turn only
     const rulesPath = `${a.log}.gate.json`
     const files = gateFiles(rulesPath)
-    writeFileSync(rulesPath, JSON.stringify(a.tools))
+    const rules: GateRules = { ...a.tools, ...(edits(a) ? { writable: editDirs(a) } : {}) }
+    writeFileSync(rulesPath, JSON.stringify(rules))
     rmSync(files.denied, { force: true })
     rmSync(files.allowed, { force: true })
 
@@ -66,7 +91,7 @@ export const codex: AgentCli = {
     ]
     if (a.resume) argv.push(a.fork ? "fork" : "resume", a.resume)
     // after `--`: a prompt that starts with a dash is still the prompt
-    argv.push("--", a.prompt)
+    argv.push("--", a.tools.allow.includes("Read") ? `${READ_NOTE}\n\n${a.prompt}` : a.prompt)
 
     return {
       argv,
