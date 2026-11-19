@@ -57,7 +57,7 @@ const VAROP_TICK_MS = 10 * 60_000
 const VAROP_NOTES_MS = 3 * 60_000
 /**
  * How much of the var-op's journal each wake shows it. Each wake is a fresh fork of the base agent
- * (a resumed session cost more each wake: $7 a wake after 74, in one run), so the journal and the
+ * (a resumed session's context grew with every wake), so the journal and the
  * board are its memory from one wake to the next.
  */
 const JOURNAL_LINES = 40
@@ -1152,7 +1152,7 @@ export class Supervisor {
           // workers' findings mid-hypothesis: batched, not once per turn
           ((this.state.turnNotes?.length ?? 0) > 0 && now - v.lastWake > VAROP_NOTES_MS) ||
           // a short queue, unless its last wake chose to queue nothing: then only an event or
-          // the tick wakes it (a wake costs dollars, to say nothing changed)
+          // the tick wakes it (no point waking it to say nothing changed)
           (!v.idle && this.activeHypotheses() < this.cfg.workers && now - v.lastWake > 60_000) ||
           now - v.lastWake > VAROP_TICK_MS
         if (due) {
@@ -1246,7 +1246,7 @@ export class Supervisor {
       cwd: this.repo,
       env: agentEnv(this.run, this.cfg, v.agent),
       // a fresh fork of the base agent at every wake: what it knows is the codebase, the brief and
-      // what this wake shows it, so each wake costs about the same
+      // what this wake shows it, so its context doesn't grow over the run
       resume: this.state.base.session!,
       fork: true,
       log: this.run.path("logs", "varop.log"),
