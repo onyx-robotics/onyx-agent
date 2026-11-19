@@ -4,6 +4,7 @@
  *   onyx research vocabulary <config>               # its endpoint types and metrics, in the org
  *   onyx research setup <repo>/onyx/research.json   # the base agent studies the repository
  *   onyx research run <repo>/onyx/research.json     # the var-op, workers and endpoints, until done
+ *     [--minutes n]                                  # run again: resumes it, n minutes more
  *   onyx research steer <config> "<message>"        # tell the var-op something
  *   onyx research plot <config>                     # the run's plot in the app
  *   onyx research limit <config> [<endpoint> <s>]   # the run's time limit per experiment
@@ -20,7 +21,7 @@ import { runTool } from "./tools"
 
 export const RESEARCH_USAGE = `onyx research vocabulary <repo>/onyx/research.json
 onyx research setup <repo>/onyx/research.json
-onyx research run <repo>/onyx/research.json
+onyx research run <repo>/onyx/research.json [--minutes <n>]
 onyx research steer <config> "<message>"
 onyx research plot <config>
 onyx research limit <config> [<endpoint> <seconds>]
@@ -29,7 +30,7 @@ onyx research help
 
 Autoresearch on this machine: a base agent studies the repository (setup), then a var-op proposes
 hypotheses and workers test them on the project's endpoints (run) until the config's minutes are
-up. Both add the config's endpoint types and metrics the org doesn't have; vocabulary does only
+up; run again, it resumes (--minutes: with that much more time to propose). Both add the config's endpoint types and metrics the org doesn't have; vocabulary does only
 that. steer tells the var-op something; plot prints the run's plot in the app (a lane per track,
 its score over time); limit shows or changes the run's time limit per experiment on an endpoint
 (a hard cutoff, sent with each experiment); greedy runs the one-agent baseline to compare a run with.
@@ -48,10 +49,15 @@ export async function research(args: string[]): Promise<number> {
       if (!rest[0]) break
       await setup(rest[0])
       return 0
-    case "run":
+    case "run": {
       if (!rest[0]) break
-      await runResearch(rest[0])
+      // run again, it resumes the run; --minutes gives it that much more time to propose
+      const i = rest.indexOf("--minutes")
+      const minutes = i > 0 ? Number(rest[i + 1]) : undefined
+      if (minutes !== undefined && !(minutes > 0)) break
+      await runResearch(rest[0], { minutes })
       return 0
+    }
     case "plot":
       if (!rest[0]) break
       console.log(await plot(rest[0]))

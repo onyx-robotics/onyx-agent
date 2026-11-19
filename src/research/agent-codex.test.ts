@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { NO_TOOLS, readOnlyTools, runAgent, workerTools, type AgentRun } from "./agents"
+import { READ_NOTE } from "./agent-codex"
 
 /**
  * A `codex` first on PATH: it keeps its arguments, prints `events` (JSONL, as `codex exec --json`
@@ -39,6 +40,9 @@ EOF_EVENTS
   return { run, args, rules }
 }
 
+/** the args after this one, as the lines the fake wrote (the prompt has newlines of its own) */
+const after = (a: string[], arg: string) => a.slice(a.indexOf(arg) + 1).join("\n")
+
 const started = { type: "thread.started", thread_id: "t1" }
 const said = (text: string) => ({ type: "item.completed", item: { type: "agent_message", text } })
 const done = { type: "turn.completed", usage: {} }
@@ -61,41 +65,48 @@ test("a Codex turn reports its thread, what it said last, and the commands its g
   })
 })
 
-test("a worker's turn: its gate as the hook, its directories and the run's writable, the network on", async () => {
+test("a worker's turn: its gate as the hook, edits only in its directories, no sandbox to keep it from committing", async () => {
   const { run, args, rules } = fakeCodex([started, done])
   await runAgent({ ...run, addDirs: ["/w", "/exp"] })
   const a = args()
   expect(a.slice(0, 2)).toEqual(["exec", "--json"])
   expect(a).toContain("--dangerously-bypass-hook-trust")
   expect(a).toContain(`approval_policy="never"`)
-  expect(a).toContain(`sandbox_mode="workspace-write"`)
-  expect(a).toContain("sandbox_workspace_write.network_access=true")
-  expect(a).toContain(`sandbox_workspace_write.writable_roots=["/w","/exp","/runs/r"]`)
+  // Codex's sandbox keeps a worktree's git metadata read only: the gate holds a worker instead
+  expect(a).toContain(`sandbox_mode="danger-full-access"`)
+  expect(a.join(" ")).not.toContain("writable_roots")
   const hook = a.find((x) => x.startsWith("hooks.PreToolUse="))!
   expect(hook).toContain(`'research' 'gate' '${rules}'`)
-  // the rules it's held to are the agent's own
-  expect(JSON.parse(readFileSync(rules, "utf8"))).toEqual(workerTools())
+  // the rules it's held to are the agent's own, and where it may edit, where it works first
+  expect(JSON.parse(readFileSync(rules, "utf8"))).toEqual({
+    ...workerTools(),
+    writable: [run.cwd, "/w", "/exp"],
+  })
   // no model: the user's Codex default; the prompt last, after --
   expect(a).not.toContain("-m")
-  expect(a.slice(-2)).toEqual(["--", "hi"])
+  expect(after(a, "--")).toBe(`${READ_NOTE}\n\nhi`)
 })
 
 test("a fork and a resume of a session, by id, on the config's model", async () => {
   const { run, args } = fakeCodex([started, done])
   await runAgent({ ...run, resume: "base", fork: true, model: "gpt-x" })
-  expect(args().slice(-4)).toEqual(["fork", "base", "--", "hi"])
+  expect(after(args(), "fork")).toBe(`base\n--\n${READ_NOTE}\n\nhi`)
   expect(args()).toContain("gpt-x")
   await runAgent({ ...run, resume: "w1" })
-  expect(args().slice(-4)).toEqual(["resume", "w1", "--", "hi"])
+  expect(after(args(), "resume")).toBe(`w1\n--\n${READ_NOTE}\n\nhi`)
 })
 
 test("a ghost has no shell and can't write; a read-only agent keeps the network for onyx research", async () => {
   const { run, args } = fakeCodex([started, done])
   await runAgent({ ...run, tools: NO_TOOLS })
   expect(args()).toContain(`sandbox_mode="read-only"`)
+  // nothing to read with: told nothing about reading
+  expect(args().at(-1)).toBe("hi")
   expect(args().join(" ")).toContain("--disable shell_tool --disable unified_exec")
   await runAgent({ ...run, tools: readOnlyTools(["onyx research *"]) })
+  expect(args()).toContain(`sandbox_mode="workspace-write"`)
   expect(args()).toContain("sandbox_workspace_write.network_access=true")
+  expect(args()).toContain(`sandbox_workspace_write.writable_roots=["/runs/r"]`)
   expect(args()).not.toContain("shell_tool")
 })
 

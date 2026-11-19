@@ -112,7 +112,7 @@ onyx research steer onyx/research.json "try caching the factorisation"
 - Start `run` in a terminal that stays open (tmux, or a background job): the machine must stay awake and online for the run.
 - Watch it in Onyx: its hypotheses, experiments and insights are graph items and jobs like the rest of the org's work, under a campaign named after the run.
 - `steer` leaves a note for the var-op, the agent that decides what's tried next; it reads it the next time it's woken.
-- Ctrl+C stops the run. `onyx research run` on the same config carries it on, with the same deadline.
+- Ctrl+C stops the run. `onyx research run` on the same config carries it on, with the same deadline; `--minutes <n>` gives it more time, and resumes a run whose time is up.
 - Before a long run, work out the cost: each worker's turn is a coding-agent session, and a run's total is printed when it stops.
 
 ## 9. Endpoints on other machines: sites

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { NO_TOOLS, readOnlyTools, workerTools } from "./agents"
-import { gateFiles, judge, runGate, simpleCommands } from "./gate"
+import { gateFiles, judge, onlyReads, patchPaths, runGate, simpleCommands } from "./gate"
 
 const sh = (command: string) => ({ command })
 const ok = { allow: true } as const
@@ -85,4 +85,85 @@ test("the hook refuses with exit 2, says why, and keeps what it refused and let 
   // no rules, or a call it can't read: nothing gets through
   expect(runGate(join(dir, "none.json"), "{}").exit).toBe(2)
   expect(runGate(rules, "not json").exit).toBe(2)
+})
+
+test("an agent that may read files may read them with its shell, as Codex does", () => {
+  const r = readOnlyTools(["onyx research aspect *"])
+  for (const c of [
+    "cat model.py",
+    "sed -n '1,200p' onyx/endpoints/cyclelife.md",
+    "sed -n '1,80p;120,160p' model.py | nl -ba",
+    "rg -n 'def fit' --glob '*.py'",
+    "rg --files",
+    "find . -name '*.py' -not -path './.venv/*'",
+    "cd /repo && ls -la && wc -l model.py",
+    `grep -rn "val_mape" onyx`,
+    "ls src/*.py",
+  ])
+    expect([c, judge(r, "Bash", sh(c))]).toEqual([c, ok])
+  // and look at an image, as Read does
+  expect(judge(r, "view_image", { path: "plots/batch3.png" })).toEqual(ok)
+  expect(judge(NO_TOOLS, "view_image", { path: "x.png" }).allow).toBe(false)
+  // still only its own onyx research command
+  expect(judge(r, "Bash", sh("cat x && onyx research propose y")).allow).toBe(false)
+})
+
+test("a read that writes or runs a program is refused", () => {
+  for (const c of [
+    "sed -i 's/a/b/' model.py",
+    "sed -n '1w out' model.py",
+    "sed -n 'e python x.py' model.py",
+    "sed -n -f script.sed model.py",
+    "sed -n '1,5p' -i model.py",
+    "find . -exec python {} ;",
+    "find . -name x -delete",
+    "find . -fprint out",
+    "find * -name x",
+    "rg --pre python x",
+    "rg --pre=./x.sh y",
+    "rg $FLAGS x",
+    "python model.py",
+    "sort -o x y",
+  ])
+    expect([c, onlyReads(c)]).toEqual([c, false])
+  const r = readOnlyTools(["onyx research aspect *"])
+  expect(judge(r, "Bash", sh("cat x > y")).allow).toBe(false)
+  expect(judge(r, "Bash", sh("cat $(python x.py)")).allow).toBe(false)
+  // an agent with no Read reads nothing with its shell
+  expect(
+    judge(
+      { tools: ["Bash"], allow: ["Bash(onyx research *)"], mode: "dontAsk" },
+      "Bash",
+      sh("cat x")
+    ).allow
+  ).toBe(false)
+})
+
+test("a worker's edits stay in its directories", () => {
+  const w = { ...workerTools(), writable: ["/runs/r/worktrees/a", "/runs/r/experiments/a"] }
+  const patch = (...files: string[]) => ({
+    command: `*** Begin Patch\n${files.map((f) => `*** Update File: ${f}\n@@\n-a\n+b`).join("\n")}\n*** End Patch`,
+  })
+  expect(
+    patchPaths(
+      "*** Begin Patch\n*** Add File: x.py\n+1\n*** Update File: y.py\n*** Move to: z.py\n"
+    )
+  ).toEqual(["x.py", "y.py", "z.py"])
+  expect(judge(w, "apply_patch", patch("model.py"))).toEqual(ok)
+  expect(
+    judge(w, "apply_patch", patch("/runs/r/worktrees/a/sub/x.py", "/runs/r/experiments/a/notes.md"))
+  ).toEqual(ok)
+  for (const f of [
+    "../b/model.py",
+    "/home/u/.bashrc",
+    "/runs/r/worktrees/ab/y",
+    "/runs/r/state.json",
+  ])
+    expect([f, judge(w, "apply_patch", patch("model.py", f)).allow]).toEqual([f, false])
+  expect(
+    judge(w, "apply_patch", { command: "*** Begin Patch\n*** Move to: ../../x\n" }).allow
+  ).toBe(false)
+  expect(judge(w, "apply_patch", { command: "*** Begin Patch\n*** End Patch" }).allow).toBe(false)
+  // rules with nowhere named (Claude Code's own, say) don't limit where
+  expect(judge(workerTools(), "apply_patch", patch("/anywhere/x"))).toEqual(ok)
 })
