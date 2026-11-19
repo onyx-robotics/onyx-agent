@@ -7,7 +7,7 @@ You can let your coding agent do most of it. Step 1 is yours (`onyx setup` also 
 ## What you need
 
 - **Linux or macOS.** On Windows, use WSL: the agents run as Unix processes.
-- **git**, and **[Bun](https://bun.sh)** 1.3.14 or later.
+- **git**. (`onyx` is a standalone binary: no Bun or Node needed.)
 - **A coding agent**, signed in (Claude Code or Codex CLI), to set the run up with you. A run's own agents are [Claude Code](https://claude.com/claude-code) or [Codex CLI](https://github.com/openai/codex) sessions, whichever the config's `agent` names (Claude Code by default), so a run needs that one signed in (`claude` or `codex` works in your terminal), and spends its usage.
 - **An account in an Onyx org**, and, for a site (step 9), someone with the org's **admin** role to approve it. That may be you.
 - **A git repository** with the code to improve, and a remote you can push to. Workers push their branches there.
