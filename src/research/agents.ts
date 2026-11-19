@@ -1,10 +1,12 @@
 /**
- * Agents are Claude Code sessions run headless (`claude -p`), with the user's own `claude` login.
- * Every agent but the base is a fork of the base agent's session, so it starts knowing the
- * codebase; a session is resumed by id to carry on (a worker after its experiments end, the
- * var-op when it's woken). Linux and macOS.
+ * Agents are sessions of a coding agent's CLI run headless, with the user's own login to it
+ * (agent-claude.ts says how for Claude Code). Every agent but the base is a fork of the base
+ * agent's session, so it starts knowing the codebase; a session is resumed by id to carry on (a
+ * worker after its experiments end, the var-op when it's woken). Linux and macOS.
  */
 import { appendFileSync } from "node:fs"
+
+import { claude } from "./agent-claude"
 
 export interface AgentRun {
   prompt: string
@@ -94,30 +96,30 @@ export const NO_TOOLS: AgentTools = { tools: [], allow: [], mode: "dontAsk" }
 /** after an agent exits, how long its output is read for (a command it started may hold it open) */
 const OUTPUT_GRACE_MS = 3_000
 
+/**
+ * One turn of a coding agent's CLI: the command for it, and what its output says. runAgent runs
+ * it, and stops, times out and logs it the same for every CLI.
+ */
+export interface AgentCli {
+  turn(a: AgentRun): AgentTurn
+}
+
+export interface AgentTurn {
+  argv: string[]
+  /** what the turn said: its session, its last message, whether it ended well, what was refused */
+  result(out: string, err: string, exitCode: number | null): Omit<AgentResult, "aborted">
+}
+
+/** the CLIs a run's agents can be sessions of, by command */
+export const AGENT_CLIS: Record<string, AgentCli> = { claude }
+
 export async function runAgent(a: AgentRun): Promise<AgentResult> {
-  const t = a.tools
-  const args = [
-    "-p",
-    a.prompt,
-    "--output-format",
-    "json",
-    "--model",
-    a.model,
-    // each rule its own argument: a rule may have spaces in it (`Bash(onyx research *)`)
-    "--tools",
-    ...(t.tools.length ? t.tools : [""]),
-    ...(t.allow.length ? ["--allowedTools", ...t.allow] : []),
-    "--permission-mode",
-    t.mode,
-  ]
-  if (a.resume) args.push("--resume", a.resume)
-  if (a.resume && a.fork) args.push("--fork-session")
-  for (const d of a.addDirs ?? []) args.push("--add-dir", d)
+  const turn = AGENT_CLIS[AGENT_CLI]!.turn(a)
   appendFileSync(
     a.log,
     `\n==== ${new Date().toISOString()} ${a.resume ? (a.fork ? `fork of ${a.resume}` : `resume ${a.resume}`) : "new"}\n${a.prompt}\n----\n`
   )
-  const proc = Bun.spawn([AGENT_CLI, ...args], {
+  const proc = Bun.spawn(turn.argv, {
     cwd: a.cwd,
     env: { ...process.env, ...a.env },
     stdout: "pipe",
@@ -139,23 +141,5 @@ export async function runAgent(a: AgentRun): Promise<AgentResult> {
   a.signal?.removeEventListener("abort", stop)
   const aborted = a.signal?.aborted ?? false
   appendFileSync(a.log, `${out}\n${err ? `stderr: ${err}\n` : ""}`)
-  try {
-    const r = JSON.parse(out) as {
-      session_id?: string
-      result?: string
-      is_error?: boolean
-      permission_denials?: { tool_input?: { command?: unknown } }[]
-    }
-    return {
-      session: r.session_id ?? null,
-      text: r.result ?? "",
-      ok: !r.is_error && proc.exitCode === 0,
-      aborted,
-      denied: (r.permission_denials ?? [])
-        .map((d) => d.tool_input?.command)
-        .filter((c): c is string => typeof c === "string"),
-    }
-  } catch {
-    return { session: null, text: err || out, ok: false, aborted, denied: [] }
-  }
+  return { ...turn.result(out, err, proc.exitCode), aborted }
 }
