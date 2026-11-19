@@ -220,6 +220,8 @@ export function judge(t: GateRules, toolName: string, toolInput: unknown): Verdi
       ? { allow: true }
       : { allow: false, reason: `\`${out}\` is outside the directories this agent edits in` }
   }
+  // Codex's way to look at an image, which Claude Code's Read does
+  if (toolName === "view_image" && t.allow.includes("Read")) return { allow: true }
   if (command === null)
     return { allow: false, reason: `${toolName} isn't one of this agent's tools` }
   const rules = shellRules(t)

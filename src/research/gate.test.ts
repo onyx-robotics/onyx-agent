@@ -101,6 +101,9 @@ test("an agent that may read files may read them with its shell, as Codex does",
     "ls src/*.py",
   ])
     expect([c, judge(r, "Bash", sh(c))]).toEqual([c, ok])
+  // and look at an image, as Read does
+  expect(judge(r, "view_image", { path: "plots/batch3.png" })).toEqual(ok)
+  expect(judge(NO_TOOLS, "view_image", { path: "x.png" }).allow).toBe(false)
   // still only its own onyx research command
   expect(judge(r, "Bash", sh("cat x && onyx research propose y")).allow).toBe(false)
 })
