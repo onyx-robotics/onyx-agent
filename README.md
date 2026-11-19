@@ -5,7 +5,7 @@
 - **`onyx`**, the command line: sign in, read the graph, log work, ingest files, queue jobs, keep your org's vocabulary as code.
 - **`onyx research`**: autoresearch on your machine. Agents run experiments on your codebase in parallel, and what they learn goes into your org's knowledge graph.
 - **The SDK** (`@onyx-robotics/agent/sdk`): `OnyxClient`, for agents, scripts and integrations.
-- **Skills for coding agents** (`skills/`): how a coding agent (Claude Code, Codex CLI, Gemini CLI or opencode) uses `onyx`, and set a repository up for a research run.
+- **Skills for coding agents** (`skills/`): how a coding agent (Claude Code or Codex CLI) uses `onyx`, and set a repository up for a research run.
 
 **New to Onyx?** [GETTING_STARTED.md](GETTING_STARTED.md) takes you from installing to your first research run, endpoints on other machines included.
 

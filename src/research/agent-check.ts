@@ -1,5 +1,5 @@
 /**
- * The coding agents Onyx's docs and tools name, and how to check one's CLI on this machine:
+ * The coding agents a run's agents can be sessions of, and how to check one's CLI on this machine:
  * installed, and signed in where its CLI can say. `onyx research` checks its config's `agent`, the
  * agent its runs' sessions are of, before it starts.
  */
@@ -10,7 +10,7 @@ import { DEFAULT_AGENT } from "./agents"
 /** A command's exit status and output (stdout and stderr); status null when it couldn't run. */
 export type Exec = (cmd: string, args: string[]) => { status: number | null; stdout: string }
 
-/** How to check a coding agent's CLI: the ones Onyx's docs and tools name. */
+/** How to check a coding agent's CLI. */
 export interface AgentCheck {
   name: string
   install: string
@@ -50,18 +50,6 @@ export const AGENTS: Record<string, AgentCheck> = {
       if (/not logged in/i.test(r.stdout)) return false
       return r.status === 0 ? true : null
     },
-  },
-  gemini: {
-    name: "Gemini CLI",
-    install: "https://github.com/google-gemini/gemini-cli",
-    keyVars: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-    login: "gemini (it asks you to sign in the first time)",
-  },
-  opencode: {
-    name: "opencode",
-    install: "https://opencode.ai",
-    keyVars: [],
-    login: "opencode auth login",
   },
 }
 

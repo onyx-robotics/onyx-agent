@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { DEFAULT_AGENT } from "./agents"
+import { AGENT_CLIS, DEFAULT_AGENT } from "./agents"
 import { AGENTS } from "./agent-check"
 import { problems, type Exec } from "./preflight"
 
@@ -23,6 +23,10 @@ function machine(answers: Record<string, { status: number | null; stdout?: strin
 describe("research preflight", () => {
   test("it checks the agent the run starts, which it knows how to check", () => {
     expect(AGENTS[DEFAULT_AGENT]).toBeDefined()
+  })
+
+  test("it knows how to check exactly the agents a run's agents can be", () => {
+    expect(Object.keys(AGENTS).sort()).toEqual(Object.keys(AGENT_CLIS).sort())
   })
 
   test("a ready machine has no problems", () => {
