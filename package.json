@@ -1,6 +1,6 @@
 {
   "name": "@onyx-robotics/agent",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Onyx from a shell: the onyx CLI, a TypeScript SDK for the Onyx API, and the research runtime that runs agents on your machine.",
   "keywords": [
     "onyx",
