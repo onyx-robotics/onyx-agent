@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { NO_TOOLS, readOnlyTools, runAgent, workerTools, type AgentRun } from "./agents"
-import { READ_NOTE } from "./agent-codex"
+import { EDIT_NOTE, READ_NOTE } from "./agent-codex"
 
 /**
  * A `codex` first on PATH: it keeps its arguments, prints `events` (JSONL, as `codex exec --json`
@@ -84,16 +84,17 @@ test("a worker's turn: its gate as the hook, edits only in its directories, no s
   })
   // no model: the user's Codex default; the prompt last, after --
   expect(a).not.toContain("-m")
-  expect(after(a, "--")).toBe(`${READ_NOTE}\n\nhi`)
+  // a worker is told it reads with its shell and edits with apply_patch, where it may
+  expect(after(a, "--")).toBe(`${READ_NOTE} ${EDIT_NOTE}\n\nhi`)
 })
 
 test("a fork and a resume of a session, by id, on the config's model", async () => {
   const { run, args } = fakeCodex([started, done])
   await runAgent({ ...run, resume: "base", fork: true, model: "gpt-x" })
-  expect(after(args(), "fork")).toBe(`base\n--\n${READ_NOTE}\n\nhi`)
+  expect(after(args(), "fork")).toBe(`base\n--\n${READ_NOTE} ${EDIT_NOTE}\n\nhi`)
   expect(args()).toContain("gpt-x")
   await runAgent({ ...run, resume: "w1" })
-  expect(after(args(), "resume")).toBe(`w1\n--\n${READ_NOTE}\n\nhi`)
+  expect(after(args(), "resume")).toBe(`w1\n--\n${READ_NOTE} ${EDIT_NOTE}\n\nhi`)
 })
 
 test("a ghost has no shell and can't write; a read-only agent keeps the network for onyx research", async () => {
@@ -108,6 +109,8 @@ test("a ghost has no shell and can't write; a read-only agent keeps the network 
   expect(args()).toContain("sandbox_workspace_write.network_access=true")
   expect(args()).toContain(`sandbox_workspace_write.writable_roots=["/runs/r"]`)
   expect(args()).not.toContain("shell_tool")
+  // it reads but doesn't edit: told nothing about apply_patch
+  expect(after(args(), "--")).toBe(`${READ_NOTE}\n\nhi`)
 })
 
 test("a failed turn says why", async () => {

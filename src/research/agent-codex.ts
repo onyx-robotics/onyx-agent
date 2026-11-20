@@ -63,7 +63,23 @@ function overrides(a: AgentRun, rulesPath: string): string[] {
 export const READ_NOTE =
   "You read files with your shell: commands that only read (`cat`, `head`, `tail`, `nl`, " +
   "`sed -n '<from>,<to>p' <file>`, `rg`, `grep`, `find` without `-exec` or `-delete`, `ls`, `wc`) " +
-  "are allowed besides the commands named below. Anything that writes or runs a program is refused."
+  "are allowed besides the commands named below. Any other command that writes or runs a program is refused."
+
+/**
+ * A worker edits with apply_patch, and its gate lets a patch through only where it edits: told
+ * so, as it's otherwise told only of the commands it may run, it writes its state file there
+ * instead of deciding it can't write one (or reaching for /tmp, a `<(…)` or a file it's testing).
+ */
+export const EDIT_NOTE =
+  "You create and edit files with apply_patch, only inside your working directory and the " +
+  "directories you're given (not /tmp). Write your state for `onyx research finish --state <file>` " +
+  "to a new file there, such as `onyx-state.md` in your working directory."
+
+/** what a Codex agent is told before the run's prompt: how it reads, and how it edits */
+const notes = (a: AgentRun) =>
+  [...(a.tools.allow.includes("Read") ? [READ_NOTE] : []), ...(edits(a) ? [EDIT_NOTE] : [])].join(
+    " "
+  )
 
 export const codex: AgentCli = {
   provider: "openai",
@@ -91,7 +107,8 @@ export const codex: AgentCli = {
     ]
     if (a.resume) argv.push(a.fork ? "fork" : "resume", a.resume)
     // after `--`: a prompt that starts with a dash is still the prompt
-    argv.push("--", a.tools.allow.includes("Read") ? `${READ_NOTE}\n\n${a.prompt}` : a.prompt)
+    const note = notes(a)
+    argv.push("--", note ? `${note}\n\n${a.prompt}` : a.prompt)
 
     return {
       argv,
