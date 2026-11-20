@@ -47,6 +47,7 @@
     "dist/**/*.js.map",
     "skills",
     "GETTING_STARTED.md",
+    "docs",
     "CHANGELOG.md"
   ],
   "publishConfig": {
@@ -56,7 +57,7 @@
   "scripts": {
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src",
+    "test": "bun test src scripts",
     "build": "bun scripts/build.ts",
     "compile": "bun scripts/compile.ts",
     "format": "prettier --write .",

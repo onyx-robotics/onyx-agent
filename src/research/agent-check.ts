@@ -1,16 +1,16 @@
 /**
- * The coding agents Onyx's docs and tools name, and how to check one's CLI on this machine:
- * installed, and signed in where its CLI can say. `onyx research` checks AGENT_CLI, the agent its
- * runs' sessions are of, before it starts.
+ * The coding agents a run's agents can be sessions of, and how to check one's CLI on this machine:
+ * installed, and signed in where its CLI can say. `onyx research` checks its config's `agent`, the
+ * agent its runs' sessions are of, before it starts.
  */
 import { spawnSync } from "node:child_process"
 
-import { AGENT_CLI } from "./agents"
+import { DEFAULT_AGENT } from "./agents"
 
 /** A command's exit status and output (stdout and stderr); status null when it couldn't run. */
 export type Exec = (cmd: string, args: string[]) => { status: number | null; stdout: string }
 
-/** How to check a coding agent's CLI: the ones Onyx's docs and tools name. */
+/** How to check a coding agent's CLI. */
 export interface AgentCheck {
   name: string
   install: string
@@ -42,25 +42,14 @@ export const AGENTS: Record<string, AgentCheck> = {
   codex: {
     name: "Codex CLI",
     install: "https://github.com/openai/codex",
-    keyVars: ["OPENAI_API_KEY", "CODEX_API_KEY"],
+    // codex exec reads CODEX_API_KEY; an OPENAI_API_KEY in the environment alone doesn't sign it in
+    keyVars: ["CODEX_API_KEY"],
     login: "codex login",
     signedIn(run) {
       const r = run("codex", ["login", "status"])
       if (/not logged in/i.test(r.stdout)) return false
       return r.status === 0 ? true : null
     },
-  },
-  gemini: {
-    name: "Gemini CLI",
-    install: "https://github.com/google-gemini/gemini-cli",
-    keyVars: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-    login: "gemini (it asks you to sign in the first time)",
-  },
-  opencode: {
-    name: "opencode",
-    install: "https://opencode.ai",
-    keyVars: [],
-    login: "opencode auth login",
   },
 }
 
@@ -80,7 +69,7 @@ export const exec: Exec = (cmd, args) => {
 
 /** A coding agent's CLI on this machine: its version line, and what's wrong (null: nothing). */
 export function checkAgent(
-  agent: string = AGENT_CLI,
+  agent: string = DEFAULT_AGENT,
   run: Exec = exec,
   env: Record<string, string | undefined> = process.env
 ): { name: string; version: string | null; problem: string | null } {

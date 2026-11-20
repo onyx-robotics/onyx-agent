@@ -7,23 +7,23 @@ You can let your coding agent do most of it. Step 1 is yours (`onyx setup` also 
 ## What you need
 
 - **Linux or macOS.** On Windows, use WSL: the agents run as Unix processes.
-- **git**, and **[Bun](https://bun.sh)** 1.3.14 or later.
-- **A coding agent**, signed in (Claude Code, Codex CLI, Gemini CLI or opencode), to set the run up with you. A run's own agents are [Claude Code](https://claude.com/claude-code) sessions today, so a run needs Claude Code signed in (`claude` works in your terminal), and spends its usage.
+- **git**. (`onyx` is a standalone binary: no Bun or Node needed.)
+- **A coding agent**, signed in (Claude Code or Codex CLI), to set the run up with you. A run's own agents are [Claude Code](https://claude.com/claude-code) or [Codex CLI](https://github.com/openai/codex) sessions, whichever the config's `agent` names (Claude Code by default), so a run needs that one signed in (`claude` or `codex` works in your terminal), and spends its usage.
 - **An account in an Onyx org**, and, for a site (step 9), someone with the org's **admin** role to approve it. That may be you.
 - **A git repository** with the code to improve, and a remote you can push to. Workers push their branches there.
 
 ## 1. Install and sign in
 
 ```bash
-git clone git@github.com:onyx-robotics/onyx.git && onyx/install.sh   # builds onyx from main into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/onyx-robotics/onyx-agent/main/scripts/install.sh | sh   # the onyx binary for this machine, into ~/.local/bin
 onyx setup        # checks git and your coding agent, signs you in, installs the skills
 ```
 
-To update onyx later: `git -C onyx pull && onyx/install.sh`. `onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
+To update onyx later, run the same line again: it installs the latest release. It needs neither Bun nor Node. `onyx setup` marks anything missing as `todo`; fix it and run it again. Signing in approves this machine in your browser, where you pick the org (`onyx login` on its own does just that, and `onyx whoami` says who you act as).
 
 ## 2. Give your coding agent the skills
 
-`onyx setup` did this: it installed the package's two skills in `~/.claude/skills` (where Claude Code reads them; another coding agent gets the same files from the package's `skills/`), `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you). `onyx setup --project` puts them in the repository's `.claude/skills` instead.
+`onyx setup` did this: it installed the package's two skills where each coding agent it found reads them, `~/.claude/skills` for Claude Code and `~/.codex/skills` for Codex CLI (another coding agent gets the same files from the package's `skills/`): `onyx` (read and log in the graph, start and steer runs) and `onyx-research-setup` (set a repository up for a run, with you). `onyx setup --project` puts them in the repository's `.claude/skills` and `.agents/skills` instead.
 
 From here, in your repository: ask your coding agent to set up an Onyx research run. The rest of this guide is the same steps by hand.
 
@@ -33,8 +33,7 @@ Write these down before anything else; every later file comes from them.
 
 - **The goal**, in a few sentences an agent can act on: what to make better, what must stay true (correctness, safety limits), and anything an agent wouldn't know (where the hardware is, what's been tried).
 - **The metrics**, each with a direction: `speedup` higher, `error_mm` lower. Name them `<namespace>.<name>` (step 4), for example `solver.speedup`.
-- **What agents may edit**: the files that hold the method (`solver.py`, `calibrate.py`). Everything else is read only to them, the measurement included.
-- **The quick evaluation**: a command that checks a change is ready to send, in well under a minute (a few samples, a compile, a unit test). It isn't the experiment.
+- **What agents may edit**: the files that hold the method (`solver.py`, `calibrate.py`). Everything else is read only to them. The measurement (`onyx/endpoints` by default) changes only when the var-op proposes it as a hypothesis of its own.
 - **Where experiments run**: an **endpoint**, a kind of machine that runs one experiment and reports its metrics. A benchmark on your own machine is the simplest (steps 5 to 8). A robot, a GPU box or a lab bench is a **site** (step 9).
 
 ## 4. Name your project's vocabulary
@@ -70,7 +69,6 @@ Run the driver once yourself from the repository's root, and check its last line
   "remote": "git@github.com:you/project.git",
   "baseBranch": "main",
   "editable": ["solver.py"],
-  "evaluate": "python onyx/endpoints/bench.py --samples 8",
   "metrics": [
     { "key": "solver.speedup", "better": "higher" },
     { "key": "solver.valid_fraction", "better": "higher" }
@@ -90,9 +88,9 @@ Run the driver once yourself from the repository's root, and check its last line
 }
 ```
 
-- `capacity` is how many experiments an endpoint runs at once; `timeoutS`, when one is given up on.
+- `capacity` is how many experiments an endpoint runs at once; `timeoutS`, the time limit per experiment the run starts with: a hard cutoff sent with each experiment to its driver, which you can change during a run (`onyx research limit onyx/research.json <endpoint> <seconds>`).
 - `workers` is how many agents work at once, and `minutes` how long the run proposes new hypotheses. Each worker holds a slot only while it's thinking: one waiting on its experiment frees its slot for another.
-- `models` (base, var-op, worker) and `experimentsPerTask` (a safety ceiling per hypothesis) have defaults.
+- `agent` (`claude`, the default, or `codex`: the coding agent the run's agents are sessions of), `models` (base, var-op, worker, ghost: by default the agent's own choice for each) and `experimentsPerTask` (a safety ceiling per hypothesis) have defaults.
 
 Add `.onyx-research/` to `.gitignore` (the run's state lives there), then commit and push `baseBranch` to `remote`.
 
@@ -102,7 +100,7 @@ Add `.onyx-research/` to `.gitignore` (the run's state lives there), then commit
 onyx research setup onyx/research.json
 ```
 
-A base agent reads the code, runs the quick evaluation, reads the endpoint guides, and records the aspects of the system experiments will be about. Every other agent of the run starts from it, so read its summary: if it misunderstood the problem, fix the goal or the guide and set up again.
+A base agent reads the code and the endpoint guides, and records the aspects of the system experiments will be about. Every other agent of the run starts from it, so read its summary: if it misunderstood the problem, fix the goal or the guide and set up again.
 
 ## 8. Run, watch and steer
 
@@ -114,7 +112,7 @@ onyx research steer onyx/research.json "try caching the factorisation"
 - Start `run` in a terminal that stays open (tmux, or a background job): the machine must stay awake and online for the run.
 - Watch it in Onyx: its hypotheses, experiments and insights are graph items and jobs like the rest of the org's work, under a campaign named after the run.
 - `steer` leaves a note for the var-op, the agent that decides what's tried next; it reads it the next time it's woken.
-- Ctrl+C stops the run. `onyx research run` on the same config carries it on, with the same deadline.
+- Ctrl+C stops the run. `onyx research run` on the same config carries it on, with the same deadline; `--minutes <n>` gives it more time, and resumes a run whose time is up.
 - Before a long run, work out the cost: each worker's turn is a coding-agent session, and a run's total is printed when it stops.
 
 ## 9. Endpoints on other machines: sites
@@ -123,7 +121,7 @@ When experiments need hardware (a robot, a rig, a GPU box), they run on a **site
 
 **On the site's machine:**
 
-1. Install `onyx-site`. It isn't published as a package yet: it's installed from the Onyx repository (`python/site-runner`, whose `SETUP.md` is the full guide). Ask your Onyx contact for access.
+1. Install `onyx-site` from PyPI, as the user that will run it: `uv tool install onyx-site` (or `pip install --user onyx-site`). Its README on PyPI covers enrolling it, running it and writing a driver.
 2. Write its site file. For an experiment that's a program in your repository, the shipped `local_program` driver runs it from the experiment's commit:
 
    ```toml
@@ -154,11 +152,11 @@ When experiments need hardware (a robot, a rig, a GPU box), they run on a **site
    fidelity = "sim"                                 # "hardware" for a physical rig
    ```
 
-   The site fetches each experiment's commit itself, with a read-only deploy key of its own (`ssh_key`). Make one on the site's machine, add its `.pub` to your repository as a deploy key without write access (`gh repo deploy-key add keys/solver_ro.pub -R you/project`), and have the site's user trust GitHub's host key, since the site won't fetch from a host it doesn't know (`gh api meta -q '.ssh_keys[]' | sed 's/^/github.com /' >> ~/.ssh/known_hosts`). `SETUP.md`, "Giving the site read access to a repository", has the steps and a check.
+   The site fetches each experiment's commit itself, with a read-only deploy key of its own (`ssh_key`). Make one on the site's machine, add its `.pub` to your repository as a deploy key without write access (`gh repo deploy-key add keys/solver_ro.pub -R you/project`), and have the site's user trust GitHub's host key, since the site won't fetch from a host it doesn't know (`gh api meta -q '.ssh_keys[]' | sed 's/^/github.com /' >> ~/.ssh/known_hosts`). [docs/sites/SETUP.md](docs/sites/SETUP.md), "Giving the site read access to a repository", has the steps and a check.
 
-   A program run this way reports its metrics in `$ONYX_OUT/metrics.json` (`{"solver.speedup": 3.2}`), not in a `METRICS` line, and everything it writes to `$ONYX_OUT` is kept: the run downloads those files for the worker that sent the experiment. The worker's packet path is in `$ONYX_PARAMS` (`params.json`, the job's props). Hardware that needs a long-lived connection gets a driver of its own (`DRIVERS.md`).
+   A program run this way reports its metrics in `$ONYX_OUT/metrics.json` (`{"solver.speedup": 3.2}`), not in a `METRICS` line, and everything it writes to `$ONYX_OUT` is kept: the run downloads those files for the worker that sent the experiment. The worker's packet path is in `$ONYX_PARAMS` (`params.json`, the job's props). Hardware that needs a long-lived connection gets a driver of its own ([docs/sites/DRIVERS.md](docs/sites/DRIVERS.md)).
 
-3. Enrol it: `onyx-site enrol`, and an admin approves the code it prints. Then `onyx-site run`, as a service (`SETUP.md`, step 7).
+3. Enrol it: `onyx-site enrol`, and an admin approves the code it prints. Then `onyx-site run`, as a service ([docs/sites/SETUP.md](docs/sites/SETUP.md), step 5).
 
 **In the run's config**, the endpoint names the site instead of a driver:
 

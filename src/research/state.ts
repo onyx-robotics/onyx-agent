@@ -13,6 +13,14 @@ export interface WorkerState {
   hypothesis: string
   /** the hypothesis's title, for its later turns' jobs */
   title?: string
+  /** a measurement hypothesis: its worker may change the measurement paths */
+  measurement?: boolean
+  /** what it said at the end of its latest turn */
+  lastText?: string
+  /** the commands its latest turn had refused */
+  denied?: string[]
+  /** how it ended: the var-op is told, a failure with its reason */
+  ended?: { outcome: string; reason?: string }
   /** the worker's ai_agent entity */
   agent: string
   session: string | null
@@ -26,7 +34,7 @@ export interface WorkerState {
   phase: "starting" | "running" | "waiting" | "queued" | "done"
   /**
    * Each turn is a worker_task job, holding its slot only while the turn runs (docs/research.md,
-   * "Worker turns"): the job of the turn running now, or of the one queued. The first is `task`.
+   * "The queue"): the job of the turn running now, or of the one queued. The first is `task`.
    */
   turnJob?: string | null
   /** turns started so far */
@@ -50,6 +58,10 @@ export interface ExperimentResult {
   status: string | null
   outcome: string | null
   metrics: Record<string, number>
+  /** what it was for (tools.ts EXPERIMENT_KINDS): measure, diagnose, repeat, ablate, variant */
+  kind?: string
+  /** which measurement it ran with (git.ts measurementOf): only results with the same compare */
+  measurement?: string
   logTail: string
   /** a site's experiment: where its files were downloaded to, and their paths in it */
   filesDir?: string
@@ -61,8 +73,19 @@ export interface RunState {
   campaign: string
   /** the supervisor's own agent (its API key's) */
   supervisor: string
-  base: { agent: string; session: string | null }
-  varop: { agent: string; session: string | null; lastWake: number; wakes: number }
+  /** cli: the coding agent its session is of (unset: claude, from before a run could choose) */
+  base: { agent: string; session: string | null; cli?: string }
+  varop: {
+    agent: string
+    /** its last wake's session (each wake is a fresh fork of the base agent's) */
+    session: string | null
+    lastWake: number
+    wakes: number
+    /** its last wake queued no new hypothesis: a short queue alone doesn't wake it again */
+    idle?: boolean
+    /** the commands its last wake had refused: its next wake is told */
+    refused?: string[]
+  }
   startedAt: number
   deadline: number
   workers: Record<string, WorkerState>
@@ -132,4 +155,18 @@ export function runFromEnv(): RunDir {
   const dir = process.env.ONYX_RESEARCH_RUN
   if (!dir) throw new Error("ONYX_RESEARCH_RUN isn't set: this command runs inside a research run")
   return new RunDir(dir)
+}
+
+/**
+ * The base agent's session, to fork the run's agents from: there once setup has run, and of the
+ * config's agent (a session of one CLI can't carry on in another).
+ */
+export function baseSession(state: RunState, cfg: { agent: string }): string {
+  if (!state.base.session) throw new Error("no base agent yet: run setup first")
+  const cli = state.base.cli ?? "claude"
+  if (cli !== cfg.agent)
+    throw new Error(
+      `the base agent is a ${cli} session and the config's agent is ${cfg.agent}: run onyx research setup again`
+    )
+  return state.base.session
 }

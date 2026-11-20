@@ -72,6 +72,29 @@ export function commitAndPush(worktree: string, branch: string, message: string)
   return git(worktree, "rev-parse", "HEAD")
 }
 
+/** The paths under `paths` that differ in the worktree from `base`: committed or not, new files too. */
+export function changedPaths(worktree: string, base: string, paths: string[]): string[] {
+  if (!paths.length) return []
+  const diff = git(worktree, "diff", "--name-only", base, "--", ...paths)
+  const added = git(worktree, "ls-files", "--others", "--exclude-standard", "--", ...paths)
+  return [...new Set([...diff.split("\n"), ...added.split("\n")].filter(Boolean))]
+}
+
+/**
+ * Which measurement a commit has: one short hash of what's at `paths` in it (a path that isn't
+ * there counts as missing), so two commits measure the same way exactly when it's equal.
+ */
+export function measurementOf(repo: string, commit: string, paths: string[]): string {
+  const parts = paths.map((p) => {
+    try {
+      return `${p}:${git(repo, "rev-parse", `${commit}:${p}`)}`
+    } catch {
+      return `${p}:none`
+    }
+  })
+  return new Bun.CryptoHasher("sha1").update(parts.join("\n")).digest("hex").slice(0, 10)
+}
+
 /**
  * A clean checkout of `commit` at `path`, fetched from the remote by its branch (a remote need not
  * serve commits by sha).

@@ -4,19 +4,20 @@
  * (`ONYX_AGENT`), and to the run's directory what the supervisor needs to see.
  */
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
-import { basename } from "node:path"
+import { basename, join } from "node:path"
 import { parseArgs } from "node:util"
 
 import { FILE_MAX_BYTES } from "../generated/contracts/contracts"
 import type { KgResult } from "../generated/contracts/contracts"
 import type { OnyxClient } from "../sdk"
 
-import { runAgent } from "./agents"
-import { loadConfig, type LoadedConfig } from "./config"
-import { commitAndPush } from "./git"
+import { NO_TOOLS, runAgent } from "./agents"
+import { loadConfig, type LoadedConfig, modelFor } from "./config"
+import { changedPaths, commitAndPush, measurementOf } from "./git"
 import { client, SOURCE, upsert } from "./platform"
-import { ghostPrompt } from "./prompts"
-import { runFromEnv, type RunDir } from "./state"
+import { limitsText, timeLimits } from "./limits"
+import { ghostPrompt, PACKETS_DIR } from "./prompts"
+import { runFromEnv, type ExperimentResult, type RunDir } from "./state"
 
 export interface Board {
   tracks: { id: string; name: string; why: string; status: string; weight: number }[]
@@ -28,12 +29,21 @@ export interface Board {
     priority: number
     base: string | null
     at: number
+    /** a measurement hypothesis: it may change how results are measured */
+    measurement?: boolean
   }[]
 }
 
-/** below this, a similar insight isn't worth a worker's attention (unrelated notes score about 0.2) */
-const SIMILAR = 0.55
+/**
+ * At or above this, an insight is close enough that its writer should say how theirs relates: the
+ * embedding model scores unrelated notes about 0.8 (docs/knowledge-graph.md), so a lower bar shows
+ * a worker nearly everything. At most SIMILAR_SHOWN of them, nearest first.
+ */
+const SIMILAR = 0.88
+const SIMILAR_SHOWN = 3
 const NOTE_KINDS = ["insight", "dead_end", "promising_direction", "risk", "transfer_note"]
+/** what an experiment is for (skills/onyx-research-worker, "Common experiment shapes") */
+export const EXPERIMENT_KINDS = ["measure", "diagnose", "repeat", "ablate", "variant"]
 
 class Usage extends Error {}
 
@@ -96,6 +106,91 @@ export async function relatedText(onyx: OnyxClient, input: Parameters<OnyxClient
   return r.results.map(formatResult).join("\n")
 }
 
+/** The board as the var-op reads it: slots, tracks, hypotheses with their results, best commits. */
+export function boardText(run: RunDir, cfg: LoadedConfig): string {
+  const b = board(run)
+  const s = run.state()
+  const lines: string[] = []
+  const left = Math.max(0, Math.round((s.deadline - Date.now()) / 60_000))
+  // only a turn running holds a slot: a worker waiting on its experiments holds none
+  const workers = Object.values(s.workers)
+  const inSlots = workers.filter((w) => w.phase === "running" || w.phase === "starting").length
+  const backInLine = workers.filter((w) => w.phase === "queued").length
+  const waiting = workers.filter((w) => w.phase === "waiting").length
+  const queuedNew = b.hypotheses.filter((h) => !s.workers[h.task]).length
+  const free = Math.max(0, cfg.workers - inSlots - backInLine - queuedNew)
+  lines.push(`Time limit per experiment (a hard cutoff): ${limitsText(timeLimits(run, cfg))}.`)
+  lines.push(
+    `${left} minutes of proposing left. ${cfg.workers} worker slots: ${inSlots} running a turn now, ${backInLine} workers back in line for one, ${queuedNew} new hypotheses queued; ${waiting} workers waiting on experiments hold no slot.${free ? ` ${free} slots will sit idle: queue at least ${free} more hypotheses.` : ""}`
+  )
+  const taskState = (task: string) => {
+    const w = s.workers[task]
+    return w
+      ? w.phase === "done"
+        ? "done"
+        : w.phase === "waiting"
+          ? "waiting on an experiment (holds no slot)"
+          : w.phase === "queued"
+            ? "back in line for a slot, with its results"
+            : "running a turn in a slot"
+      : "queued"
+  }
+  lines.push("\n## Tracks")
+  for (const t of b.tracks)
+    lines.push(`- ${t.id} [${t.status}, weight ${t.weight}] ${t.name}: ${t.why}`)
+  if (!b.tracks.length) lines.push("(none yet)")
+  const measurements = new Set(Object.values(s.results).map((r) => r.measurement ?? "-"))
+  const several = measurements.size > 1
+  lines.push("\n## Hypotheses")
+  for (const h of b.hypotheses) {
+    const w = s.workers[h.task]
+    const ids = w
+      ? [...w.experiments, ...(run.read<string[]>(`workers/${w.task}/pending.json`) ?? [])]
+      : []
+    const res = ids
+      .map((x) => {
+        const r = s.results[x]
+        if (!r) return `${short(x)} in flight`
+        const m = Object.entries(r.metrics)
+          .map(([k, v]) => `${k}=${+v.toPrecision(4)}`)
+          .join(" ")
+        return `${short(r.id)} ${r.kind ?? "measure"} ${r.outcome ?? "?"} ${m} @${r.commit.slice(0, 10)}${several ? ` (measurement ${r.measurement ?? "-"})` : ""}`
+      })
+      .join("; ")
+    lines.push(
+      `- ${h.id} [${taskState(h.task)}]${h.measurement ? " [measurement]" : ""} track ${short(h.track)}: ${h.title}${res ? `\n    experiments: ${res}` : ""}`
+    )
+  }
+  if (!b.hypotheses.length) lines.push("(none yet)")
+  lines.push(
+    `\n## Best commits (diagnostic runs left out${several ? "; results measured differently are never compared" : ""})`
+  )
+  const ok = Object.values(s.results).filter(
+    (r) => r.outcome === "succeeded" && (r.kind ?? "measure") !== "diagnose"
+  )
+  const byMeasurement = new Map<string, ExperimentResult[]>()
+  for (const r of ok)
+    byMeasurement.set(r.measurement ?? "-", [...(byMeasurement.get(r.measurement ?? "-") ?? []), r])
+  if (!byMeasurement.size) byMeasurement.set("-", [])
+  for (const [measured, rs] of byMeasurement) {
+    if (several) lines.push(`Measured by ${measured}:`)
+    for (const m of cfg.metrics) {
+      const best = rs
+        .filter((r) => m.key in r.metrics)
+        .sort((a, b) =>
+          m.better === "higher"
+            ? b.metrics[m.key]! - a.metrics[m.key]!
+            : a.metrics[m.key]! - b.metrics[m.key]!
+        )
+        .slice(0, 3)
+      lines.push(
+        `- ${m.key} (${m.better}): ${best.map((r) => `${+r.metrics[m.key]!.toPrecision(4)} @${r.commit} (experiment ${r.id})`).join(", ") || "none yet"}`
+      )
+    }
+  }
+  return lines.join("\n")
+}
+
 // ---------------------------------------------------------------- commands
 
 const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<string> }> = {
@@ -123,69 +218,7 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
     help: "board: tracks, hypotheses, results and the best commits (var-op)",
     async run() {
       const e = env()
-      const b = board(e.run)
-      const s = e.run.state()
-      const lines: string[] = []
-      const left = Math.max(0, Math.round((s.deadline - Date.now()) / 60_000))
-      // only a turn running holds a slot: a worker waiting on its experiments holds none
-      const workers = Object.values(s.workers)
-      const inSlots = workers.filter((w) => w.phase === "running" || w.phase === "starting").length
-      const backInLine = workers.filter((w) => w.phase === "queued").length
-      const waiting = workers.filter((w) => w.phase === "waiting").length
-      const queuedNew = b.hypotheses.filter((h) => !s.workers[h.task]).length
-      const free = Math.max(0, e.cfg.workers - inSlots - backInLine - queuedNew)
-      lines.push(
-        `${left} minutes of proposing left. ${e.cfg.workers} worker slots: ${inSlots} running a turn now, ${backInLine} workers back in line for one, ${queuedNew} new hypotheses queued; ${waiting} workers waiting on experiments hold no slot.${free ? ` ${free} slots will sit idle: queue at least ${free} more hypotheses.` : ""}`
-      )
-      const taskState = (task: string) => {
-        const w = s.workers[task]
-        return w
-          ? w.phase === "done"
-            ? "done"
-            : w.phase === "waiting"
-              ? "waiting on an experiment (holds no slot)"
-              : w.phase === "queued"
-                ? "back in line for a slot, with its results"
-                : "running a turn in a slot"
-          : "queued"
-      }
-      lines.push("\n## Tracks")
-      for (const t of b.tracks)
-        lines.push(`- ${t.id} [${t.status}, weight ${t.weight}] ${t.name}: ${t.why}`)
-      if (!b.tracks.length) lines.push("(none yet)")
-      lines.push("\n## Hypotheses")
-      for (const h of b.hypotheses) {
-        const w = s.workers[h.task]
-        const exps = (w?.experiments ?? []).map((x) => s.results[x]).filter(Boolean)
-        const res = exps
-          .map(
-            (r) =>
-              `${short(r!.id)} ${r!.outcome ?? "?"} ${Object.entries(r!.metrics)
-                .map(([k, v]) => `${k}=${+v.toPrecision(4)}`)
-                .join(" ")} @${r!.commit.slice(0, 10)}`
-          )
-          .join("; ")
-        lines.push(
-          `- ${h.id} [${taskState(h.task)}] track ${short(h.track)}: ${h.title}${res ? `\n    experiments: ${res}` : ""}`
-        )
-      }
-      if (!b.hypotheses.length) lines.push("(none yet)")
-      lines.push("\n## Best commits")
-      const ok = Object.values(s.results).filter((r) => r.outcome === "succeeded")
-      for (const m of e.cfg.metrics) {
-        const best = ok
-          .filter((r) => m.key in r.metrics)
-          .sort((a, b) =>
-            m.better === "higher"
-              ? b.metrics[m.key]! - a.metrics[m.key]!
-              : a.metrics[m.key]! - b.metrics[m.key]!
-          )
-          .slice(0, 3)
-        lines.push(
-          `- ${m.key} (${m.better}): ${best.map((r) => `${+r.metrics[m.key]!.toPrecision(4)} @${r.commit} (experiment ${r.id})`).join(", ") || "none yet"}`
-        )
-      }
-      return lines.join("\n")
+      return boardText(e.run, e.cfg)
     },
   },
 
@@ -249,7 +282,7 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
   },
 
   propose: {
-    help: 'propose --track <track> --title "<hypothesis>" --why "<text>" [--base <commit>] [--informed-by ids] [--reworks <hypothesis>] [--about "aspect,..."] [--priority n] (var-op)',
+    help: 'propose --track <track> --title "<hypothesis>" --why "<text>" [--base <commit>] [--informed-by ids] [--reworks <hypothesis>] [--about "aspect,..."] [--priority n] [--measurement] (var-op; --measurement: it changes how results are measured)',
     async run(args) {
       const { values: o } = parseArgs({
         args,
@@ -262,6 +295,7 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
           reworks: { type: "string" },
           about: { type: "string" },
           priority: { type: "string" },
+          measurement: { type: "boolean" },
         },
       })
       if (!o.track || !o.title || !o.why)
@@ -291,6 +325,7 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
             name: o.title.slice(0, 500),
             summary: o.why.slice(0, 4000),
             status: "proposed",
+            ...(o.measurement ? { props: { measurement: true } } : {}),
             createdBy: e.agent,
           },
         ],
@@ -304,7 +339,12 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
           name: o.title.slice(0, 500),
           summary: o.why.slice(0, 4000),
           priority,
-          props: { hypothesis: id, base_commit: base ?? e.cfg.baseBranch, track: track.id },
+          props: {
+            hypothesis: id,
+            base_commit: base ?? e.cfg.baseBranch,
+            track: track.id,
+            ...(o.measurement ? { measurement: true } : {}),
+          },
           links: [{ rel: "tests", dst: id }],
           createdBy: e.agent,
         },
@@ -317,9 +357,10 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
         priority,
         base,
         at: Date.now(),
+        ...(o.measurement ? { measurement: true } : {}),
       })
       e.run.write("board.json", b)
-      return `hypothesis ${id} queued (task ${task})`
+      return `${o.measurement ? "measurement " : ""}hypothesis ${id} queued (task ${task})`
     },
   },
 
@@ -377,14 +418,17 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
       const state = readFileSync(statePath, "utf8")
       const agentItem = (await e.onyx.getEntity(author)) as { name?: string }
       const r = await runAgent({
+        agent: e.cfg.agent,
         prompt: ghostPrompt(agentItem.name ?? author, state, question),
-        model: e.cfg.models.ghost,
+        model: modelFor(e.cfg, "ghost"),
         cwd: e.run.path("repo"),
         env: {},
         resume: s.base.session ?? undefined,
         fork: true,
         log: e.run.path("logs", "ghosts.log"),
         timeoutMs: 300_000,
+        // it answers from its state, which is in the prompt
+        tools: NO_TOOLS,
       })
       return r.ok ? r.text : `the ghost couldn't answer: ${r.text.slice(0, 500)}`
     },
@@ -403,7 +447,7 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
   },
 
   experiment: {
-    help: 'experiment --endpoint <type> -m "<what it tests>" [--packet <repo path>] (worker)',
+    help: `experiment --endpoint <type> --kind ${EXPERIMENT_KINDS.join("|")} -m "<what it tests>" [--packet <repo path>] (worker)`,
     async run(args) {
       const { values: o } = parseArgs({
         args,
@@ -411,8 +455,12 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
           endpoint: { type: "string" },
           m: { type: "string", short: "m" },
           packet: { type: "string" },
+          kind: { type: "string" },
         },
       })
+      const kind = o.kind ?? "measure"
+      if (!EXPERIMENT_KINDS.includes(kind))
+        throw new Usage(`--kind: ${EXPERIMENT_KINDS.join(", ")}`)
       const e = env()
       const task = process.env.ONYX_TASK
       if (!task) throw new Usage("experiment is a worker's command")
@@ -428,13 +476,36 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
       const done = w.experiments.length + pending.length
       if (done >= e.cfg.experimentsPerTask)
         return `You've reached the run's ceiling of ${e.cfg.experimentsPerTask} experiments for one hypothesis. Record your insights, including what you'd test next and why, and finish: the var-op can give a follow-up its own hypothesis.`
+      if (o.packet && !existsSync(join(w.worktree, o.packet)))
+        throw new Usage(
+          `--packet ${o.packet}: no such file in your worktree (write packets in ${PACKETS_DIR}/)`
+        )
+      const touched = w.measurement ? [] : changedPaths(w.worktree, w.baseCommit, e.cfg.measurement)
+      if (touched.length)
+        throw new Usage(
+          `your change touches the measurement (${touched.join(", ")}): only a measurement hypothesis may change how results are measured. Put those files back as they were at ${w.baseCommit.slice(0, 10)} (git diff shows what changed), and if you think the measurement should change, say why in an insight or at the end of your turn: the var-op can propose it`
+        )
       const commit = commitAndPush(w.worktree, w.branch, o.m)
+      const measurement = measurementOf(w.worktree, commit, e.cfg.measurement)
+      // the campaign's limit as it is now, sent with the experiment: its driver stops it there
+      const timeLimit = timeLimits(e.run, e.cfg)[ep.type]!
       const id = e.onyx.newId()
+      // Fair share of a shared endpoint: the more experiments this run has in flight, the lower the
+      // priority of its next one, so a run using little of the endpoint goes ahead of one using a
+      // lot. (Two runs on one site's bench, at equal priority, were served first come: one run's
+      // slow experiments held 7 of 8 slots and the other's waited behind them.)
+      const s = e.run.state()
+      let inFlight = 0
+      for (const x of Object.values(s.workers))
+        if (x.phase !== "done")
+          for (const p of e.run.read<string[]>(`workers/${x.task}/pending.json`) ?? [])
+            if (!s.results[p]) inFlight++
       await e.onyx.submitJobs([
         {
           id,
           type: "experiment",
           on: ep.type,
+          priority: -inFlight,
           name: o.m.slice(0, 500),
           summary: o.m.slice(0, 4000),
           props: {
@@ -442,6 +513,9 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
             branch: w.branch,
             base_commit: w.baseCommit,
             packet: o.packet ?? null,
+            kind,
+            measurement,
+            time_limit_s: timeLimit,
             endpoint: ep.type,
             // what a site fetches (python/site-runner, "Writing a driver"); the ref for remotes
             // that refuse fetching by sha
@@ -455,7 +529,7 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
         },
       ])
       e.run.write(`workers/${task}/pending.json`, [...pending, id])
-      return `experiment ${id} queued on ${ep.type} at commit ${commit.slice(0, 10)}. End your turn now: you'll be resumed with its result.`
+      return `experiment ${id} queued on ${ep.type} at commit ${commit.slice(0, 10)}, time limit ${timeLimit} s. End your turn now: you'll be resumed with its result.`
     },
   },
 
@@ -486,7 +560,9 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
           types: ["note"],
           limit: 8,
         })
-        const similar = near.results.filter((r) => (r.similarity ?? 0) >= SIMILAR)
+        const similar = near.results
+          .filter((r) => (r.similarity ?? 0) >= SIMILAR)
+          .slice(0, SIMILAR_SHOWN)
         if (similar.length)
           return `Similar insights are already in the graph:\n${similar.map(formatResult).join("\n")}\n\nDecide how yours relates to each (supports, contradicts, refines, supersedes; or none), then run the same command again with --checked and a --rel <relation>:<id>[:confidence] for each that relates.`
       }
@@ -583,14 +659,8 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
       const text = readFileSync(o.state, "utf8")
       if (text.trim().length < 200)
         throw new Usage("your state is too short to answer questions from: fill in every section")
-      // a hypothesis is answered by measurement: analysis alone isn't a result the others can use
-      const submitted =
-        (e.run.state().workers[task]?.experiments.length ?? 0) +
-        (e.run.read<string[]>(`workers/${task}/pending.json`) ?? []).length
-      if (submitted === 0)
-        throw new Usage(
-          "you haven't measured anything yet: submit at least one experiment (onyx research experiment) before you finish"
-        )
+      // a hypothesis can be answered without an experiment (a thought experiment, reading the
+      // code): the state says how it was answered
       const id = e.onyx.newId()
       await e.onyx.ingest({
         items: [
@@ -599,7 +669,10 @@ const COMMANDS: Record<string, { help: string; run: (args: string[]) => Promise<
             type: "agent_state",
             name: `state of ${short(e.agent)}`,
             summary: text.slice(0, 4000),
-            props: { state_text: text.slice(0, 60_000), model: e.cfg.models.worker },
+            props: {
+              state_text: text.slice(0, 60_000),
+              model: modelFor(e.cfg, "worker") ?? `${e.cfg.agent} default`,
+            },
             createdBy: e.agent,
           },
         ],

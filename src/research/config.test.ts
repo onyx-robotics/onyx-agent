@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test"
 
 import { checkPack } from "../generated/contracts/registry/pack-format"
-import { researchConfig, vocabularyOf } from "./config"
+import { modelFor, researchConfig, vocabularyOf } from "./config"
+import { baseSession, type RunState } from "./state"
 
 test("a config's endpoints and metrics, as the definitions the run adds to the org", () => {
   const cfg = researchConfig.parse({
@@ -35,4 +36,45 @@ test("a config's endpoints and metrics, as the definitions the run adds to the o
   ])
   // what the server checks them against
   expect("pack" in checkPack({ key: "bench", version: 1, ...v })).toBe(true)
+})
+
+const minimal = {
+  name: "n",
+  goal: "g",
+  remote: "r",
+  editable: ["a.py"],
+  metrics: [{ key: "bench.t", better: "lower" }],
+  endpoints: [{ type: "bench.sim", label: "l", guide: "g.md", driver: "x" }],
+}
+
+test("a run's agents are Claude Code sessions unless its config says, and its models are the CLI's", () => {
+  const cfg = researchConfig.parse(minimal)
+  expect(cfg.agent).toBe("claude")
+  expect(["base", "varop", "worker", "ghost"].map((r) => modelFor(cfg, r as "base"))).toEqual([
+    "opus",
+    "opus",
+    "sonnet",
+    "haiku",
+  ])
+  // one the config sets is its own, and the rest stay the CLI's
+  const own = researchConfig.parse({ ...minimal, models: { worker: "opus" } })
+  expect([modelFor(own, "worker"), modelFor(own, "ghost")]).toEqual(["opus", "haiku"])
+})
+
+test("an agent the runtime can't run is refused when the config is read", () => {
+  const r = researchConfig.safeParse({ ...minimal, agent: "amp" })
+  expect(r.success).toBe(false)
+  expect(JSON.stringify(r.error?.issues)).toContain("agent: one of")
+})
+
+test("the base agent's session carries on only in the CLI it's a session of", () => {
+  const state = (cli?: string) => ({ base: { agent: "a", session: "s", cli } }) as RunState
+  // a run set up before a config could choose has a claude session
+  expect(baseSession(state(), { agent: "claude" })).toBe("s")
+  expect(() => baseSession(state("claude"), { agent: "codex" })).toThrow(
+    "run onyx research setup again"
+  )
+  expect(() =>
+    baseSession({ base: { agent: "a", session: null } } as RunState, { agent: "claude" })
+  ).toThrow("run setup first")
 })

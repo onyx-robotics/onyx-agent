@@ -4,11 +4,11 @@ Thanks for helping. Issues and pull requests are welcome here.
 
 ## How a change gets in
 
-This repository is a mirror: the code is written in Onyx's private monorepo, where this directory lives beside the server it talks to, and every merge there is synced here. So a pull request here isn't merged here:
+This repository is a mirror: the code is written in Onyx's private monorepo, where this directory lives beside the server it talks to, and each release brings everything merged there since the last one here. So a pull request here isn't merged here:
 
 1. Open it here as usual. It's reviewed here, in public, and CI runs on it.
 2. Once it's approved, a maintainer applies it in the monorepo, keeping you as its author or co-author (a `Co-authored-by:` trailer with the name and email of your commits).
-3. The sync brings it back here, and the pull request is closed with a link to the commit.
+3. The next release brings it back here, and the pull request is closed with a link to the commit.
 
 Keep a pull request to one change, with a description of what it changes for someone using the package.
 
